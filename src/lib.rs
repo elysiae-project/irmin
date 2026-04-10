@@ -1,0 +1,283 @@
+//! Sophon game downloader. Manifest-based chunk downloads with zstd
+//! compression.
+
+pub mod api_scrape;
+pub mod game_installer;
+pub mod proto_parse;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use napi::bindgen_prelude::BigInt;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi_derive::napi;
+use serde::{Deserialize, Serialize};
+
+use game_installer::DownloadHandle;
+
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static ACTIVE_DOWNLOAD: OnceLock<Mutex<Option<DownloadHandle>>> = OnceLock::new();
+
+pub(crate) fn client() -> &'static reqwest::Client {
+    HTTP_CLIENT
+        .get()
+        .expect("HTTP client not initialized; call initClient() first")
+}
+
+pub(crate) fn active_download() -> &'static Mutex<Option<DownloadHandle>> {
+    ACTIVE_DOWNLOAD.get_or_init(|| Mutex::new(None))
+}
+
+/// Initialize the HTTP client. Must be called once before any download.
+#[napi]
+pub fn init_client() -> napi::Result<()> {
+    HTTP_CLIENT
+        .set(reqwest::Client::new())
+        .map_err(|_| napi::Error::from_reason("init_client already called"))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SophonProgress {
+    FetchingManifest,
+    Downloading {
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
+    Paused {
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
+    Assembling {
+        assembled_files: u64,
+        total_files: u64,
+    },
+    Warning {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    Finished,
+}
+
+/// Builds a closure `Fn(SophonProgress) + Send + Sync + Clone + 'static` that
+/// serializes each progress event to a JSON string and forwards it to the
+/// provided ThreadsafeFunction.
+fn make_progress_emitter(
+    tsfn: ThreadsafeFunction<String>,
+) -> impl Fn(SophonProgress) + Send + Sync + Clone + 'static {
+    let inner = Arc::new(tsfn);
+    move |progress: SophonProgress| {
+        if let Ok(json) = serde_json::to_string(&progress) {
+            let _ = inner.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    }
+}
+
+/// Downloads a fresh game installation.
+#[napi]
+pub async fn sophon_download(
+    game_id: String,
+    vo_lang: String,
+    output_path: String,
+    on_progress: ThreadsafeFunction<String>,
+) -> napi::Result<()> {
+    let game_dir = PathBuf::from(&output_path);
+    let emitter = make_progress_emitter(on_progress);
+
+    emitter(SophonProgress::FetchingManifest);
+
+    let (installers, tag) = game_installer::build_installers(client(), &game_id, &vo_lang)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    let handle = DownloadHandle::new();
+    *active_download().lock().unwrap() = Some(handle.clone());
+
+    let install_emitter = emitter.clone();
+    let result = game_installer::install(
+        installers,
+        &game_dir,
+        vec![],
+        &tag,
+        false,
+        handle,
+        install_emitter,
+    )
+    .await
+    .map_err(|e| napi::Error::from_reason(e.to_string()));
+
+    *active_download().lock().unwrap() = None;
+    emitter(SophonProgress::Finished);
+    result
+}
+
+/// Updates an existing game installation.
+#[napi]
+pub async fn sophon_update(
+    game_id: String,
+    vo_lang: String,
+    output_path: String,
+    on_progress: ThreadsafeFunction<String>,
+) -> napi::Result<()> {
+    let game_dir = PathBuf::from(&output_path);
+    let emitter = make_progress_emitter(on_progress);
+
+    let current_tag = game_installer::read_installed_tag_pub(&game_dir)
+        .ok_or_else(|| napi::Error::from_reason("No installed version found — cannot update"))?;
+
+    emitter(SophonProgress::FetchingManifest);
+
+    let (installers, deleted_files, new_tag) =
+        game_installer::build_update_installers(client(), &game_id, &vo_lang, &current_tag)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    let handle = DownloadHandle::new();
+    *active_download().lock().unwrap() = Some(handle.clone());
+
+    let install_emitter = emitter.clone();
+    let result = game_installer::install(
+        installers,
+        &game_dir,
+        deleted_files,
+        &new_tag,
+        false,
+        handle,
+        install_emitter,
+    )
+    .await
+    .map_err(|e| napi::Error::from_reason(e.to_string()));
+
+    *active_download().lock().unwrap() = None;
+    emitter(SophonProgress::Finished);
+    result
+}
+
+/// Pre-downloads an upcoming game version using patch-based preinstall.
+#[napi]
+pub async fn sophon_preinstall(
+    game_id: String,
+    vo_lang: String,
+    output_path: String,
+    on_progress: ThreadsafeFunction<String>,
+) -> napi::Result<()> {
+    let game_dir = PathBuf::from(&output_path);
+    let emitter = make_progress_emitter(on_progress);
+
+    emitter(SophonProgress::FetchingManifest);
+
+    let (installers, tag) =
+        game_installer::build_preinstall_installers(client(), &game_id, &vo_lang)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    let handle = DownloadHandle::new();
+    *active_download().lock().unwrap() = Some(handle.clone());
+
+    let install_emitter = emitter.clone();
+    let result = game_installer::install(
+        installers,
+        &game_dir,
+        vec![],
+        &tag,
+        true,
+        handle,
+        install_emitter,
+    )
+    .await
+    .map_err(|e| napi::Error::from_reason(e.to_string()));
+
+    *active_download().lock().unwrap() = None;
+    emitter(SophonProgress::Finished);
+    result
+}
+
+/// Applies a previously downloaded preinstall package.
+#[napi]
+pub async fn sophon_apply_preinstall(
+    preinstall_tag: String,
+    output_path: String,
+) -> napi::Result<()> {
+    let game_dir = PathBuf::from(&output_path);
+    game_installer::apply_preinstall(&game_dir, &preinstall_tag)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+/// Pauses the active download.
+#[napi]
+pub fn sophon_pause() -> napi::Result<()> {
+    if let Some(h) = active_download().lock().unwrap().as_ref() {
+        h.pause();
+        Ok(())
+    } else {
+        Err(napi::Error::from_reason("No active download"))
+    }
+}
+
+/// Resumes a paused download.
+#[napi]
+pub fn sophon_resume() -> napi::Result<()> {
+    if let Some(h) = active_download().lock().unwrap().as_ref() {
+        h.resume();
+        Ok(())
+    } else {
+        Err(napi::Error::from_reason("No active download"))
+    }
+}
+
+/// Cancels the active download.
+#[napi]
+pub fn sophon_cancel() -> napi::Result<()> {
+    if let Some(h) = active_download().lock().unwrap().as_ref() {
+        h.cancel();
+        Ok(())
+    } else {
+        Err(napi::Error::from_reason("No active download"))
+    }
+}
+
+/// Checks if an update is available for the game.
+#[napi]
+pub async fn sophon_check_update(
+    game_id: String,
+    vo_lang: String,
+    output_path: String,
+) -> napi::Result<UpdateInfoNapi> {
+    let game_dir = PathBuf::from(&output_path);
+    let info = game_installer::check_update(client(), &game_id, &vo_lang, &game_dir)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(UpdateInfoNapi {
+        update_available: info.update_available,
+        preinstall_available: info.preinstall_available,
+        preinstall_downloaded: info.preinstall_downloaded,
+        current_tag: info.current_tag,
+        remote_tag: info.remote_tag,
+        preinstall_tag: info.preinstall_tag,
+        update_compressed_size: BigInt::from(info.update_compressed_size),
+        update_decompressed_size: BigInt::from(info.update_decompressed_size),
+        preinstall_compressed_size: BigInt::from(info.preinstall_compressed_size),
+        preinstall_decompressed_size: BigInt::from(info.preinstall_decompressed_size),
+    })
+}
+
+/// napi-facing wrapper for `game_installer::UpdateInfo`. Uses `BigInt` for
+/// `u64` fields because napi-rs 3.10+ does not implement `ToNapiValue` for
+/// `u64` directly (to avoid silent precision loss).
+#[napi(object)]
+pub struct UpdateInfoNapi {
+    pub update_available: bool,
+    pub preinstall_available: bool,
+    pub preinstall_downloaded: bool,
+    pub current_tag: Option<String>,
+    pub remote_tag: String,
+    pub preinstall_tag: Option<String>,
+    pub update_compressed_size: BigInt,
+    pub update_decompressed_size: BigInt,
+    pub preinstall_compressed_size: BigInt,
+    pub preinstall_decompressed_size: BigInt,
+}
