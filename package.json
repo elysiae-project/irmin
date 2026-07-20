@@ -2,15 +2,15 @@
   "name": "irmin",
   "version": "1.0.0",
   "description": "Native Sophon game downloader for Electron",
+  "author": "The Elysiae Project",
+  "license": "BSD-3-Clause",
+  "type": "module",
   "main": "dist/irmin.node",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "napi build --release --config-path napi.config.json --output-dir ./dist",
     "build:debug": "napi build --config-path napi.config.json --output-dir ./dist"
   },
-  "author": "Chakorn Kungsanarux",
-  "license": "MIT",
-  "type": "module",
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0"
   }
