@@ -12,6 +12,6 @@
     "build:debug": "napi build --config-path napi.config.json --output-dir ./dist"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.0.0"
+    "@napi-rs/cli": "^3.7.3"
   }
 }

@@ -274,7 +274,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/cli@npm:^3.0.0":
+"@napi-rs/cli@npm:^3.7.3":
   version: 3.7.3
   resolution: "@napi-rs/cli@npm:3.7.3"
   dependencies:
@@ -1117,7 +1117,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "irmin@workspace:."
   dependencies:
-    "@napi-rs/cli": "npm:^3.0.0"
+    "@napi-rs/cli": "npm:^3.7.3"
   languageName: unknown
   linkType: soft
 
