@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::commands::sophon_downloader::proto_parse::SophonManifestProto;
+use crate::proto_parse::SophonManifestProto;
 
 /// Compute a deterministic content-based hash of a Sophon manifest.
 ///
@@ -34,8 +34,8 @@ pub fn compute_content_manifest_hash(manifest: &SophonManifestProto) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::sophon_downloader::manifest::compute_content_manifest_hash;
-    use crate::commands::sophon_downloader::proto_parse::{
+    use crate::manifest::compute_content_manifest_hash;
+    use crate::proto_parse::{
         SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
     };
 

@@ -1,10 +1,9 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use flate2::read::DeflateDecoder;
-use tauri_plugin_log::log;
 
 use super::CompressionMode;
-use crate::commands::sophon_downloader::game_installer::assembly_opt::{
+use crate::game_installer::assembly_opt::{
     MAX_WINDOW_LOG, return_dctx, take_dctx, window_log_for_size,
 };
 

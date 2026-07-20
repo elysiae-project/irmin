@@ -43,7 +43,7 @@ pub fn retry_delay(attempt: u32) -> Duration {
 }
 
 pub async fn cancelable_sleep(
-    handle: &crate::commands::sophon_downloader::game_installer::handle::DownloadHandle,
+    handle: &crate::game_installer::handle::DownloadHandle,
     delay: Duration,
 ) -> Result<(), ()> {
     tokio::select! {
@@ -152,7 +152,7 @@ pub fn write_installed_tag(game_dir: &Path, tag: &str) -> io::Result<()> {
     fs::write(version_file_path(game_dir), tag)
 }
 
-pub use crate::commands::sophon_downloader::types::CompletedFiles;
+pub use crate::types::CompletedFiles;
 pub use assembly::validate_asset_name;
 pub use error::SophonError;
 pub use handle::DownloadHandle;

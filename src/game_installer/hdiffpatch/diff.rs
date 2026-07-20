@@ -36,7 +36,7 @@ impl HDiff {
         match self.apply_inner(on_progress.as_ref().map(|cb| cb.as_ref())) {
             Ok(()) => true,
             Err(err) => {
-                tauri_plugin_log::log::error!("[HDiff::apply] Error: {err}");
+                log::error!("[HDiff::apply] Error: {err}");
                 false
             }
         }

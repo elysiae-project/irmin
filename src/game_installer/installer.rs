@@ -50,7 +50,6 @@ use futures_util::future::try_join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use tauri_plugin_log::log;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -65,16 +64,16 @@ use super::compact_manifest::{ChunkRef, CompactManifest};
 use super::error::{SophonError, SophonResult};
 use super::handle::DownloadHandle;
 use super::*;
-use crate::commands::sophon_downloader::SophonProgress;
-use crate::commands::sophon_downloader::api_scrape::{
+use crate::SophonProgress;
+use crate::api_scrape::{
     DownloadInfo, SophonBuildData, SophonManifestMeta,
 };
-use crate::commands::sophon_downloader::proto_parse::{
+use crate::proto_parse::{
     SophonManifestAssetProperty, SophonManifestProto,
 };
 
 #[cfg(test)]
-use crate::commands::sophon_downloader::proto_parse::SophonManifestAssetChunk;
+use crate::proto_parse::SophonManifestAssetChunk;
 
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 pub type StateSaver = Arc<dyn Fn(&HashMap<String, u64>) + Send + Sync>;
@@ -1214,7 +1213,7 @@ async fn process_download_item(
     }
 
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
-    if count.is_multiple_of(crate::commands::sophon_downloader::CHUNK_STATE_SAVE_INTERVAL) {
+    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
         let dc = Arc::clone(&ctx.downloaded_chunks);
         let cn = Arc::clone(&ctx.chunk_names);
         let saver = Arc::clone(&ctx.state_saver);
@@ -2602,7 +2601,7 @@ fn reassemble_single_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::sophon_downloader::api_scrape::Compression;
+    use crate::api_scrape::Compression;
 
     fn make_chunk(name: &str, size: u64) -> SophonManifestAssetChunk {
         SophonManifestAssetChunk {
@@ -3130,7 +3129,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_chunk_with_retries_success_on_first() {
-        use crate::commands::sophon_downloader::api_scrape::Compression;
+        use crate::api_scrape::Compression;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3235,7 +3234,7 @@ mod tests {
     /// download. Prevents appending fresh bytes to corrupted data.
     #[tokio::test]
     async fn download_chunk_with_retries_mismatch_discards_partial() {
-        use crate::commands::sophon_downloader::api_scrape::Compression;
+        use crate::api_scrape::Compression;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 

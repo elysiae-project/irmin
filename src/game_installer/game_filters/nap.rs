@@ -1,11 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use tauri_plugin_log::log;
 
 use super::write_lang_file;
-use crate::commands::sophon_downloader::game_installer::installer::InstallerData;
-use crate::commands::sophon_downloader::proto_parse::SophonManifestAssetProperty;
+use crate::game_installer::installer::InstallerData;
+use crate::proto_parse::SophonManifestAssetProperty;
 
 const GAME_DATA_DIR: &str =
     "\x5a\x65\x6e\x6c\x65\x73\x73\x5a\x6f\x6e\x65\x5a\x65\x72\x6f\x5f\x44\x61\x74\x61";

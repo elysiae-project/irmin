@@ -2,18 +2,18 @@ use std::time::Duration;
 
 use reqwest::Client;
 
-use crate::commands::sophon_downloader::api_scrape::{
+use crate::api_scrape::{
     FrontDoorResponse, GameBranch, PackageBranch, SophonBuildData, SophonBuildResponse,
     SophonPatchBuildData, SophonPatchBuildResponse, SophonPatchManifestMeta,
 };
-use crate::commands::sophon_downloader::proto_parse::{
+use crate::proto_parse::{
     SophonManifestProto, SophonPatchProto, decode_manifest, decode_patch_manifest,
 };
 
 use super::error::{SophonError, SophonResult};
 use super::{FRONT_DOOR_URL, SOPHON_BUILD_URL_BASE};
-use crate::commands::sophon_downloader::api_scrape::DownloadInfo;
-use crate::commands::sophon_downloader::compute_content_manifest_hash;
+use crate::api_scrape::DownloadInfo;
+use crate::compute_content_manifest_hash;
 
 pub struct ManifestWithHash {
     pub manifest: SophonManifestProto,

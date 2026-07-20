@@ -14,7 +14,6 @@ pub(crate) const VERIFICATION_CACHE_MAX_ENTRIES: usize = 5_000;
 #[cfg(test)]
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use tauri_plugin_log::log;
 
 use super::VERIFICATION_CACHE_FILE;
 use super::assembly_opt::md5_hex_eq;

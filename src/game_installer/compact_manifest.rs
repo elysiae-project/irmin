@@ -5,7 +5,7 @@
 //! per-string and per-Vec heap allocation overhead and improves jemalloc
 //! fragmentation by co-locating fields in contiguous allocations.
 
-use crate::commands::sophon_downloader::proto_parse::{
+use crate::proto_parse::{
     SophonManifestAssetChunk, SophonManifestAssetProperty,
 };
 use rustc_hash::FxHashMap;
@@ -332,7 +332,7 @@ impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::sophon_downloader::proto_parse::SophonManifestAssetChunk;
+    use crate::proto_parse::SophonManifestAssetChunk;
 
     fn make_chunk(
         name: &str,

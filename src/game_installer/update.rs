@@ -2,14 +2,13 @@ use std::path::Path;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tauri_plugin_log::log;
 
 use super::api::{fetch_build, is_known_vo_locale, vo_lang_matches};
 use super::error::{SophonError, SophonResult};
 use super::read_installed_tag;
 
-use crate::commands::sophon_downloader::api_scrape::PackageBranch;
-use crate::commands::sophon_downloader::api_scrape::SophonManifestMeta;
+use crate::api_scrape::PackageBranch;
+use crate::api_scrape::SophonManifestMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
@@ -248,7 +247,7 @@ pub async fn fetch_diff_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::sophon_downloader::game_installer::api;
+    use crate::game_installer::api;
 
     #[test]
     fn parse_size_returns_correct_values() {

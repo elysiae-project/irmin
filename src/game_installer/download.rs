@@ -5,7 +5,6 @@ use std::path::Path;
 use futures_util::StreamExt;
 use libc;
 use reqwest::Client;
-use tauri_plugin_log::log;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 use super::CHUNK_WRITE_BUFFER_SIZE;
@@ -15,7 +14,7 @@ use super::assembly_opt::{
 use super::compact_manifest::ChunkRef;
 use super::error::{SophonError, SophonResult};
 use super::handle::DownloadHandle;
-use crate::commands::sophon_downloader::api_scrape::DownloadInfo;
+use crate::api_scrape::DownloadInfo;
 
 pub(crate) struct EvictingWriter {
     inner: BufWriter<tokio::fs::File>,

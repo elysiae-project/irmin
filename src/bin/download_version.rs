@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use elysiae_lib::commands::sophon_downloader::SophonProgress;
-use elysiae_lib::commands::sophon_downloader::game_installer::{
+use irmin::SophonProgress;
+use irmin::game_installer::{
     self, DownloadHandle, InstallCallbacks, InstallOptions, ResumeContext,
 };
 use serde::{Deserialize, Serialize};

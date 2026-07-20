@@ -10,7 +10,6 @@ use std::thread_local;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use tauri_plugin_log::log;
 
 thread_local! {
     static TRANSFER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -22,8 +21,8 @@ use super::cache::VerificationEntry;
 use super::error::{SophonError, SophonResult};
 use super::installer::ChunkNameLookup;
 use super::{FILE_WRITE_BUFFER_SIZE, PROGRESS_UPDATE_INTERVAL_MS};
-use crate::commands::sophon_downloader::SophonProgress;
-use crate::commands::sophon_downloader::game_installer::compact_manifest::CompactManifest;
+use crate::SophonProgress;
+use crate::game_installer::compact_manifest::CompactManifest;
 
 #[inline]
 pub fn chunk_filename(chunk_name: &str) -> String {
@@ -1000,8 +999,8 @@ mod tests {
     use super::super::compact_manifest::StringArena;
     use super::super::profiling::PipelineProfiler;
     use super::*;
-    use crate::commands::sophon_downloader::game_installer::compact_manifest::CompactManifest;
-    use crate::commands::sophon_downloader::proto_parse::{
+    use crate::game_installer::compact_manifest::CompactManifest;
+    use crate::proto_parse::{
         SophonManifestAssetChunk, SophonManifestAssetProperty,
     };
 

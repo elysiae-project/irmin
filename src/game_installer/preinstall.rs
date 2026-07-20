@@ -23,7 +23,6 @@ use futures_util::StreamExt;
 use futures_util::future::try_join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tauri_plugin_log::log;
 
 use super::api::{
     fetch_build, fetch_front_door, fetch_manifest, fetch_patch_build, fetch_patch_manifest,
@@ -34,10 +33,10 @@ use super::error::{SophonError, SophonResult};
 use super::handle::DownloadHandle;
 use super::read_installed_tag;
 use super::{MAX_RETRIES, cancelable_sleep, retry_delay};
-use crate::commands::sophon_downloader::api_scrape::{
+use crate::api_scrape::{
     DownloadInfo, SophonBuildData, SophonManifestMeta, SophonPatchManifestMeta,
 };
-use crate::commands::sophon_downloader::proto_parse::{
+use crate::proto_parse::{
     SophonManifestAssetChunk, SophonManifestProto, SophonPatchAssetChunk, SophonPatchAssetProperty,
 };
 
@@ -597,7 +596,7 @@ async fn process_preinstall_chunk(
 
     let save_count = chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if save_count
-        .is_multiple_of(crate::commands::sophon_downloader::CHUNK_STATE_SAVE_INTERVAL as usize)
+        .is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL as usize)
     {
         let map: HashMap<String, u64> = chunk_bytes_map
             .iter()
@@ -2282,7 +2281,7 @@ async fn apply_download_over(
     Ok(())
 }
 
-use crate::commands::sophon_downloader::SophonProgress;
+use crate::SophonProgress;
 
 #[cfg(test)]
 mod tests {
@@ -2367,7 +2366,7 @@ mod tests {
             main_chunk_download: DownloadInfo {
                 encryption: 0,
                 password: String::new(),
-                compression: crate::commands::sophon_downloader::api_scrape::Compression::None,
+                compression: crate::api_scrape::Compression::None,
                 url_prefix: "https://example.com/".to_string(),
                 url_suffix: "v2".to_string(),
             },
@@ -3775,7 +3774,7 @@ mod tests {
         DownloadInfo {
             encryption: 0,
             password: String::new(),
-            compression: crate::commands::sophon_downloader::api_scrape::Compression::None,
+            compression: crate::api_scrape::Compression::None,
             url_prefix: "https://example.com/".to_string(),
             url_suffix: "v1".to_string(),
         }

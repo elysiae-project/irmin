@@ -113,7 +113,7 @@ impl PipelineProfiler {
 
         #[cfg(feature = "sophon-profiling")]
         {
-            use tauri_plugin_log::log;
+
             let count = self.report_count.fetch_add(1, Ordering::Relaxed) + 1;
             let elapsed = self.start.elapsed().as_secs_f64();
             if elapsed < 1.0 {

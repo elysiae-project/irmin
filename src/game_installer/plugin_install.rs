@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::Client;
-use tauri_plugin_log::log;
 use tokio::io::AsyncWriteExt;
 use zip::ZipArchive;
 
@@ -18,7 +17,7 @@ use super::plugin_api::{
     ChannelSdkData, PackageData, PluginPackageInfo, ValidationEntry, fetch_channel_sdks,
     fetch_plugins, game_id_for_code,
 };
-use crate::commands::sophon_downloader::SophonProgress;
+use crate::SophonProgress;
 
 type ProgressFn = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 

@@ -1,12 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use tauri_plugin_log::log;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::error::{SophonError, SophonResult};
-use crate::commands::sophon_downloader::SophonProgress;
+use crate::SophonProgress;
 
 const STATE_RUNNING: u8 = 0;
 const STATE_PAUSED: u8 = 1;
@@ -166,7 +165,7 @@ mod tests {
     async fn handle_resume_notifies_waiters() {
         let handle = DownloadHandle::new();
         handle.pause();
-        let updater = |_progress: crate::commands::sophon_downloader::SophonProgress| {};
+        let updater = |_progress: crate::SophonProgress| {};
         let h = handle.clone();
         let result = tokio::spawn(async move { h.wait_if_paused(&updater, 0, 100).await });
         tokio::task::yield_now().await;
@@ -179,7 +178,7 @@ mod tests {
     async fn handle_wait_if_paused_returns_cancelled() {
         let handle = DownloadHandle::new();
         handle.pause();
-        let updater = |_progress: crate::commands::sophon_downloader::SophonProgress| {};
+        let updater = |_progress: crate::SophonProgress| {};
         let h = handle.clone();
         let result = tokio::spawn(async move { h.wait_if_paused(&updater, 0, 100).await });
         tokio::task::yield_now().await;

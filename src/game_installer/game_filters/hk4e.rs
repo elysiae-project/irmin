@@ -4,11 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri_plugin_log::log;
 
 use super::write_lang_file;
-use crate::commands::sophon_downloader::game_installer::compact_manifest::CompactManifest;
-use crate::commands::sophon_downloader::proto_parse::SophonManifestAssetProperty;
+use crate::game_installer::compact_manifest::CompactManifest;
+use crate::proto_parse::SophonManifestAssetProperty;
 
 const ALL_AUDIO_LANGUAGES: &[&str] = &["Chinese", "English(US)", "Japanese", "Korean"];
 
@@ -456,7 +455,7 @@ mod tests {
     // write_pkg_version_from_manifest
     #[test]
     fn test_write_pkg_version_from_manifest_creates_files() {
-        use crate::commands::sophon_downloader::game_installer::compact_manifest::CompactManifest;
+        use crate::game_installer::compact_manifest::CompactManifest;
         let dir = tempfile::tempdir().unwrap();
 
         let assets_vec = vec![
@@ -516,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_write_pkg_version_from_manifest_no_audio_langs() {
-        use crate::commands::sophon_downloader::game_installer::compact_manifest::CompactManifest;
+        use crate::game_installer::compact_manifest::CompactManifest;
         let dir = tempfile::tempdir().unwrap();
 
         let assets_vec = vec![SophonManifestAssetProperty {
@@ -585,7 +584,7 @@ mod tests {
     // write_single_pkg_version
     #[test]
     fn test_write_single_pkg_version_skips_directories() {
-        use crate::commands::sophon_downloader::game_installer::compact_manifest::CompactManifest;
+        use crate::game_installer::compact_manifest::CompactManifest;
         let dir = tempfile::tempdir().unwrap();
         let assets_vec = vec![
             SophonManifestAssetProperty {

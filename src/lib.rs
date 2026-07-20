@@ -2,8 +2,12 @@
 //! compression.
 
 pub mod api_scrape;
+pub mod client;
 pub mod game_installer;
+pub mod manifest;
+pub mod progress;
 pub mod proto_parse;
+pub mod types;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,9 +15,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use napi::bindgen_prelude::BigInt;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use serde::{Deserialize, Serialize};
 
 use game_installer::DownloadHandle;
+use game_installer::installer::{InstallCallbacks, InstallOptions, ResumeContext};
+use progress::SophonProgress;
+
+pub use manifest::compute_content_manifest_hash;
+pub use types::CHUNK_STATE_SAVE_INTERVAL;
+pub use client::DownloadClient;
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static ACTIVE_DOWNLOAD: OnceLock<Mutex<Option<DownloadHandle>>> = OnceLock::new();
@@ -37,43 +46,18 @@ pub fn init_client() -> napi::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum SophonProgress {
-    FetchingManifest,
-    Downloading {
-        downloaded_bytes: u64,
-        total_bytes: u64,
-    },
-    Paused {
-        downloaded_bytes: u64,
-        total_bytes: u64,
-    },
-    Assembling {
-        assembled_files: u64,
-        total_files: u64,
-    },
-    Warning {
-        message: String,
-    },
-    Error {
-        message: String,
-    },
-    Finished,
-}
-
 /// Builds a closure `Fn(SophonProgress) + Send + Sync + Clone + 'static` that
 /// serializes each progress event to a JSON string and forwards it to the
 /// provided ThreadsafeFunction.
 fn make_progress_emitter(
     tsfn: ThreadsafeFunction<String>,
-) -> impl Fn(SophonProgress) + Send + Sync + Clone + 'static {
+) -> Arc<dyn Fn(SophonProgress) + Send + Sync> {
     let inner = Arc::new(tsfn);
-    move |progress: SophonProgress| {
+    Arc::new(move |progress: SophonProgress| {
         if let Ok(json) = serde_json::to_string(&progress) {
             let _ = inner.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
         }
-    }
+    })
 }
 
 /// Downloads a fresh game installation.
@@ -85,33 +69,52 @@ pub async fn sophon_download(
     on_progress: ThreadsafeFunction<String>,
 ) -> napi::Result<()> {
     let game_dir = PathBuf::from(&output_path);
-    let emitter = make_progress_emitter(on_progress);
+    let updater = make_progress_emitter(on_progress);
 
-    emitter(SophonProgress::FetchingManifest);
+    updater(SophonProgress::FetchingManifest);
 
-    let (installers, tag) = game_installer::build_installers(client(), &game_id, &vo_lang)
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    let (installers, tag, game_code) =
+        game_installer::build_installers(client(), &game_id, &vo_lang)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     let handle = DownloadHandle::new();
     *active_download().lock().unwrap() = Some(handle.clone());
 
-    let install_emitter = emitter.clone();
-    let result = game_installer::install(
+    let options = InstallOptions {
+        is_preinstall: false,
+        is_resume: false,
+        handle,
+    };
+    let callbacks = InstallCallbacks {
+        updater: updater.clone(),
+        state_saver: Arc::new(|_| {}),
+        completion_state: Arc::new(OnceLock::new()),
+    };
+    let resume = ResumeContext {
+        prev_manifest_hash: String::new(),
+        prev_downloaded_chunks: Default::default(),
+        resume_seed: Default::default(),
+    };
+    let vo_langs = vec![vo_lang.clone()];
+
+    game_installer::install(
         installers,
         &game_dir,
         vec![],
         &tag,
-        false,
-        handle,
-        install_emitter,
+        resume,
+        options,
+        callbacks,
+        &game_code,
+        &vo_langs,
     )
     .await
-    .map_err(|e| napi::Error::from_reason(e.to_string()));
+    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     *active_download().lock().unwrap() = None;
-    emitter(SophonProgress::Finished);
-    result
+    updater(SophonProgress::Finished);
+    Ok(())
 }
 
 /// Updates an existing game installation.
@@ -123,37 +126,55 @@ pub async fn sophon_update(
     on_progress: ThreadsafeFunction<String>,
 ) -> napi::Result<()> {
     let game_dir = PathBuf::from(&output_path);
-    let emitter = make_progress_emitter(on_progress);
+    let updater = make_progress_emitter(on_progress);
 
-    let current_tag = game_installer::read_installed_tag_pub(&game_dir)
+    let current_tag = game_installer::read_installed_tag(&game_dir)
         .ok_or_else(|| napi::Error::from_reason("No installed version found — cannot update"))?;
 
-    emitter(SophonProgress::FetchingManifest);
+    updater(SophonProgress::FetchingManifest);
 
-    let (installers, deleted_files, new_tag) =
-        game_installer::build_update_installers(client(), &game_id, &vo_lang, &current_tag)
+    let (installers, deleted_files, new_tag, game_code) =
+        game_installer::build_update_installers(client(), &game_id, &vo_lang, &current_tag, &game_dir)
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     let handle = DownloadHandle::new();
     *active_download().lock().unwrap() = Some(handle.clone());
 
-    let install_emitter = emitter.clone();
-    let result = game_installer::install(
+    let options = InstallOptions {
+        is_preinstall: false,
+        is_resume: false,
+        handle,
+    };
+    let callbacks = InstallCallbacks {
+        updater: updater.clone(),
+        state_saver: Arc::new(|_| {}),
+        completion_state: Arc::new(OnceLock::new()),
+    };
+    let resume = ResumeContext {
+        prev_manifest_hash: String::new(),
+        prev_downloaded_chunks: Default::default(),
+        resume_seed: Default::default(),
+    };
+    let vo_langs = vec![vo_lang.clone()];
+
+    game_installer::install(
         installers,
         &game_dir,
         deleted_files,
         &new_tag,
-        false,
-        handle,
-        install_emitter,
+        resume,
+        options,
+        callbacks,
+        &game_code,
+        &vo_langs,
     )
     .await
-    .map_err(|e| napi::Error::from_reason(e.to_string()));
+    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     *active_download().lock().unwrap() = None;
-    emitter(SophonProgress::Finished);
-    result
+    updater(SophonProgress::Finished);
+    Ok(())
 }
 
 /// Pre-downloads an upcoming game version using patch-based preinstall.
@@ -165,34 +186,34 @@ pub async fn sophon_preinstall(
     on_progress: ThreadsafeFunction<String>,
 ) -> napi::Result<()> {
     let game_dir = PathBuf::from(&output_path);
-    let emitter = make_progress_emitter(on_progress);
+    let updater = make_progress_emitter(on_progress);
 
-    emitter(SophonProgress::FetchingManifest);
+    updater(SophonProgress::FetchingManifest);
 
-    let (installers, tag) =
-        game_installer::build_preinstall_installers(client(), &game_id, &vo_lang)
-            .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    let plan = game_installer::build_preinstall_plan(client(), &game_id, &vo_lang, &game_dir)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     let handle = DownloadHandle::new();
     *active_download().lock().unwrap() = Some(handle.clone());
 
-    let install_emitter = emitter.clone();
-    let result = game_installer::install(
-        installers,
+    game_installer::preinstall_download(
+        client(),
+        &plan,
         &game_dir,
-        vec![],
-        &tag,
-        true,
+        &game_id,
+        &vo_lang,
         handle,
-        install_emitter,
+        updater.clone(),
+        Arc::new(|_| {}),
+        Default::default(),
     )
     .await
-    .map_err(|e| napi::Error::from_reason(e.to_string()));
+    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     *active_download().lock().unwrap() = None;
-    emitter(SophonProgress::Finished);
-    result
+    updater(SophonProgress::Finished);
+    Ok(())
 }
 
 /// Applies a previously downloaded preinstall package.
@@ -202,9 +223,16 @@ pub async fn sophon_apply_preinstall(
     output_path: String,
 ) -> napi::Result<()> {
     let game_dir = PathBuf::from(&output_path);
-    game_installer::apply_preinstall(&game_dir, &preinstall_tag)
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
+    let handle = DownloadHandle::new();
+    game_installer::apply_preinstall(
+        client(),
+        &game_dir,
+        &preinstall_tag,
+        Arc::new(|_| {}),
+        &handle,
+    )
+    .await
+    .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 /// Pauses the active download.

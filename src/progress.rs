@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::commands::sophon_downloader::game_installer::SophonError;
+use crate::game_installer::SophonError;
 
 /// Progress events emitted during download operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]

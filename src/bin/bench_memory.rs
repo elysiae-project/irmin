@@ -22,14 +22,14 @@ use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 
-use elysiae_lib::commands::sophon_downloader::game_installer::{
+use irmin::game_installer::{
     assembly::{assemble_file, chunk_filename},
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
     installer::{ChunkNameLookup, intern_old_chunk_offsets},
     sysio,
 };
-use elysiae_lib::commands::sophon_downloader::proto_parse::{
+use irmin::proto_parse::{
     SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
 };
 
@@ -503,7 +503,7 @@ fn op_stream_md5_128m(dir: &Path) {
     let big = dir.join("stream_md5.bin");
     fill_file(&big, 128, 0xCD);
     evict_page_cache(&big);
-    let _ = elysiae_lib::commands::sophon_downloader::game_installer::cache::file_md5_digest(&big);
+    let _ = irmin::game_installer::cache::file_md5_digest(&big);
 }
 
 /// XXH64 of 128 MiB via pread. Compares throughput and RSS against MD5.

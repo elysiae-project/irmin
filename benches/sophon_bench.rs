@@ -21,14 +21,14 @@ use std::sync::atomic::AtomicU32;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use md5::{Digest, Md5};
 
-use elysiae_lib::commands::sophon_downloader::game_installer::{
+use irmin::game_installer::{
     assembly::{assemble_file, chunk_filename},
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
     installer::ChunkNameLookup,
     sysio,
 };
-use elysiae_lib::commands::sophon_downloader::proto_parse::{
+use irmin::proto_parse::{
     SophonManifestAssetChunk, SophonManifestAssetProperty,
 };
 
@@ -421,7 +421,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             cache.clear();
             evict_page_cache(&path);
             let _ =
-                elysiae_lib::commands::sophon_downloader::game_installer::cache::check_file_md5_cached(
+                irmin::game_installer::cache::check_file_md5_cached(
                     &path,
                     bytes,
                     &md5,

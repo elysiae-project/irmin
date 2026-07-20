@@ -2,10 +2,9 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-use tauri_plugin_log::log;
 
 use super::write_lang_file;
-use crate::commands::sophon_downloader::proto_parse::SophonManifestAssetProperty;
+use crate::proto_parse::SophonManifestAssetProperty;
 
 const AUDIO_LANG_FILE: &str = "AudioLaucherRecord.txt";
 const GAME_DATA_DIR: &str = "\x53\x74\x61\x72\x52\x61\x69\x6c\x5f\x44\x61\x74\x61";

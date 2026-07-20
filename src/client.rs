@@ -36,6 +36,6 @@ impl DownloadClient {
 /// Thread-safe container for the active download handle.
 pub struct ActiveDownload(
     pub  tokio::sync::Mutex<
-        Option<crate::commands::sophon_downloader::game_installer::DownloadHandle>,
+        Option<crate::game_installer::DownloadHandle>,
     >,
 );

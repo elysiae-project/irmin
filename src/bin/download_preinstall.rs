@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use elysiae_lib::commands::sophon_downloader::SophonProgress;
-use elysiae_lib::commands::sophon_downloader::game_installer::{self, DownloadHandle};
+use irmin::SophonProgress;
+use irmin::game_installer::{self, DownloadHandle};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Builder;
 

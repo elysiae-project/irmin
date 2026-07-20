@@ -5,7 +5,7 @@ use super::{
     MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT, RleRefClip,
     SeekableRead,
 };
-use crate::commands::sophon_downloader::game_installer::hdiffpatch::parser::{
+use crate::game_installer::hdiffpatch::parser::{
     BinaryExtensions, read_long_7bit_from_slice,
 };
 
