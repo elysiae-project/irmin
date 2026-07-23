@@ -19,6 +19,7 @@ use napi_derive::napi;
 use game_installer::DownloadHandle;
 use game_installer::installer::{InstallCallbacks, InstallOptions, ResumeContext};
 use progress::SophonProgress;
+use types::DownloadState;
 
 pub use manifest::compute_content_manifest_hash;
 pub use types::CHUNK_STATE_SAVE_INTERVAL;
@@ -26,6 +27,9 @@ pub use client::DownloadClient;
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static ACTIVE_DOWNLOAD: OnceLock<Mutex<Option<DownloadHandle>>> = OnceLock::new();
+
+/// Filename of the persisted download state within the state directory.
+const DOWNLOAD_STATE_FILE: &str = ".sophon_download_state";
 
 pub(crate) fn client() -> &'static reqwest::Client {
     HTTP_CLIENT
@@ -35,6 +39,14 @@ pub(crate) fn client() -> &'static reqwest::Client {
 
 pub(crate) fn active_download() -> &'static Mutex<Option<DownloadHandle>> {
     ACTIVE_DOWNLOAD.get_or_init(|| Mutex::new(None))
+}
+
+/// Load persisted download state from `state_dir`. Returns `None` if the
+/// file is missing or unparseable.
+fn load_download_state(state_dir: &str) -> Option<DownloadState> {
+    let path = PathBuf::from(state_dir).join(DOWNLOAD_STATE_FILE);
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 /// Initialize the HTTP client. Must be called once before any download.
@@ -291,6 +303,12 @@ pub async fn sophon_check_update(
         preinstall_compressed_size: BigInt::from(info.preinstall_compressed_size),
         preinstall_decompressed_size: BigInt::from(info.preinstall_decompressed_size),
     })
+}
+
+/// Checks if there is a downloadable state to resume.
+#[napi]
+pub fn sophon_has_resume_state(state_dir: String) -> bool {
+    load_download_state(&state_dir).is_some()
 }
 
 /// napi-facing wrapper for `game_installer::UpdateInfo`. Uses `BigInt` for
