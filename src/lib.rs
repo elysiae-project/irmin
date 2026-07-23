@@ -21,6 +21,14 @@ use game_installer::installer::{InstallCallbacks, InstallOptions, ResumeContext}
 use progress::SophonProgress;
 use types::DownloadState;
 
+/// Global allocator. Jemalloc is only used under `sophon-profiling` because
+/// statically linking it into a `cdylib` inflates the static TLS block, which
+/// breaks `dlopen` from Electron ("cannot allocate memory in static TLS
+/// block"). The default build uses the system allocator to stay load-safe.
+#[cfg(all(unix, feature = "sophon-profiling"))]
+#[global_allocator]
+static GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub use manifest::compute_content_manifest_hash;
 pub use types::CHUNK_STATE_SAVE_INTERVAL;
 pub use client::DownloadClient;

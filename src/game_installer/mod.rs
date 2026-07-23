@@ -169,7 +169,7 @@ pub use update::{UpdateInfo, check_update};
 /// major sophon phase transitions (download → assembly, etc.) to reduce
 /// resident memory.
 pub fn reclaim_memory() {
-    #[cfg(not(target_env = "msvc"))]
+    #[cfg(feature = "sophon-profiling")]
     {
         let _ = tikv_jemalloc_ctl::epoch::advance();
     }
