@@ -356,3 +356,23 @@ pub fn sophon_get_resume_info(state_dir: String) -> Option<ResumeInfoNapi> {
         },
     })
 }
+
+/// Verifies the integrity of installed game files and re-downloads any
+/// corrupted ones.
+#[napi]
+pub async fn sophon_verify_integrity(
+    game_id: String,
+    vo_lang: String,
+    output_path: String,
+    on_progress: ThreadsafeFunction<String>,
+) -> napi::Result<()> {
+    let game_dir = PathBuf::from(&output_path);
+    let updater = make_progress_emitter(on_progress);
+
+    game_installer::verify_integrity(client(), &game_id, &vo_lang, &game_dir, move |p| {
+        updater(p)
+    })
+    .await
+    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(())
+}
