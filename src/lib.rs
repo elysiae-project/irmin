@@ -327,3 +327,32 @@ pub struct UpdateInfoNapi {
     pub preinstall_compressed_size: BigInt,
     pub preinstall_decompressed_size: BigInt,
 }
+
+/// napi-facing mirror of `types::DownloadType`. Serialized as camelCase
+/// strings to match the serde representation persisted in state files.
+#[napi(string_enum = "camelCase")]
+pub enum DownloadTypeNapi {
+    Fresh,
+    Update,
+    Preinstall,
+}
+
+/// napi-facing wrapper for `types::ResumeInfo`.
+#[napi(object)]
+pub struct ResumeInfoNapi {
+    pub game_id: String,
+    pub download_type: DownloadTypeNapi,
+}
+
+/// Returns details about the resumable download state, if any.
+#[napi]
+pub fn sophon_get_resume_info(state_dir: String) -> Option<ResumeInfoNapi> {
+    load_download_state(&state_dir).map(|s| ResumeInfoNapi {
+        game_id: s.game_id,
+        download_type: match s.download_type {
+            types::DownloadType::Fresh => DownloadTypeNapi::Fresh,
+            types::DownloadType::Update => DownloadTypeNapi::Update,
+            types::DownloadType::Preinstall => DownloadTypeNapi::Preinstall,
+        },
+    })
+}
