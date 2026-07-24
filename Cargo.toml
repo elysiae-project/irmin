@@ -2,7 +2,7 @@
 name = "irmin"
 version = "1.0.0"
 description = "Native Sophon game downloader for Electron"
-authors = ["Chakorn Kungsanarux <chakornk2007@gmail.com>"]
+authors = ["The Elysiae Project"]
 edition = "2024"
 rust-version = "1.92.0"
 
