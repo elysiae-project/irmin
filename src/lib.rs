@@ -27,10 +27,7 @@ pub type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 /// State saver callback for persisting download progress.
 pub type StateSaver = Arc<dyn Fn(&std::collections::HashMap<String, u64>) + Send + Sync>;
 
-/// Global allocator. Jemalloc is only used under `sophon-profiling` because
-/// statically linking it into a `cdylib` inflates the static TLS block, which
-/// breaks `dlopen` from Electron ("cannot allocate memory in static TLS
-/// block"). The default build uses the system allocator to stay load-safe.
+/// Global allocator. Enabled under `sophon-profiling` for jemalloc stats.
 #[cfg(all(unix, feature = "sophon-profiling"))]
 #[global_allocator]
 static GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
