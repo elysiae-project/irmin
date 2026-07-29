@@ -8,25 +8,10 @@ rust-version = "1.92.0"
 
 [lib]
 name = "irmin"
-crate-type = ["cdylib"]
-
-[build-dependencies]
-napi-build = "1"
+crate-type = ["lib"]
 
 [dependencies]
-napi = { version = "3", features = [
-    "napi6",
-    "tokio_rt",
-    "tokio_sync",
-    "tokio_time",
-    "tokio_macros",
-    "tokio_net",
-    "tokio_io_util",
-    "serde-json",
-] }
-napi-derive = "3"
-
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 tokio-util = "0.7"
 futures = "0.3"
 futures-util = "0.3"
