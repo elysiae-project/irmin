@@ -80,7 +80,7 @@ pub type StateSaver = Arc<dyn Fn(&HashMap<String, u64>) + Send + Sync>;
 
 pub struct ResumeContext {
     pub prev_manifest_hash: String,
-    pub prev_downloaded_chunks: FxHashMap<String, u64>,
+    pub prev_downloaded_chunks: HashMap<String, u64>,
     /// Persisted completion seed loaded from the on-disk resume state.
     /// install() uses this to pre-populate `completion_flags` before
     /// assembly tasks fire so that previously finished files short-circuit

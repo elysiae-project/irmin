@@ -1,58 +1,37 @@
 [package]
 name = "irmin"
 version = "1.0.0"
-description = "Native Sophon game downloader for Electron"
+description = "Sophon game downloader"
 authors = ["The Elysiae Project"]
 edition = "2024"
 rust-version = "1.92.0"
 
 [lib]
 name = "irmin"
-crate-type = ["cdylib"]
-
-[build-dependencies]
-napi-build = "1"
+crate-type = ["lib"]
 
 [dependencies]
-napi = { version = "3", features = [
-    "napi6",
-    "tokio_rt",
-    "tokio_sync",
-    "tokio_time",
-    "tokio_macros",
-    "tokio_net",
-    "tokio_io_util",
-    "serde-json",
-] }
-napi-derive = "3"
-
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 tokio-util = "0.7"
-futures = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-reqwest = { version = "0.13", features = ["stream", "blocking", "json"] }
+reqwest = { version = "0.13", features = ["stream", "json"] }
 zstd = "0.13"
 md-5 = "0.11"
 fast-md5 = "1.0"
 prost = "0.14"
 dashmap = { version = "6", features = ["serde"] }
 hex = "0.4"
-bytes = "1"
-lru = "0.18"
 thiserror = "2"
 sha2 = "0.11"
-sysinfo = "0.39"
 libc = "0.2"
-twox-hash = "2"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 rustc-hash = "2"
 lz4 = "1"
 flate2 = "1"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 tempfile = "3"
-fs_extra = "1"
 log = "0.4"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
@@ -60,7 +39,6 @@ tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
 wiremock = "0.6"
 criterion = "0.8"
 openssl = "0.10"
