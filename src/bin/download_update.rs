@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+
+use rustc_hash::FxHashMap;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -135,7 +138,7 @@ async fn async_main() {
         &new_tag,
         game_installer::ResumeContext {
             prev_manifest_hash: String::new(),
-            prev_downloaded_chunks: HashMap::new(),
+            prev_downloaded_chunks: FxHashMap::default(),
             resume_seed: Default::default(),
         },
         game_installer::InstallOptions {
