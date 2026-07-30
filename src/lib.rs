@@ -45,8 +45,8 @@ pub fn load_download_state(state_dir: &str) -> Option<DownloadState> {
 }
 
 /// Downloads a fresh game installation. The caller supplies the
-/// [`DownloadHandle`] so it can `pause`/`resume`/`cancel` the in-flight
-/// download from another task — there is no global active-download state.
+/// [`DownloadHandle`] so it can pause/resume/cancel the in-flight
+/// download from another task.
 pub async fn sophon_download(
     client: &reqwest::Client,
     game_id: &str,
