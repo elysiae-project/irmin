@@ -22,17 +22,18 @@ Add the crate and call the high-level convenience functions:
 
 ```rust
 use std::sync::Arc;
-use irmin::{sophon_download, SophonProgress};
+use irmin::{sophon_download, DownloadHandle, SophonProgress};
 
 let client = reqwest::Client::new();
+let handle = DownloadHandle::new();
 let on_progress: irmin::ProgressUpdater = Arc::new(|p: SophonProgress| {
     println!("{p:?}");
 });
 
-sophon_download(&client, "hk4e", "en-us", "/path/to/game", on_progress).await?;
+sophon_download(&client, "hk4e", "en-us", "/path/to/game", &handle, on_progress).await?;
 ```
 
-The convenience functions take a `&reqwest::Client` explicitly, so you control connection pooling. For lower-level control, the `game_installer` module exposes `build_installers`, `install`, `preinstall_download`, `apply_preinstall`, `check_update`, and `verify_integrity` directly.
+The convenience functions take a `&reqwest::Client` explicitly, so you control connection pooling. Each download function also takes a `&DownloadHandle`; clone it before the call and you can `handle.pause()`, `handle.resume()`, or `handle.cancel()` the in-flight download from any other task. There is no global active-download registry. For lower-level control, the `game_installer` module exposes `build_installers`, `install`, `preinstall_download`, `apply_preinstall`, `check_update`, and `verify_integrity` directly.
 
 Supported game identifiers:
 

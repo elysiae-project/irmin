@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+
+use rustc_hash::FxHashMap;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -107,23 +110,23 @@ async fn async_main() {
                         "Resuming download of {game_id} version {tag} ({count} chunks, {:.1} MiB already downloaded)...",
                         bytes as f64 / (1024.0 * 1024.0)
                     );
-                    (saved.manifest_hash, saved.downloaded_chunks, true)
+                    (saved.manifest_hash, saved.downloaded_chunks.into_iter().collect(), true)
                 } else {
                     eprintln!(
                         "Tag mismatch (saved={}, requested={}), starting fresh",
                         saved.tag, tag
                     );
-                    (String::new(), HashMap::new(), false)
+                    (String::new(), FxHashMap::default(), false)
                 }
             }
             Err(err) => {
                 eprintln!("Corrupt state file, starting fresh: {err}");
-                (String::new(), HashMap::new(), false)
+                (String::new(), FxHashMap::default(), false)
             }
         }
     } else {
         eprintln!("Downloading {game_id} version {tag}...");
-        (String::new(), HashMap::new(), false)
+        (String::new(), FxHashMap::default(), false)
     };
 
     let client = reqwest::Client::new();
