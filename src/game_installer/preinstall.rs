@@ -289,6 +289,9 @@ pub async fn build_preinstall_plan(
         );
     }
     all_patch_assets.reserve(total_patch_assets.min(MAX_PREINSTALL_ASSETS));
+    seen_chunk_names.reserve(total_patch_assets.min(MAX_PREINSTALL_ASSETS));
+    seen_patch_targets.reserve(total_patch_assets.min(MAX_PREINSTALL_ASSETS));
+    unique_chunks.reserve(total_patch_assets.min(MAX_PREINSTALL_ASSETS));
 
     for result in patch_results {
         let patch_manifest = result.patch_manifest;

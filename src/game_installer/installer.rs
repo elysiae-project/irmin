@@ -672,12 +672,13 @@ async fn build_download_state(
     Arc<ChunkNameLookup>,
 )> {
     let total_chunks: usize = ctx.all_files.num_chunks();
+    let total_files: usize = ctx.all_files.num_files();
     let mut download_items: Vec<DownloadItem> = Vec::with_capacity(total_chunks);
     let mut download_items_index: FxHashMap<&str, u32> =
         FxHashMap::with_capacity_and_hasher(total_chunks, Default::default());
-    let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::new();
-    let mut chunk_refcounts: Vec<AtomicU32> = Vec::new();
-    let mut pending_counts: Vec<AtomicU32> = Vec::new();
+    let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::with_capacity(total_chunks);
+    let mut chunk_refcounts: Vec<AtomicU32> = Vec::with_capacity(total_chunks);
+    let mut pending_counts: Vec<AtomicU32> = Vec::with_capacity(total_files);
 
     let mut all_files_index: usize = 0;
 
