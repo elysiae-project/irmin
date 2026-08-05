@@ -116,7 +116,7 @@ impl HDiff {
         }
 
         // Newfile patch: old_data_size == 0 means source is optional.
-        let source_mmap;
+        let mut source_mmap = None;
         let mut old_file_fallback: Option<File> = None;
         let mut source_cursor: Option<Cursor<&[u8]>> = None;
 
@@ -172,12 +172,23 @@ impl HDiff {
             BufWriter::with_capacity(super::super::FILE_WRITE_BUFFER_SIZE, out_file);
 
         if header_info.is_single_compressed_diff {
-            super::patch_sf::PatchSF::new(header_info).patch(
-                old_source,
-                &mut out_writer,
-                &self.diff_path,
-                on_progress,
-            )?;
+            // Direct slice path avoids seek+read_exact vtable dispatch per cover chunk.
+            let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
+            if let Some(slice) = old_slice {
+                super::patch_sf::PatchSF::new(header_info).patch_with_slice(
+                    slice,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            } else {
+                super::patch_sf::PatchSF::new(header_info).patch(
+                    old_source,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            }
         } else {
             super::patch_single::PatchSingle::new(header_info).patch(
                 old_source,
