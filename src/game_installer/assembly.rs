@@ -241,31 +241,12 @@ pub fn assemble_file(
     let _ = super::sysio::preallocate(&out_file, file_size);
 
     let mut total_written: u64 = 0;
-    let all_chunks_have_hashes = (chunk_range.start..chunk_range.end).all(|ci| {
-        let chunk = all_files.chunk(ci as usize);
-        super::assembly_opt::chunk_hash_required(chunk.chunk_decompressed_hash_md5)
-    });
     let has_file_hash = !file_hash_md5.is_empty();
     let total_chunks = (chunk_range.end - chunk_range.start) as usize;
     const MAX_PARALLEL_WORKERS: usize = 4;
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().min(MAX_PARALLEL_WORKERS))
         .unwrap_or(1);
-    let parallelize =
-        num_workers > 1 && total_chunks >= 4 && (all_chunks_have_hashes || has_file_hash);
-    let mut file_hasher = if file_hash_md5.is_empty() {
-        if !is_dir {
-            log::warn!(
-                "File '{name}' has no asset_hash_md5; assembled without file-level verification",
-                name = file_name
-            );
-        }
-        None
-    } else if all_chunks_have_hashes || parallelize {
-        None
-    } else {
-        Some(take_md5()?)
-    };
 
     let mut transfer_buffer = TRANSFER_BUF.with(|cell| {
         let mut buf = cell.take();
@@ -284,16 +265,23 @@ pub fn assemble_file(
     };
 
     let chunk_offsets: Vec<u64> = all_files.file_chunk_offsets(file_idx);
-    // Verify total decompressed size matches declared file size.
+    // Verify total decompressed size and check chunk hash availability in one pass.
     let mut total_decompressed: u64 = 0;
+    let mut all_chunks_have_hashes = true;
     for ci in chunk_range.start..chunk_range.end {
+        let chunk = all_files.chunk(ci as usize);
         total_decompressed = total_decompressed
-            .checked_add(all_files.chunk(ci as usize).chunk_size_decompressed)
+            .checked_add(chunk.chunk_size_decompressed)
             .ok_or_else(|| SophonError::SizeMismatch {
                 item: file_name.to_string(),
                 expected: file_size,
                 actual: total_decompressed,
             })?;
+        if all_chunks_have_hashes
+            && !super::assembly_opt::chunk_hash_required(chunk.chunk_decompressed_hash_md5)
+        {
+            all_chunks_have_hashes = false;
+        }
     }
     if total_decompressed != file_size {
         return Err(SophonError::SizeMismatch {
@@ -302,6 +290,22 @@ pub fn assemble_file(
             actual: total_decompressed,
         });
     }
+
+    let parallelize =
+        num_workers > 1 && total_chunks >= 4 && (all_chunks_have_hashes || has_file_hash);
+    let mut file_hasher = if file_hash_md5.is_empty() {
+        if !is_dir {
+            log::warn!(
+                "File '{name}' has no asset_hash_md5; assembled without file-level verification",
+                name = file_name
+            );
+        }
+        None
+    } else if all_chunks_have_hashes || parallelize {
+        None
+    } else {
+        Some(take_md5()?)
+    };
 
     let parallel_hashed_file = parallelize && has_file_hash && !all_chunks_have_hashes;
     let hasher_result: Mutex<Option<SophonResult<[u8; 16]>>> = Mutex::new(None);
