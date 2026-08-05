@@ -7,9 +7,9 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use super::FILE_WRITE_BUFFER_SIZE;
 use super::error::{SophonError, SophonResult};
 use super::sysio;
+use super::FILE_WRITE_BUFFER_SIZE;
 
 const ASSEMBLY_BUFFER_SIZE: usize = 256 * 1024;
 
@@ -159,7 +159,11 @@ pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
     })
 }
 
-pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>) {
+pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, window_log_used: u32) {
+    // Drops contexts with window > 4 MB to avoid retaining large buffers.
+    if window_log_used > 22 {
+        return;
+    }
     ZSTD_DCTX.with(|cell| cell.borrow_mut().replace(ctx));
 }
 
@@ -285,7 +289,7 @@ fn decompress_chunk_oneshot(
         let written = ctx
             .decompress(output, compressed)
             .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
-        return_dctx(ctx);
+        return_dctx(ctx, window_log_for_size(expected_size));
 
         if written != expected_usize {
             return Err(SophonError::SizeMismatch {
@@ -617,7 +621,7 @@ fn decompress_chunk_with_window(
             (bytes, chunk_hasher)
         }; // decoder dropped, ctx borrow released
 
-        return_dctx(ctx);
+        return_dctx(ctx, window_log);
         (bytes, chunk_hasher)
     };
 
