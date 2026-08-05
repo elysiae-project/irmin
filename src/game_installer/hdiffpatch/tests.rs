@@ -1137,3 +1137,354 @@ fn read_non_single_file_header_one_byte_compressed_counts() {
         "compress_cover_buf_size == 1 must count as compressed"
     );
 }
+
+// E2E patch application tests with generated fixtures.
+// Uses the same encoding approach as the benchmark fixture generators.
+
+/// Encode a non-negative i64 as a 7-bit varint (tag_bit=0).
+fn encode_7bit_varint(v: i64) -> Vec<u8> {
+    assert!(v >= 0);
+    if v < 0x80 {
+        return vec![v as u8];
+    }
+    let bits = 64 - (v as u64).leading_zeros() as usize;
+    let groups = (bits + 6) / 7;
+    let mut out = Vec::with_capacity(groups);
+    for i in (0..groups).rev() {
+        let chunk = ((v >> (i * 7)) & 0x7F) as u8;
+        if i > 0 {
+            out.push(chunk | 0x80);
+        } else {
+            out.push(chunk);
+        }
+    }
+    out[0] |= 0x80;
+    out
+}
+
+/// Encode tagged varint with tag_bit=1 (cover header delta format).
+fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
+    assert!(value >= 0);
+    let mut out = Vec::new();
+    if value < 64 {
+        out.push((sign << 7) | (value as u8));
+    } else {
+        let bits = 64 - (value as u64).leading_zeros() as usize;
+        let remaining_bits = bits - 6;
+        let extra_groups = (remaining_bits + 6) / 7;
+        let total_shift = extra_groups * 7;
+        let first_payload = ((value >> total_shift) & 0x3F) as u8;
+        out.push((sign << 7) | 0x40 | first_payload);
+        for g in (0..extra_groups).rev() {
+            let chunk = ((value >> (g * 7)) & 0x7F) as u8;
+            if g > 0 {
+                out.push(chunk | 0x80);
+            } else {
+                out.push(chunk);
+            }
+        }
+    }
+    out
+}
+
+/// Encode tagged varint with tag_bit=2 (RLE ctrl format).
+fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
+    assert!(value >= 0 && rle_type < 4);
+    let mut out = Vec::new();
+    if value < 32 {
+        out.push((rle_type << 6) | (value as u8));
+    } else {
+        let bits = 64 - (value as u64).leading_zeros() as usize;
+        let remaining_bits = bits - 5;
+        let extra_groups = (remaining_bits + 6) / 7;
+        let total_shift = extra_groups * 7;
+        let first_payload = ((value >> total_shift) & 0x1F) as u8;
+        out.push((rle_type << 6) | 0x20 | first_payload);
+        for g in (0..extra_groups).rev() {
+            let chunk = ((value >> (g * 7)) & 0x7F) as u8;
+            if g > 0 {
+                out.push(chunk | 0x80);
+            } else {
+                out.push(chunk);
+            }
+        }
+    }
+    out
+}
+
+/// Generate deterministic pseudo-random data.
+fn test_prng_data(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = [
+        seed,
+        seed.wrapping_mul(6364136223846793005).wrapping_add(1),
+        seed.wrapping_mul(1442695040888963407).wrapping_add(3),
+        seed ^ 0xdeadbeefcafe1234,
+    ];
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = s[3].rotate_left(45);
+        out.push(result as u8);
+    }
+    out
+}
+
+/// Build a valid HDIFF20&nocomp patch from old/new byte slices.
+fn build_v20_nocomp_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
+    let block_size = 256usize;
+    let num_blocks = old.len() / block_size;
+
+    let mut covers: Vec<(u64, u64, u64)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for i in 0..num_blocks {
+        let off = i * block_size;
+        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        if same {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if let Some(start) = run_start {
+            covers.push((
+                (start * block_size) as u64,
+                (start * block_size) as u64,
+                ((i - start) * block_size) as u64,
+            ));
+            run_start = None;
+        }
+    }
+    if let Some(start) = run_start {
+        covers.push((
+            (start * block_size) as u64,
+            (start * block_size) as u64,
+            ((num_blocks - start) * block_size) as u64,
+        ));
+    }
+
+    let cover_count = covers.len();
+
+    // Encode covers
+    let mut cover_buf = Vec::new();
+    let mut last_old_end = 0u64;
+    let mut last_new_end = 0u64;
+    for &(old_pos, new_pos, length) in &covers {
+        let delta = if old_pos >= last_old_end {
+            old_pos - last_old_end
+        } else {
+            last_old_end - old_pos
+        };
+        let sign = if old_pos >= last_old_end { 0 } else { 1 };
+        cover_buf.extend_from_slice(&encode_tagged_1bit(sign, delta as i64));
+        cover_buf.extend_from_slice(&encode_7bit_varint((new_pos - last_new_end) as i64));
+        cover_buf.extend_from_slice(&encode_7bit_varint(length as i64));
+        last_old_end = old_pos + length;
+        last_new_end = new_pos + length;
+    }
+
+    // RLE: (len0=cover_length, lenv=0) per cover
+    let mut rle_buf = Vec::new();
+    for &(_, _, length) in &covers {
+        rle_buf.extend_from_slice(&encode_7bit_varint(length as i64));
+        rle_buf.extend_from_slice(&encode_7bit_varint(0));
+    }
+
+    // Diff stream
+    let mut diff_stream = Vec::new();
+    diff_stream.extend_from_slice(&encode_7bit_varint(cover_buf.len() as i64));
+    diff_stream.extend_from_slice(&encode_7bit_varint(rle_buf.len() as i64));
+    diff_stream.extend_from_slice(&cover_buf);
+    diff_stream.extend_from_slice(&rle_buf);
+    let mut prev_end = 0u64;
+    for &(_, new_pos, length) in &covers {
+        if new_pos > prev_end {
+            diff_stream.extend_from_slice(&new[prev_end as usize..new_pos as usize]);
+        }
+        prev_end = new_pos + length;
+    }
+    if prev_end < new.len() as u64 {
+        diff_stream.extend_from_slice(&new[prev_end as usize..]);
+    }
+
+    let uncompressed_size = diff_stream.len() as i64;
+    let step_mem_size = (cover_buf.len() + rle_buf.len()) as i64;
+
+    let mut patch = Vec::new();
+    patch.extend_from_slice(b"HDIFF20&nocomp\0");
+    patch.extend_from_slice(&encode_7bit_varint(new.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(old.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(cover_count as i64));
+    patch.extend_from_slice(&encode_7bit_varint(step_mem_size));
+    patch.extend_from_slice(&encode_7bit_varint(uncompressed_size));
+    patch.extend_from_slice(&encode_7bit_varint(0));
+    patch.extend_from_slice(&diff_stream);
+    patch
+}
+
+/// Build a valid HDIFF13&zstd patch from old/new byte slices.
+fn build_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
+    let block_size = 256usize;
+    let num_blocks = old.len() / block_size;
+
+    let mut covers: Vec<(u64, u64, u64)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for i in 0..num_blocks {
+        let off = i * block_size;
+        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        if same {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if let Some(start) = run_start {
+            covers.push((
+                (start * block_size) as u64,
+                (start * block_size) as u64,
+                ((i - start) * block_size) as u64,
+            ));
+            run_start = None;
+        }
+    }
+    if let Some(start) = run_start {
+        covers.push((
+            (start * block_size) as u64,
+            (start * block_size) as u64,
+            ((num_blocks - start) * block_size) as u64,
+        ));
+    }
+
+    let cover_count = covers.len() as i64;
+
+    // Cover buffer
+    let mut cover_buf = Vec::new();
+    let mut last_old_pos_back = 0i64;
+    let mut last_new_pos_back = 0i64;
+    for &(old_pos, new_pos, length) in &covers {
+        let (old_pos, new_pos, length) = (old_pos as i64, new_pos as i64, length as i64);
+        let inc = (old_pos - last_old_pos_back).unsigned_abs() as i64;
+        let sign: u8 = if old_pos >= last_old_pos_back { 0 } else { 1 };
+        cover_buf.extend_from_slice(&encode_tagged_1bit(sign, inc));
+        cover_buf.extend_from_slice(&encode_7bit_varint(new_pos - last_new_pos_back));
+        cover_buf.extend_from_slice(&encode_7bit_varint(length));
+        last_old_pos_back = old_pos + length;
+        last_new_pos_back = new_pos + length;
+    }
+
+    // RLE ctrl: type-0 entries for gaps and covers
+    let mut rle_ctrl_buf = Vec::new();
+    let mut prev_new_end = 0i64;
+    for &(_, new_pos, length) in &covers {
+        let (new_pos, length) = (new_pos as i64, length as i64);
+        let gap = new_pos - prev_new_end;
+        if gap > 0 {
+            rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, gap - 1));
+        }
+        rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, length - 1));
+        prev_new_end = new_pos + length;
+    }
+    let tail_gap = new.len() as i64 - prev_new_end;
+    if tail_gap > 0 {
+        rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, tail_gap - 1));
+    }
+
+    // new_data_diff
+    let mut new_data_diff = Vec::new();
+    let mut prev_end = 0u64;
+    for &(_, new_pos, length) in &covers {
+        if new_pos > prev_end {
+            new_data_diff.extend_from_slice(&new[prev_end as usize..new_pos as usize]);
+        }
+        prev_end = new_pos + length;
+    }
+    if prev_end < new.len() as u64 {
+        new_data_diff.extend_from_slice(&new[prev_end as usize..]);
+    }
+
+    // Compress each section
+    let cover_compressed = zstd::encode_all(cover_buf.as_slice(), 3).unwrap();
+    let rle_ctrl_compressed = zstd::encode_all(rle_ctrl_buf.as_slice(), 3).unwrap();
+    let new_data_compressed = zstd::encode_all(new_data_diff.as_slice(), 3).unwrap();
+
+    let mut patch = Vec::new();
+    patch.extend_from_slice(b"HDIFF13&zstd\0");
+    patch.extend_from_slice(&encode_7bit_varint(new.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(old.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(cover_count));
+    patch.extend_from_slice(&encode_7bit_varint(cover_buf.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(cover_compressed.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(rle_ctrl_buf.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(rle_ctrl_compressed.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(0i64)); // rle_code_buf_size
+    patch.extend_from_slice(&encode_7bit_varint(0i64)); // compress_rle_code_buf_size
+    patch.extend_from_slice(&encode_7bit_varint(new_data_diff.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(new_data_compressed.len() as i64));
+    patch.extend_from_slice(&cover_compressed);
+    patch.extend_from_slice(&rle_ctrl_compressed);
+    patch.extend_from_slice(&new_data_compressed);
+    patch
+}
+
+#[test]
+fn hdiff_e2e_v20_nocomp_applies_correctly() {
+    let old = test_prng_data(100, 8192);
+    let mut new = old.clone();
+    // Modify ~25% of blocks to exercise gap/new_data paths
+    for i in (0..32).filter(|i| i % 4 == 0) {
+        let off = i * 256;
+        let replacement = test_prng_data(2000 + i as u64, 256);
+        new[off..off + 256].copy_from_slice(&replacement);
+    }
+
+    let patch = build_v20_nocomp_patch(&old, &new);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    let out_path = dir.path().join("out.bin");
+
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().to_string(),
+        patch_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+    );
+    assert!(hdiff.apply(None), "v20 nocomp patch failed");
+
+    let result = fs::read(&out_path).unwrap();
+    assert_eq!(result, new, "v20 nocomp output mismatch");
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_applies_correctly() {
+    let old = test_prng_data(200, 8192);
+    let mut new = old.clone();
+    // Modify ~25% of blocks
+    for i in (0..32).filter(|i| i % 4 == 1) {
+        let off = i * 256;
+        let replacement = test_prng_data(3000 + i as u64, 256);
+        new[off..off + 256].copy_from_slice(&replacement);
+    }
+
+    let patch = build_v13_zstd_patch(&old, &new);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    let out_path = dir.path().join("out.bin");
+
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().to_string(),
+        patch_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+    );
+    assert!(hdiff.apply(None), "v13 zstd patch failed");
+
+    let result = fs::read(&out_path).unwrap();
+    assert_eq!(result, new, "v13 zstd output mismatch");
+}
