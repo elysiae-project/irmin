@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::AtomicU32;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use md5::{Digest, Md5};
 
 use irmin::game_installer::{
@@ -28,9 +28,7 @@ use irmin::game_installer::{
     installer::ChunkNameLookup,
     sysio,
 };
-use irmin::proto_parse::{
-    SophonManifestAssetChunk, SophonManifestAssetProperty,
-};
+use irmin::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 
 /// Fill a file with `mib` MiB of byte `fill`.
 fn fill_file(path: &std::path::Path, mib: usize, fill: u8) {
@@ -40,6 +38,51 @@ fn fill_file(path: &std::path::Path, mib: usize, fill: u8) {
         f.write_all(&block).expect("write");
     }
     f.sync_all().expect("sync");
+}
+
+/// Generate pseudo-random data with realistic compression ratio (~2-3:1 at zstd level 3).
+/// Uses xoshiro256** seeded deterministically. Every 4th 1 KiB block is a repeat of the
+/// previous block, giving zstd something to match without collapsing to trivial ratios.
+fn gen_prng_data(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = [
+        seed,
+        seed.wrapping_mul(6364136223846793005).wrapping_add(1),
+        seed.wrapping_mul(1442695040888963407).wrapping_add(3),
+        seed ^ 0xdeadbeefcafe1234,
+    ];
+    let mut out = Vec::with_capacity(len);
+    let mut block_idx = 0u64;
+    while out.len() < len {
+        let chunk_size = 1024.min(len - out.len());
+        if block_idx % 4 == 3 && out.len() >= 1024 {
+            // Repeat previous block for compressibility
+            let start = out.len() - 1024;
+            let repeated: Vec<u8> = out[start..start + chunk_size].to_vec();
+            out.extend_from_slice(&repeated);
+        } else {
+            for _ in 0..chunk_size {
+                // xoshiro256** next
+                let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+                let t = s[1] << 17;
+                s[2] ^= s[0];
+                s[3] ^= s[1];
+                s[1] ^= s[2];
+                s[0] ^= s[3];
+                s[2] ^= t;
+                s[3] = s[3].rotate_left(45);
+                out.push(result as u8);
+            }
+        }
+        block_idx += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+/// Fill a file with PRNG data (realistic entropy for zstd benchmarks).
+fn fill_file_prng(path: &std::path::Path, mib: usize, seed: u64) {
+    let data = gen_prng_data(seed, mib * 1024 * 1024);
+    fs::write(path, &data).expect("write");
 }
 
 /// Advise the kernel to drop a file's pages so the next bench run re-faults it.
@@ -205,9 +248,7 @@ const ZSTD_MIB: u64 = 8;
 /// buffer size `assembly_opt.rs` streams into.
 fn bench_zstd_decompress(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let raw_path = dir.path().join("raw.bin");
-    fill_file(&raw_path, ZSTD_MIB as usize, 0x42);
-    let raw = fs::read(&raw_path).unwrap();
+    let raw = gen_prng_data(0xBEEF, ZSTD_MIB as usize * 1024 * 1024);
     let comp_path = dir.path().join("chunk.zst");
     {
         let f = fs::File::create(&comp_path).unwrap();
@@ -251,6 +292,7 @@ fn bench_zstd_decompress(c: &mut Criterion) {
 /// chunks of `chunk_mib` MiB each, zstd-compressed on disk. When
 /// `with_chunk_hashes` is true, each chunk's `chunk_decompressed_hash_md5` is
 /// populated, enabling chunk-level verification and file-hash elision.
+/// Uses PRNG data with realistic entropy for meaningful zstd timings.
 fn build_assembly_fixture(
     chunks_dir: &std::path::Path,
     chunk_mib: usize,
@@ -261,7 +303,7 @@ fn build_assembly_fixture(
     let chunks: Vec<SophonManifestAssetChunk> = (0..num_chunks)
         .map(|i| {
             let name = format!("ck{i:02}");
-            let data = vec![(i as u8).wrapping_mul(7).wrapping_add(0x40); chunk_mib * 1024 * 1024];
+            let data = gen_prng_data(42 + i as u64, chunk_mib * 1024 * 1024);
             let comp = zstd::encode_all(&data[..], 3).unwrap();
             fs::write(chunks_dir.join(chunk_filename(&name)), &comp).unwrap();
             raw.extend_from_slice(&data);
@@ -420,15 +462,10 @@ fn bench_verify_file_md5(c: &mut Criterion) {
         b.iter(|| {
             cache.clear();
             evict_page_cache(&path);
-            let _ =
-                irmin::game_installer::cache::check_file_md5_cached(
-                    &path,
-                    bytes,
-                    &md5,
-                    &game_dir,
-                    &cache,
-                )
-                .unwrap();
+            let _ = irmin::game_installer::cache::check_file_md5_cached(
+                &path, bytes, &md5, &game_dir, &cache,
+            )
+            .unwrap();
         });
     });
     group.finish();
@@ -495,7 +532,7 @@ const ONESHOT_MIB: u64 = 8;
 /// `decompress_chunk_oneshot` uses for chunks <= 8 MiB.
 fn bench_zstd_oneshot(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let raw = vec![0x42u8; ONESHOT_MIB as usize * 1024 * 1024];
+    let raw = gen_prng_data(0xCAFE, ONESHOT_MIB as usize * 1024 * 1024);
     let comp = zstd::encode_all(&raw[..], 3).unwrap();
     let comp_path = dir.path().join("oneshot.zst");
     fs::write(&comp_path, &comp).unwrap();
