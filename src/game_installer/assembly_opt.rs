@@ -253,6 +253,10 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        // Hint transparent hugepages for regions >= 2 MiB to reduce TLB pressure.
+        if map_len >= 2 * 1024 * 1024 {
+            libc::madvise(base, map_len, libc::MADV_HUGEPAGE);
+        }
         Ok(MmapGuard {
             ptr: base.add(ptr_offset),
             len,
