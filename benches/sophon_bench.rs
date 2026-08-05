@@ -878,6 +878,45 @@ fn bench_protobuf_decode(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Buffer pool benchmark
+// ---------------------------------------------------------------------------
+
+use irmin::game_installer::hdiffpatch::{BufferPool, BENCH_MAX_ARRAY_POOL_LEN};
+
+const POOL_OPS: u64 = 1000;
+
+/// BufferPool take/return cycle vs raw Vec::with_capacity allocation.
+fn bench_buffer_pool(c: &mut Criterion) {
+    let mut group = c.benchmark_group("buffer_pool");
+    group.throughput(Throughput::Elements(POOL_OPS));
+
+    group.bench_function("pooled_take_return", |b| {
+        let pool = BufferPool::new(4);
+        // Seed pool with one buffer
+        pool.return_buf(Vec::with_capacity(BENCH_MAX_ARRAY_POOL_LEN));
+        b.iter(|| {
+            for _ in 0..POOL_OPS {
+                let buf = pool.take(BENCH_MAX_ARRAY_POOL_LEN);
+                std::hint::black_box(buf.capacity());
+                pool.return_buf(buf);
+            }
+        });
+    });
+
+    group.bench_function("raw_alloc", |b| {
+        b.iter(|| {
+            for _ in 0..POOL_OPS {
+                let buf = Vec::<u8>::with_capacity(BENCH_MAX_ARRAY_POOL_LEN);
+                std::hint::black_box(buf.capacity());
+                drop(buf);
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -892,5 +931,6 @@ criterion_group!(
     bench_varint_decode,
     bench_cover_stream_decode,
     bench_protobuf_decode,
+    bench_buffer_pool,
 );
 criterion_main!(benches);
