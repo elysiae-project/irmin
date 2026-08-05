@@ -16,6 +16,45 @@ pub(crate) fn write_cover_stream_to_output(
     header_info: &HeaderInfo,
     on_progress: Option<&dyn Fn(u64)>,
 ) -> std::io::Result<()> {
+    write_cover_stream_inner(
+        clips,
+        input_stream,
+        None,
+        output_stream,
+        header_info,
+        on_progress,
+    )
+}
+
+/// Variant with direct old-data slice access, bypassing seek+read_exact.
+pub(crate) fn write_cover_stream_to_output_with_slice(
+    clips: &mut [Box<dyn Read>],
+    old_data: &[u8],
+    output_stream: &mut dyn Write,
+    header_info: &HeaderInfo,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> std::io::Result<()> {
+    // ponytail: dummy never read when old_data is Some
+    let mut dummy = Cursor::new(&[][..]);
+    write_cover_stream_inner(
+        clips,
+        &mut dummy,
+        Some(old_data),
+        output_stream,
+        header_info,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cover_stream_inner(
+    clips: &mut [Box<dyn Read>],
+    input_stream: &mut dyn SeekableRead,
+    old_data: Option<&[u8]>,
+    output_stream: &mut dyn Write,
+    header_info: &HeaderInfo,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> std::io::Result<()> {
     // Safety: every index 0..MAX_ARRAY_POOL_LEN is populated by read_exact
     // or write_all before being read in the RLE decode loop.
     #[allow(clippy::uninit_vec)]
@@ -81,6 +120,7 @@ pub(crate) fn write_cover_stream_to_output(
         tbytes_copy_old_clip_patch(
             &mut cache,
             input_stream,
+            old_data,
             &mut rle_struct,
             cover.old_pos,
             cover.cover_length,
@@ -152,6 +192,7 @@ fn write_cache_to_output(
 fn tbytes_copy_old_clip_patch(
     out_cache: &mut Cursor<Vec<u8>>,
     input_stream: &mut dyn SeekableRead,
+    old_data: Option<&[u8]>,
     rle_loader: &mut RleRefClip,
     old_pos: i64,
     add_length: i64,
@@ -163,8 +204,15 @@ fn tbytes_copy_old_clip_patch(
         return Err(std::io::Error::other("add_length is negative"));
     }
     let last_pos = out_cache.position();
-    input_stream.seek(SeekFrom::Start(old_pos as u64))?;
-    tbytes_copy_stream_inner(input_stream, out_cache, shared_buffer, add_length as usize)?;
+    if let Some(slice) = old_data {
+        // Direct slice write — no seek, no chunked read_exact.
+        let start = old_pos as usize;
+        let end = start + add_length as usize;
+        out_cache.write_all(&slice[start..end])?;
+    } else {
+        input_stream.seek(SeekFrom::Start(old_pos as u64))?;
+        tbytes_copy_stream_inner(input_stream, out_cache, shared_buffer, add_length as usize)?;
+    }
     out_cache.seek(SeekFrom::Start(last_pos))?;
     tbytes_determine_rle_type(
         rle_loader,

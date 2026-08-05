@@ -190,12 +190,22 @@ impl HDiff {
                 )?;
             }
         } else {
-            super::patch_single::PatchSingle::new(header_info).patch(
-                old_source,
-                &mut out_writer,
-                &self.diff_path,
-                on_progress,
-            )?;
+            let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
+            if let Some(slice) = old_slice {
+                super::patch_single::PatchSingle::new(header_info).patch_with_slice(
+                    slice,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            } else {
+                super::patch_single::PatchSingle::new(header_info).patch(
+                    old_source,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            }
         }
         out_writer.flush()?;
 

@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 use super::compression::get_clip_stream;
-use super::patch_core::write_cover_stream_to_output;
+use super::patch_core::{write_cover_stream_to_output, write_cover_stream_to_output_with_slice};
 use super::{CompressionMode, HeaderInfo, SeekableRead};
 
 pub(crate) struct PatchSingle {
@@ -21,6 +21,33 @@ impl PatchSingle {
         patch_path: &str,
         on_progress: Option<&dyn Fn(u64)>,
     ) -> std::io::Result<()> {
+        let mut clips = self.open_clips(patch_path)?;
+        let hi = &self.header_info;
+        write_cover_stream_to_output(&mut clips, input_stream, output_stream, hi, on_progress)?;
+        Ok(())
+    }
+
+    /// Patch with direct slice access to old data, bypassing seek+read_exact.
+    pub fn patch_with_slice(
+        &self,
+        old_data: &[u8],
+        output_stream: &mut dyn Write,
+        patch_path: &str,
+        on_progress: Option<&dyn Fn(u64)>,
+    ) -> std::io::Result<()> {
+        let mut clips = self.open_clips(patch_path)?;
+        let hi = &self.header_info;
+        write_cover_stream_to_output_with_slice(
+            &mut clips,
+            old_data,
+            output_stream,
+            hi,
+            on_progress,
+        )?;
+        Ok(())
+    }
+
+    fn open_clips(&self, patch_path: &str) -> std::io::Result<[Box<dyn Read>; 4]> {
         let padding: u64 = match self.header_info.comp_mode {
             CompressionMode::Zlib => 1,
             _ => 0,
@@ -128,9 +155,7 @@ impl PatchSingle {
             new_data_diff_comp,
             false,
         )?;
-        let mut clips: [Box<dyn Read>; 4] = [clip0, clip1, clip2, clip3];
-        write_cover_stream_to_output(&mut clips, input_stream, output_stream, hi, on_progress)?;
-        Ok(())
+        Ok([clip0, clip1, clip2, clip3])
     }
 }
 
