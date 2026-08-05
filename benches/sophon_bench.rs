@@ -1,17 +1,14 @@
 //! Real measurement benchmarks for the Sophon installer hot paths.
 //!
-//! The metrics here drive concrete optimization decisions: copy backend
-//! (`copy_file_range` vs user-space read+write), MD5 backend (openssl EVP vs
-//! the md-5 crate), zstd decompress buffer sizing, end-to-end assembly
-//! throughput, and post-assembly file verification. Each group sets a per-bench
-//! throughput so criterion reports MiB/s.
+//! Each benchmark measures a component of the actual implementation — no
+//! comparisons against unused alternatives. Use criterion baselines to compare
+//! before/after an optimization:
 //!
 //! Run:                cargo bench
 //! Run one group:      cargo bench -- io_copy
 //! Save a baseline:    cargo bench -- --save-baseline before
 //! Compare to baseline: cargo bench -- --baseline before
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
@@ -100,7 +97,7 @@ fn evict_page_cache(path: &std::path::Path) {
 
 const COPY_MIB: u64 = 64;
 
-/// User-space copy through a 256 KiB buffer: the assembly fallback path.
+/// IO throughput for the actual assembly hot paths.
 fn bench_io_copy(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = dir.path().join("src.bin");
@@ -111,24 +108,6 @@ fn bench_io_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("io_copy");
     group.throughput(Throughput::Bytes(bytes));
 
-    group.bench_function(BenchmarkId::new("read_write_256k", COPY_MIB), |b| {
-        b.iter(|| {
-            evict_page_cache(&src);
-            let mut s = fs::File::open(&src).unwrap();
-            let mut d = fs::File::create(&dst).unwrap();
-            d.set_len(bytes).unwrap();
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                let n = s.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
-                }
-                d.write_all(&buf[..n]).unwrap();
-            }
-            d.sync_all().unwrap();
-        });
-    });
-
     group.bench_function(BenchmarkId::new("copy_file_range", COPY_MIB), |b| {
         b.iter(|| {
             evict_page_cache(&src);
@@ -136,27 +115,6 @@ fn bench_io_copy(c: &mut Criterion) {
             d.set_len(bytes).unwrap();
             sysio::copy_file_region_to(&src, 0, &d, 0, bytes).unwrap();
             d.sync_all().unwrap();
-        });
-    });
-
-    group.bench_function(BenchmarkId::new("read_write_md5", COPY_MIB), |b| {
-        b.iter(|| {
-            evict_page_cache(&src);
-            let mut s = fs::File::open(&src).unwrap();
-            let mut d = fs::File::create(&dst).unwrap();
-            d.set_len(bytes).unwrap();
-            let mut buf = vec![0u8; 256 * 1024];
-            let mut h = Md5::new();
-            loop {
-                let n = s.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-                d.write_all(&buf[..n]).unwrap();
-            }
-            d.sync_all().unwrap();
-            let _ = h.finalize();
         });
     });
 
@@ -189,9 +147,7 @@ fn bench_io_copy(c: &mut Criterion) {
 
 const MD5_MIB: u64 = 50;
 
-/// MD5 of a 50 MiB file via the `md-5` crate (software compression) vs openssl
-/// EVP (libcrypto, hardware-accelerated on x86_64). Directly comparable since
-/// both share the throughput and the source file is identical.
+/// MD5 throughput of a 50 MiB file via the `md-5` crate (the verification hasher).
 fn bench_md5(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("md5.bin");
@@ -217,26 +173,6 @@ fn bench_md5(c: &mut Criterion) {
                 off += n as u64;
             }
             let _ = hex::encode(h.finalize());
-        });
-    });
-
-    group.bench_function(BenchmarkId::new("openssl_evp", MD5_MIB), |b| {
-        b.iter(|| {
-            evict_page_cache(&path);
-            let f = fs::File::open(&path).unwrap();
-            let mut hasher =
-                openssl::hash::Hasher::new(openssl::hash::MessageDigest::md5()).unwrap();
-            let mut buf = vec![0u8; 256 * 1024];
-            let mut off = 0u64;
-            loop {
-                let n = f.read_at(&mut buf, off).unwrap();
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]).unwrap();
-                off += n as u64;
-            }
-            let _ = hex::encode(hasher.finish().unwrap());
         });
     });
 
@@ -497,37 +433,18 @@ fn bench_verify_file_md5(c: &mut Criterion) {
 
 const HASH_MIB: u64 = 128;
 
-/// XXH64 vs MD5 throughput on a 128 MiB file via pread. XXH64 is the
-/// compressed-chunk hash format used by some manifests.
-fn bench_xxh64_vs_md5(c: &mut Criterion) {
+/// XXH64 throughput on a 128 MiB file via pread. This is the compressed-chunk
+/// hash verification path used during downloads.
+fn bench_xxh64(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("hash.bin");
     fill_file(&path, HASH_MIB as usize, 0xCD);
     let bytes = HASH_MIB * 1024 * 1024;
 
-    let mut group = c.benchmark_group("hash_128m");
+    let mut group = c.benchmark_group("xxh64_throughput");
     group.throughput(Throughput::Bytes(bytes));
 
-    group.bench_function("md5_crate", |b| {
-        b.iter(|| {
-            evict_page_cache(&path);
-            let f = fs::File::open(&path).unwrap();
-            let mut h = Md5::new();
-            let mut buf = vec![0u8; 256 * 1024];
-            let mut off = 0u64;
-            loop {
-                let n = f.read_at(&mut buf, off).unwrap();
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-                off += n as u64;
-            }
-            let _ = h.finalize();
-        });
-    });
-
-    group.bench_function("xxh64", |b| {
+    group.bench_function("128m", |b| {
         b.iter(|| {
             evict_page_cache(&path);
             let f = fs::File::open(&path).unwrap();
@@ -651,8 +568,7 @@ fn bench_compact_manifest_build(c: &mut Criterion) {
 
 const LOOKUP_CHUNKS: usize = 10000;
 
-/// ChunkNameLookup binary search vs HashMap lookup. Measures the lookup
-/// throughput for the two approaches used to resolve chunk names.
+/// ChunkNameLookup binary search throughput (the actual chunk resolution path).
 fn bench_chunk_lookup(c: &mut Criterion) {
     let names: Vec<String> = (0..LOOKUP_CHUNKS)
         .map(|i| format!("chunk_{i:08}"))
@@ -660,10 +576,6 @@ fn bench_chunk_lookup(c: &mut Criterion) {
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let arena = StringArena::from(name_refs.as_slice());
     let lookup = ChunkNameLookup::from_arena(arena);
-    let mut hashmap: HashMap<String, usize> = HashMap::with_capacity(LOOKUP_CHUNKS);
-    for (i, n) in names.iter().enumerate() {
-        hashmap.insert(n.clone(), i);
-    }
 
     let mut group = c.benchmark_group("chunk_lookup");
     group.throughput(Throughput::Elements(LOOKUP_CHUNKS as u64));
@@ -673,18 +585,6 @@ fn bench_chunk_lookup(c: &mut Criterion) {
             let mut found = 0usize;
             for n in &names {
                 if lookup.lookup(n).is_some() {
-                    found += 1;
-                }
-            }
-            std::hint::black_box(found);
-        });
-    });
-
-    group.bench_function("hashmap_10000", |b| {
-        b.iter(|| {
-            let mut found = 0usize;
-            for n in &names {
-                if hashmap.contains_key(n) {
                     found += 1;
                 }
             }
@@ -911,7 +811,7 @@ use irmin::game_installer::hdiffpatch::{BufferPool, BENCH_MAX_ARRAY_POOL_LEN};
 
 const POOL_OPS: u64 = 1000;
 
-/// BufferPool take/return cycle vs raw Vec::with_capacity allocation.
+/// BufferPool take/return cycle throughput (the actual allocation path in hdiffpatch).
 fn bench_buffer_pool(c: &mut Criterion) {
     let mut group = c.benchmark_group("buffer_pool");
     group.throughput(Throughput::Elements(POOL_OPS));
@@ -925,16 +825,6 @@ fn bench_buffer_pool(c: &mut Criterion) {
                 let buf = pool.take(BENCH_MAX_ARRAY_POOL_LEN);
                 std::hint::black_box(buf.capacity());
                 pool.return_buf(buf);
-            }
-        });
-    });
-
-    group.bench_function("raw_alloc", |b| {
-        b.iter(|| {
-            for _ in 0..POOL_OPS {
-                let buf = Vec::<u8>::with_capacity(BENCH_MAX_ARRAY_POOL_LEN);
-                std::hint::black_box(buf.capacity());
-                drop(buf);
             }
         });
     });
@@ -1546,7 +1436,7 @@ criterion_group!(
     bench_zstd_decompress,
     bench_assembly_e2e,
     bench_verify_file_md5,
-    bench_xxh64_vs_md5,
+    bench_xxh64,
     bench_zstd_oneshot,
     bench_compact_manifest_build,
     bench_chunk_lookup,
