@@ -169,6 +169,13 @@ pub fn check_file_md5_with_cache_key_and_size(
         Err(err) => return Err(err),
     };
     let actual_size = metadata.len();
+
+    // Fast rejection: skip DashMap lookup if size doesn't match.
+    if actual_size != expected_size {
+        cache.remove(cache_key);
+        return Ok((false, Some(actual_size)));
+    }
+
     let mtime = metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
@@ -182,14 +189,8 @@ pub fn check_file_md5_with_cache_key_and_size(
         if entry.mtime_secs == mtime {
             return Ok((true, Some(actual_size)));
         }
-        if actual_size == expected_size {
-            return Ok((true, Some(actual_size)));
-        }
-    }
-
-    if actual_size != expected_size {
-        cache.remove(cache_key);
-        return Ok((false, Some(actual_size)));
+        // Size matches and cache entry matches — trust it.
+        return Ok((true, Some(actual_size)));
     }
 
     let actual = file_md5_digest(path)?;

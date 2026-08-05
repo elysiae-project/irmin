@@ -347,7 +347,7 @@ pub fn assemble_file(
                 let tmp_path = &tmp_path;
                 let chunk_done = &chunk_done;
                 let chunk_infos = &chunk_infos;
-                let err = &first_error;
+                let err_flag = &has_error;
                 let hasher_result = &hasher_result;
                 let ht = &hasher_thread_handle;
                 s.spawn(move || {
@@ -376,7 +376,7 @@ pub fn assemble_file(
                     });
                     for (i, &(offset, size)) in chunk_infos.iter().enumerate() {
                         loop {
-                            if err.lock().unwrap().is_some() {
+                            if err_flag.load(Ordering::Relaxed) {
                                 return;
                             }
                             if chunk_done[i].load(Ordering::Acquire) {
