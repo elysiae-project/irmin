@@ -562,4 +562,40 @@ mod tests {
         assert_eq!(original, decoded);
         assert_eq!(decoded.assets[0].asset_chunks[0].chunk_old_offset, 200);
     }
+
+    /// Verifies u64::MAX and i64::MIN survive proto encode/decode without
+    /// truncation. Guards against varint or field-type regressions.
+    #[test]
+    fn decode_manifest_boundary_values_survive_roundtrip() {
+        let original = SophonManifestProto {
+            assets: vec![SophonManifestAssetProperty {
+                asset_name: "max_values.pak".into(),
+                asset_chunks: vec![SophonManifestAssetChunk {
+                    chunk_name: "boundary".into(),
+                    chunk_decompressed_hash_md5: "x".into(),
+                    chunk_on_file_offset: u64::MAX,
+                    chunk_size: u64::MAX,
+                    chunk_size_decompressed: u64::MAX,
+                    chunk_compressed_hash_xxh: u64::MAX,
+                    chunk_compressed_hash_md5: "y".into(),
+                    chunk_old_offset: i64::MIN,
+                }],
+                asset_type: u32::MAX,
+                asset_size: u64::MAX,
+                asset_hash_md5: "z".into(),
+            }],
+        };
+        let buf = original.encode_to_vec();
+        let decoded = decode_manifest(&buf).unwrap();
+        assert_eq!(original, decoded);
+
+        let c = &decoded.assets[0].asset_chunks[0];
+        assert_eq!(c.chunk_on_file_offset, u64::MAX);
+        assert_eq!(c.chunk_size, u64::MAX);
+        assert_eq!(c.chunk_size_decompressed, u64::MAX);
+        assert_eq!(c.chunk_compressed_hash_xxh, u64::MAX);
+        assert_eq!(c.chunk_old_offset, i64::MIN);
+        assert_eq!(decoded.assets[0].asset_size, u64::MAX);
+        assert_eq!(decoded.assets[0].asset_type, u32::MAX);
+    }
 }

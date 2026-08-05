@@ -465,4 +465,84 @@ mod tests {
         let result = get_clip_stream(file, CompressionMode::Nocomp, 0, 5, 5, false);
         assert!(result.is_ok(), "Nocomp should succeed with comp_length > 0");
     }
+
+    /// LZ4 decompression round-trip via get_clip_stream (buffered).
+    /// Exercises the otherwise-untested Lz4 dispatch path.
+    #[test]
+    fn get_clip_stream_lz4_buffered_roundtrip() {
+        // Generate 64 KiB of data and LZ4-frame-compress it
+        let original: Vec<u8> = (0..65536u32)
+            .map(|i| (i.wrapping_mul(7) ^ i >> 3) as u8)
+            .collect();
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = lz4::EncoderBuilder::new()
+                .level(4)
+                .build(&mut compressed)
+                .unwrap();
+            std::io::Write::write_all(&mut encoder, &original).unwrap();
+            let (_, result) = encoder.finish();
+            result.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lz4_data.bin");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let (mut reader, file_bytes) = get_clip_stream(
+            file,
+            CompressionMode::Lz4,
+            0,
+            original.len() as u64,
+            compressed.len() as u64,
+            true,
+        )
+        .unwrap();
+        assert_eq!(file_bytes, compressed.len() as u64);
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output.len(), original.len());
+        assert_eq!(output, original);
+    }
+
+    /// LZ4 decompression via get_clip_stream (unbuffered / streaming).
+    #[test]
+    fn get_clip_stream_lz4_unbuffered_roundtrip() {
+        let original: Vec<u8> = (0..65536u32)
+            .map(|i| (i.wrapping_mul(13) ^ i >> 5) as u8)
+            .collect();
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = lz4::EncoderBuilder::new()
+                .level(4)
+                .build(&mut compressed)
+                .unwrap();
+            std::io::Write::write_all(&mut encoder, &original).unwrap();
+            let (_, result) = encoder.finish();
+            result.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lz4_stream.bin");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let (mut reader, _) = get_clip_stream(
+            file,
+            CompressionMode::Lz4,
+            0,
+            original.len() as u64,
+            compressed.len() as u64,
+            false,
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
+    }
 }
