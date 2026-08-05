@@ -671,6 +671,75 @@ fn bench_chunk_lookup(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Varint decode benchmark
+// ---------------------------------------------------------------------------
+
+use irmin::game_installer::hdiffpatch::read_long_7bit_from_slice;
+
+/// Encode a non-negative i64 as a 7-bit varint (tag_bit=0 format).
+fn encode_7bit_varint(v: i64) -> Vec<u8> {
+    debug_assert!(v >= 0);
+    if v < 0x80 {
+        return vec![v as u8];
+    }
+    let bits = 64 - (v as u64).leading_zeros() as usize;
+    let groups = (bits + 6) / 7;
+    let mut out = Vec::with_capacity(groups);
+    for i in (0..groups).rev() {
+        let chunk = ((v >> (i * 7)) & 0x7F) as u8;
+        if i > 0 {
+            out.push(chunk | 0x80);
+        } else {
+            out.push(chunk);
+        }
+    }
+    // Set continuation bit on first byte (bit 7 signals multi-byte)
+    out[0] |= 0x80;
+    out
+}
+
+/// Generate a buffer of `count` varints with mixed 1-8 byte encodings.
+fn gen_varint_buffer(count: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(count * 4);
+    for i in 0..count {
+        let v = match i % 8 {
+            0 => (i % 64) as i64,                   // 1 byte (0-63)
+            1 => 100 + (i % 28) as i64,             // 1 byte (100-127)
+            2 => 200 + (i % 1000) as i64,           // 2 bytes
+            3 => 20_000 + (i % 10_000) as i64,      // 3 bytes
+            4 => 2_000_000 + (i as i64),            // 4 bytes
+            5 => 300_000_000 + (i as i64),          // 5 bytes
+            6 => 40_000_000_000i64 + (i as i64),    // 6 bytes
+            _ => 5_000_000_000_000i64 + (i as i64), // 7+ bytes
+        };
+        buf.extend_from_slice(&encode_7bit_varint(v));
+    }
+    buf
+}
+
+const VARINT_COUNT: usize = 100_000;
+
+/// Varint decoding throughput: read_long_7bit_from_slice over 100k varints
+/// of varying encoded lengths (1-8 bytes).
+fn bench_varint_decode(c: &mut Criterion) {
+    let buf = gen_varint_buffer(VARINT_COUNT);
+
+    let mut group = c.benchmark_group("varint_decode");
+    group.throughput(Throughput::Elements(VARINT_COUNT as u64));
+
+    group.bench_function("mixed_100k", |b| {
+        b.iter(|| {
+            let mut offset = 0usize;
+            for _ in 0..VARINT_COUNT {
+                std::hint::black_box(read_long_7bit_from_slice(&buf, &mut offset, 0, 0).unwrap());
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -682,5 +751,6 @@ criterion_group!(
     bench_zstd_oneshot,
     bench_compact_manifest_build,
     bench_chunk_lookup,
+    bench_varint_decode,
 );
 criterion_main!(benches);
