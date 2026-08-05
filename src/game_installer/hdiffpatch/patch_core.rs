@@ -34,7 +34,7 @@ pub(crate) fn write_cover_stream_to_output_with_slice(
     header_info: &HeaderInfo,
     on_progress: Option<&dyn Fn(u64)>,
 ) -> std::io::Result<()> {
-    // ponytail: dummy never read when old_data is Some
+    // dummy never read when old_data is Some
     let mut dummy = Cursor::new(&[][..]);
     write_cover_stream_inner(
         clips,

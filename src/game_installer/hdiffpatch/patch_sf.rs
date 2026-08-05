@@ -40,7 +40,7 @@ impl PatchSF {
         patch_path: &str,
         on_progress: Option<&dyn Fn(u64)>,
     ) -> std::io::Result<()> {
-        // ponytail: dummy cursor never actually read when old_data is Some
+        // dummy cursor never actually read when old_data is Some
         let mut dummy = std::io::Cursor::new(&[][..]);
         self.patch_inner(
             &mut dummy,
@@ -178,7 +178,7 @@ fn patch_loop(
             }
             cover_count -= 1;
 
-            // ponytail: length==0 covers are near-nonexistent in real patches;
+            // length==0 covers are near-nonexistent in real patches;
             // keeping the branch for correctness but the predictor will skip it.
             if length > 0 {
                 if let Some(slice) = old_data {
@@ -313,7 +313,7 @@ impl<'a> Rle0Decoder<'a> {
     /// If the decoder is currently in a zero-run of at least `n` bytes,
     /// consume those bytes (leaving data untouched) and return true.
     /// Otherwise return false and consume nothing.
-    // ponytail: hot fast-path for large unchanged regions; avoids io_buf chunking entirely.
+    // hot fast-path for large unchanged regions; avoids io_buf chunking entirely.
     fn try_skip_zeros(&mut self, n: usize) -> std::io::Result<bool> {
         // Ensure we're in the len0 state. If we just finished a lenv and
         // need_decode0 is true with lenv==0, decode the next len0 first.

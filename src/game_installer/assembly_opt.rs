@@ -308,7 +308,7 @@ fn decompress_chunk_oneshot(
         return Err(SophonError::Io(io::Error::other("empty chunk")));
     }
 
-    // ponytail: pread into thread-local buffer instead of mmap; saves ~5 syscalls/chunk.
+    // pread into thread-local buffer instead of mmap; saves ~5 syscalls/chunk.
     // Upgrade path: if chunks exceed ONESHOT_MAX_SIZE, fall back to mmap or streaming.
     let mut compressed_buf = take_compressed_buf(compressed_size);
     let n = f.read_at(&mut compressed_buf[..compressed_size], 0)?;
