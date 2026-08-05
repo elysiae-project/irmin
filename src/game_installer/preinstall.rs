@@ -1952,9 +1952,8 @@ fn apply_hdiff_patch(
     }));
 
     {
-        let chunk_fd = fs::File::open(&chunk_path).map(|f| f.as_raw_fd()).ok();
-        if let Some(fd) = chunk_fd {
-            posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+        if let Ok(f) = fs::File::open(&chunk_path) {
+            posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
         }
     }
 
