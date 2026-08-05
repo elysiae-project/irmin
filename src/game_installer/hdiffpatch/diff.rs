@@ -5,15 +5,15 @@ use std::path::PathBuf;
 use super::header::{DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo};
 use super::parser::BinaryExtensions;
 
-pub(crate) struct HDiff {
-    pub(crate) source_path: String,
-    pub(crate) diff_path: String,
-    pub(crate) dest_path: String,
-    pub(crate) diff_offset: u64,
+pub struct HDiff {
+    pub source_path: String,
+    pub diff_path: String,
+    pub dest_path: String,
+    pub diff_offset: u64,
 }
 
 impl HDiff {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "benchmark"))]
     pub fn new(source_path: String, diff_path: String, dest_path: String) -> Self {
         Self::with_offset(source_path, diff_path, dest_path, 0)
     }

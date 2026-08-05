@@ -9,6 +9,9 @@ mod download;
 mod error;
 mod game_filters;
 mod handle;
+#[cfg(feature = "benchmark")]
+pub mod hdiffpatch;
+#[cfg(not(feature = "benchmark"))]
 mod hdiffpatch;
 pub mod installer;
 mod plugin_api;

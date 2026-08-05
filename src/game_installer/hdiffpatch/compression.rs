@@ -4,7 +4,7 @@ use flate2::read::DeflateDecoder;
 
 use super::CompressionMode;
 use crate::game_installer::assembly_opt::{
-    MAX_WINDOW_LOG, return_dctx, take_dctx, window_log_for_size,
+    return_dctx, take_dctx, window_log_for_size, MAX_WINDOW_LOG,
 };
 
 /// True when a zstd decode error indicates the `WindowLogMax` cap was
@@ -204,7 +204,7 @@ impl Read for LimitedFile {
 #[cfg(test)]
 mod tests {
     use super::super::CompressionMode;
-    use super::{LimitedFile, get_clip_stream};
+    use super::{get_clip_stream, LimitedFile};
     use std::io::Read;
 
     #[test]
@@ -375,8 +375,8 @@ mod tests {
 
     #[test]
     fn get_clip_stream_zlib_buffered_roundtrip() {
-        use flate2::Compression;
         use flate2::write::DeflateEncoder;
+        use flate2::Compression;
 
         let original = b"Hello World from zlib raw-deflate roundtrip test!";
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
@@ -410,8 +410,8 @@ mod tests {
 
     #[test]
     fn get_clip_stream_zlib_unbuffered_roundtrip() {
-        use flate2::Compression;
         use flate2::write::DeflateEncoder;
+        use flate2::Compression;
 
         let original = b"Unbuffered zlib raw-deflate roundtrip test data.";
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());

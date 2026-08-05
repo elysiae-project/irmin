@@ -43,20 +43,15 @@ pub(crate) struct RleRefClip {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CoverHeader {
-    pub(crate) old_pos: i64,
-    pub(crate) new_pos: i64,
-    pub(crate) cover_length: i64,
-    pub(crate) next_cover_index: i64,
+pub struct CoverHeader {
+    pub old_pos: i64,
+    pub new_pos: i64,
+    pub cover_length: i64,
+    pub next_cover_index: i64,
 }
 
 impl CoverHeader {
-    pub(crate) fn new(
-        old_pos: i64,
-        new_pos: i64,
-        cover_length: i64,
-        next_cover_index: i64,
-    ) -> Self {
+    pub fn new(old_pos: i64, new_pos: i64, cover_length: i64, next_cover_index: i64) -> Self {
         Self {
             old_pos,
             new_pos,
@@ -68,7 +63,7 @@ impl CoverHeader {
 
 pub(crate) const K_SIGN_TAG_BIT: u8 = 1;
 pub(crate) const K_BYTE_RLE_TYPE: u8 = 2;
-pub(crate) const MAX_MEM_BUFFER_LEN: i64 = 3 << 20;
-pub(crate) const MAX_MEM_BUFFER_LIMIT: usize = 5 << 20;
-pub(crate) const MAX_ARRAY_POOL_LEN: usize = 2 << 20;
-pub(crate) const MAX_ARRAY_POOL_SECOND_OFFSET: usize = MAX_ARRAY_POOL_LEN / 2;
+pub const MAX_MEM_BUFFER_LEN: i64 = 3 << 20;
+pub const MAX_MEM_BUFFER_LIMIT: usize = 5 << 20;
+pub const MAX_ARRAY_POOL_LEN: usize = 2 << 20;
+pub const MAX_ARRAY_POOL_SECOND_OFFSET: usize = MAX_ARRAY_POOL_LEN / 2;

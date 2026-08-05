@@ -1,13 +1,10 @@
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use super::{
-    BufferPool, CoverHeader, HeaderInfo, K_BYTE_RLE_TYPE, K_SIGN_TAG_BIT, MAX_ARRAY_POOL_LEN,
-    MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT, RleRefClip,
-    SeekableRead,
+    BufferPool, CoverHeader, HeaderInfo, RleRefClip, SeekableRead, K_BYTE_RLE_TYPE, K_SIGN_TAG_BIT,
+    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT,
 };
-use crate::game_installer::hdiffpatch::parser::{
-    BinaryExtensions, read_long_7bit_from_slice,
-};
+use crate::game_installer::hdiffpatch::parser::{read_long_7bit_from_slice, BinaryExtensions};
 
 static SHARED_BUFFER_POOL: BufferPool = BufferPool::new(1);
 static CACHE_BUFFER_POOL: BufferPool = BufferPool::new(1);
@@ -390,7 +387,7 @@ pub(crate) fn tbytes_set_rle_vector_software(
     Ok(())
 }
 
-pub(crate) struct CoverHeaderIterator<'a> {
+pub struct CoverHeaderIterator<'a> {
     reader: CoverReader<'a>,
     remaining: i64,
     last_old_pos_back: i64,
@@ -653,7 +650,7 @@ pub(crate) fn enumerate_cover_headers(
 }
 
 #[allow(clippy::needless_lifetimes)]
-pub(crate) fn enumerate_cover_headers_checked<'a>(
+pub fn enumerate_cover_headers_checked<'a>(
     cover_reader: &'a mut dyn Read,
     cover_size: i64,
     cover_count: i64,
