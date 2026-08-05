@@ -266,7 +266,7 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
 // Grows to fit the largest chunk seen on this thread (up to ONESHOT_MAX_SIZE)
 // and is reused across calls, avoiding mmap/munmap syscall overhead per chunk.
 thread_local! {
-    static COMPRESSED_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static COMPRESSED_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Take the thread-local compressed buffer, growing it if needed.
