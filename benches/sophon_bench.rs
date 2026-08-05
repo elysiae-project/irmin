@@ -447,6 +447,7 @@ fn bench_assembly_e2e(c: &mut Criterion) {
 const VERIFY_MIB: u64 = 50;
 
 /// `check_file_md5_cached` cache-miss path: full read + MD5 of a 50 MiB file.
+/// Also benchmarks cache-hit path (metadata lookup only, no file read).
 fn bench_verify_file_md5(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let game_dir = dir.path().to_path_buf();
@@ -469,6 +470,28 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             .unwrap();
         });
     });
+
+    // Populate cache for hit benchmark
+    {
+        cache.clear();
+        let result = irmin::game_installer::cache::check_file_md5_cached(
+            &path, bytes, &md5, &game_dir, &cache,
+        )
+        .unwrap();
+        assert!(result, "cache population should succeed");
+    }
+
+    group.bench_function("hit", |b| {
+        let game_dir = game_dir.clone();
+        b.iter(|| {
+            let result = irmin::game_installer::cache::check_file_md5_cached(
+                &path, bytes, &md5, &game_dir, &cache,
+            )
+            .unwrap();
+            assert!(result);
+        });
+    });
+
     group.finish();
 }
 
