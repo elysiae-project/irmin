@@ -871,4 +871,76 @@ mod tests {
         std::fs::write(&path, b"data").unwrap();
         assert!(verify_existing_file_hash(&path, "", None).await.unwrap());
     }
+
+    #[tokio::test]
+    async fn evicting_writer_multiple_writes_produces_correct_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut w = EvictingWriter::new(file);
+
+        w.write_all(b"hello ").await.unwrap();
+        w.write_all(b"world").await.unwrap();
+        w.write_all(b"!").await.unwrap();
+        w.flush().await.unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"hello world!");
+    }
+
+    #[tokio::test]
+    async fn evicting_writer_written_tracks_total_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut w = EvictingWriter::new(file);
+
+        assert_eq!(w.written(), 0);
+        w.write_all(&[0u8; 1000]).await.unwrap();
+        assert_eq!(w.written(), 1000);
+        w.write_all(&[0u8; 500]).await.unwrap();
+        assert_eq!(w.written(), 1500);
+    }
+
+    #[tokio::test]
+    async fn evicting_writer_with_offset_starts_at_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+
+        // Pre-create a file with existing content
+        std::fs::write(&path, b"EXISTING_HEADER_").unwrap();
+
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let offset = 16u64;
+        let mut w = EvictingWriter::with_offset(file, offset);
+
+        assert_eq!(w.written(), offset);
+        w.write_all(b"appended_data").await.unwrap();
+        assert_eq!(w.written(), offset + 13);
+        w.flush().await.unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"EXISTING_HEADER_appended_data");
+    }
+
+    #[tokio::test]
+    async fn evicting_writer_flush_and_evict_all_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut w = EvictingWriter::new(file);
+
+        w.write_all(&[0xAB; 4096]).await.unwrap();
+        // flush_and_evict_all must not error
+        w.flush_and_evict_all().await.unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 4096);
+        assert!(contents.iter().all(|&b| b == 0xAB));
+    }
 }
