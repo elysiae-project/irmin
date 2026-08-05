@@ -2003,4 +2003,91 @@ mod tests {
         // No chunk was downloaded.
         assert!(chunk_refcounts.is_empty());
     }
+
+    /// Verifies assembled output == decompressed chunk concatenation with PRNG data,
+    /// and that the file MD5 matches the manifest. Guards against decompression or
+    /// offset calculation regressions.
+    #[test]
+    fn assemble_file_prng_data_matches_expected_md5() {
+        let dir = tempfile::tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        let chunks_dir = dir.path().join("chunks");
+        let temp_dir = dir.path().join("tmp");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::create_dir_all(&chunks_dir).unwrap();
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Generate 4 chunks of PRNG data (xoshiro256**)
+        fn prng_block(seed: u64, len: usize) -> Vec<u8> {
+            let mut s = [seed, seed.wrapping_mul(6364136223846793005).wrapping_add(1),
+                         seed.wrapping_mul(1442695040888963407).wrapping_add(3),
+                         seed ^ 0xdeadbeefcafe1234];
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                let r = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+                let t = s[1] << 17;
+                s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
+                s[2] ^= t; s[3] = s[3].rotate_left(45);
+                out.push(r as u8);
+            }
+            out
+        }
+
+        let chunk_data: Vec<Vec<u8>> = (0..4)
+            .map(|i| prng_block(42 + i, 16384))
+            .collect();
+
+        let mut expected = Vec::new();
+        let mut chunks = Vec::new();
+        let names: Vec<String> = (0..4).map(|i| format!("prng_c{i}")).collect();
+
+        for (i, data) in chunk_data.iter().enumerate() {
+            make_chunk_file(&chunks_dir, &names[i], data);
+            let offset = expected.len() as u64;
+            expected.extend_from_slice(data);
+            chunks.push(SophonManifestAssetChunk {
+                chunk_name: names[i].clone(),
+                chunk_decompressed_hash_md5: String::new(),
+                chunk_on_file_offset: offset,
+                chunk_size: 0,
+                chunk_size_decompressed: data.len() as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: String::new(),
+                chunk_old_offset: -1,
+            });
+        }
+
+        let file_md5 = compute_md5_hex(&expected);
+        let file = SophonManifestAssetProperty {
+            asset_name: "assembled_prng.bin".to_string(),
+            asset_chunks: chunks,
+            asset_type: 0,
+            asset_size: expected.len() as u64,
+            asset_hash_md5: file_md5.clone(),
+        };
+
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let chunk_names = make_chunk_names(&name_refs);
+        let chunk_refcounts: Vec<AtomicU32> = (0..4).map(|_| AtomicU32::new(100)).collect();
+        let verify_cache = DashMap::new();
+
+        assemble_test_file(
+            file,
+            &game_dir,
+            &chunks_dir,
+            &temp_dir,
+            &chunk_names,
+            &chunk_refcounts,
+            &verify_cache,
+        )
+        .unwrap();
+
+        let result = fs::read(game_dir.join("assembled_prng.bin")).unwrap();
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(result, expected, "assembled output differs from decompressed concatenation");
+
+        // Verify the file-level MD5 matches
+        let result_md5 = compute_md5_hex(&result);
+        assert_eq!(result_md5, file_md5);
+    }
 }
