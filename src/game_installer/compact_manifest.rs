@@ -542,4 +542,108 @@ mod tests {
         }
         assert_eq!(global_chunk_idx, total_chunks);
     }
+
+    /// Documents that chunk_size and chunk_size_decompressed are truncated to
+    /// u32 during CompactManifest construction. If someone widens the column
+    /// without updating the cast, this test catches the change.
+    #[test]
+    fn truncation_chunk_size_to_u32() {
+        let big_value = (u32::MAX as u64) + 1;
+        let chunk = SophonManifestAssetChunk {
+            chunk_name: "big".into(),
+            chunk_decompressed_hash_md5: String::new(),
+            chunk_on_file_offset: 0,
+            chunk_size: big_value,
+            chunk_size_decompressed: big_value,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: String::new(),
+            chunk_old_offset: -1,
+        };
+        let f = make_file("a.pak", "h", 0, big_value, vec![chunk]);
+        let cm = CompactManifest::from(vec![f]);
+        let c = cm.chunk(0);
+        // Truncation wraps: (u32::MAX + 1) as u32 == 0
+        assert_eq!(c.chunk_size, 0);
+        assert_eq!(c.chunk_size_decompressed, 0);
+    }
+
+    /// Documents that file_type is truncated to u8. Values > 255 wrap.
+    #[test]
+    fn truncation_file_type_to_u8() {
+        let f = make_file("dir.pak", "h", 256, 0, vec![]);
+        let cm = CompactManifest::from(vec![f]);
+        // 256u32 as u8 == 0
+        assert_eq!(cm.file_type(0), 0);
+    }
+
+    /// Verifies file_idx_for_chunk resolves correctly across multiple files.
+    #[test]
+    fn file_idx_for_chunk_multi_file() {
+        let f0 = make_file(
+            "a.pak",
+            "h1",
+            0,
+            200,
+            vec![
+                make_chunk("c0", 0, 100, 100),
+                make_chunk("c1", 100, 100, 100),
+            ],
+        );
+        let f1 = make_file(
+            "b.pak",
+            "h2",
+            0,
+            300,
+            vec![
+                make_chunk("c2", 0, 100, 100),
+                make_chunk("c3", 100, 100, 100),
+                make_chunk("c4", 200, 100, 100),
+            ],
+        );
+        let f2 = make_file("c.pak", "h3", 0, 100, vec![make_chunk("c5", 0, 100, 100)]);
+        let cm = CompactManifest::from(vec![f0, f1, f2]);
+
+        assert_eq!(cm.file_idx_for_chunk(0), 0);
+        assert_eq!(cm.file_idx_for_chunk(1), 0);
+        assert_eq!(cm.file_idx_for_chunk(2), 1);
+        assert_eq!(cm.file_idx_for_chunk(3), 1);
+        assert_eq!(cm.file_idx_for_chunk(4), 1);
+        assert_eq!(cm.file_idx_for_chunk(5), 2);
+    }
+
+    /// Verifies chunk_file_offset computes prefix sums correctly across files
+    /// with varying chunk sizes.
+    #[test]
+    fn chunk_file_offset_multi_file_prefix_sum() {
+        let f0 = make_file(
+            "a.pak",
+            "h1",
+            0,
+            700,
+            vec![
+                make_chunk("c0", 0, 100, 200),
+                make_chunk("c1", 200, 100, 500),
+            ],
+        );
+        let f1 = make_file(
+            "b.pak",
+            "h2",
+            0,
+            900,
+            vec![
+                make_chunk("c2", 0, 100, 300),
+                make_chunk("c3", 300, 100, 400),
+                make_chunk("c4", 700, 100, 200),
+            ],
+        );
+        let cm = CompactManifest::from(vec![f0, f1]);
+
+        // File 0: chunk 0 at offset 0, chunk 1 at offset 200
+        assert_eq!(cm.chunk_file_offset(0), 0);
+        assert_eq!(cm.chunk_file_offset(1), 200);
+        // File 1: chunk 2 at offset 0, chunk 3 at offset 300, chunk 4 at offset 700
+        assert_eq!(cm.chunk_file_offset(2), 0);
+        assert_eq!(cm.chunk_file_offset(3), 300);
+        assert_eq!(cm.chunk_file_offset(4), 700);
+    }
 }
