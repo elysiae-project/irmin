@@ -209,4 +209,31 @@ mod tests {
             "content hash algorithm changed: resume state compatibility broken"
         );
     }
+
+    /// chunk_old_offset is runtime-only metadata and must not affect the hash.
+    #[test]
+    fn compute_content_manifest_hash_excludes_old_offset() {
+        let make = |offset: i64| SophonManifestProto {
+            assets: vec![SophonManifestAssetProperty {
+                asset_name: "a.pak".into(),
+                asset_chunks: vec![SophonManifestAssetChunk {
+                    chunk_name: "c0".into(),
+                    chunk_decompressed_hash_md5: "deadbeef".into(),
+                    chunk_on_file_offset: 0,
+                    chunk_size: 1000,
+                    chunk_size_decompressed: 2000,
+                    chunk_compressed_hash_xxh: 0,
+                    chunk_compressed_hash_md5: "cafebabe".into(),
+                    chunk_old_offset: offset,
+                }],
+                asset_type: 0,
+                asset_size: 2000,
+                asset_hash_md5: "filehash".into(),
+            }],
+        };
+        assert_eq!(
+            compute_content_manifest_hash(&make(-1)),
+            compute_content_manifest_hash(&make(4096)),
+        );
+    }
 }
