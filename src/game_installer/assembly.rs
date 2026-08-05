@@ -473,22 +473,19 @@ pub fn assemble_file(
                                 chunk.chunk_decompressed_hash_md5,
                             )
                         } else {
-                            if !validate_chunk_name(chunk.chunk_name) {
-                                Err(SophonError::PathTraversal(chunk.chunk_name.into()))
-                            } else {
-                                chunk_path.push(chunk.chunk_name);
-                                chunk_path.set_extension("zstd");
-                                let result = write_decompressed_chunk_at(
-                                    &chunk_path,
-                                    out,
-                                    offset,
-                                    chunk.chunk_size_decompressed,
-                                    None,
-                                    chunk.chunk_decompressed_hash_md5,
-                                );
-                                chunk_path.pop();
-                                result
-                            }
+                            debug_assert!(validate_chunk_name(chunk.chunk_name));
+                            chunk_path.push(chunk.chunk_name);
+                            chunk_path.set_extension("zstd");
+                            let result = write_decompressed_chunk_at(
+                                &chunk_path,
+                                out,
+                                offset,
+                                chunk.chunk_size_decompressed,
+                                None,
+                                chunk.chunk_decompressed_hash_md5,
+                            );
+                            chunk_path.pop();
+                            result
                         };
                         match result {
                             Ok(bytes) => {
@@ -564,9 +561,7 @@ pub fn assemble_file(
                 total_written += bytes_written;
             // Old-source chunks were never downloaded.
             } else {
-                if !validate_chunk_name(chunk.chunk_name) {
-                    return Err(SophonError::PathTraversal(chunk.chunk_name.into()));
-                }
+                debug_assert!(validate_chunk_name(chunk.chunk_name));
                 chunk_path.push(chunk.chunk_name);
                 chunk_path.set_extension("zstd");
 
@@ -624,12 +619,15 @@ pub fn assemble_file(
         }
     }
 
-    super::assembly_opt::posix_advise(
-        out_file.as_raw_fd(),
-        0,
-        file_size,
-        libc::POSIX_FADV_DONTNEED,
-    );
+    // Only evict the full file when per-chunk eviction was skipped (hasher needs pages resident).
+    if parallel_hashed_file {
+        super::assembly_opt::posix_advise(
+            out_file.as_raw_fd(),
+            0,
+            file_size,
+            libc::POSIX_FADV_DONTNEED,
+        );
+    }
     drop(out_file);
 
     if total_written != file_size {
