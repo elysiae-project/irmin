@@ -77,7 +77,7 @@ impl PatchSF {
             on_progress,
         );
         WORK_BUF_POOL.return_buf(io_buf);
-        STEP_BUF_POOL.return_buf_shrunken(step_buf, IO_BUF_SIZE);
+        STEP_BUF_POOL.return_buf(step_buf);
         result
     }
 }
@@ -138,12 +138,11 @@ fn patch_loop(
                 let gap = new_pos - prev_new_end;
                 copy_n(&mut *diff, out, gap, io_buf)?;
                 total_written += gap;
-                if let Some(ref cb) = on_progress {
-                    cb(total_written);
-                }
             }
             cover_count -= 1;
 
+            // ponytail: length==0 covers are near-nonexistent in real patches;
+            // keeping the branch for correctness but the predictor will skip it.
             if length > 0 {
                 old.seek(SeekFrom::Start(old_pos))?;
                 let mut rem = length;
@@ -155,9 +154,9 @@ fn patch_loop(
                     rem -= take as u64;
                 }
                 total_written += length;
-                if let Some(ref cb) = on_progress {
-                    cb(total_written);
-                }
+            }
+            if let Some(ref cb) = on_progress {
+                cb(total_written);
             }
         }
     }

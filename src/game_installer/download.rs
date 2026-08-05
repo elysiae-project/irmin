@@ -495,15 +495,15 @@ async fn download_full_file_with_response(
                         actual: total_len,
                     });
                 }
+                if let Err(err) = file.write_all(&bytes).await {
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(SophonError::Io(err));
+                }
                 if let Some(ref mut h) = hasher {
                     h.update(&bytes)?;
                 }
                 if let Some(ref mut h) = xxh64_hasher {
                     h.update(&bytes);
-                }
-                if let Err(err) = file.write_all(&bytes).await {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Io(err));
                 }
             }
             Some(Err(e)) => {
@@ -547,23 +547,16 @@ async fn download_full_file_with_response(
                 }
             }
             16 => {
-                let matched = if let Some(ref h) = xxh64_hasher {
-                    let digest = h.digest();
-                    xxh64_hex_eq(digest, expected)
-                } else {
-                    file.flush().await?;
-                    verify_existing_file_hash(dest, expected, Some(total_len)).await?
-                };
-                if !matched {
+                let digest = xxh64_hasher
+                    .as_ref()
+                    .expect("xxh64_hasher present when hash len == 16")
+                    .digest();
+                if !xxh64_hex_eq(digest, expected) {
                     let _ = tokio::fs::remove_file(dest).await;
-                    let actual = xxh64_hasher
-                        .as_ref()
-                        .map(|h| format!("{:016x}", h.digest()))
-                        .unwrap_or_else(|| expected.to_string());
                     return Err(SophonError::Md5Mismatch {
                         item: chunk.chunk_name.to_string(),
                         expected: expected.to_string(),
-                        actual,
+                        actual: format!("{:016x}", digest),
                     });
                 }
             }
@@ -740,23 +733,16 @@ async fn download_with_resume(
                 }
             }
             16 => {
-                let matched = if let Some(ref h) = xxh64_hasher {
-                    let digest = h.digest();
-                    xxh64_hex_eq(digest, expected)
-                } else {
-                    file.flush().await?;
-                    verify_existing_file_hash(dest, expected, Some(total_len)).await?
-                };
-                if !matched {
+                let digest = xxh64_hasher
+                    .as_ref()
+                    .expect("xxh64_hasher present when hash len == 16")
+                    .digest();
+                if !xxh64_hex_eq(digest, expected) {
                     let _ = tokio::fs::remove_file(dest).await;
-                    let actual = xxh64_hasher
-                        .as_ref()
-                        .map(|h| format!("{:016x}", h.digest()))
-                        .unwrap_or_else(|| expected.to_string());
                     return Err(SophonError::Md5Mismatch {
                         item: chunk.chunk_name.to_string(),
                         expected: expected.to_string(),
-                        actual,
+                        actual: format!("{:016x}", digest),
                     });
                 }
             }
