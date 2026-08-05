@@ -11,7 +11,7 @@ use super::error::{SophonError, SophonResult};
 use super::sysio;
 use super::FILE_WRITE_BUFFER_SIZE;
 
-const ASSEMBLY_BUFFER_SIZE: usize = 256 * 1024;
+const ASSEMBLY_BUFFER_SIZE: usize = 1024 * 1024;
 
 const ONESHOT_MAX_SIZE: usize = 64 * 1024 * 1024;
 
@@ -184,8 +184,9 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
+        // MADV_DONTNEED on MAP_SHARED dirty pages triggers writeback implicitly.
+        // msync(MS_ASYNC) is redundant on Linux >= 2.6.17 for shared mappings.
         unsafe {
-            libc::msync(self.map_base, self.map_len, libc::MS_ASYNC);
             libc::madvise(self.map_base, self.map_len, libc::MADV_DONTNEED);
         }
     }
@@ -348,6 +349,8 @@ fn decompress_chunk_oneshot(
         let mut ctx = take_dctx();
         ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
             .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
+        // Skip frame checksum (xxHash64) since MD5 verification covers integrity.
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
 
         let written = ctx
             .decompress(output, compressed)
@@ -628,6 +631,7 @@ fn decompress_chunk_with_window(
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx reset")))?;
         ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax")))?;
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
 
         let (bytes, chunk_hasher) = {
             let buf_reader = BufReader::with_capacity(FILE_WRITE_BUFFER_SIZE, f);
