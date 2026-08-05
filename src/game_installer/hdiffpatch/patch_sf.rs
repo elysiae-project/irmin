@@ -195,12 +195,12 @@ fn patch_loop(
                         // Zero-run: write old data directly without io_buf copy.
                         out.write_all(src)?;
                     } else {
+                        // XOR from source slice into io_buf without prior memcpy.
                         let mut off = 0usize;
                         let len = length as usize;
                         while off < len {
                             let take = io_buf.len().min(len - off);
-                            io_buf[..take].copy_from_slice(&src[off..off + take]);
-                            rle0.add(&mut io_buf[..take])?;
+                            rle0.add_from_source(&src[off..off + take], &mut io_buf[..take])?;
                             out.write_all(&io_buf[..take])?;
                             off += take;
                         }
@@ -356,6 +356,62 @@ impl<'a> Rle0Decoder<'a> {
                 // Iter-zip form enables LLVM autovectorization (vpaddb).
                 for (d, s) in dst.iter_mut().zip(src.iter()) {
                     *d = d.wrapping_add(*s);
+                }
+                self.pos += to_read;
+                self.lenv -= to_read;
+                dp += to_read;
+                rem -= to_read;
+            } else if self.need_decode0 {
+                self.need_decode0 = false;
+                match rle_varint(self.buf, &mut self.pos) {
+                    Some(v) => self.len0 = v,
+                    None => {
+                        return Err(std::io::Error::other("truncated RLE varint in RLE0 (len0)"));
+                    }
+                }
+            } else {
+                self.need_decode0 = true;
+                match rle_varint(self.buf, &mut self.pos) {
+                    Some(v) => self.lenv = v,
+                    None => {
+                        return Err(std::io::Error::other("truncated RLE varint in RLE0 (lenv)"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply RLE decoding from a read-only source into a separate output buffer.
+    /// Equivalent to copying `source` into `out` then calling `add(out)`, but
+    /// avoids the initial memcpy for the zero-run (len0) regions.
+    fn add_from_source(&mut self, source: &[u8], out: &mut [u8]) -> std::io::Result<()> {
+        debug_assert_eq!(source.len(), out.len());
+        let mut dp = 0usize;
+        let mut rem = source.len();
+        while rem > 0 {
+            if self.len0 > 0 {
+                let take = self.len0.min(rem);
+                // Zero-run: output = source unchanged, no copy_from_slice needed
+                // if caller writes out[..] to the writer.
+                out[dp..dp + take].copy_from_slice(&source[dp..dp + take]);
+                self.len0 -= take;
+                dp += take;
+                rem -= take;
+            } else if self.lenv > 0 {
+                let available = self.buf.len().saturating_sub(self.pos);
+                if self.lenv > available {
+                    return Err(std::io::Error::other(
+                        "RLE0 diff data exceeds remaining code buffer",
+                    ));
+                }
+                let to_read = self.lenv.min(rem);
+                let rle_src = &self.buf[self.pos..self.pos + to_read];
+                let old_src = &source[dp..dp + to_read];
+                let dst = &mut out[dp..dp + to_read];
+                // source[i] + rle[i] directly into output, no prior copy needed.
+                for ((d, o), r) in dst.iter_mut().zip(old_src.iter()).zip(rle_src.iter()) {
+                    *d = o.wrapping_add(*r);
                 }
                 self.pos += to_read;
                 self.lenv -= to_read;
@@ -578,6 +634,28 @@ mod tests {
         assert_eq!(data[..10], [0x00u8; 10]);
         assert_eq!(data[10], 0x11);
         assert_eq!(data[11], 0x22);
+    }
+
+    #[test]
+    fn rle0decoder_add_from_source_matches_add() {
+        // Same pattern as rle0decoder_large_skip but using add_from_source.
+        let rle_buf = vec![10u8, 2u8, 0x11u8, 0x22u8];
+        let source = [0xAAu8; 12];
+
+        let mut rle0 = Rle0Decoder::new(&rle_buf);
+        let mut out = [0u8; 12];
+        rle0.add_from_source(&source, &mut out).unwrap();
+        // First 10 bytes: source unchanged (0xAA)
+        assert_eq!(out[..10], [0xAA; 10]);
+        // Last 2: source + rle = 0xAA + 0x11, 0xAA + 0x22
+        assert_eq!(out[10], 0xAAu8.wrapping_add(0x11));
+        assert_eq!(out[11], 0xAAu8.wrapping_add(0x22));
+
+        // Verify equivalence with copy+add approach
+        let mut rle0b = Rle0Decoder::new(&rle_buf);
+        let mut data = source;
+        rle0b.add(&mut data).unwrap();
+        assert_eq!(out, data);
     }
 
     #[test]
