@@ -325,6 +325,9 @@ pub fn assemble_file(
             })
             .collect();
 
+        let hasher_thread_handle: std::sync::OnceLock<std::thread::Thread> =
+            std::sync::OnceLock::new();
+
         std::thread::scope(|s| {
             if parallel_hashed_file {
                 let tmp_path = &tmp_path;
@@ -332,7 +335,9 @@ pub fn assemble_file(
                 let chunk_infos = &chunk_infos;
                 let err = &first_error;
                 let hasher_result = &hasher_result;
+                let ht = &hasher_thread_handle;
                 s.spawn(move || {
+                    ht.set(std::thread::current()).ok();
                     let file = match File::open(tmp_path) {
                         Ok(f) => f,
                         Err(e) => {
@@ -363,7 +368,7 @@ pub fn assemble_file(
                             if chunk_done[i].load(Ordering::Acquire) {
                                 break;
                             }
-                            std::hint::spin_loop();
+                            std::thread::park_timeout(std::time::Duration::from_millis(1));
                         }
                         let mut remaining = size as usize;
                         let mut pos = offset;
@@ -422,6 +427,7 @@ pub fn assemble_file(
                 let skip_evict = parallel_hashed_file;
                 let chunk_done = &chunk_done;
                 let chunk_offsets = &chunk_offsets[..];
+                let ht = &hasher_thread_handle;
                 s.spawn(move || {
                     let mut transfer_buf = TRANSFER_BUF.with(|cell| {
                         let mut buf = cell.take();
@@ -483,6 +489,9 @@ pub fn assemble_file(
                                 }
                                 let idx = (ci - chunk_range.start) as usize;
                                 chunk_done[idx].store(true, Ordering::Release);
+                                if let Some(t) = ht.get() {
+                                    t.unpark();
+                                }
                             }
                             Err(e) => {
                                 let mut guard = err.lock().unwrap();
