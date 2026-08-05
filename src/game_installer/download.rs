@@ -449,7 +449,11 @@ async fn download_full_file_with_response(
     let mut file = EvictingWriter::new(file);
     let mut stream = resp.bytes_stream();
     let needs_hash = !chunk.chunk_compressed_hash_md5.is_empty();
-    let mut hasher = if needs_hash { Some(take_md5()?) } else { None };
+    let mut hasher = if needs_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
+        Some(take_md5()?)
+    } else {
+        None
+    };
     let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> =
         if needs_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
             Some(super::assembly_opt::take_xxh64())
@@ -620,7 +624,11 @@ async fn download_with_resume(
     check_available_space(dest, remaining)?;
 
     let needs_hash = !chunk.chunk_compressed_hash_md5.is_empty();
-    let mut hasher = if needs_hash { Some(take_md5()?) } else { None };
+    let mut hasher = if needs_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
+        Some(take_md5()?)
+    } else {
+        None
+    };
     let needs_xxh64 = needs_hash && chunk.chunk_compressed_hash_md5.len() == 16;
     let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> = if needs_xxh64 {
         Some(super::assembly_opt::take_xxh64())
