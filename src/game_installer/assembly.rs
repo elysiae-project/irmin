@@ -622,22 +622,15 @@ pub fn assemble_file(
             }
             None => {}
         }
-        super::assembly_opt::posix_advise(
-            out_file.as_raw_fd(),
-            0,
-            file_size,
-            libc::POSIX_FADV_DONTNEED,
-        );
-        drop(out_file);
-    } else {
-        super::assembly_opt::posix_advise(
-            out_file.as_raw_fd(),
-            0,
-            file_size,
-            libc::POSIX_FADV_DONTNEED,
-        );
-        drop(out_file);
     }
+
+    super::assembly_opt::posix_advise(
+        out_file.as_raw_fd(),
+        0,
+        file_size,
+        libc::POSIX_FADV_DONTNEED,
+    );
+    drop(out_file);
 
     if total_written != file_size {
         let _ = fs::remove_file(&tmp_path);
