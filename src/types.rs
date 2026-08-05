@@ -208,4 +208,68 @@ mod tests {
             CompletedFiles::Legacy(_) => panic!("expected Indices"),
         }
     }
+
+    /// Full DownloadState round-trip with populated downloaded_chunks and
+    /// completed_files. Guards against serialization regressions.
+    #[test]
+    fn download_state_full_roundtrip() {
+        let mut downloaded_chunks = HashMap::new();
+        downloaded_chunks.insert("chunk_abc".to_string(), 524288);
+        downloaded_chunks.insert("chunk_def".to_string(), 1048576);
+        downloaded_chunks.insert("chunk_ghi".to_string(), 262144);
+
+        let state = DownloadState {
+            game_id: "hk4e_global".to_string(),
+            vo_lang: "en-us".to_string(),
+            output_path: "/home/user/games/gi".to_string(),
+            download_type: DownloadType::Update,
+            current_tag: Some("4.8.0_live".to_string()),
+            manifest_hash: "81909ab67f4a879a".to_string(),
+            downloaded_chunks: downloaded_chunks.clone(),
+            completed_files: CompletedFiles::Indices(vec![0, 3, 7, 15, 42]),
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let restored: DownloadState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.game_id, state.game_id);
+        assert_eq!(restored.vo_lang, state.vo_lang);
+        assert_eq!(restored.output_path, state.output_path);
+        assert_eq!(restored.current_tag, state.current_tag);
+        assert_eq!(restored.manifest_hash, state.manifest_hash);
+        assert_eq!(restored.downloaded_chunks, downloaded_chunks);
+        match restored.completed_files {
+            CompletedFiles::Indices(ix) => assert_eq!(ix, vec![0, 3, 7, 15, 42]),
+            CompletedFiles::Legacy(_) => panic!("expected Indices"),
+        }
+    }
+
+    /// Backward compatibility: a committed JSON shape deserializes to known values.
+    /// If field names or casing change, this test breaks.
+    #[test]
+    fn download_state_golden_json_backward_compat() {
+        let golden = r#"{
+            "gameId": "hk4e_global",
+            "voLang": "en-us",
+            "outputPath": "/opt/games/gi",
+            "downloadType": "update",
+            "currentTag": "4.7.0_live",
+            "manifestHash": "abcdef1234567890",
+            "downloadedChunks": {"ck_001": 65536, "ck_002": 131072},
+            "completedFiles": [0, 1, 2, 10]
+        }"#;
+        let state: DownloadState = serde_json::from_str(golden).unwrap();
+        assert_eq!(state.game_id, "hk4e_global");
+        assert_eq!(state.vo_lang, "en-us");
+        assert_eq!(state.output_path, "/opt/games/gi");
+        assert_eq!(state.current_tag, Some("4.7.0_live".to_string()));
+        assert_eq!(state.manifest_hash, "abcdef1234567890");
+        assert_eq!(state.downloaded_chunks.len(), 2);
+        assert_eq!(state.downloaded_chunks["ck_001"], 65536);
+        assert_eq!(state.downloaded_chunks["ck_002"], 131072);
+        match state.completed_files {
+            CompletedFiles::Indices(ix) => assert_eq!(ix, vec![0, 1, 2, 10]),
+            CompletedFiles::Legacy(_) => panic!("expected Indices"),
+        }
+    }
 }
