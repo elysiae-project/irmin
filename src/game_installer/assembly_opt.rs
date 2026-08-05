@@ -349,8 +349,10 @@ fn decompress_chunk_oneshot(
         let mut ctx = take_dctx();
         ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
             .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
-        // Skip frame checksum (xxHash64) since MD5 verification covers integrity.
-        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+        // Only skip frame checksum when MD5 verification covers integrity.
+        if chunk_hash_required(chunk_decompressed_hash_md5) || file_hasher.is_some() {
+            let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+        }
 
         let written = ctx
             .decompress(output, compressed)
@@ -631,7 +633,9 @@ fn decompress_chunk_with_window(
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx reset")))?;
         ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax")))?;
-        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+        if chunk_hash_required(chunk_decompressed_hash_md5) || file_hasher.is_some() {
+            let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+        }
 
         let (bytes, chunk_hasher) = {
             let buf_reader = BufReader::with_capacity(FILE_WRITE_BUFFER_SIZE, f);
