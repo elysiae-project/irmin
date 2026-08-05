@@ -60,54 +60,40 @@ impl EvictingWriter {
 }
 
 fn get_available_space(path: &Path) -> Option<u64> {
-    use rustc_hash::FxHashMap;
     use std::cell::RefCell;
     use std::os::unix::ffi::OsStrExt;
-    use std::rc::Rc;
     use std::time::Instant;
 
     thread_local! {
-        static CSTRING_CACHE: RefCell<FxHashMap<Rc<Path>, Rc<std::ffi::CString>>> = RefCell::new(FxHashMap::default());
-        static SPACE_CACHE: RefCell<Option<(Instant, u64)>> = const { RefCell::new(None) };
+        static SPACE_CACHE: RefCell<Option<(Instant, u64, std::ffi::CString)>> = const { RefCell::new(None) };
     }
 
     const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
-    if let Some((checked_at, space)) = SPACE_CACHE.with(|cell| *cell.borrow())
-        && checked_at.elapsed() < CACHE_TTL
-    {
+    let path_bytes = path.as_os_str().as_bytes();
+    let hit = SPACE_CACHE.with(|cell| {
+        let b = cell.borrow();
+        match b.as_ref() {
+            Some((ts, space, cs))
+                if ts.elapsed() < CACHE_TTL && cs.as_bytes() == path_bytes =>
+            {
+                Some(*space)
+            }
+            _ => None,
+        }
+    });
+    if let Some(space) = hit {
         return Some(space);
     }
 
-    let key: Rc<Path> = Rc::from(path.to_path_buf());
-    let cpath_opt = CSTRING_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        if let Some(existing) = cache.get(&key).cloned() {
-            Some(existing)
-        } else {
-            let bytes = path.as_os_str().as_bytes();
-            match std::ffi::CString::new(bytes) {
-                Ok(s) => {
-                    let new = Rc::new(s);
-                    cache.insert(key.clone(), new.clone());
-                    if cache.len() > 16 {
-                        cache.clear();
-                    }
-                    Some(new)
-                }
-                Err(_) => None,
-            }
-        }
-    });
-    let cpath = cpath_opt?;
-
+    let cpath = std::ffi::CString::new(path_bytes).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
     if ret != 0 {
         return None;
     }
     let space = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
-    SPACE_CACHE.with(|cell| *cell.borrow_mut() = Some((Instant::now(), space)));
+    SPACE_CACHE.with(|cell| *cell.borrow_mut() = Some((Instant::now(), space, cpath)));
     Some(space)
 }
 
