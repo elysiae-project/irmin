@@ -272,4 +272,23 @@ mod tests {
             CompletedFiles::Legacy(_) => panic!("expected Indices"),
         }
     }
+
+    /// Pins ResumeInfo serialization format. If field names change, the
+    /// frontend receives different JSON and resume UI breaks.
+    #[test]
+    fn resume_info_golden_json() {
+        let info = ResumeInfo {
+            game_id: "hk4e_global".to_string(),
+            download_type: DownloadType::Update,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["gameId"], "hk4e_global");
+        assert_eq!(json["downloadType"], "update");
+
+        // Deserialize from known wire format
+        let wire = r#"{"gameId":"sr_global","downloadType":"preinstall"}"#;
+        let back: ResumeInfo = serde_json::from_str(wire).unwrap();
+        assert_eq!(back.game_id, "sr_global");
+        assert_eq!(back.download_type, DownloadType::Preinstall);
+    }
 }
