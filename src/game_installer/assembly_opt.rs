@@ -474,7 +474,6 @@ pub fn write_chunk_from_mmap(
     );
 
     let bytes_written = (expected_size_u - remaining) as u64;
-    sync_and_evict_range(out_file.as_raw_fd(), new_offset, bytes_written);
 
     buf.clear();
     OPT_BUFFER.with(|cell| cell.replace(buf));
@@ -648,7 +647,6 @@ fn decompress_chunk_with_window(
     };
 
     posix_advise(compressed_fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-    sync_and_evict_range(out_file.as_raw_fd(), offset, bytes_written);
 
     if bytes_written != expected_size {
         return Err(SophonError::SizeMismatch {

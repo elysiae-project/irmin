@@ -45,8 +45,9 @@ pub fn decrement_chunk_refcount(
     let Some(idx) = chunk_lookup.lookup(chunk_name) else {
         return;
     };
-    let prev = chunk_refcounts[idx].fetch_sub(1, Ordering::AcqRel);
+    let prev = chunk_refcounts[idx].fetch_sub(1, Ordering::Release);
     if prev == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
         let mut p = chunks_dir.join(chunk_lookup.get(idx));
         p.set_extension("zstd");
         let _ = fs::remove_file(&p);
@@ -69,27 +70,39 @@ pub fn cleanup_tmp_files(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Single-pass byte scan for path-safety. Rejects empty names, null bytes,
+/// absolute paths, drive letters, and `..` path components.
 pub fn validate_chunk_name(chunk_name: &str) -> bool {
-    if chunk_name.is_empty() {
-        log::warn!("chunk_name is empty, skipping file operation");
+    let b = chunk_name.as_bytes();
+    if b.is_empty() {
         return false;
     }
-    if chunk_name.contains('\0') {
-        log::warn!("chunk_name contains null byte, skipping file operation");
+    // Drive letter (e.g. "C:")
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
         return false;
     }
-    let mut chars = chunk_name.chars();
-    if let (Some(first), Some(':')) = (chars.next(), chars.next())
-        && first.is_ascii_alphabetic()
-    {
-        log::warn!("chunk_name has drive letter, skipping file operation");
+    // Absolute path
+    if b[0] == b'/' || b[0] == b'\\' {
         return false;
     }
-    if chunk_name.starts_with('/')
-        || chunk_name.starts_with('\\')
-        || chunk_name.split(&['/', '\\']).any(|c| c == "..")
-    {
-        log::warn!("chunk_name has path traversal pattern, skipping file operation");
+    // Single pass: detect null bytes and ".." components
+    let mut seg_start: usize = 0;
+    let mut i: usize = 0;
+    while i < b.len() {
+        match b[i] {
+            0 => return false,
+            b'/' | b'\\' => {
+                if i - seg_start == 2 && b[seg_start] == b'.' && b[seg_start + 1] == b'.' {
+                    return false;
+                }
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Check trailing segment
+    if i - seg_start == 2 && b[seg_start] == b'.' && b[seg_start + 1] == b'.' {
         return false;
     }
     true
