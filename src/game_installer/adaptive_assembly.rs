@@ -77,11 +77,6 @@ impl AdaptiveAssembly {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn adjust(&self) -> usize {
-        self.current_target()
-    }
-
     pub fn set_download_active(&self, active: bool) {
         self.download_active.store(active, Ordering::Relaxed);
     }

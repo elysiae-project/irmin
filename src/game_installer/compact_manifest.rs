@@ -82,12 +82,6 @@ impl StringArena {
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
-    }
-
-    #[inline]
     pub fn byte_len(&self) -> usize {
         self.data.len()
     }
@@ -159,8 +153,8 @@ impl CompactManifest {
         self.arena.get(self.file_hash_idx[file_idx])
     }
 
+    #[cfg(test)]
     #[inline]
-    #[allow(dead_code)]
     pub fn file_type(&self, file_idx: usize) -> u32 {
         self.file_type[file_idx] as u32
     }

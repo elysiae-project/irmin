@@ -53,7 +53,7 @@ impl EvictingWriter {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn written(&self) -> u64 {
         self.written
     }

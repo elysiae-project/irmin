@@ -113,7 +113,6 @@ impl PipelineProfiler {
 
         #[cfg(feature = "sophon-profiling")]
         {
-
             let count = self.report_count.fetch_add(1, Ordering::Relaxed) + 1;
             let elapsed = self.start.elapsed().as_secs_f64();
             if elapsed < 1.0 {
@@ -387,28 +386,6 @@ impl<'a> AssemblyTimer<'a> {
             #[cfg(feature = "sophon-profiling")]
             start: Instant::now(),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn record_decompress_time(&self, duration: std::time::Duration) {
-        let ns = duration.as_nanos() as u64;
-        self.profiler
-            .assembly_decompress_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        self.profiler
-            .assembly_decompress_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[allow(dead_code)]
-    pub fn record_write_time(&self, duration: std::time::Duration) {
-        let ns = duration.as_nanos() as u64;
-        self.profiler
-            .assembly_write_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        self.profiler
-            .assembly_write_count
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn finish(self) {
