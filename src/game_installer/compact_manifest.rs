@@ -26,6 +26,7 @@ impl<'a> From<&'a SophonManifestAssetChunk> for ChunkRef<'a> {
 /// `String` and referenced by offset. Length is derived from consecutive
 /// offsets, so each string costs 4 bytes (u32 offset) instead of 8.
 #[derive(Default)]
+#[allow(clippy::len_without_is_empty)]
 pub struct StringArena {
     data: String,
     offsets: Vec<u32>,
