@@ -168,10 +168,10 @@ pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, window_log_used: 
 }
 
 pub(crate) struct MmapGuard {
-    ptr: *mut libc::c_void,
-    len: usize,
-    map_base: *mut libc::c_void,
-    map_len: usize,
+    pub(crate) ptr: *mut libc::c_void,
+    pub(crate) len: usize,
+    pub(crate) map_base: *mut libc::c_void,
+    pub(crate) map_len: usize,
 }
 
 impl MmapGuard {
