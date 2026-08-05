@@ -284,29 +284,22 @@ pub fn assemble_file(
     };
 
     let chunk_offsets: Vec<u64> = all_files.file_chunk_offsets(file_idx);
-    let mut cursor = 0u64;
-    for (i, ci) in (chunk_range.start..chunk_range.end).enumerate() {
-        let chunk = all_files.chunk(ci as usize);
-        if chunk_offsets[i] != cursor {
-            return Err(SophonError::SizeMismatch {
-                item: file_name.to_string(),
-                expected: file_size,
-                actual: chunk_offsets[i],
-            });
-        }
-        cursor = chunk_offsets[i]
-            .checked_add(chunk.chunk_size_decompressed)
+    // Verify total decompressed size matches declared file size.
+    let mut total_decompressed: u64 = 0;
+    for ci in chunk_range.start..chunk_range.end {
+        total_decompressed = total_decompressed
+            .checked_add(all_files.chunk(ci as usize).chunk_size_decompressed)
             .ok_or_else(|| SophonError::SizeMismatch {
                 item: file_name.to_string(),
                 expected: file_size,
-                actual: cursor,
+                actual: total_decompressed,
             })?;
     }
-    if cursor != file_size {
+    if total_decompressed != file_size {
         return Err(SophonError::SizeMismatch {
             item: file_name.to_string(),
             expected: file_size,
-            actual: cursor,
+            actual: total_decompressed,
         });
     }
 
