@@ -150,4 +150,63 @@ mod tests {
         let hash = compute_content_manifest_hash(&manifest);
         assert_eq!(hash.len(), 16);
     }
+
+    /// Golden value test. If this fails, the hash algorithm changed and all
+    /// existing resume state files are invalidated.
+    #[test]
+    fn compute_content_manifest_hash_golden_value() {
+        let manifest = SophonManifestProto {
+            assets: vec![
+                SophonManifestAssetProperty {
+                    asset_name: "GameData/level01.pak".into(),
+                    asset_chunks: vec![
+                        SophonManifestAssetChunk {
+                            chunk_name: "chunk_a1".into(),
+                            chunk_decompressed_hash_md5: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".into(),
+                            chunk_on_file_offset: 0,
+                            chunk_size: 524288,
+                            chunk_size_decompressed: 1048576,
+                            chunk_compressed_hash_xxh: 12345,
+                            chunk_compressed_hash_md5: "d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1".into(),
+                            chunk_old_offset: -1,
+                        },
+                        SophonManifestAssetChunk {
+                            chunk_name: "chunk_a2".into(),
+                            chunk_decompressed_hash_md5: "1234567890abcdef1234567890abcdef".into(),
+                            chunk_on_file_offset: 1048576,
+                            chunk_size: 262144,
+                            chunk_size_decompressed: 524288,
+                            chunk_compressed_hash_xxh: 67890,
+                            chunk_compressed_hash_md5: "fedcba0987654321fedcba0987654321".into(),
+                            chunk_old_offset: -1,
+                        },
+                    ],
+                    asset_type: 0,
+                    asset_size: 1572864,
+                    asset_hash_md5: "abcdef1234567890abcdef1234567890".into(),
+                },
+                SophonManifestAssetProperty {
+                    asset_name: "GameData/config.json".into(),
+                    asset_chunks: vec![SophonManifestAssetChunk {
+                        chunk_name: "chunk_b1".into(),
+                        chunk_decompressed_hash_md5: "00112233445566778899aabbccddeeff".into(),
+                        chunk_on_file_offset: 0,
+                        chunk_size: 4096,
+                        chunk_size_decompressed: 8192,
+                        chunk_compressed_hash_xxh: 11111,
+                        chunk_compressed_hash_md5: "ffeeddccbbaa99887766554433221100".into(),
+                        chunk_old_offset: -1,
+                    }],
+                    asset_type: 0,
+                    asset_size: 8192,
+                    asset_hash_md5: "11223344556677889900aabbccddeeff".into(),
+                },
+            ],
+        };
+        let hash = compute_content_manifest_hash(&manifest);
+        assert_eq!(
+            hash, "81909ab67f4a879a",
+            "content hash algorithm changed: resume state compatibility broken"
+        );
+    }
 }
