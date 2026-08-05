@@ -115,13 +115,18 @@ pub fn compute_eta_speed(
     if samples.len() < ETA_MIN_SAMPLES {
         return 0.0;
     }
-    let mut sorted: Vec<f64> = samples.iter().copied().collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
+    let n = samples.len();
+    let mut buf = [0.0f64; ETA_WINDOW_SAMPLES];
+    let slice = samples.make_contiguous();
+    buf[..n].copy_from_slice(slice);
+    let mid = n / 2;
+    buf[..n].select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    if n % 2 == 0 {
+        // For even count, average the two middle elements.
+        let left_max = buf[..mid].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (left_max + buf[mid]) / 2.0
     } else {
-        sorted[mid]
+        buf[mid]
     }
 }
 

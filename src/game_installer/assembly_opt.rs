@@ -413,13 +413,6 @@ pub fn write_chunk_from_mmap(
     }
 
     let file_len = old_file.metadata().map_err(SophonError::Io)?.len();
-    posix_advise(
-        old_file.as_raw_fd(),
-        old_offset,
-        expected_size,
-        libc::POSIX_FADV_SEQUENTIAL,
-    );
-
     if old_offset + expected_size > file_len {
         return Err(SophonError::SizeMismatch {
             item: old_file_path.display().to_string(),
@@ -427,6 +420,13 @@ pub fn write_chunk_from_mmap(
             actual: file_len.saturating_sub(old_offset),
         });
     }
+
+    posix_advise(
+        old_file.as_raw_fd(),
+        old_offset,
+        expected_size,
+        libc::POSIX_FADV_SEQUENTIAL,
+    );
 
     let expected_size_u = expected_size as usize;
 

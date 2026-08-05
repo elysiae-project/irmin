@@ -324,6 +324,7 @@ pub fn assemble_file(
     if parallelize {
         let total_written_atomic = AtomicU64::new(0);
         let first_error = Mutex::new(None);
+        let has_error = AtomicBool::new(false);
         let downloaded_chunks: Vec<AtomicBool> =
             (0..total_chunks).map(|_| AtomicBool::new(false)).collect();
         let raw_fd = out_file.as_raw_fd();
@@ -431,6 +432,7 @@ pub fn assemble_file(
                 }
                 let tw = &total_written_atomic;
                 let err = &first_error;
+                let err_flag = &has_error;
                 let dl_chunks = &downloaded_chunks;
                 let target = &target_path;
                 let old = old_file.as_ref();
@@ -452,7 +454,7 @@ pub fn assemble_file(
                     });
                     let mut chunk_path = cdir.to_path_buf();
                     for ci in indices {
-                        if err.lock().unwrap().is_some() {
+                        if err_flag.load(Ordering::Relaxed) {
                             break;
                         }
                         let chunk = files.chunk(ci as usize);
@@ -514,6 +516,7 @@ pub fn assemble_file(
                                 if guard.is_none() {
                                     *guard = Some(e);
                                 }
+                                err_flag.store(true, Ordering::Relaxed);
                             }
                         }
                     }
