@@ -614,9 +614,9 @@ fn compression_mode_default_equals_nocomp() {
 
 #[test]
 fn constants_correct_values() {
-    assert_eq!(MAX_MEM_BUFFER_LEN, 3 << 20);
-    assert_eq!(MAX_MEM_BUFFER_LIMIT, 5 << 20);
-    assert_eq!(MAX_ARRAY_POOL_LEN, 2 << 20);
+    assert_eq!(MAX_MEM_BUFFER_LEN, 1 << 20);
+    assert_eq!(MAX_MEM_BUFFER_LIMIT, 2 << 20);
+    assert_eq!(MAX_ARRAY_POOL_LEN, 1 << 20);
     assert_eq!(MAX_ARRAY_POOL_SECOND_OFFSET, MAX_ARRAY_POOL_LEN / 2);
 }
 

@@ -63,7 +63,7 @@ impl CoverHeader {
 
 pub(crate) const K_SIGN_TAG_BIT: u8 = 1;
 pub(crate) const K_BYTE_RLE_TYPE: u8 = 2;
-pub const MAX_MEM_BUFFER_LEN: i64 = 3 << 20;
-pub const MAX_MEM_BUFFER_LIMIT: usize = 5 << 20;
-pub const MAX_ARRAY_POOL_LEN: usize = 2 << 20;
+pub const MAX_MEM_BUFFER_LEN: i64 = 1 << 20;
+pub const MAX_MEM_BUFFER_LIMIT: usize = 2 << 20;
+pub const MAX_ARRAY_POOL_LEN: usize = 1 << 20;
 pub const MAX_ARRAY_POOL_SECOND_OFFSET: usize = MAX_ARRAY_POOL_LEN / 2;
