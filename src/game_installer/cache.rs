@@ -653,4 +653,39 @@ mod tests {
             "cache must not grow past the cap"
         );
     }
+
+    /// Documents current behavior: when a cached file's mtime changes but size
+    /// still matches expected_size, the cache returns true without re-hashing.
+    /// This is a performance tradeoff (avoids re-hash on mtime-only changes like
+    /// backup software touching files). A future correctness fix may change this.
+    #[test]
+    fn check_file_md5_cached_hit_despite_mtime_change_same_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let game_dir = dir.path().to_path_buf();
+        let path = game_dir.join("target.bin");
+        let content = b"original_content";
+        fs::write(&path, content).unwrap();
+
+        let md5 = hex::encode(file_md5_digest(&path).unwrap());
+        let size = content.len() as u64;
+        let cache: DashMap<String, VerificationEntry> = DashMap::new();
+
+        // Populate cache via actual verification
+        let result = check_file_md5_cached(&path, size, &md5, &game_dir, &cache).unwrap();
+        assert!(result, "initial verification should pass");
+        assert_eq!(cache.len(), 1);
+
+        // Overwrite file with same-size different content
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(&path, b"modified_content").unwrap();
+
+        // Current behavior: returns true because actual_size == expected_size.
+        // The cache entry's md5 matches expected_md5, and size matches, so
+        // the code skips re-hashing even though mtime changed.
+        let result = check_file_md5_cached(&path, size, &md5, &game_dir, &cache).unwrap();
+        assert!(
+            result,
+            "current behavior: cache trusts size match when mtime differs"
+        );
+    }
 }
