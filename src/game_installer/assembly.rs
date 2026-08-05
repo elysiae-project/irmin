@@ -596,6 +596,9 @@ pub fn assemble_file(
         }
     }
 
+    // Set permissions on the tmp file before syncing; avoids a stat after rename.
+    let _ = unsafe { libc::fchmod(out_file.as_raw_fd(), 0o644) };
+
     out_file.sync_data().map_err(|err| {
         let _ = fs::remove_file(&tmp_path);
         SophonError::Io(err)
@@ -668,14 +671,6 @@ pub fn assemble_file(
         } else {
             let _ = fs::remove_file(&tmp_path);
             return Err(SophonError::Io(err));
-        }
-    }
-
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(mut perms) = fs::metadata(&target_path).map(|m| m.permissions()) {
-            perms.set_mode(0o644);
-            let _ = fs::set_permissions(&target_path, perms);
         }
     }
 
