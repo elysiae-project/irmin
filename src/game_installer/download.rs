@@ -943,4 +943,51 @@ mod tests {
         assert_eq!(contents.len(), 4096);
         assert!(contents.iter().all(|&b| b == 0xAB));
     }
+
+    /// Pins xxh64 digest to canonical reference values. Guards against seed
+    /// or endianness drift that would silently break chunk hash verification.
+    #[test]
+    fn xxh64_canonical_reference_value() {
+        let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+        h.update(b"");
+        assert_eq!(h.digest(), 0xef46db3751d8e999, "XXH64 empty string");
+
+        let mut h2 = xxhash_rust::xxh64::Xxh64::new(0);
+        h2.update(b"hello world");
+        assert_eq!(format!("{:016x}", h2.digest()), "45ab6734b21e6968");
+    }
+
+    /// Verifies pread_hash_md5_digest produces correct output for files
+    /// larger than the 256KB BufReader buffer (exercises multi-iteration loop).
+    #[test]
+    fn pread_hash_md5_digest_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let data: Vec<u8> = (0..524288u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let digest = pread_hash_md5_digest(&path, None).unwrap();
+        // Compute expected via single-shot
+        let expected = {
+            let mut h = super::super::assembly_opt::take_md5().unwrap();
+            h.update(&data).unwrap();
+            h.finish().unwrap()
+        };
+        assert_eq!(digest, expected);
+    }
+
+    /// Verifies pread_hash_xxh64_digest produces correct output for files
+    /// larger than the 256KB BufReader buffer.
+    #[test]
+    fn pread_hash_xxh64_digest_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let data: Vec<u8> = (0..524288u32).map(|i| (i.wrapping_mul(13)) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let value = pread_hash_xxh64_digest(&path, None).unwrap();
+        let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+        h.update(&data);
+        assert_eq!(value, h.digest());
+    }
 }
