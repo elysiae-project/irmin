@@ -866,4 +866,91 @@ mod tests {
             "should report buffer_size limit hit"
         );
     }
+
+    /// Encode a value as a 7-bit varint (tag_bit=0) for round-trip testing.
+    fn encode_7bit(v: i64) -> Vec<u8> {
+        assert!(v >= 0);
+        if v < 0x80 {
+            return vec![v as u8];
+        }
+        let bits = 64 - (v as u64).leading_zeros() as usize;
+        let groups = (bits + 6) / 7;
+        let mut out = Vec::with_capacity(groups);
+        for i in (0..groups).rev() {
+            let chunk = ((v >> (i * 7)) & 0x7F) as u8;
+            if i > 0 {
+                out.push(chunk | 0x80);
+            } else {
+                out.push(chunk);
+            }
+        }
+        out[0] |= 0x80;
+        out
+    }
+
+    /// Verifies encode -> decode round-trip for boundary values and a large
+    /// deterministic sample. Guards against bit-manipulation regressions.
+    #[test]
+    fn varint_roundtrip_boundary_values() {
+        let boundary_values: Vec<i64> = vec![
+            0,
+            1,
+            63,
+            64,
+            127,
+            128,
+            16383,
+            16384,
+            2097151,
+            2097152,
+            268435455,
+            268435456,
+            i64::MAX >> 7,
+        ];
+        for &v in &boundary_values {
+            let encoded = encode_7bit(v);
+            let mut offset = 0usize;
+            let decoded = read_long_7bit_from_slice(&encoded, &mut offset, 0, 0).unwrap();
+            assert_eq!(
+                decoded, v,
+                "round-trip failed for {v} (encoded {encoded:?})"
+            );
+            assert_eq!(offset, encoded.len(), "didn't consume all bytes for {v}");
+        }
+    }
+
+    #[test]
+    fn varint_roundtrip_1000_values() {
+        // Generate values spanning 1-byte through 8-byte encodings
+        let values: Vec<i64> = (0..1000)
+            .map(|i| match i % 8 {
+                0 => i % 64,
+                1 => 100 + (i % 28),
+                2 => 200 + (i % 1000),
+                3 => 20_000 + (i % 10_000),
+                4 => 2_000_000 + i,
+                5 => 300_000_000 + i,
+                6 => 40_000_000_000i64 + i,
+                _ => 5_000_000_000_000i64 + i,
+            })
+            .collect();
+
+        // Encode all into one buffer, then decode sequentially
+        let mut buf = Vec::new();
+        for &v in &values {
+            buf.extend_from_slice(&encode_7bit(v));
+        }
+
+        let mut offset = 0usize;
+        for (idx, &expected) in values.iter().enumerate() {
+            let decoded = read_long_7bit_from_slice(&buf, &mut offset, 0, 0)
+                .unwrap_or_else(|e| panic!("decode failed at index {idx}: {e}"));
+            assert_eq!(decoded, expected, "mismatch at index {idx}");
+        }
+        assert_eq!(
+            offset,
+            buf.len(),
+            "leftover bytes after decoding all values"
+        );
+    }
 }
