@@ -38,7 +38,7 @@ impl StringArena {
         Self {
             data: String::with_capacity(total_bytes),
             offsets: Vec::with_capacity(spans + 1),
-            dedup: FxHashMap::default(),
+            dedup: FxHashMap::with_capacity_and_hasher(spans / 2, Default::default()),
         }
     }
 
@@ -255,7 +255,7 @@ impl CompactManifest {
 }
 
 impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
-    fn from(properties: Vec<SophonManifestAssetProperty>) -> Self {
+    fn from(mut properties: Vec<SophonManifestAssetProperty>) -> Self {
         let total_files = properties.len();
         let total_chunks: usize = properties.iter().map(|f| f.asset_chunks.len()).sum();
         let estimated_string_bytes: usize = properties
@@ -293,13 +293,13 @@ impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
         let mut chunk_size_decompressed = Vec::with_capacity(total_chunks);
         let mut chunk_old_offset = Vec::with_capacity(total_chunks);
 
-        for file in &properties {
+        for file in properties.drain(..) {
             file_name_idx.push(arena.intern(&file.asset_name));
             file_hash_idx.push(arena.intern_dedup(&file.asset_hash_md5));
             file_type.push(file.asset_type as u8);
             file_size.push(file.asset_size);
             file_chunk_start.push(chunk_name_idx.len() as u32);
-            for chunk in &file.asset_chunks {
+            for chunk in file.asset_chunks {
                 chunk_name_idx.push(arena.intern(&chunk.chunk_name));
                 chunk_decomp_hash_idx.push(arena.intern_dedup(&chunk.chunk_decompressed_hash_md5));
                 chunk_comp_hash_idx.push(arena.intern_dedup(&chunk.chunk_compressed_hash_md5));
