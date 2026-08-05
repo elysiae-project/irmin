@@ -80,6 +80,7 @@ fn gen_prng_data(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// Fill a file with PRNG data (realistic entropy for zstd benchmarks).
+#[allow(dead_code)]
 fn fill_file_prng(path: &std::path::Path, mib: usize, seed: u64) {
     let data = gen_prng_data(seed, mib * 1024 * 1024);
     fs::write(path, &data).expect("write");
@@ -882,6 +883,7 @@ fn bench_protobuf_decode(c: &mut Criterion) {
 // Buffer pool benchmark
 // ---------------------------------------------------------------------------
 
+use irmin::game_installer::hdiffpatch::HDiffPublic as HDiff;
 use irmin::game_installer::hdiffpatch::{BufferPool, BENCH_MAX_ARRAY_POOL_LEN};
 
 const POOL_OPS: u64 = 1000;
@@ -917,6 +919,227 @@ fn bench_buffer_pool(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// HDiffPatch E2E benchmark
+// ---------------------------------------------------------------------------
+
+/// Encode a tagged varint with tag_bit=1 (used for cover header delta encoding in v20/PatchSF).
+/// Returns bytes for the first byte (with sign in bit 7) + continuation.
+fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
+    debug_assert!(value >= 0);
+    // tag_bit=1: bit 7 = sign, bit 6 = continuation flag, bits 0-5 = first 6 bits of value
+    let mut out = Vec::new();
+    if value < 64 {
+        out.push((sign << 7) | (value as u8));
+    } else {
+        let bits = 64 - (value as u64).leading_zeros() as usize;
+        // First 6 bits in byte 0, then 7-bit groups
+        let remaining_bits = bits - 6;
+        let extra_groups = (remaining_bits + 6) / 7;
+        let total_shift = extra_groups * 7;
+        let first_payload = ((value >> total_shift) & 0x3F) as u8;
+        out.push((sign << 7) | 0x40 | first_payload);
+        for g in (0..extra_groups).rev() {
+            let chunk = ((value >> (g * 7)) & 0x7F) as u8;
+            if g > 0 {
+                out.push(chunk | 0x80);
+            } else {
+                out.push(chunk);
+            }
+        }
+    }
+    out
+}
+
+/// Generate a valid HDIFF20&nocomp patch file.
+/// Creates a patch where ~10% of 4 KiB blocks are "modified" (replaced with new data).
+/// The rest are copied from old via covers.
+fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
+    let block_size = 4096usize;
+    let num_blocks = old.len() / block_size;
+
+    // Determine which blocks differ
+    let mut covers: Vec<(u64, u64, u64)> = Vec::new(); // (old_pos, new_pos, length)
+    let mut run_start: Option<usize> = None;
+
+    for i in 0..num_blocks {
+        let off = i * block_size;
+        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        if same {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else {
+            if let Some(start) = run_start {
+                let pos = (start * block_size) as u64;
+                let len = ((i - start) * block_size) as u64;
+                covers.push((pos, pos, len));
+                run_start = None;
+            }
+        }
+    }
+    if let Some(start) = run_start {
+        let pos = (start * block_size) as u64;
+        let len = ((num_blocks - start) * block_size) as u64;
+        covers.push((pos, pos, len));
+    }
+
+    let cover_count = covers.len();
+    let new_data_size = new.len() as i64;
+    let old_data_size = old.len() as i64;
+
+    // Encode covers for PatchSF format (same as PatchSingle cover encoding: sign+delta, gap, length)
+    let mut cover_buf = Vec::new();
+    let mut last_old_end = 0u64;
+    let mut last_new_end = 0u64;
+    for &(old_pos, new_pos, length) in &covers {
+        let delta = if old_pos >= last_old_end {
+            let d = old_pos - last_old_end;
+            cover_buf.extend_from_slice(&encode_tagged_1bit(0, d as i64));
+            d
+        } else {
+            let d = last_old_end - old_pos;
+            cover_buf.extend_from_slice(&encode_tagged_1bit(1, d as i64));
+            d
+        };
+        let _ = delta;
+        let new_pos_gap = new_pos - last_new_end;
+        cover_buf.extend_from_slice(&encode_7bit_varint(new_pos_gap as i64));
+        cover_buf.extend_from_slice(&encode_7bit_varint(length as i64));
+        last_old_end = old_pos + length;
+        last_new_end = new_pos + length;
+    }
+
+    // RLE buffer: for each cover, (len0=cover_length, lenv=0) — no XOR modification
+    let mut rle_buf = Vec::new();
+    for &(_, _, length) in &covers {
+        rle_buf.extend_from_slice(&encode_7bit_varint(length as i64)); // len0
+        rle_buf.extend_from_slice(&encode_7bit_varint(0)); // lenv
+    }
+
+    // Gap data: bytes from `new` that are between covers
+    let mut gap_data = Vec::new();
+    let mut prev_new_end = 0u64;
+    for &(_, new_pos, length) in &covers {
+        if new_pos > prev_new_end {
+            gap_data.extend_from_slice(&new[prev_new_end as usize..new_pos as usize]);
+        }
+        prev_new_end = new_pos + length;
+    }
+    // Tail
+    if prev_new_end < new.len() as u64 {
+        gap_data.extend_from_slice(&new[prev_new_end as usize..]);
+    }
+
+    // Build the diff stream: [buf_cover_size][buf_rle_size][covers][rle][gap_data_interleaved]
+    // For simplicity: single step with all covers, then all gap/tail data at the end.
+    // The gap data must be interspersed at the right points in the stream.
+    // PatchSF reads gaps between covers inline from the diff stream.
+    // So: step header + step data, then gap bytes interleaved per cover.
+
+    // Actually, patch_loop reads: step_header, step_data (covers+rle), then for each cover
+    // it checks if there's a gap and reads from diff. So the stream must be:
+    // [step_header][step_data][gap0_data][gap1_data]...[tail_data]
+    // where gapN appears between covers where new_pos > prev_new_end.
+
+    let mut diff_stream = Vec::new();
+    // Step header
+    diff_stream.extend_from_slice(&encode_7bit_varint(cover_buf.len() as i64));
+    diff_stream.extend_from_slice(&encode_7bit_varint(rle_buf.len() as i64));
+    // Step data
+    diff_stream.extend_from_slice(&cover_buf);
+    diff_stream.extend_from_slice(&rle_buf);
+    // Gap data interspersed (same order as covers processed)
+    let mut prev_end = 0u64;
+    for &(_, new_pos, length) in &covers {
+        if new_pos > prev_end {
+            diff_stream.extend_from_slice(&new[prev_end as usize..new_pos as usize]);
+        }
+        prev_end = new_pos + length;
+    }
+    if prev_end < new.len() as u64 {
+        diff_stream.extend_from_slice(&new[prev_end as usize..]);
+    }
+
+    let uncompressed_size = diff_stream.len() as i64;
+    let step_mem_size = (cover_buf.len() + rle_buf.len()) as i64;
+
+    // Build the full patch file
+    let mut patch = Vec::new();
+    // Header line (null-terminated)
+    patch.extend_from_slice(b"HDIFF20&nocomp\0");
+    // Header fields as varints
+    patch.extend_from_slice(&encode_7bit_varint(new_data_size));
+    patch.extend_from_slice(&encode_7bit_varint(old_data_size));
+    patch.extend_from_slice(&encode_7bit_varint(cover_count as i64));
+    patch.extend_from_slice(&encode_7bit_varint(step_mem_size));
+    patch.extend_from_slice(&encode_7bit_varint(uncompressed_size));
+    patch.extend_from_slice(&encode_7bit_varint(0)); // compressed_size = 0 (nocomp)
+                                                     // Diff data
+    patch.extend_from_slice(&diff_stream);
+
+    patch
+}
+
+/// Mutate ~10% of 4 KiB blocks in `data` with PRNG replacement.
+fn mutate_blocks(data: &[u8], mutation_rate_pct: usize) -> Vec<u8> {
+    let block_size = 4096;
+    let mut out = data.to_vec();
+    let num_blocks = out.len() / block_size;
+    for i in 0..num_blocks {
+        if (i * 7 + 3) % 100 < mutation_rate_pct {
+            let replacement = gen_prng_data(1000 + i as u64, block_size);
+            out[i * block_size..(i + 1) * block_size].copy_from_slice(&replacement);
+        }
+    }
+    out
+}
+
+const HDIFF_MIB: usize = 4;
+
+/// End-to-end HDiffPatch throughput: full patch application (v20 nocomp).
+fn bench_hdiffpatch_e2e(c: &mut Criterion) {
+    let old = gen_prng_data(0xDEAD, HDIFF_MIB * 1024 * 1024);
+    let new = mutate_blocks(&old, 10);
+    let patch_v20 = gen_hdiff_v20_patch(&old, &new);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch_v20).unwrap();
+
+    // Verify correctness once before benchmarking
+    {
+        let mut hdiff = HDiff::new(
+            old_path.to_string_lossy().to_string(),
+            patch_path.to_string_lossy().to_string(),
+            out_path.to_string_lossy().to_string(),
+        );
+        assert!(hdiff.apply(None), "patch verification failed");
+        let result = fs::read(&out_path).unwrap();
+        assert_eq!(result.len(), new.len(), "output size mismatch");
+        assert_eq!(result, new, "patch output does not match expected new data");
+    }
+
+    let mut group = c.benchmark_group("hdiffpatch_e2e");
+    group.throughput(Throughput::Bytes(new.len() as u64));
+
+    group.bench_function(BenchmarkId::new("v20_nocomp", HDIFF_MIB), |b| {
+        b.iter(|| {
+            let mut hdiff = HDiff::new(
+                old_path.to_string_lossy().to_string(),
+                patch_path.to_string_lossy().to_string(),
+                out_path.to_string_lossy().to_string(),
+            );
+            assert!(hdiff.apply(None));
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -932,5 +1155,6 @@ criterion_group!(
     bench_cover_stream_decode,
     bench_protobuf_decode,
     bench_buffer_pool,
+    bench_hdiffpatch_e2e,
 );
 criterion_main!(benches);
