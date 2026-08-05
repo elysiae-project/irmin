@@ -740,6 +740,89 @@ fn bench_varint_decode(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Cover stream decode benchmark
+// ---------------------------------------------------------------------------
+
+use irmin::game_installer::hdiffpatch::enumerate_cover_headers_checked;
+
+/// Encode a tagged varint (tag_bit=1) into a p_sign byte + continuation bytes.
+/// Returns (p_sign_byte, continuation_bytes). `sign` is 0 (positive) or 1 (negative).
+fn encode_cover_header_entry(
+    sign: u8,
+    inc_old_pos: i64,
+    copy_length: i64,
+    cover_length: i64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    // p_sign byte: bit 7 = sign, bit 6 = continuation, bits 0-5 = first 6 bits of inc_old_pos
+    if inc_old_pos < 64 {
+        out.push((sign << 7) | (inc_old_pos as u8));
+    } else {
+        // Need continuation bytes. First byte: sign | 0x40 (continuation set) | top 6 bits
+        let bits = 64 - (inc_old_pos as u64).leading_zeros() as usize;
+        let groups = (bits.saturating_sub(6) + 6) / 7 + 1; // 1 for first 6-bit group
+        let shift = (groups - 1) * 7;
+        let first_payload = ((inc_old_pos >> shift) & 0x3F) as u8;
+        out.push((sign << 7) | 0x40 | first_payload);
+        // Remaining groups (7 bits each, MSB-first)
+        for g in (0..groups - 1).rev() {
+            let chunk = ((inc_old_pos >> (g * 7)) & 0x7F) as u8;
+            if g > 0 {
+                out.push(chunk | 0x80);
+            } else {
+                out.push(chunk);
+            }
+        }
+    }
+    // copy_length and cover_length as standard varints
+    out.extend_from_slice(&encode_7bit_varint(copy_length));
+    out.extend_from_slice(&encode_7bit_varint(cover_length));
+    out
+}
+
+/// Generate a cover header buffer with `count` entries for benchmarking.
+/// Produces realistic cover sequences: monotonically advancing positions.
+fn gen_cover_buffer(count: usize) -> (Vec<u8>, i64) {
+    let mut buf = Vec::with_capacity(count * 6);
+    for i in 0..count {
+        // Mix of small and medium increments
+        let inc = match i % 10 {
+            0..=5 => 4 + (i % 60) as i64,     // single-byte (< 64)
+            6..=8 => 100 + (i % 1000) as i64, // two-byte
+            _ => 10_000 + (i % 5000) as i64,  // three-byte
+        };
+        let copy_len = (i % 32) as i64;
+        let cover_len = 64 + (i % 128) as i64;
+        buf.extend_from_slice(&encode_cover_header_entry(0, inc, copy_len, cover_len));
+    }
+    let size = buf.len() as i64;
+    (buf, size)
+}
+
+const COVER_COUNT: usize = 10_000;
+
+/// Cover header enumeration throughput via the streaming iterator.
+fn bench_cover_stream_decode(c: &mut Criterion) {
+    let (buf, buf_size) = gen_cover_buffer(COVER_COUNT);
+
+    let mut group = c.benchmark_group("cover_stream_decode");
+    group.throughput(Throughput::Elements(COVER_COUNT as u64));
+
+    group.bench_function("checked_10k", |b| {
+        b.iter(|| {
+            let mut cursor = std::io::Cursor::new(&buf);
+            let iter =
+                enumerate_cover_headers_checked(&mut cursor, buf_size, COVER_COUNT as i64).unwrap();
+            for h in iter {
+                std::hint::black_box(h.unwrap());
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -752,5 +835,6 @@ criterion_group!(
     bench_compact_manifest_build,
     bench_chunk_lookup,
     bench_varint_decode,
+    bench_cover_stream_decode,
 );
 criterion_main!(benches);
