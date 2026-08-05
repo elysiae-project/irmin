@@ -1492,3 +1492,23 @@
             url_suffix: "v1".to_string(),
         }
     }
+
+    /// Verifies the BufReader-based incremental MD5 loop produces correct
+    /// digests for files larger than the 256KB internal buffer.
+    #[test]
+    fn verify_chunk_md5_large_file_multi_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large_chunk");
+
+        // 512 KiB of patterned data (spans two 256KB buffers)
+        let data: Vec<u8> = (0..524288u32)
+            .map(|i| (i.wrapping_mul(7) ^ (i >> 3)) as u8)
+            .collect();
+        let md5_hex = hex::encode(md5::Md5::digest(&data));
+        fs::write(&path, &data).unwrap();
+
+        assert!(
+            verify_chunk_md5(&path, &md5_hex),
+            "multi-buffer MD5 should match single-shot digest"
+        );
+    }
