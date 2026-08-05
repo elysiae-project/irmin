@@ -2922,6 +2922,44 @@ mod tests {
         assert_eq!(diff[0].asset_chunks[0].chunk_old_offset, -1);
     }
 
+    /// Same chunk hash at different offsets in different files must resolve
+    /// to the per-file offset, not a single global offset.
+    #[test]
+    fn assign_chunk_offsets_same_hash_different_offsets_per_file() {
+        let old_manifest = SophonManifestProto {
+            assets: vec![
+                make_file(
+                    "a.pak",
+                    "m1",
+                    vec![make_chunk_with_hash("c0", 100, "hash_shared", 1000)],
+                ),
+                make_file(
+                    "b.pak",
+                    "m2",
+                    vec![make_chunk_with_hash("c0", 100, "hash_shared", 5000)],
+                ),
+            ],
+        };
+        let (offsets, name_to_id, hash_to_id) = intern_old_chunk_offsets(&old_manifest);
+
+        let mut diff = vec![
+            make_file(
+                "a.pak",
+                "m1_new",
+                vec![make_chunk_with_hash("c0", 100, "hash_shared", 0)],
+            ),
+            make_file(
+                "b.pak",
+                "m2_new",
+                vec![make_chunk_with_hash("c0", 100, "hash_shared", 0)],
+            ),
+        ];
+
+        assign_chunk_offsets(&mut diff, &offsets, &name_to_id, &hash_to_id);
+        assert_eq!(diff[0].asset_chunks[0].chunk_old_offset, 1000);
+        assert_eq!(diff[1].asset_chunks[0].chunk_old_offset, 5000);
+    }
+
     #[test]
     fn collect_deleted_files_basic() {
         let old = SophonManifestProto {

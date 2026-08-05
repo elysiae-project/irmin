@@ -3779,4 +3779,30 @@ mod tests {
             url_suffix: "v1".to_string(),
         }
     }
+
+    /// PatchMethod must deserialize from specific wire strings. If serde
+    /// rename_all or variant names change, existing state files break.
+    #[test]
+    fn patch_method_deserializes_from_known_wire_strings() {
+        assert_eq!(
+            serde_json::from_str::<PatchMethod>(r#""copyOver""#).unwrap(),
+            PatchMethod::CopyOver
+        );
+        assert_eq!(
+            serde_json::from_str::<PatchMethod>(r#""patch""#).unwrap(),
+            PatchMethod::Patch
+        );
+        assert_eq!(
+            serde_json::from_str::<PatchMethod>(r#""downloadOver""#).unwrap(),
+            PatchMethod::DownloadOver
+        );
+        assert_eq!(
+            serde_json::from_str::<PatchMethod>(r#""remove""#).unwrap(),
+            PatchMethod::Remove
+        );
+        assert_eq!(
+            serde_json::from_str::<PatchMethod>(r#""skip""#).unwrap(),
+            PatchMethod::Skip
+        );
+    }
 }
