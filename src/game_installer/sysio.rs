@@ -87,13 +87,17 @@ pub fn copy_file_region_to(
 }
 
 /// Pre-allocate disk blocks for `file` up to `len` bytes using
-/// `posix_fallocate(2)`. Improves sequential write performance by
-/// avoiding fragmentation and CoW overhead on copy-on-write filesystems.
+/// `fallocate(2)` with `FALLOC_FL_KEEP_SIZE`. Allocates extents without
+/// zeroing or changing file size. Silently ignores unsupported filesystems.
 pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::posix_fallocate(fd, 0, len as libc::off_t) };
+    let ret = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len as libc::off_t) };
     if ret != 0 {
-        return Err(std::io::Error::from_raw_os_error(ret));
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EOPNOTSUPP | libc::ENOSYS) => {}
+            _ => return Err(e),
+        }
     }
     Ok(())
 }
