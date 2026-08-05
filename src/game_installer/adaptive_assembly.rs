@@ -27,17 +27,25 @@ const MIN_ADAPTIVE_TARGET: usize = ASSEMBLY_CONCURRENCY;
 /// drops (bottleneck detected) it scales back down.
 pub struct AdaptiveAssembly {
     target: AtomicUsize,
+    max_target: usize,
     download_active: AtomicBool,
     assembled_files: Option<Arc<AtomicU64>>,
     last_count: AtomicUsize,
-    last_throughput: AtomicU64, // files per second, scaled by 1000
+    last_throughput: AtomicU64, // EWMA-smoothed files/sec, scaled by 1000
     last_adjust_time: std::sync::Mutex<Instant>,
 }
 
+/// EWMA smoothing factor for throughput measurement.
+const EWMA_ALPHA: f64 = 0.3;
+
 impl AdaptiveAssembly {
     pub fn new() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         Self {
             target: AtomicUsize::new(ASSEMBLY_CONCURRENCY),
+            max_target: cpus * 2,
             download_active: AtomicBool::new(true),
             assembled_files: None,
             last_count: AtomicUsize::new(0),
@@ -47,8 +55,12 @@ impl AdaptiveAssembly {
     }
 
     pub fn with_tracker(assembled_files: Arc<AtomicU64>) -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         Self {
             target: AtomicUsize::new(ASSEMBLY_CONCURRENCY),
+            max_target: cpus * 2,
             download_active: AtomicBool::new(true),
             assembled_files: Some(assembled_files),
             last_count: AtomicUsize::new(0),
@@ -115,8 +127,15 @@ impl AdaptiveAssembly {
                 this.last_count.store(current_count, Ordering::Relaxed);
 
                 let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-                let throughput = (delta as f64) / elapsed_secs;
-                let prev_throughput = this.last_throughput.load(Ordering::Relaxed) as f64 / 1000.0;
+                let raw_throughput = (delta as f64) / elapsed_secs;
+
+                // EWMA-smooth throughput to suppress single-interval noise.
+                let prev_smoothed = this.last_throughput.load(Ordering::Relaxed) as f64 / 1000.0;
+                let throughput = if prev_smoothed == 0.0 {
+                    raw_throughput
+                } else {
+                    EWMA_ALPHA * raw_throughput + (1.0 - EWMA_ALPHA) * prev_smoothed
+                };
                 this.last_throughput
                     .store((throughput * 1000.0) as u64, Ordering::Relaxed);
                 *last_time = now;
@@ -124,16 +143,16 @@ impl AdaptiveAssembly {
 
                 // On the first measurement after downloads finish just record
                 // the baseline and do not adjust yet.
-                if prev_throughput == 0.0 {
+                if prev_smoothed == 0.0 {
                     continue;
                 }
 
                 let current_target = this.target.load(Ordering::Relaxed);
-                let new_target = if throughput >= prev_throughput * BOTTLENECK_THRESHOLD {
+                let new_target = if throughput >= prev_smoothed * BOTTLENECK_THRESHOLD {
                     // Throughput is healthy — scale up.
                     let scaled = (current_target as f64 * SCALE_UP_FACTOR) as usize;
                     let incremented = current_target.saturating_add(1);
-                    scaled.max(incremented)
+                    scaled.max(incremented).min(this.max_target)
                 } else {
                     // Bottleneck detected — scale down.
                     let scaled = (current_target as f64 * SCALE_DOWN_FACTOR) as usize;
