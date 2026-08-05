@@ -7,6 +7,7 @@
 
 use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
 
 impl<'a> From<&'a SophonManifestAssetChunk> for ChunkRef<'a> {
     fn from(chunk: &'a SophonManifestAssetChunk) -> Self {
@@ -28,7 +29,7 @@ impl<'a> From<&'a SophonManifestAssetChunk> for ChunkRef<'a> {
 pub struct StringArena {
     data: String,
     offsets: Vec<u32>,
-    dedup: FxHashMap<String, u32>,
+    dedup: FxHashMap<u64, u32>,
 }
 
 impl StringArena {
@@ -47,15 +48,20 @@ impl StringArena {
         idx
     }
 
-    /// Intern a string, returning the index of an existing identical string
-    /// if one was already interned. Saves memory when many chunks share the
-    /// same hash (e.g., empty `chunk_compressed_hash_md5`).
+    /// Intern a string, returning an existing index if an identical string
+    /// was already interned. Uses a hash key to avoid per-entry String allocs.
     pub fn intern_dedup(&mut self, s: &str) -> u32 {
-        if let Some(&idx) = self.dedup.get(s) {
-            return idx;
+        let mut h = rustc_hash::FxHasher::default();
+        s.hash(&mut h);
+        let key = h.finish();
+        if let Some(&idx) = self.dedup.get(&key) {
+            // Verify match to handle (rare) hash collisions.
+            if self.get(idx) == s {
+                return idx;
+            }
         }
         let idx = self.intern(s);
-        self.dedup.insert(s.to_string(), idx);
+        self.dedup.insert(key, idx);
         idx
     }
 
