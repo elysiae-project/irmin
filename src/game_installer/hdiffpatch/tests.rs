@@ -495,9 +495,8 @@ fn padding_applies_only_to_zlib_mode() {
 }
 
 use super::{
-    CompressionMode, CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo,
+    CompressionMode, CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, RleRefClip,
     MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT,
-    RleRefClip,
 };
 
 #[test]

@@ -87,7 +87,7 @@ pub(crate) trait BinaryExtensions: Read {
 
 impl<T: Read> BinaryExtensions for T {}
 
-pub(crate) fn read_long_7bit_from_slice(
+pub fn read_long_7bit_from_slice(
     buf: &[u8],
     offset: &mut usize,
     tag_bit: u8,
@@ -129,7 +129,7 @@ pub(crate) fn read_long_7bit_from_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryExtensions, read_long_7bit_from_slice};
+    use super::{read_long_7bit_from_slice, BinaryExtensions};
     use std::io::Cursor;
 
     fn src(data: &[u8]) -> Cursor<Vec<u8>> {
