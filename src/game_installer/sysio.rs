@@ -49,6 +49,8 @@ pub fn copy_file_range(
 /// Copy a region from an open source file into `dst_file` at `dst_off` using
 /// `copy_file_range`. Applies `POSIX_FADV_DONTNEED` on the source region
 /// once copied so the source pages do not stay resident.
+/// Copy a region from `src` to `dst` using `copy_file_range`. Evicts source
+/// pages after the copy. Callers handle destination eviction.
 pub fn copy_file_from(
     src: &File,
     src_off: u64,
@@ -64,22 +66,6 @@ pub fn copy_file_from(
             src_fd,
             src_off as libc::off_t,
             len as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    let _ = unsafe {
-        libc::sync_file_range(
-            dst_fd,
-            dst_off as libc::off64_t,
-            copied as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WRITE,
-        )
-    };
-    let _ = unsafe {
-        libc::posix_fadvise(
-            dst_fd,
-            dst_off as libc::off_t,
-            copied as libc::off_t,
             libc::POSIX_FADV_DONTNEED,
         )
     };

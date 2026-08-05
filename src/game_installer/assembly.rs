@@ -538,10 +538,6 @@ pub fn assemble_file(
             let oi = (ci - chunk_range.start) as usize;
             let offset = chunk_offsets[oi];
             if chunk.chunk_old_offset >= 0 {
-                debug_assert!(
-                    chunk.chunk_old_offset >= 0,
-                    "chunk_old_offset must be non-negative"
-                );
                 let old_file = old_file
                     .as_ref()
                     .expect("has_old_chunks guarantees old file");
