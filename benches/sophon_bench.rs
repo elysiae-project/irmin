@@ -16,7 +16,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::atomic::AtomicU32;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use md5::{Digest, Md5};
+use fast_md5;
 
 use irmin::game_installer::{
     assembly::{assemble_file, chunk_filename},
@@ -126,7 +126,7 @@ fn bench_io_copy(c: &mut Criterion) {
             let d = fs::File::create(&dst).unwrap();
             d.set_len(bytes).unwrap();
             let mut buf = vec![0u8; 256 * 1024];
-            let mut h = Md5::new();
+            let mut h = fast_md5::Md5::new();
             let mut off = 0u64;
             loop {
                 let n = s.read_at(&mut buf, off).unwrap();
@@ -161,7 +161,7 @@ fn bench_md5(c: &mut Criterion) {
         b.iter(|| {
             evict_page_cache(&path);
             let f = fs::File::open(&path).unwrap();
-            let mut h = Md5::new();
+            let mut h = fast_md5::Md5::new();
             let mut buf = vec![0u8; 256 * 1024];
             let mut off = 0u64;
             loop {
@@ -246,7 +246,7 @@ fn build_assembly_fixture(
             raw.extend_from_slice(&data);
             let offset = (i * chunk_mib * 1024 * 1024) as u64;
             let chunk_hash = if with_chunk_hashes {
-                hex::encode(Md5::digest(&data))
+                hex::encode(fast_md5::digest(&data))
             } else {
                 String::new()
             };
@@ -262,7 +262,7 @@ fn build_assembly_fixture(
             }
         })
         .collect();
-    let file_md5 = hex::encode(Md5::digest(&raw));
+    let file_md5 = hex::encode(fast_md5::digest(&raw));
     let file = SophonManifestAssetProperty {
         asset_name: "assembled.bin".to_string(),
         asset_chunks: chunks,
@@ -389,7 +389,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
     let game_dir = dir.path().to_path_buf();
     let path = game_dir.join("verify.bin");
     fill_file(&path, VERIFY_MIB as usize, 0xAB);
-    let md5 = hex::encode(Md5::digest(fs::read(&path).unwrap()));
+    let md5 = hex::encode(fast_md5::digest(&fs::read(&path).unwrap()));
     let bytes = VERIFY_MIB * 1024 * 1024;
     let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
 
