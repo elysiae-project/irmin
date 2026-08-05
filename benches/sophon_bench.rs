@@ -1095,32 +1095,194 @@ fn mutate_blocks(data: &[u8], mutation_rate_pct: usize) -> Vec<u8> {
     out
 }
 
+/// Encode a tagged varint with tag_bit=2 (used for RLE ctrl entries in v13 PatchSingle).
+/// rle_type occupies bits 7-6 of the first byte.
+fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
+    debug_assert!(value >= 0);
+    debug_assert!(rle_type < 4);
+    // tag_bit=2: bit 5 = continuation flag, bits 0-4 = first 5 bits of value
+    let mut out = Vec::new();
+    if value < 32 {
+        out.push((rle_type << 6) | (value as u8));
+    } else {
+        let bits = 64 - (value as u64).leading_zeros() as usize;
+        let remaining_bits = bits - 5;
+        let extra_groups = (remaining_bits + 6) / 7;
+        let total_shift = extra_groups * 7;
+        let first_payload = ((value >> total_shift) & 0x1F) as u8;
+        out.push((rle_type << 6) | 0x20 | first_payload);
+        for g in (0..extra_groups).rev() {
+            let chunk = ((value >> (g * 7)) & 0x7F) as u8;
+            if g > 0 {
+                out.push(chunk | 0x80);
+            } else {
+                out.push(chunk);
+            }
+        }
+    }
+    out
+}
+
+/// Generate a valid HDIFF13&nocomp patch file (PatchSingle format with 4 streams).
+fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
+    let block_size = 4096usize;
+    let num_blocks = old.len() / block_size;
+
+    // Determine which blocks are identical vs modified
+    let mut covers: Vec<(u64, u64, u64)> = Vec::new(); // (old_pos, new_pos, length)
+    let mut run_start: Option<usize> = None;
+
+    for i in 0..num_blocks {
+        let off = i * block_size;
+        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        if same {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if let Some(start) = run_start {
+            let pos = (start * block_size) as u64;
+            let len = ((i - start) * block_size) as u64;
+            covers.push((pos, pos, len));
+            run_start = None;
+        }
+    }
+    if let Some(start) = run_start {
+        let pos = (start * block_size) as u64;
+        let len = ((num_blocks - start) * block_size) as u64;
+        covers.push((pos, pos, len));
+    }
+
+    let cover_count = covers.len() as i64;
+    let new_data_size = new.len() as i64;
+    let old_data_size = old.len() as i64;
+
+    // Build cover buffer (same encoding as used in write_cover_stream_to_output)
+    // Each cover: p_sign (tagged varint for inc_old_pos with sign), copy_length varint, cover_length varint
+    let mut cover_buf = Vec::new();
+    let mut last_old_pos_back = 0i64;
+    let mut last_new_pos_back = 0i64;
+    for &(old_pos, new_pos, length) in &covers {
+        let old_pos = old_pos as i64;
+        let new_pos = new_pos as i64;
+        let length = length as i64;
+
+        let inc_old_pos = (old_pos - last_old_pos_back).unsigned_abs() as i64;
+        let sign: u8 = if old_pos >= last_old_pos_back { 0 } else { 1 };
+        cover_buf.extend_from_slice(&encode_tagged_1bit(sign, inc_old_pos));
+
+        let copy_length = new_pos - last_new_pos_back;
+        cover_buf.extend_from_slice(&encode_7bit_varint(copy_length));
+        cover_buf.extend_from_slice(&encode_7bit_varint(length));
+
+        last_old_pos_back = old_pos + length;
+        last_new_pos_back = new_pos + length;
+    }
+
+    // Build rle_ctrl buffer: for each gap + cover, one type-0 entry covering full length
+    // Order: gap0_rle, cover0_rle, gap1_rle, cover1_rle, ...
+    let mut rle_ctrl_buf = Vec::new();
+    let mut prev_new_end = 0i64;
+    for &(_, new_pos, length) in &covers {
+        let new_pos = new_pos as i64;
+        let length = length as i64;
+        let gap = new_pos - prev_new_end;
+        if gap > 0 {
+            // RLE type 0, raw_length = gap - 1
+            rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, gap - 1));
+        }
+        // RLE type 0, raw_length = cover_length - 1
+        rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, length - 1));
+        prev_new_end = new_pos + length;
+    }
+    // Tail gap
+    let tail_gap = new_data_size - prev_new_end;
+    if tail_gap > 0 {
+        rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, tail_gap - 1));
+    }
+
+    // rle_code is empty (type 0 doesn't read from rle_code)
+    let rle_code_buf: Vec<u8> = Vec::new();
+
+    // new_data_diff: bytes from new that fill the gaps between covers + tail
+    let mut new_data_diff = Vec::new();
+    let mut prev_end = 0u64;
+    for &(_, new_pos, length) in &covers {
+        if new_pos > prev_end {
+            new_data_diff.extend_from_slice(&new[prev_end as usize..new_pos as usize]);
+        }
+        prev_end = new_pos + length;
+    }
+    if prev_end < new.len() as u64 {
+        new_data_diff.extend_from_slice(&new[prev_end as usize..]);
+    }
+
+    // Build patch file
+    let mut patch = Vec::new();
+    patch.extend_from_slice(b"HDIFF13&nocomp\0");
+
+    // Header varints (read_non_single_file_header)
+    patch.extend_from_slice(&encode_7bit_varint(new_data_size));
+    patch.extend_from_slice(&encode_7bit_varint(old_data_size));
+    // DiffChunkInfo fields
+    patch.extend_from_slice(&encode_7bit_varint(cover_count));
+    patch.extend_from_slice(&encode_7bit_varint(cover_buf.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(0)); // compress_cover_buf_size (0 = nocomp)
+    patch.extend_from_slice(&encode_7bit_varint(rle_ctrl_buf.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(0)); // compress_rle_ctrl_buf_size
+    patch.extend_from_slice(&encode_7bit_varint(rle_code_buf.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(0)); // compress_rle_code_buf_size
+    patch.extend_from_slice(&encode_7bit_varint(new_data_diff.len() as i64));
+    patch.extend_from_slice(&encode_7bit_varint(0)); // compress_new_data_diff_size
+
+    // Data sections (consecutive)
+    patch.extend_from_slice(&cover_buf);
+    patch.extend_from_slice(&rle_ctrl_buf);
+    patch.extend_from_slice(&rle_code_buf);
+    patch.extend_from_slice(&new_data_diff);
+
+    patch
+}
+
 const HDIFF_MIB: usize = 4;
 
-/// End-to-end HDiffPatch throughput: full patch application (v20 nocomp).
+/// End-to-end HDiffPatch throughput: full patch application.
 fn bench_hdiffpatch_e2e(c: &mut Criterion) {
     let old = gen_prng_data(0xDEAD, HDIFF_MIB * 1024 * 1024);
     let new = mutate_blocks(&old, 10);
     let patch_v20 = gen_hdiff_v20_patch(&old, &new);
+    let patch_v13 = gen_hdiff_v13_patch(&old, &new);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let old_path = dir.path().join("old.bin");
-    let patch_path = dir.path().join("patch.hdiff");
+    let patch_v20_path = dir.path().join("patch_v20.hdiff");
+    let patch_v13_path = dir.path().join("patch_v13.hdiff");
     let out_path = dir.path().join("out.bin");
     fs::write(&old_path, &old).unwrap();
-    fs::write(&patch_path, &patch_v20).unwrap();
+    fs::write(&patch_v20_path, &patch_v20).unwrap();
+    fs::write(&patch_v13_path, &patch_v13).unwrap();
 
-    // Verify correctness once before benchmarking
+    // Verify v20 correctness
     {
         let mut hdiff = HDiff::new(
             old_path.to_string_lossy().to_string(),
-            patch_path.to_string_lossy().to_string(),
+            patch_v20_path.to_string_lossy().to_string(),
             out_path.to_string_lossy().to_string(),
         );
-        assert!(hdiff.apply(None), "patch verification failed");
+        assert!(hdiff.apply(None), "v20 patch verification failed");
         let result = fs::read(&out_path).unwrap();
-        assert_eq!(result.len(), new.len(), "output size mismatch");
-        assert_eq!(result, new, "patch output does not match expected new data");
+        assert_eq!(result, new, "v20 patch output mismatch");
+    }
+
+    // Verify v13 correctness
+    {
+        let mut hdiff = HDiff::new(
+            old_path.to_string_lossy().to_string(),
+            patch_v13_path.to_string_lossy().to_string(),
+            out_path.to_string_lossy().to_string(),
+        );
+        assert!(hdiff.apply(None), "v13 patch verification failed");
+        let result = fs::read(&out_path).unwrap();
+        assert_eq!(result, new, "v13 patch output mismatch");
     }
 
     let mut group = c.benchmark_group("hdiffpatch_e2e");
@@ -1130,7 +1292,18 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
         b.iter(|| {
             let mut hdiff = HDiff::new(
                 old_path.to_string_lossy().to_string(),
-                patch_path.to_string_lossy().to_string(),
+                patch_v20_path.to_string_lossy().to_string(),
+                out_path.to_string_lossy().to_string(),
+            );
+            assert!(hdiff.apply(None));
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("v13_nocomp", HDIFF_MIB), |b| {
+        b.iter(|| {
+            let mut hdiff = HDiff::new(
+                old_path.to_string_lossy().to_string(),
+                patch_v13_path.to_string_lossy().to_string(),
                 out_path.to_string_lossy().to_string(),
             );
             assert!(hdiff.apply(None));
