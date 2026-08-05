@@ -746,6 +746,8 @@ fn bench_varint_decode(c: &mut Criterion) {
 
 use irmin::game_installer::hdiffpatch::enumerate_cover_headers_checked;
 
+use irmin::proto_parse::SophonManifestProto;
+use prost::Message;
 /// Encode a tagged varint (tag_bit=1) into a p_sign byte + continuation bytes.
 /// Returns (p_sign_byte, continuation_bytes). `sign` is 0 (positive) or 1 (negative).
 fn encode_cover_header_entry(
@@ -823,6 +825,59 @@ fn bench_cover_stream_decode(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Protobuf manifest decode benchmark
+// ---------------------------------------------------------------------------
+
+const PROTO_FILES: usize = 5000;
+const PROTO_CHUNKS_PER_FILE: usize = 50;
+
+/// Generate a prost-encoded SophonManifestProto with `files` assets, each with `chunks` chunks.
+fn gen_protobuf_manifest(files: usize, chunks: usize) -> Vec<u8> {
+    let assets: Vec<SophonManifestAssetProperty> = (0..files)
+        .map(|f| {
+            let asset_chunks: Vec<SophonManifestAssetChunk> = (0..chunks)
+                .map(|c| SophonManifestAssetChunk {
+                    chunk_name: format!("f{f}c{c}"),
+                    chunk_decompressed_hash_md5: format!("{:032x}", f * chunks + c),
+                    chunk_on_file_offset: (c * 1024 * 1024) as u64,
+                    chunk_size: 512 * 1024,
+                    chunk_size_decompressed: 1024 * 1024,
+                    chunk_compressed_hash_xxh: (f * chunks + c) as u64,
+                    chunk_compressed_hash_md5: format!("{:032x}", f * chunks + c + 1),
+                    chunk_old_offset: -1,
+                })
+                .collect();
+            SophonManifestAssetProperty {
+                asset_name: format!("data/assets/bundle_{f:04}.pak"),
+                asset_chunks,
+                asset_type: 0,
+                asset_size: (chunks * 1024 * 1024) as u64,
+                asset_hash_md5: format!("{f:032x}"),
+            }
+        })
+        .collect();
+    let manifest = SophonManifestProto { assets };
+    manifest.encode_to_vec()
+}
+
+/// Protobuf manifest decode throughput: prost decode of 5000 assets x 50 chunks.
+fn bench_protobuf_decode(c: &mut Criterion) {
+    let encoded = gen_protobuf_manifest(PROTO_FILES, PROTO_CHUNKS_PER_FILE);
+
+    let mut group = c.benchmark_group("protobuf_manifest");
+    group.throughput(Throughput::Elements(PROTO_FILES as u64));
+
+    group.bench_function("decode_5000x50", |b| {
+        b.iter(|| {
+            let manifest = SophonManifestProto::decode(encoded.as_slice()).unwrap();
+            std::hint::black_box(manifest.assets.len());
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -836,5 +891,6 @@ criterion_group!(
     bench_chunk_lookup,
     bench_varint_decode,
     bench_cover_stream_decode,
+    bench_protobuf_decode,
 );
 criterion_main!(benches);
