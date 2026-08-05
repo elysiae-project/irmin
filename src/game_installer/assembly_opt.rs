@@ -227,12 +227,17 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
     })
 }
 
+fn page_size() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize)
+}
+
 pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Result<MmapGuard> {
     if len == 0 {
         return Err(io::Error::other("zero-length mmap"));
     }
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
-    let page_mask = !(page_size - 1);
+    let ps = page_size();
+    let page_mask = !(ps - 1);
     let map_offset = offset & page_mask as u64;
     let ptr_offset = (offset - map_offset) as usize;
     let map_len = len + ptr_offset;
