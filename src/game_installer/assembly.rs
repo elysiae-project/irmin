@@ -265,9 +265,10 @@ pub fn assemble_file(
     };
 
     let chunk_offsets: Vec<u64> = all_files.file_chunk_offsets(file_idx);
-    // Verify total decompressed size and check chunk hash availability in one pass.
+    // Verify total decompressed size, check chunk hashes, and detect old chunks in one pass.
     let mut total_decompressed: u64 = 0;
     let mut all_chunks_have_hashes = true;
+    let mut has_old_chunks = false;
     for ci in chunk_range.start..chunk_range.end {
         let chunk = all_files.chunk(ci as usize);
         total_decompressed = total_decompressed
@@ -281,6 +282,9 @@ pub fn assemble_file(
             && !super::assembly_opt::chunk_hash_required(chunk.chunk_decompressed_hash_md5)
         {
             all_chunks_have_hashes = false;
+        }
+        if chunk.chunk_old_offset >= 0 {
+            has_old_chunks = true;
         }
     }
     if total_decompressed != file_size {
@@ -310,8 +314,6 @@ pub fn assemble_file(
     let parallel_hashed_file = parallelize && has_file_hash && !all_chunks_have_hashes;
     let hasher_result: Mutex<Option<SophonResult<[u8; 16]>>> = Mutex::new(None);
 
-    let has_old_chunks = (chunk_range.start..chunk_range.end)
-        .any(|ci| all_files.chunk(ci as usize).chunk_old_offset >= 0);
     let old_file: Option<File> = if has_old_chunks {
         Some(File::open(&target_path).map_err(SophonError::Io)?)
     } else {
