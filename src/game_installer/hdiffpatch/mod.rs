@@ -67,6 +67,7 @@ impl BufferPool {
         }
     }
 
+    #[cfg(test)]
     pub fn return_buf_shrunken(&self, mut buf: Vec<u8>, max_cap: usize) {
         let mut pool = self.buffers.lock().unwrap();
         if pool.len() < self.max_idle {
