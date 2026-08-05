@@ -513,7 +513,7 @@
         std::fs::write(&file_path, data).unwrap();
 
         let md5_hex = {
-            let mut hasher = md5::Md5::new();
+            let mut hasher = fast_md5::Md5::new();
             hasher.update(data);
             hex::encode(hasher.finalize())
         };
@@ -571,7 +571,7 @@
 
         let server = MockServer::start().await;
         let data = b"chunk payload".to_vec();
-        let expected_md5 = hex::encode(md5::Md5::digest(&data));
+        let expected_md5 = hex::encode(fast_md5::digest(&data));
 
         let data_len = data.len() as u64;
         let chunk = SophonManifestAssetChunk {
@@ -679,7 +679,7 @@
         // Intentionally wrong hash so the chunk always fails MD5 verification.
         let _wrong_md5 = "00000000000000000000000000000000";
 
-        let wrong_md5 = hex::encode(md5::Md5::digest(b"wrong_data"));
+        let wrong_md5 = hex::encode(fast_md5::digest(b"wrong_data"));
         let data_len = data.len() as u64;
         let chunk = SophonManifestAssetChunk {
             chunk_name: "discard_partial_chunk".to_string(),

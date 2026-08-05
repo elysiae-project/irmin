@@ -93,7 +93,7 @@ pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
     let ret = unsafe { libc::posix_fallocate(fd, 0, len as libc::off_t) };
     if ret != 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::from_raw_os_error(ret));
     }
     Ok(())
 }

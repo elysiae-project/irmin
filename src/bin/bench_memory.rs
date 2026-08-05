@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use md5::{Digest, Md5};
+use fast_md5;
 
 use irmin::game_installer::{
     assembly::{assemble_file, chunk_filename},
@@ -163,7 +163,7 @@ fn op_read_md5_with_fadvise(path: &Path, mib: usize, advise: bool) {
     let f = fs::File::open(path).expect("open");
     let fd = f.as_raw_fd();
     let mut buf = vec![0u8; 256 * 1024];
-    let mut h = Md5::new();
+    let mut h = fast_md5::Md5::new();
     let mut off = 0u64;
     let total = (mib * 1024 * 1024) as u64;
     while off < total {
@@ -204,7 +204,7 @@ fn setup_assembly_fixture(
             fs::write(chunks_dir.join(chunk_filename(&name)), &comp).unwrap();
             let offset = (i as u64) * chunk_size;
             let chunk_hash = if with_chunk_hashes {
-                hex::encode(Md5::digest(&data))
+                hex::encode(fast_md5::digest(&data))
             } else {
                 String::new()
             };
@@ -350,7 +350,7 @@ fn op_read_write_md5(dir: &Path) {
     let mut d = fs::File::create(&dst).unwrap();
     d.set_len(64 * 1024 * 1024).unwrap();
     let mut buf = vec![0u8; 256 * 1024];
-    let mut h = Md5::new();
+    let mut h = fast_md5::Md5::new();
     loop {
         let n = s.read(&mut buf).unwrap();
         if n == 0 {
@@ -490,7 +490,7 @@ fn op_mmap_md5_128m(dir: &Path) {
     if mmap == libc::MAP_FAILED {
         panic!("mmap failed");
     }
-    let mut h = Md5::new();
+    let mut h = fast_md5::Md5::new();
     h.update(unsafe { std::slice::from_raw_parts(mmap as *const u8, len) });
     let _ = hex::encode(h.finalize());
     unsafe {

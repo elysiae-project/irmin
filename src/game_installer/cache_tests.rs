@@ -94,7 +94,7 @@
             .as_secs();
         let cache = DashMap::new();
         let md5 = {
-            let mut hasher = Md5::new();
+            let mut hasher = fast_md5::Md5::new();
             hasher.update(b"hello world");
             hex::encode(hasher.finalize())
         };
@@ -159,7 +159,7 @@
             .as_secs();
         let cache = DashMap::new();
         let actual_md5 = {
-            let mut hasher = Md5::new();
+            let mut hasher = fast_md5::Md5::new();
             hasher.update(b"hello world");
             hex::encode(hasher.finalize())
         };
@@ -197,7 +197,7 @@
             .as_secs();
         let cache = DashMap::new();
         let md5 = {
-            let mut hasher = Md5::new();
+            let mut hasher = fast_md5::Md5::new();
             hasher.update(b"hello world");
             hex::encode(hasher.finalize())
         };
@@ -279,7 +279,7 @@
         fs::write(&file_path, b"").unwrap();
         let cache = DashMap::new();
         let md5 = {
-            let mut hasher = Md5::new();
+            let mut hasher = fast_md5::Md5::new();
             hasher.update(b"");
             hex::encode(hasher.finalize())
         };
@@ -375,7 +375,7 @@
         let file_path = game_dir.join("capped.dat");
         fs::write(&file_path, b"capped").unwrap();
         let md5 = {
-            let mut hasher = Md5::new();
+            let mut hasher = fast_md5::Md5::new();
             hasher.update(b"capped");
             hex::encode(hasher.finalize())
         };

@@ -12,7 +12,7 @@ pub use dashmap::DashMap as VerificationCache;
 pub(crate) const VERIFICATION_CACHE_MAX_ENTRIES: usize = 5_000;
 
 #[cfg(test)]
-use md5::{Digest, Md5};
+use fast_md5;
 use serde::{Deserialize, Serialize};
 
 use super::VERIFICATION_CACHE_FILE;
