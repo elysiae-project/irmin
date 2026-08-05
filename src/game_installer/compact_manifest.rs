@@ -5,9 +5,7 @@
 //! per-string and per-Vec heap allocation overhead and improves jemalloc
 //! fragmentation by co-locating fields in contiguous allocations.
 
-use crate::proto_parse::{
-    SophonManifestAssetChunk, SophonManifestAssetProperty,
-};
+use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 use rustc_hash::FxHashMap;
 
 impl<'a> From<&'a SophonManifestAssetChunk> for ChunkRef<'a> {
@@ -478,5 +476,70 @@ mod tests {
         let f2 = make_file("b.pak", "shared", 0, 200, vec![]);
         let cm = CompactManifest::from(vec![f1, f2]);
         assert_eq!(cm.arena.len(), 3);
+    }
+
+    /// Verifies all stored fields survive Proto -> CompactManifest for 100 assets
+    /// with varied chunk counts. Guards against columnar layout changes dropping data.
+    #[test]
+    fn roundtrip_all_fields_100_assets() {
+        let assets: Vec<SophonManifestAssetProperty> = (0..100)
+            .map(|f| {
+                let chunk_count = 1 + (f % 50);
+                let chunks: Vec<SophonManifestAssetChunk> = (0..chunk_count)
+                    .map(|c| SophonManifestAssetChunk {
+                        chunk_name: format!("chunk_f{f}_c{c}"),
+                        chunk_decompressed_hash_md5: format!("{:032x}", f * 1000 + c),
+                        chunk_on_file_offset: (c as u64) * 4096,
+                        chunk_size: 2048 + c as u64,
+                        chunk_size_decompressed: 4096 + c as u64,
+                        chunk_compressed_hash_xxh: (f * c) as u64,
+                        chunk_compressed_hash_md5: format!("{:032x}", f * 1000 + c + 1),
+                        chunk_old_offset: if c % 3 == 0 { -1 } else { (c * 4096) as i64 },
+                    })
+                    .collect();
+                SophonManifestAssetProperty {
+                    asset_name: format!("data/bundle_{f:04}.pak"),
+                    asset_chunks: chunks,
+                    asset_type: if f % 20 == 0 { 64 } else { 0 },
+                    asset_size: (chunk_count as u64) * 4096,
+                    asset_hash_md5: format!("{f:032x}"),
+                }
+            })
+            .collect();
+
+        let total_chunks: usize = assets.iter().map(|a| a.asset_chunks.len()).sum();
+        let cm = CompactManifest::from(assets.clone());
+
+        assert_eq!(cm.num_files(), assets.len());
+        assert_eq!(cm.num_chunks(), total_chunks);
+
+        let mut global_chunk_idx = 0usize;
+        for (fi, asset) in assets.iter().enumerate() {
+            assert_eq!(cm.file_name(fi), asset.asset_name);
+            assert_eq!(cm.file_hash_md5(fi), asset.asset_hash_md5);
+            assert_eq!(cm.file_type(fi), asset.asset_type);
+            assert_eq!(cm.file_size(fi), asset.asset_size);
+
+            let range = cm.file_chunk_range(fi);
+            assert_eq!((range.end - range.start) as usize, asset.asset_chunks.len());
+
+            for (ci, src_chunk) in asset.asset_chunks.iter().enumerate() {
+                let c = cm.file_chunk(fi, ci);
+                assert_eq!(c.chunk_name, src_chunk.chunk_name);
+                assert_eq!(
+                    c.chunk_decompressed_hash_md5,
+                    src_chunk.chunk_decompressed_hash_md5
+                );
+                assert_eq!(c.chunk_size, src_chunk.chunk_size);
+                assert_eq!(c.chunk_size_decompressed, src_chunk.chunk_size_decompressed);
+                assert_eq!(
+                    c.chunk_compressed_hash_md5,
+                    src_chunk.chunk_compressed_hash_md5
+                );
+                assert_eq!(c.chunk_old_offset, src_chunk.chunk_old_offset);
+                global_chunk_idx += 1;
+            }
+        }
+        assert_eq!(global_chunk_idx, total_chunks);
     }
 }
