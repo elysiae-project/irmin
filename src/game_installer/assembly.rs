@@ -437,6 +437,7 @@ pub fn assemble_file(
                         unsafe { buf.set_len(FILE_WRITE_BUFFER_SIZE) };
                         buf
                     });
+                    let mut chunk_path = cdir.to_path_buf();
                     for ci in indices {
                         if err.lock().unwrap().is_some() {
                             break;
@@ -461,16 +462,18 @@ pub fn assemble_file(
                             if !validate_chunk_name(chunk.chunk_name) {
                                 Err(SophonError::PathTraversal(chunk.chunk_name.into()))
                             } else {
-                                let mut chunk_path = cdir.join(chunk.chunk_name);
+                                chunk_path.push(chunk.chunk_name);
                                 chunk_path.set_extension("zstd");
-                                write_decompressed_chunk_at(
+                                let result = write_decompressed_chunk_at(
                                     &chunk_path,
                                     out,
                                     offset,
                                     chunk.chunk_size_decompressed,
                                     None,
                                     chunk.chunk_decompressed_hash_md5,
-                                )
+                                );
+                                chunk_path.pop();
+                                result
                             }
                         };
                         match result {
@@ -520,6 +523,7 @@ pub fn assemble_file(
             return Err(e);
         }
     } else {
+        let mut chunk_path = chunks_dir.to_path_buf();
         for ci in chunk_range.start..chunk_range.end {
             let chunk = all_files.chunk(ci as usize);
             let oi = (ci - chunk_range.start) as usize;
@@ -552,7 +556,7 @@ pub fn assemble_file(
                 if !validate_chunk_name(chunk.chunk_name) {
                     return Err(SophonError::PathTraversal(chunk.chunk_name.into()));
                 }
-                let mut chunk_path = chunks_dir.join(chunk.chunk_name);
+                chunk_path.push(chunk.chunk_name);
                 chunk_path.set_extension("zstd");
 
                 let bytes_written = write_decompressed_chunk_at(
@@ -566,6 +570,7 @@ pub fn assemble_file(
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
                 })?;
+                chunk_path.pop();
 
                 total_written += bytes_written;
                 guard.chunks.push(chunk.chunk_name);
