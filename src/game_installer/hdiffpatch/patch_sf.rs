@@ -468,6 +468,7 @@ fn rle_varint(buf: &[u8], pos: &mut usize) -> Option<usize> {
     Some(val as usize)
 }
 
+#[inline]
 fn copy_n(
     src: &mut dyn Read,
     dst: &mut dyn Write,
