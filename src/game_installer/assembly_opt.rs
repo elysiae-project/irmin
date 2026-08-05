@@ -262,6 +262,33 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
     }
 }
 
+// Thread-local reusable buffer for reading compressed chunk data via pread.
+// Grows to fit the largest chunk seen on this thread (up to ONESHOT_MAX_SIZE)
+// and is reused across calls, avoiding mmap/munmap syscall overhead per chunk.
+thread_local! {
+    static COMPRESSED_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+}
+
+/// Take the thread-local compressed buffer, growing it if needed.
+/// Caller must return it via [`return_compressed_buf`] when done.
+fn take_compressed_buf(len: usize) -> Vec<u8> {
+    COMPRESSED_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut().split_off(0);
+        if buf.capacity() < len {
+            buf.reserve(len - buf.len());
+        }
+        // Safety: pread will overwrite these bytes; avoid zeroing cost.
+        unsafe { buf.set_len(len) };
+        buf
+    })
+}
+
+fn return_compressed_buf(buf: Vec<u8>) {
+    COMPRESSED_BUF.with(|cell| {
+        *cell.borrow_mut() = buf;
+    });
+}
+
 fn decompress_chunk_oneshot(
     chunk_path: &Path,
     out_file: &File,
@@ -280,8 +307,18 @@ fn decompress_chunk_oneshot(
     if compressed_size == 0 {
         return Err(SophonError::Io(io::Error::other("empty chunk")));
     }
-    let mmap = unsafe { mmap_read_only_unchecked(&f, compressed_size) }?;
-    let compressed = mmap.as_slice();
+
+    // ponytail: pread into thread-local buffer instead of mmap; saves ~5 syscalls/chunk.
+    // Upgrade path: if chunks exceed ONESHOT_MAX_SIZE, fall back to mmap or streaming.
+    let mut compressed_buf = take_compressed_buf(compressed_size);
+    let n = f.read_at(&mut compressed_buf[..compressed_size], 0)?;
+    if n != compressed_size {
+        return_compressed_buf(compressed_buf);
+        return Err(SophonError::Io(io::Error::other(
+            "short read on compressed chunk",
+        )));
+    }
+    let compressed = &compressed_buf[..compressed_size];
 
     let mut out_mmap = mmap_read_write(out_file, offset, expected_usize)?;
 
@@ -343,6 +380,7 @@ fn decompress_chunk_oneshot(
         Ok(expected_size)
     })();
 
+    return_compressed_buf(compressed_buf);
     out_mmap.flush_and_evict();
     drop(out_mmap);
     result
