@@ -874,7 +874,7 @@ mod tests {
             return vec![v as u8];
         }
         let bits = 64 - (v as u64).leading_zeros() as usize;
-        let groups = (bits + 6) / 7;
+        let groups = bits.div_ceil(7);
         let mut out = Vec::with_capacity(groups);
         for i in (0..groups).rev() {
             let chunk = ((v >> (i * 7)) & 0x7F) as u8;
