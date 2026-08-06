@@ -1766,17 +1766,38 @@ pub async fn install(
             let chunks_dir_validate = Arc::clone(&chunks_dir);
             prev_downloaded_chunks = tokio::task::spawn_blocking(move || {
                 let before = prev_downloaded_chunks.len();
-                prev_downloaded_chunks.retain(|chunk_name, chunk_size| {
-                    chunk_still_valid_for_resume(chunk_name, *chunk_size, &chunks_dir_validate)
+                let num_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let chunks_vec: Vec<_> = prev_downloaded_chunks.into_iter().collect();
+                let chunk_size = (chunks_vec.len() + num_threads - 1) / num_threads;
+                let validated: rustc_hash::FxHashMap<String, u64> = std::thread::scope(|s| {
+                    let handles: Vec<_> = chunks_vec
+                        .chunks(chunk_size.max(1))
+                        .map(|batch| {
+                            let dir = &chunks_dir_validate;
+                            s.spawn(move || {
+                                batch
+                                    .iter()
+                                    .filter(|(name, size)| chunk_still_valid_for_resume(name, *size, dir))
+                                    .map(|(name, size)| (name.clone(), *size))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap_or_default())
+                        .collect()
                 });
-                let removed = before - prev_downloaded_chunks.len();
+                let removed = before - validated.len();
                 if removed > 0 {
                     log::warn!(
                         "Removed {removed}/{before} stale chunk entries from resume state (chunks dir: {dir})",
                         dir = chunks_dir_validate.display()
                     );
                 }
-                prev_downloaded_chunks
+                validated
             })
             .await?;
         }
