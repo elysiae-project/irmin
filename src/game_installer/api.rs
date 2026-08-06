@@ -160,16 +160,41 @@ pub async fn fetch_patch_build(
         tag = branch.tag,
     );
 
-    let raw_resp =
-        tokio::time::timeout(Duration::from_secs(35), client.post(&url).send()).await??;
-    let resp: SophonPatchBuildResponse = raw_resp.error_for_status()?.json().await?;
-    let data = resp
-        .data
-        .ok_or_else(|| SophonError::ApiError(resp.retcode, resp.message))?;
-    if data.manifests.is_empty() {
-        return Err(SophonError::NoManifests);
+    for attempt in 0..API_MAX_RETRIES {
+        let result =
+            tokio::time::timeout(Duration::from_secs(35), client.post(&url).send()).await;
+
+        match result {
+            Ok(Ok(resp)) => {
+                let resp = resp.error_for_status()?;
+                let resp: SophonPatchBuildResponse = resp.json().await?;
+                let data = resp
+                    .data
+                    .ok_or_else(|| SophonError::ApiError(resp.retcode, resp.message))?;
+                if data.manifests.is_empty() {
+                    return Err(SophonError::NoManifests);
+                }
+                return Ok(data);
+            }
+            Ok(Err(err)) if err.is_timeout() || err.is_connect() => {
+                if attempt + 1 < API_MAX_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_timeout) => {
+                if attempt + 1 < API_MAX_RETRIES {
+                    continue;
+                }
+                return Err(SophonError::Io(std::io::Error::other(
+                    "fetch_patch_build timed out after retries",
+                )));
+            }
+        }
     }
-    Ok(data)
+    unreachable!()
 }
 
 pub struct PatchManifestWithMeta {
