@@ -92,7 +92,8 @@ async fn download_zip(
         .error_for_status()?;
     let total_bytes = resp.content_length().unwrap_or(0);
 
-    let mut file = tokio::fs::File::create(dest).await?;
+    let raw_file = tokio::fs::File::create(dest).await?;
+    let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, raw_file);
     let mut stream = resp.bytes_stream();
     let needs_hash = !expected_md5.is_empty();
     let mut hasher = if needs_hash {
