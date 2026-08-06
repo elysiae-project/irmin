@@ -143,7 +143,8 @@ pub(crate) fn get_clip_stream(
                 file,
                 remaining: comp_length,
             };
-            let mut decoder = DeflateDecoder::new(limited);
+            let mut decoder =
+                DeflateDecoder::new(std::io::BufReader::with_capacity(256 * 1024, limited));
 
             if is_buffered {
                 if length > MAX_BUFFERED_SIZE {
@@ -163,7 +164,8 @@ pub(crate) fn get_clip_stream(
                 file,
                 remaining: comp_length,
             };
-            let mut decoder = lz4::Decoder::new(limited)?;
+            let mut decoder =
+                lz4::Decoder::new(std::io::BufReader::with_capacity(256 * 1024, limited))?;
 
             if is_buffered {
                 if length > MAX_BUFFERED_SIZE {
