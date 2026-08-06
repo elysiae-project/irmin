@@ -1124,7 +1124,6 @@ async fn process_eager_item(
     assemble_tx: &mpsc::Sender<(usize, usize)>,
     handle: &DownloadHandle,
 ) -> SophonResult<()> {
-    use super::compact_manifest::CompactManifest;
 
     // Check bitmap for resume.
     let global_chunk_idx = {
@@ -1179,7 +1178,7 @@ async fn process_eager_item(
         .get_handle(file_idx)
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
 
-    let decompressed_bytes = tokio::task::spawn_blocking({
+    let _decompressed_bytes = tokio::task::spawn_blocking({
         let compressed = compressed_data.to_vec();
         let out = Arc::clone(&out_file);
         let decomp_hash = chunk.chunk_decompressed_hash_md5.to_string();
@@ -2173,7 +2172,7 @@ pub async fn install(
         adaptive_assembly: Arc::clone(&adaptive_assembly),
         profiler: Arc::new(super::profiling::PipelineProfiler::new()),
         completion_flags: Arc::clone(&completion_flags),
-        output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(&game_dir)),
+        output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(game_dir)),
         chunk_bitmap: {
             let bitmap_path = game_dir.join(".sophon_bitmap");
             let total = all_files.num_chunks();
