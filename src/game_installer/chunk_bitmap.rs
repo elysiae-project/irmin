@@ -265,7 +265,7 @@ mod tests {
         let path = dir.path().join("bad.bitmap");
 
         // Too short
-        std::fs::write(&path, &[0u8; 4]).unwrap();
+        std::fs::write(&path, [0u8; 4]).unwrap();
         assert!(ChunkBitmap::load(&path).is_err());
 
         // Wrong magic
