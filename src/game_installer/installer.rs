@@ -1343,44 +1343,7 @@ async fn process_download_item(
 
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-        let dc = Arc::clone(&ctx.downloaded_chunks);
-        let cn = Arc::clone(&ctx.chunk_names);
-        let saver = Arc::clone(&ctx.state_saver);
-        let prev_handle = {
-            let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-                log::error!("last_save mutex poisoned, recovering");
-                err.into_inner()
-            });
-            guard.take()
-        };
-        if let Some(h) = prev_handle {
-            let _ = h.await;
-        }
-        let new_handle = tokio::task::spawn_blocking(move || {
-            let map: HashMap<String, u64> = if let (Some(dc), Some(cn)) = (dc.get(), cn.get()) {
-                dc.iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| {
-                        let val = v.load(Ordering::Relaxed);
-                        if val > 0 {
-                            Some((cn.get(i).to_string(), val as u64))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            } else {
-                HashMap::new()
-            };
-            saver(&map);
-        });
-        {
-            let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-                log::error!("last_save mutex poisoned, recovering");
-                err.into_inner()
-            });
-            *guard = Some(new_handle);
-        }
+        save_assembly_state(ctx).await;
     }
 
     let db = if was_actually_downloaded {
