@@ -299,7 +299,7 @@ thread_local! {
 /// Caller must return it via [`return_compressed_buf`] when done.
 fn take_compressed_buf(len: usize) -> Vec<u8> {
     COMPRESSED_BUF.with(|cell| {
-        let mut buf = cell.borrow_mut().split_off(0);
+        let mut buf = std::mem::take(&mut *cell.borrow_mut());
         if buf.capacity() < len {
             buf.reserve(len - buf.len());
         }
