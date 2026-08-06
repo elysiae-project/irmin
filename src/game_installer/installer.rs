@@ -1770,7 +1770,7 @@ pub async fn install(
                     .map(|n| n.get())
                     .unwrap_or(4);
                 let chunks_vec: Vec<_> = prev_downloaded_chunks.into_iter().collect();
-                let chunk_size = (chunks_vec.len() + num_threads - 1) / num_threads;
+                let chunk_size = chunks_vec.len().div_ceil(num_threads);
                 let validated: rustc_hash::FxHashMap<String, u64> = std::thread::scope(|s| {
                     let handles: Vec<_> = chunks_vec
                         .chunks(chunk_size.max(1))
