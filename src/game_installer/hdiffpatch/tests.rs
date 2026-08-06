@@ -1148,7 +1148,7 @@ fn encode_7bit_varint(v: i64) -> Vec<u8> {
         return vec![v as u8];
     }
     let bits = 64 - (v as u64).leading_zeros() as usize;
-    let groups = (bits + 6) / 7;
+    let groups = bits.div_ceil(7);
     let mut out = Vec::with_capacity(groups);
     for i in (0..groups).rev() {
         let chunk = ((v >> (i * 7)) & 0x7F) as u8;
@@ -1171,7 +1171,7 @@ fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
     } else {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         let remaining_bits = bits - 6;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x3F) as u8;
         out.push((sign << 7) | 0x40 | first_payload);
@@ -1196,7 +1196,7 @@ fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
     } else {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         let remaining_bits = bits - 5;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x1F) as u8;
         out.push((rle_type << 6) | 0x20 | first_payload);
