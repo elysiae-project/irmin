@@ -173,7 +173,7 @@ fn write_single_pkg_version(
     assets: &CompactManifest,
 ) -> std::io::Result<()> {
     let path = game_dir.join(filename);
-    let mut file = File::create(&path)?;
+    let mut file = std::io::BufWriter::new(File::create(&path)?);
 
     for i in 0..assets.num_files() {
         if assets.is_directory(i) {
