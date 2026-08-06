@@ -28,12 +28,18 @@ impl OutputAllocator {
 
     /// Pre-allocates an output file at its full size. Creates parent directories.
     /// Stores the open fd in the handle cache for later pwrite access.
+    /// Thread-safe: only the first caller for a given file_idx creates the file.
     pub fn preallocate_file(
         &self,
         file_idx: usize,
         relative_path: &str,
         size: u64,
     ) -> SophonResult<()> {
+        // Use entry API to avoid TOCTOU race (two workers calling simultaneously).
+        if self.handles.contains_key(&file_idx) {
+            return Ok(());
+        }
+
         let full_path = self.game_dir.join(relative_path);
 
         if let Some(parent) = full_path.parent() {
@@ -51,7 +57,8 @@ impl OutputAllocator {
         file.set_len(size).map_err(SophonError::Io)?;
         let _ = sysio::preallocate(&file, size);
 
-        self.handles.insert(file_idx, Arc::new(file));
+        // Only insert if another thread didn't race us.
+        self.handles.entry(file_idx).or_insert(Arc::new(file));
         Ok(())
     }
 
