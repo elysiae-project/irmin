@@ -191,7 +191,7 @@ impl PipelineProfiler {
             let idle_s = window_idle as f64 / 1_000_000_000.0;
             let total_worker_s =
                 self.total_chunks.load(Ordering::Relaxed) as f64 * avg_chunk_us / 1_000_000.0;
-            let total_available_s = elapsed * 16.0;
+            let total_available_s = elapsed * super::DOWNLOAD_CONCURRENCY as f64;
             let utilization_pct = if total_available_s > 0.0 {
                 (total_worker_s / total_available_s * 100.0).min(100.0)
             } else {
