@@ -432,6 +432,11 @@ async fn download_full_file_with_response(
     check_available_space(dest, chunk.chunk_size)?;
 
     let file = tokio::fs::File::create(dest).await?;
+    // Pre-allocate to prevent fragmentation and detect ENOSPC early.
+    {
+        let std_file = file.try_clone().await?.into_std().await;
+        let _ = super::sysio::preallocate(&std_file, chunk.chunk_size);
+    }
     let mut file = EvictingWriter::new(file);
     let mut stream = resp.bytes_stream();
     let mut hasher = if chunk.chunk_compressed_hash_md5.len() == 32 {
