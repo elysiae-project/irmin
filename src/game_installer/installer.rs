@@ -123,6 +123,10 @@ struct InstallContext {
     /// `Arc<Mutex<HashSet<String>>>` with a constant-memory atomic array:
     /// no per-file String alloc and zero lock contention.
     completion_flags: Arc<[AtomicBool]>,
+    /// Output file handle cache for eager decompression.
+    output_allocator: Arc<super::output_allocator::OutputAllocator>,
+    /// Completion bitmap for eager decompression resume.
+    chunk_bitmap: Arc<super::chunk_bitmap::ChunkBitmap>,
 }
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -1106,6 +1110,108 @@ async fn download_chunk_with_retries(
     }
 }
 
+/// Eager decompression path: downloads compressed data into memory, decompresses
+/// inline, and writes directly to the output file. Skips .zstd intermediate.
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    handle: &DownloadHandle,
+) -> SophonResult<()> {
+    use super::compact_manifest::CompactManifest;
+
+    // Check bitmap for resume.
+    let global_chunk_idx = {
+        let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
+        range.start as usize + item.chunk_idx as usize
+    };
+    if ctx.chunk_bitmap.is_complete(global_chunk_idx) {
+        // Already decompressed in a prior session. Update progress and skip.
+        ctx.downloaded_bytes
+            .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+        notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx);
+        return Ok(());
+    }
+
+    // Ensure output file is pre-allocated.
+    let file_idx = item.file_idx as usize;
+    if ctx.output_allocator.get_handle(file_idx).is_none() {
+        let file_name = ctx.all_files.file_name(file_idx);
+        let file_size = ctx.all_files.file_size(file_idx);
+        ctx.output_allocator
+            .preallocate_file(file_idx, file_name, file_size)?;
+    }
+
+    // Download compressed chunk into memory.
+    let client = &ctx.installer_clients[item.installer_idx as usize];
+    let download_info = &ctx.installer_downloads[item.installer_idx as usize];
+    let mut url = String::with_capacity(256);
+    download_info.url_for_into(chunk.chunk_name, &mut url);
+
+    let resp = client.get(&url).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(SophonError::Io(std::io::Error::other(format!(
+            "HTTP {} for chunk {}",
+            resp.status(),
+            chunk.chunk_name
+        ))));
+    }
+
+    let compressed_data = resp.bytes().await.map_err(SophonError::Http)?;
+
+    if handle.is_cancelled() {
+        return Err(SophonError::Cancelled);
+    }
+
+    // Compute chunk offset within the output file.
+    let chunk_offset = ctx.all_files.file_chunk_offsets(file_idx)[item.chunk_idx as usize];
+
+    // Decompress and write to output file.
+    let out_file = ctx
+        .output_allocator
+        .get_handle(file_idx)
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
+
+    let decompressed_bytes = tokio::task::spawn_blocking({
+        let compressed = compressed_data.to_vec();
+        let out = Arc::clone(&out_file);
+        let decomp_hash = chunk.chunk_decompressed_hash_md5.to_string();
+        let comp_hash = chunk.chunk_compressed_hash_md5.to_string();
+        let expected_size = chunk.chunk_size_decompressed;
+        move || {
+            super::eager_decompress::eager_decompress_chunk(
+                &compressed,
+                &out,
+                chunk_offset,
+                expected_size,
+                &comp_hash,
+                &decomp_hash,
+            )
+        }
+    })
+    .await
+    .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
+
+    // Mark chunk complete in bitmap.
+    ctx.chunk_bitmap.mark_complete(global_chunk_idx);
+
+    // Update progress.
+    ctx.downloaded_bytes
+        .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+
+    // Notify assembly (for file-level completion tracking via pending_counts).
+    notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx);
+
+    Ok(())
+}
+
 fn notify_assembly_ready(
     item_idx: usize,
     chunk_entries: &[FileEntry],
@@ -1158,6 +1264,24 @@ async fn process_download_item(
     if !validate_chunk_name(chunk.chunk_name) {
         return Err(SophonError::PathTraversal(chunk.chunk_name.into()));
     }
+
+    // Eager decompression path: download compressed bytes into memory,
+    // decompress directly to the output file, skip .zstd intermediate.
+    if item.use_eager {
+        return process_eager_item(
+            &item,
+            item_idx,
+            chunk,
+            &ctx,
+            &chunk_entries,
+            &chunk_entry_offsets,
+            &pending_counts,
+            &assemble_tx,
+            &handle,
+        )
+        .await;
+    }
+
     let dest = {
         let mut p = ctx.chunks_dir.join(chunk.chunk_name);
         p.set_extension("zstd");
@@ -2049,6 +2173,17 @@ pub async fn install(
         adaptive_assembly: Arc::clone(&adaptive_assembly),
         profiler: Arc::new(super::profiling::PipelineProfiler::new()),
         completion_flags: Arc::clone(&completion_flags),
+        output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(&game_dir)),
+        chunk_bitmap: {
+            let bitmap_path = game_dir.join(".sophon_bitmap");
+            let total = all_files.num_chunks();
+            Arc::new(if bitmap_path.exists() {
+                super::chunk_bitmap::ChunkBitmap::load(&bitmap_path)
+                    .unwrap_or_else(|_| super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total).unwrap())
+            } else {
+                super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total).unwrap()
+            })
+        },
     });
 
     #[cfg(feature = "sophon-profiling")]
