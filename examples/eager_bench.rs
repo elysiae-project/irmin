@@ -9,9 +9,13 @@ fn main() {
     let data_size = 8 * 1024 * 1024;
     let mut data = vec![0u8; data_size];
     let mut seed: u64 = 12345;
-    for i in 0..data_size {
+    for (i, byte) in data.iter_mut().enumerate() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        data[i] = (seed >> 33) as u8;
+        *byte = (seed >> 33) as u8;
+        // Reset seed periodically based on position for compressibility patterns
+        if i % 4096 == 0 {
+            seed = seed.wrapping_add(i as u64);
+        }
     }
     // Add repetition for compressibility
     for i in (4096..data_size).step_by(4096) {
