@@ -1563,13 +1563,9 @@ async fn finalize_install(
         let assembled = ctx.assembled_files.load(Ordering::Relaxed);
         let total = ctx.total_files;
         if assembled != total {
-            log::warn!(
-                "Sophon install completed but assembled_files ({assembled}) != total_files ({total}). {missing} files may be missing!",
-                missing = total - assembled,
-            );
-        } else {
-            log::info!("Sophon install: all {total} files assembled successfully");
+            return Err(SophonError::AssemblyIncomplete { assembled, total });
         }
+        log::info!("Sophon install: all {total} files assembled successfully");
     }
 
     {
