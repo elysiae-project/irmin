@@ -359,7 +359,12 @@ async fn install_single_plugin(
 
     download_zip(client, &pkg.url, &zip_path, &pkg.md5, updater).await?;
 
-    if let Err(err) = extract_zip(&zip_path, game_dir) {
+    let zp = zip_path.clone();
+    let gd = game_dir.to_path_buf();
+    if let Err(err) = tokio::task::spawn_blocking(move || extract_zip(&zp, &gd))
+        .await
+        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))?
+    {
         let _ = fs::remove_file(&zip_path);
         return Err(err);
     }
@@ -463,7 +468,12 @@ async fn install_single_sdk(
     )
     .await?;
 
-    if let Err(err) = extract_zip(&zip_path, game_dir) {
+    let zp = zip_path.clone();
+    let gd = game_dir.to_path_buf();
+    if let Err(err) = tokio::task::spawn_blocking(move || extract_zip(&zp, &gd))
+        .await
+        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))?
+    {
         let _ = fs::remove_file(&zip_path);
         return Err(err);
     }
