@@ -188,6 +188,18 @@ pub fn reclaim_memory() {
     }
 }
 
+/// Raise RLIMIT_NOFILE to the hard limit. The eager decompression path may
+/// open many output files concurrently. Call early in process startup.
+pub fn raise_fd_limit() {
+    unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
+            rlim.rlim_cur = rlim.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
