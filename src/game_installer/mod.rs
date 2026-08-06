@@ -7,6 +7,7 @@ pub mod cache;
 pub mod chunk_bitmap;
 pub mod compact_manifest;
 mod download;
+mod eager_decompress;
 mod error;
 mod game_filters;
 mod handle;
