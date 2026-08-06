@@ -158,7 +158,7 @@ fn eager_mixed_mode_coexistence() {
         .unwrap();
 
     for chunk_idx in 0..3 {
-        let data: Vec<u8> = vec![(chunk_idx as u8 + 0xA0); chunk_size];
+        let data: Vec<u8> = vec![chunk_idx as u8 + 0xA0; chunk_size];
         let compressed = compress_data(&data);
         let handle = alloc.get_handle(0).unwrap();
         let written = eager_decompress_chunk(
@@ -181,7 +181,7 @@ fn eager_mixed_mode_coexistence() {
 
     for i in 0..3 {
         let chunk_idx = 3 + i;
-        let data: Vec<u8> = vec![(chunk_idx as u8 + 0xB0); chunk_size];
+        let data: Vec<u8> = vec![chunk_idx as u8 + 0xB0; chunk_size];
         let compressed = compress_data(&data);
         let handle = alloc.get_handle(1).unwrap();
         let written = eager_decompress_chunk(
