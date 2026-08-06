@@ -1273,11 +1273,7 @@ fn build_v20_nocomp_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut last_old_end = 0u64;
     let mut last_new_end = 0u64;
     for &(old_pos, new_pos, length) in &covers {
-        let delta = if old_pos >= last_old_end {
-            old_pos - last_old_end
-        } else {
-            last_old_end - old_pos
-        };
+        let delta = old_pos.abs_diff(last_old_end);
         let sign = if old_pos >= last_old_end { 0 } else { 1 };
         cover_buf.extend_from_slice(&encode_tagged_1bit(sign, delta as i64));
         cover_buf.extend_from_slice(&encode_7bit_varint((new_pos - last_new_end) as i64));
