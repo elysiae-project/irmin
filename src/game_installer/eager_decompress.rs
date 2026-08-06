@@ -15,13 +15,13 @@ use super::assembly_opt::{
 use super::error::{SophonError, SophonResult};
 
 /// Buffer size for reading from the zstd decoder and writing to the output file.
-pub(crate) const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
+pub const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Performs eager decompression: decompresses compressed data and writes
 /// decompressed output directly to `out_file` at `chunk_offset`.
 ///
 /// Returns the number of decompressed bytes written on success.
-pub(crate) fn eager_decompress_chunk(
+pub fn eager_decompress_chunk(
     compressed_data: &[u8],
     out_file: &File,
     chunk_offset: u64,

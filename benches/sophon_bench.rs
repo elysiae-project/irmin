@@ -1445,5 +1445,51 @@ criterion_group!(
     bench_protobuf_decode,
     bench_buffer_pool,
     bench_hdiffpatch_e2e,
+    bench_eager_decompress,
 );
 criterion_main!(benches);
+
+fn bench_eager_decompress(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("eager_out.bin");
+
+    // Generate 8 MiB of compressible data
+    let data_size: usize = 8 * 1024 * 1024;
+    let mut data = vec![0u8; data_size];
+    let mut seed: u64 = 99999;
+    for b in data.iter_mut() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *b = (seed >> 33) as u8;
+    }
+
+    let compressed = zstd::encode_all(std::io::Cursor::new(&data), 3).unwrap();
+    let comp_hash = hex::encode(fast_md5::digest(&compressed));
+    let decomp_hash = hex::encode(fast_md5::digest(&data));
+
+    let mut group = c.benchmark_group("eager_decompress");
+    group.throughput(Throughput::Bytes(data_size as u64));
+
+    group.bench_function("8m", |b| {
+        b.iter(|| {
+            let out_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&out_path)
+                .unwrap();
+            out_file.set_len(data_size as u64).unwrap();
+            irmin::game_installer::eager_decompress::eager_decompress_chunk(
+                &compressed,
+                &out_file,
+                0,
+                data_size as u64,
+                &comp_hash,
+                &decomp_hash,
+            )
+            .unwrap();
+        });
+    });
+
+    group.finish();
+}
