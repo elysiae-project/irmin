@@ -1244,7 +1244,7 @@ fn build_v20_nocomp_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -1334,7 +1334,7 @@ fn build_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
