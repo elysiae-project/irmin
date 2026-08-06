@@ -168,6 +168,10 @@ impl HDiff {
         }
 
         let out_file = File::create(&self.dest_path)?;
+        if expected_size > 0 {
+            out_file.set_len(expected_size as u64)?;
+            let _ = crate::game_installer::sysio::preallocate(&out_file, expected_size as u64);
+        }
         let mut out_writer =
             BufWriter::with_capacity(super::super::FILE_WRITE_BUFFER_SIZE, out_file);
 
