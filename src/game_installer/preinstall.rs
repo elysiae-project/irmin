@@ -2314,7 +2314,5 @@ async fn apply_download_over(
 use crate::SophonProgress;
 
 #[cfg(test)]
-
-#[cfg(test)]
 #[path = "preinstall_tests.rs"]
 mod tests;
