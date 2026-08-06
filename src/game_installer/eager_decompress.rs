@@ -3,26 +3,25 @@
 //! Feeds HTTP bytes to a zstd streaming decoder and writes decompressed output
 //! directly to the target file at the chunk's offset via pwrite. Computes both
 //! compressed and decompressed hashes inline.
+#![allow(dead_code, unused_imports)]
 
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
 
 use super::assembly_opt::{
     self, chunk_hash_required, md5_hex_eq, md5_to_hex, return_md5, take_md5, xxh64_hex_eq, Md5,
 };
 use super::error::{SophonError, SophonResult};
-use super::handle::DownloadHandle;
 
 /// Buffer size for reading from the zstd decoder and writing to the output file.
-const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
+pub(crate) const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Performs eager decompression: downloads a chunk, decompresses inline, and writes
+/// Performs eager decompression: decompresses compressed data and writes
 /// decompressed output directly to `out_file` at `chunk_offset`.
 ///
 /// Returns the number of decompressed bytes written on success.
-pub fn eager_decompress_chunk(
+pub(crate) fn eager_decompress_chunk(
     compressed_data: &[u8],
     out_file: &File,
     chunk_offset: u64,
@@ -64,7 +63,7 @@ pub fn eager_decompress_chunk(
     }
 
     // Decompress and write to output file.
-    let reader = BufReader::with_capacity(256 * 1024, compressed_data);
+    let reader = std::io::BufReader::with_capacity(256 * 1024, compressed_data);
     let mut decoder =
         zstd::Decoder::new(reader).map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
 

@@ -4,7 +4,7 @@
 //! One bit per chunk index, stored as a file with an 8-byte header.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,7 +19,7 @@ pub struct ChunkBitmap {
 impl ChunkBitmap {
     /// Creates a new empty bitmap file at `path` for `total_chunks` entries.
     pub fn create(path: &Path, total_chunks: usize) -> io::Result<Self> {
-        let word_count = (total_chunks + 63) / 64;
+        let word_count = total_chunks.div_ceil(64);
         let byte_count = word_count * 8;
 
         let mut f = File::create(path)?;
@@ -51,7 +51,7 @@ impl ChunkBitmap {
         }
 
         let total_chunks = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        let word_count = (total_chunks + 63) / 64;
+        let word_count = total_chunks.div_ceil(64);
         let expected_len = 8 + word_count * 8;
 
         if data.len() < expected_len {

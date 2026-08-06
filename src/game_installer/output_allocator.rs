@@ -5,8 +5,6 @@
 //! declared size before downloads begin.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
