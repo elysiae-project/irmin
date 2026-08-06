@@ -13,7 +13,6 @@ use dashmap::DashMap;
 
 thread_local! {
     static TRANSFER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    static HASHER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 use super::assembly_opt::{Md5, md5_hex_eq, md5_to_hex, return_md5, take_md5};
@@ -349,6 +348,7 @@ pub fn assemble_file(
                 let err_flag = &has_error;
                 let hasher_result = &hasher_result;
                 let ht = &hasher_thread_handle;
+                let map_len = file_size as usize;
                 s.spawn(move || {
                     ht.set(std::thread::current()).ok();
                     let file = match File::open(tmp_path) {
@@ -365,14 +365,15 @@ pub fn assemble_file(
                             return;
                         }
                     };
-                    let mut buf = HASHER_BUF.with(|cell| {
-                        let mut buf = cell.take();
-                        if buf.capacity() < 256 * 1024 {
-                            buf = Vec::with_capacity(256 * 1024);
+                    // MAP_SHARED read-only mmap sees concurrent pwrite_at updates
+                    // to the page cache, eliminating per-chunk read_at syscalls.
+                    let map = match super::assembly_opt::mmap_shared_read_only(&file, map_len) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            *hasher_result.lock().unwrap() = Some(Err(SophonError::Io(e)));
+                            return;
                         }
-                        unsafe { buf.set_len(256 * 1024) };
-                        buf
-                    });
+                    };
                     for (i, &(offset, size)) in chunk_infos.iter().enumerate() {
                         loop {
                             if err_flag.load(Ordering::Relaxed) {
@@ -383,27 +384,11 @@ pub fn assemble_file(
                             }
                             std::thread::park_timeout(std::time::Duration::from_millis(1));
                         }
-                        let mut remaining = size as usize;
-                        let mut pos = offset;
-                        while remaining > 0 {
-                            let to_read = remaining.min(buf.len());
-                            use std::os::unix::fs::FileExt;
-                            let n = match file.read_at(&mut buf[..to_read], pos) {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    *hasher_result.lock().unwrap() = Some(Err(SophonError::Io(e)));
-                                    return;
-                                }
-                            };
-                            if n == 0 {
-                                break;
-                            }
-                            if let Err(e) = hasher.update(&buf[..n]) {
-                                *hasher_result.lock().unwrap() = Some(Err(SophonError::Io(e)));
-                                return;
-                            }
-                            remaining -= n;
-                            pos += n as u64;
+                        let off = offset as usize;
+                        let end = off + size as usize;
+                        if let Err(e) = hasher.update(&map.as_slice()[off..end]) {
+                            *hasher_result.lock().unwrap() = Some(Err(SophonError::Io(e)));
+                            return;
                         }
                     }
                     match hasher.finish() {
@@ -415,8 +400,7 @@ pub fn assemble_file(
                             *hasher_result.lock().unwrap() = Some(Err(SophonError::Io(e)));
                         }
                     }
-                    buf.clear();
-                    HASHER_BUF.with(|cell| cell.replace(buf));
+                    drop(map);
                 });
             }
 

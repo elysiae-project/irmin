@@ -252,6 +252,40 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
     })
 }
 
+/// MAP_SHARED read-only mapping: sees concurrent pwrite updates to the file's
+/// page cache. Used by the parallel hasher thread to hash assembling output
+/// without per-chunk read_at syscalls. `MADV_POPULATE_READ` pre-faults pages.
+pub(crate) fn mmap_shared_read_only(file: &File, len: usize) -> io::Result<MmapGuard> {
+    if len == 0 {
+        return Err(io::Error::other("empty file"));
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        // Pre-fault all pages so the hash loop doesn't pay per-page fault cost.
+        // Linux 5.14+; silently ignored on older kernels.
+        libc::madvise(ptr, len, libc::MADV_POPULATE_READ);
+        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+    }
+    Ok(MmapGuard {
+        ptr,
+        len,
+        map_base: ptr,
+        map_len: len,
+    })
+}
+
 fn page_size() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize)
