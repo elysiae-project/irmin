@@ -17,7 +17,7 @@ struct SavedState {
 }
 
 fn state_file(game_dir: &Path) -> std::path::PathBuf {
-    game_dir.with_extension(".preinstall_state.json")
+    game_dir.join(".preinstall_state.json")
 }
 
 fn progress(p: SophonProgress) {
