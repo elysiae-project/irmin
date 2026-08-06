@@ -574,10 +574,14 @@ pub fn decompress_chunk_optimized(
             &mut file_hasher,
             chunk_decompressed_hash_md5,
         );
-        if result.is_ok() {
-            return result;
+        match &result {
+            Ok(_) => return result,
+            // Hash mismatches indicate corrupt data; retrying with streaming won't help.
+            Err(SophonError::Md5Mismatch { .. }) => return result,
+            Err(SophonError::SizeMismatch { .. }) => return result,
+            // Decompression/IO errors may succeed with streaming (different window, buffering).
+            Err(_) => {}
         }
-        // Fall through to streaming decompression on any error.
     }
 
     let dynamic_log = window_log_for_size(expected_size);
