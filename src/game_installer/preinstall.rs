@@ -1640,6 +1640,26 @@ impl FilterCache {
     }
 }
 
+/// Case-insensitive substring check without allocating a lowercased copy.
+/// Assumes `pattern` is already lowercase.
+fn contains_ignore_ascii_case(haystack: &str, pattern: &str) -> bool {
+    if pattern.len() > haystack.len() {
+        return false;
+    }
+    let h = haystack.as_bytes();
+    let p = pattern.as_bytes();
+    for i in 0..=(h.len() - p.len()) {
+        if h[i..i + p.len()]
+            .iter()
+            .zip(p.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_filtered_asset(cache: &FilterCache, asset: &PatchAssetInfo) -> bool {
     if let Some(ref tokens) = cache.kdel_tokens {
         for token in tokens {
@@ -1650,11 +1670,11 @@ fn is_filtered_asset(cache: &FilterCache, asset: &PatchAssetInfo) -> bool {
     }
 
     if cache.blacklist_entries.is_some() || cache.ignored_lang_patterns.is_some() {
-        let asset_lower = asset.target_file_path.to_ascii_lowercase();
+        let path = &asset.target_file_path;
 
         if let Some(ref entries) = cache.blacklist_entries {
             for entry in entries {
-                if asset_lower.contains(entry.as_str()) {
+                if contains_ignore_ascii_case(path, entry) {
                     return true;
                 }
             }
@@ -1662,7 +1682,7 @@ fn is_filtered_asset(cache: &FilterCache, asset: &PatchAssetInfo) -> bool {
 
         if let Some(ref patterns) = cache.ignored_lang_patterns {
             for pattern in patterns {
-                if asset_lower.contains(pattern.as_str()) {
+                if contains_ignore_ascii_case(path, pattern) {
                     return true;
                 }
             }
