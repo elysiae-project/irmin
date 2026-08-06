@@ -414,6 +414,9 @@ fn decompress_chunk_oneshot(
     })();
 
     return_compressed_buf(compressed_buf);
+    // Evict compressed chunk pages from page cache.
+    posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+    drop(f);
     out_mmap.flush_and_evict();
     drop(out_mmap);
     result
