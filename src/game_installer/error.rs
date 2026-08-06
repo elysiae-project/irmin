@@ -539,5 +539,12 @@ mod tests {
         );
         assert!(!SophonError::OriginalFileMissing("f".into()).is_retryable());
         assert!(!SophonError::ApiError(400, "bad".into()).is_retryable());
+        assert!(
+            !SophonError::AssemblyIncomplete {
+                assembled: 99,
+                total: 100
+            }
+            .is_retryable()
+        );
     }
 }
