@@ -444,7 +444,7 @@ pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, le
             fd,
             offset as libc::off64_t,
             len as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WRITE,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
         )
     };
     posix_advise(fd, offset, len, libc::POSIX_FADV_DONTNEED);
