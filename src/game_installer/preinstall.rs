@@ -140,9 +140,10 @@ pub fn save_preinstall_state(game_dir: &Path, state: &PreinstallState) -> Sophon
         serde_json::to_writer(&mut writer, state)
             .map_err(|err| SophonError::PreinstallStateInvalid(err.to_string()))?;
         writer.flush()?;
-        let _ = writer
+        let inner = writer
             .into_inner()
             .map_err(|err| SophonError::Io(err.into_error()))?;
+        inner.sync_data()?;
     }
     fs::rename(&tmp_path, &path)?;
     Ok(())

@@ -111,6 +111,7 @@ pub fn save_verification_cache(
         let mut writer = std::io::BufWriter::with_capacity(super::FILE_WRITE_BUFFER_SIZE, f);
         serde_json::to_writer(&mut writer, &serializable)?;
         writer.flush()?;
+        writer.get_ref().sync_data()?;
     }
     fs::rename(&tmp_path, &cache_path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp_path);
