@@ -613,15 +613,25 @@ async fn download_with_resume(
             None
         };
     if hasher.is_some() || xxh64_hasher.is_some() {
-        pread_hash_slice(dest, existing_size, &mut |chunk| {
-            if let Some(ref mut h) = hasher {
-                h.update(chunk)?;
-            }
-            if let Some(ref mut h) = xxh64_hasher {
-                h.update(chunk);
-            }
-            Ok(())
-        })?;
+        let dest_owned = dest.to_path_buf();
+        let mut h = hasher.take();
+        let mut xh = xxh64_hasher.take();
+        let result = tokio::task::spawn_blocking(move || {
+            pread_hash_slice(&dest_owned, existing_size, &mut |chunk| {
+                if let Some(ref mut hasher) = h {
+                    hasher.update(chunk)?;
+                }
+                if let Some(ref mut xxh) = xh {
+                    xxh.update(chunk);
+                }
+                Ok(())
+            })?;
+            Ok::<_, SophonError>((h, xh))
+        })
+        .await
+        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
+        hasher = result.0;
+        xxh64_hasher = result.1;
     }
 
     let file = tokio::fs::OpenOptions::new()
