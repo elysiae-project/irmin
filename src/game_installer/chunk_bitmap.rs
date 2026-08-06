@@ -241,4 +241,67 @@ mod tests {
 
         assert_eq!(bm.count_complete(), 1000);
     }
+
+    #[test]
+    fn non_64_aligned_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bitmap");
+
+        // 65 chunks = 1 full word + 1 bit in second word
+        let bm = ChunkBitmap::create(&path, 65).unwrap();
+        bm.mark_complete(64);
+        assert!(bm.is_complete(64));
+        assert!(!bm.is_complete(63));
+
+        bm.sync().unwrap();
+        let loaded = ChunkBitmap::load(&path).unwrap();
+        assert!(loaded.is_complete(64));
+        assert_eq!(loaded.total_chunks(), 65);
+    }
+
+    #[test]
+    fn corrupted_file_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.bitmap");
+
+        // Too short
+        std::fs::write(&path, &[0u8; 4]).unwrap();
+        assert!(ChunkBitmap::load(&path).is_err());
+
+        // Wrong magic
+        let mut data = vec![0u8; 16];
+        data[..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        data[4..8].copy_from_slice(&10u32.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+        assert!(ChunkBitmap::load(&path).is_err());
+
+        // Truncated bitmap body
+        let mut data = vec![0u8; 8]; // header only, no bitmap bytes
+        data[..4].copy_from_slice(&0x49524D42u32.to_le_bytes()); // correct magic
+        data[4..8].copy_from_slice(&100u32.to_le_bytes()); // claims 100 chunks
+        std::fs::write(&path, &data).unwrap();
+        assert!(ChunkBitmap::load(&path).is_err());
+    }
+
+    #[test]
+    fn clear_range_crosses_word_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bitmap");
+
+        let bm = ChunkBitmap::create(&path, 128).unwrap();
+        // Mark chunks 60-70 (crosses the 64-bit word boundary at index 64)
+        for i in 60..70 {
+            bm.mark_complete(i);
+        }
+        assert!(bm.all_complete_for_range(60, 70));
+
+        // Clear 62-67 (crosses boundary)
+        bm.clear_range(62, 67);
+        assert!(!bm.is_complete(62));
+        assert!(!bm.is_complete(66));
+        assert!(bm.is_complete(60));
+        assert!(bm.is_complete(61));
+        assert!(bm.is_complete(67));
+        assert!(bm.is_complete(68));
+    }
 }
