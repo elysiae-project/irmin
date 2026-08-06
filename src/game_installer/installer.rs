@@ -1236,12 +1236,12 @@ fn notify_assembly_ready(
 async fn process_download_item(
     item: DownloadItem,
     item_idx: usize,
-    ctx: Arc<InstallContext>,
-    chunk_entries: Arc<Vec<FileEntry>>,
-    chunk_entry_offsets: Arc<Vec<u32>>,
-    pending_counts: Arc<Vec<AtomicU32>>,
-    assemble_tx: mpsc::Sender<(usize, usize)>,
-    handle: DownloadHandle,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    handle: &DownloadHandle,
 ) -> SophonResult<()> {
     let mut _chunk_timer = super::profiling::ChunkTimer::new(&ctx.profiler);
 
@@ -1271,12 +1271,12 @@ async fn process_download_item(
             &item,
             item_idx,
             chunk,
-            &ctx,
-            &chunk_entries,
-            &chunk_entry_offsets,
-            &pending_counts,
-            &assemble_tx,
-            &handle,
+            ctx,
+            chunk_entries,
+            chunk_entry_offsets,
+            pending_counts,
+            assemble_tx,
+            handle,
         )
         .await;
     }
@@ -1315,8 +1315,8 @@ async fn process_download_item(
             &ctx.installer_downloads[item.installer_idx as usize],
             &dest,
             needs_download.1,
-            &ctx,
-            &handle,
+            ctx,
+            handle,
         )
         .await?;
         was_actually_downloaded = true;
@@ -1439,10 +1439,10 @@ async fn process_download_item(
 
     notify_assembly_ready(
         item_idx,
-        &chunk_entries,
-        &chunk_entry_offsets,
-        &pending_counts,
-        &assemble_tx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        assemble_tx,
     );
 
     _chunk_timer.finish(chunk.chunk_size, was_actually_downloaded);
@@ -1510,12 +1510,12 @@ async fn run_downloads(
                 let result = process_download_item(
                     item,
                     item_idx,
-                    Arc::clone(&ctx),
-                    Arc::clone(&chunk_entries),
-                    Arc::clone(&chunk_entry_offsets),
-                    Arc::clone(&pending_counts),
-                    assemble_tx.clone(),
-                    handle.clone(),
+                    &ctx,
+                    &chunk_entries,
+                    &chunk_entry_offsets,
+                    &pending_counts,
+                    &assemble_tx,
+                    &handle,
                 )
                 .await;
                 if let Err(err) = result {

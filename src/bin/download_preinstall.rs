@@ -174,7 +174,7 @@ async fn async_main() {
 
     let result = game_installer::preinstall_download(
         &client,
-        &plan,
+        plan,
         game_dir,
         game_id,
         vo_lang,
