@@ -144,6 +144,12 @@ impl HDiff {
                     Ok(guard) => {
                         unsafe {
                             libc::madvise(guard.map_base, guard.map_len, libc::MADV_RANDOM);
+                            // Pre-fault source pages (Linux 5.14+). Silently ignored on older kernels.
+                            libc::madvise(
+                                guard.map_base,
+                                guard.map_len,
+                                22, /* MADV_POPULATE_READ */
+                            );
                         }
                         source_mmap = Some(guard);
                         source_cursor = Some(Cursor::new(source_mmap.as_ref().unwrap().as_slice()));
