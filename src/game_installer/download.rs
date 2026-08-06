@@ -19,13 +19,17 @@ use crate::api_scrape::DownloadInfo;
 pub(crate) struct EvictingWriter {
     inner: BufWriter<tokio::fs::File>,
     written: u64,
+    last_evicted: u64,
 }
+
+const EVICT_INTERVAL: u64 = 4 * 1024 * 1024;
 
 impl EvictingWriter {
     pub(crate) fn new(file: tokio::fs::File) -> Self {
         Self {
             inner: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_SIZE, file),
             written: 0,
+            last_evicted: 0,
         }
     }
 
@@ -33,12 +37,25 @@ impl EvictingWriter {
         Self {
             inner: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_SIZE, file),
             written: offset,
+            last_evicted: offset,
         }
     }
 
     pub(crate) async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         self.inner.write_all(buf).await?;
         self.written += buf.len() as u64;
+        // Periodically evict written pages to reduce page cache pressure.
+        if self.written - self.last_evicted >= EVICT_INTERVAL {
+            self.inner.flush().await?;
+            let fd = self.inner.get_ref().as_raw_fd();
+            posix_advise(
+                fd,
+                self.last_evicted,
+                self.written - self.last_evicted,
+                libc::POSIX_FADV_DONTNEED,
+            );
+            self.last_evicted = self.written;
+        }
         Ok(())
     }
 
