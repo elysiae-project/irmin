@@ -1179,7 +1179,7 @@ async fn process_eager_item(
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
 
     let _decompressed_bytes = tokio::task::spawn_blocking({
-        let compressed = compressed_data.to_vec();
+        let compressed = compressed_data;
         let out = Arc::clone(&out_file);
         let decomp_hash = chunk.chunk_decompressed_hash_md5.to_string();
         let comp_hash = chunk.chunk_compressed_hash_md5.to_string();

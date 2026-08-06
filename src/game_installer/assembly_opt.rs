@@ -149,6 +149,27 @@ fn hex_nibble(b: u8) -> Option<u8> {
 thread_local! {
     static OPT_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ZSTD_DCTX: RefCell<Option<zstd::zstd_safe::DCtx<'static>>> = const { RefCell::new(None) };
+    static EAGER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take the thread-local eager decompression buffer (1 MiB).
+pub(crate) fn take_eager_buf() -> Vec<u8> {
+    EAGER_BUF.with(|cell| {
+        let mut buf = std::mem::take(&mut *cell.borrow_mut());
+        if buf.capacity() < super::eager_decompress::EAGER_BUFFER_SIZE {
+            buf = Vec::with_capacity(super::eager_decompress::EAGER_BUFFER_SIZE);
+        }
+        unsafe { buf.set_len(super::eager_decompress::EAGER_BUFFER_SIZE) };
+        buf
+    })
+}
+
+/// Return the eager buffer to the thread-local pool.
+pub(crate) fn return_eager_buf(mut buf: Vec<u8>) {
+    buf.clear();
+    EAGER_BUF.with(|cell| {
+        *cell.borrow_mut() = buf;
+    });
 }
 
 pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {

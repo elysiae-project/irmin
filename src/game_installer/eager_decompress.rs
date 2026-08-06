@@ -62,16 +62,20 @@ pub(crate) fn eager_decompress_chunk(
         }
     }
 
-    // Decompress and write to output file.
-    let reader = std::io::BufReader::with_capacity(256 * 1024, compressed_data);
-    let mut decoder =
-        zstd::Decoder::new(reader).map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
-
-    // Skip zstd frame checksum when we verify via MD5.
+    // Decompress and write to output file using pooled DCtx.
     let need_decompressed_hash = chunk_hash_required(decompressed_hash);
+    let mut ctx = assembly_opt::take_dctx();
+    ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
+        .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
+    // Use MAX_WINDOW_LOG since we don't know the frame's actual window from metadata.
+    let window_log = assembly_opt::MAX_WINDOW_LOG;
+    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
+        .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx WindowLogMax")))?;
     if need_decompressed_hash {
-        let _ = decoder.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
     }
+
+    let mut decoder = zstd::Decoder::with_context(std::io::Cursor::new(compressed_data), &mut ctx);
 
     let mut decompressed_hasher: Option<Md5> = if need_decompressed_hash {
         Some(take_md5()?)
@@ -79,7 +83,8 @@ pub(crate) fn eager_decompress_chunk(
         None
     };
 
-    let mut buf = vec![0u8; EAGER_BUFFER_SIZE];
+    // Reuse thread-local buffer to avoid 1 MiB alloc per call.
+    let mut buf = assembly_opt::take_eager_buf();
     let mut bytes_written: u64 = 0;
     let mut write_offset = chunk_offset;
 
@@ -102,6 +107,11 @@ pub(crate) fn eager_decompress_chunk(
         write_offset += n as u64;
         bytes_written += n as u64;
     }
+
+    // Return pooled resources.
+    drop(decoder);
+    assembly_opt::return_dctx(ctx, window_log);
+    assembly_opt::return_eager_buf(buf);
 
     // Verify decompressed size.
     if bytes_written != expected_decompressed_size {
