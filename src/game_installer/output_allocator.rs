@@ -56,6 +56,9 @@ impl OutputAllocator {
 
         file.set_len(size).map_err(SophonError::Io)?;
         let _ = sysio::preallocate(&file, size);
+        // Random pwrite pattern from multiple workers; disable useless readahead.
+        use std::os::unix::io::AsRawFd;
+        super::assembly_opt::posix_advise(file.as_raw_fd(), 0, size, libc::POSIX_FADV_RANDOM);
 
         // Only insert if another thread didn't race us.
         self.handles.entry(file_idx).or_insert(Arc::new(file));
