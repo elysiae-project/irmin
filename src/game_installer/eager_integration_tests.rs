@@ -1,9 +1,6 @@
 //! Integration tests for eager decompression path.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::FileExt;
-use std::sync::Arc;
 
 use crate::game_installer::chunk_bitmap::ChunkBitmap;
 use crate::game_installer::eager_decompress::eager_decompress_chunk;
