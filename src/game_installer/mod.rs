@@ -4,6 +4,7 @@ mod api;
 pub mod assembly;
 mod assembly_opt;
 pub mod cache;
+pub mod chunk_bitmap;
 pub mod compact_manifest;
 mod download;
 mod error;
@@ -14,6 +15,7 @@ pub mod hdiffpatch;
 #[cfg(not(feature = "benchmark"))]
 mod hdiffpatch;
 pub mod installer;
+pub mod output_allocator;
 mod plugin_api;
 mod plugin_install;
 mod preinstall;
