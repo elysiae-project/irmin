@@ -125,7 +125,7 @@ pub fn compute_eta_speed(
     let slice = samples.make_contiguous();
     buf[..n].copy_from_slice(slice);
     let mid = n / 2;
-    buf[..n].select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    buf[..n].select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     if n.is_multiple_of(2) {
         // For even count, average the two middle elements.
         let left_max = buf[..mid].iter().copied().fold(f64::NEG_INFINITY, f64::max);
