@@ -1760,22 +1760,32 @@ pub async fn install(
 
     // Create directories before `build_installer_data` filters them out,
     // so new directories from updates exist on disk.
-    for installer in &installers {
-        for asset in &installer.manifest.assets {
-            if asset.is_directory() {
-                if let Err(err) = validate_asset_name(&asset.asset_name) {
+    {
+        let dirs: Vec<std::path::PathBuf> = installers
+            .iter()
+            .flat_map(|inst| inst.manifest.assets.iter())
+            .filter(|a| a.is_directory())
+            .filter_map(|a| {
+                if let Err(err) = validate_asset_name(&a.asset_name) {
                     log::warn!(
                         "Skipping directory with invalid asset_name \"{name}\": {err}",
-                        name = asset.asset_name
+                        name = a.asset_name
                     );
-                    continue;
+                    None
+                } else {
+                    Some(game_dir.join(&a.asset_name))
                 }
-                let dir_path = game_dir.join(&asset.asset_name);
-                let dp = dir_path.clone();
-                tokio::task::spawn_blocking(move || fs::create_dir_all(&dp))
-                    .await?
-                    .map_err(SophonError::from)?;
-            }
+            })
+            .collect();
+        if !dirs.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                for dir in &dirs {
+                    fs::create_dir_all(dir)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await?
+            .map_err(SophonError::from)?;
         }
     }
 
