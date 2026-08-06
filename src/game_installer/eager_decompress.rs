@@ -242,4 +242,125 @@ mod tests {
         assert!(full[..4096].iter().all(|&b| b == 0));
         assert!(full[6144..].iter().all(|&b| b == 0));
     }
+
+    #[test]
+    fn eager_decompress_xxh64_hash_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("output.bin");
+
+        let original = vec![0x77u8; 2048];
+        let compressed = compress_data(&original);
+        // XXH64 hash is 16 hex chars
+        let xxh = format!("{:016x}", xxhash_rust::xxh64::xxh64(&compressed, 0));
+        let decomp_hash = md5_hex(&original);
+
+        let out_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&out_path)
+            .unwrap();
+        out_file.set_len(2048).unwrap();
+
+        let written =
+            eager_decompress_chunk(&compressed, &out_file, 0, 2048, &xxh, &decomp_hash).unwrap();
+
+        assert_eq!(written, 2048);
+        let result = std::fs::read(&out_path).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn eager_decompress_corrupt_zstd_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("output.bin");
+
+        // Garbage bytes that aren't valid zstd
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03];
+
+        let out_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&out_path)
+            .unwrap();
+        out_file.set_len(1024).unwrap();
+
+        // Empty hash = skip verification, let decoder fail
+        let result = eager_decompress_chunk(&garbage, &out_file, 0, 1024, "", "");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eager_decompress_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("output.bin");
+
+        let original = vec![0x55u8; 1024];
+        let compressed = compress_data(&original);
+        let comp_hash = md5_hex(&compressed);
+
+        let out_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&out_path)
+            .unwrap();
+        out_file.set_len(2048).unwrap();
+
+        // Expect 2048 but data decompresses to 1024
+        let result = eager_decompress_chunk(
+            &compressed,
+            &out_file,
+            0,
+            2048, // wrong expected size
+            &comp_hash,
+            "",
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            super::super::error::SophonError::SizeMismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, 2048);
+                assert_eq!(actual, 1024);
+            }
+            other => panic!("expected SizeMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eager_decompress_decompressed_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("output.bin");
+
+        let original = vec![0x99u8; 512];
+        let compressed = compress_data(&original);
+        let comp_hash = md5_hex(&compressed);
+
+        let out_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&out_path)
+            .unwrap();
+        out_file.set_len(512).unwrap();
+
+        // Correct compressed hash but wrong decompressed hash
+        let result = eager_decompress_chunk(
+            &compressed,
+            &out_file,
+            0,
+            512,
+            &comp_hash,
+            "ffffffffffffffffffffffffffffffff", // wrong decompressed hash
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            super::super::error::SophonError::Md5Mismatch { .. } => {}
+            other => panic!("expected Md5Mismatch, got: {other:?}"),
+        }
+    }
 }
