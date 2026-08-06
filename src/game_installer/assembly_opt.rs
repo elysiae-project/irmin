@@ -240,6 +240,9 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
     }
     unsafe {
         libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+        if len >= 2 * 1024 * 1024 {
+            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+        }
     }
     Ok(MmapGuard {
         ptr,
