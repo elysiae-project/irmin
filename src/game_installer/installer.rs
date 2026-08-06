@@ -144,6 +144,7 @@ struct DownloadItem {
     chunk_idx: u32,
     installer_idx: u32,
     is_pre_downloaded: bool,
+    use_eager: bool,
 }
 
 type FileEntry = (u32, u32, u32);
@@ -611,6 +612,9 @@ fn register_chunks_for_file<'a>(
 ) {
     let range = all_files.file_chunk_range(file_idx);
 
+    // A file qualifies for eager decompression when all its chunks are pure downloads.
+    let file_is_eager = (range.start..range.end)
+        .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
     for ci in range.start..range.end {
@@ -635,6 +639,7 @@ fn register_chunks_for_file<'a>(
                 chunk_idx: (global_chunk_idx - range.start as usize) as u32,
                 installer_idx: installer_idx as u32,
                 is_pre_downloaded: is_pre,
+                use_eager: file_is_eager,
             });
             download_items_index.insert(name, idx);
             idx
