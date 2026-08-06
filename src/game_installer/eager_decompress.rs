@@ -165,6 +165,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&out_path)
             .unwrap();
         out_file.set_len(4096).unwrap();
@@ -191,6 +192,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&out_path)
             .unwrap();
         out_file.set_len(1024).unwrap();
@@ -225,6 +227,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&out_path)
             .unwrap();
         // File is 8192 bytes, chunk goes at offset 4096
@@ -258,6 +261,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&out_path)
             .unwrap();
         out_file.set_len(2048).unwrap();
@@ -282,6 +286,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&out_path)
             .unwrap();
         out_file.set_len(1024).unwrap();
@@ -304,6 +309,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&out_path)
             .unwrap();
         out_file.set_len(2048).unwrap();
@@ -343,6 +349,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&out_path)
             .unwrap();
         out_file.set_len(512).unwrap();
