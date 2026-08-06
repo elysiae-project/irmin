@@ -26,6 +26,8 @@ mod profiling;
 pub mod sysio;
 
 #[cfg(test)]
+mod eager_integration_tests;
+#[cfg(test)]
 mod integration_tests;
 
 /// Max retries for failed chunk downloads.
