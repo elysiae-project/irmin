@@ -1227,7 +1227,11 @@ fn notify_assembly_ready(
     for (file_idx, tmp_dir_idx, pending_idx) in &chunk_entries[start..end] {
         let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            let _ = assemble_tx.try_send((*file_idx as usize, *tmp_dir_idx as usize));
+            if let Err(e) = assemble_tx.try_send((*file_idx as usize, *tmp_dir_idx as usize)) {
+                log::error!(
+                    "Assembly notification dropped for file_idx={file_idx}: {e}. File may not be assembled.",
+                );
+            }
         }
     }
 }
