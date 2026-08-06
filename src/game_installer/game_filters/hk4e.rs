@@ -45,6 +45,19 @@ pub fn filter_hk4e_asset_list(
         .copied()
         .collect();
 
+    // Filter ctable_streaming.dat unconditionally (not language-dependent).
+    assets.retain(|asset| {
+        if asset
+            .asset_name
+            .to_lowercase()
+            .ends_with("ctable_streaming.dat")
+        {
+            log::warn!("Filtered ctable asset: {}", asset.asset_name);
+            return false;
+        }
+        true
+    });
+
     if ignored_langs.is_empty() {
         return;
     }
@@ -64,12 +77,6 @@ pub fn filter_hk4e_asset_list(
                 log::warn!("Filtered unneeded audio asset: {name}");
                 return false;
             }
-        }
-
-        if asset_lower.ends_with("ctable_streaming.dat") {
-            let name = &asset.asset_name;
-            log::warn!("Filtered ctable asset: {name}");
-            return false;
         }
 
         true

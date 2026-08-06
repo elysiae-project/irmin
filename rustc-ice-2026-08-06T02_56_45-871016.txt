@@ -1,0 +1,26 @@
+thread 'rustc' panicked at /rustc-dev/c935696dd07ca51e6fba2f6579919eea2a50863b/compiler/rustc_errors/src/lib.rs:455:17:
+`trimmed_def_paths` called, diagnostics were expected but none were emitted. Use `with_no_trimmed_paths` for debugging. Backtraces are currently disabled: set `RUST_BACKTRACE=1` and re-run to see where it happened.
+stack backtrace:
+   0:     0x7f8f65a41d0b - <std[d7d0ddfb10bdc7]::backtrace::Backtrace>::create
+   1:     0x7f8f65a41c55 - <std[d7d0ddfb10bdc7]::backtrace::Backtrace>::force_capture
+   2:     0x7f8f64a50dad - std[d7d0ddfb10bdc7]::panicking::update_hook::<alloc[23a4481fcbb97b7f]::boxed::Box<rustc_driver_impl[50e76e1dd3a4a14e]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7f8f65a54952 - std[d7d0ddfb10bdc7]::panicking::panic_with_hook
+   4:     0x7f8f65a37252 - std[d7d0ddfb10bdc7]::panicking::panic_handler::{closure#0}
+   5:     0x7f8f65a2b789 - std[d7d0ddfb10bdc7]::sys::backtrace::__rust_end_short_backtrace::<std[d7d0ddfb10bdc7]::panicking::panic_handler::{closure#0}, !>
+   6:     0x7f8f65a38cbd - __rustc[4b25d82b28ca9f99]::rust_begin_unwind
+   7:     0x7f8f6277f93c - core[67c42cdc86eeb6b0]::panicking::panic_fmt
+   8:     0x7f8f6702a992 - <rustc_errors[e0bcd30e0b1f1c7b]::DiagCtxtInner as core[67c42cdc86eeb6b0]::ops::drop::Drop>::drop
+   9:     0x7f8f6702a250 - core[67c42cdc86eeb6b0]::ptr::drop_in_place::<rustc_errors[e0bcd30e0b1f1c7b]::DiagCtxt>
+  10:     0x7f8f6719ece3 - core[67c42cdc86eeb6b0]::ptr::drop_in_place::<rustc_session[25366934795e3cb6]::parse::ParseSess>
+  11:     0x7f8f6719f24e - core[67c42cdc86eeb6b0]::ptr::drop_in_place::<rustc_interface[57babec0e12977f3]::interface::Compiler>
+  12:     0x7f8f67195093 - rustc_interface[57babec0e12977f3]::interface::run_compiler::<(), rustc_driver_impl[50e76e1dd3a4a14e]::run_compiler::{closure#0}>::{closure#1}
+  13:     0x7f8f6716217e - std[d7d0ddfb10bdc7]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[57babec0e12977f3]::util::run_in_thread_with_globals<rustc_interface[57babec0e12977f3]::util::run_in_thread_pool_with_globals<rustc_interface[57babec0e12977f3]::interface::run_compiler<(), rustc_driver_impl[50e76e1dd3a4a14e]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  14:     0x7f8f671628ad - <std[d7d0ddfb10bdc7]::thread::lifecycle::spawn_unchecked<rustc_interface[57babec0e12977f3]::util::run_in_thread_with_globals<rustc_interface[57babec0e12977f3]::util::run_in_thread_pool_with_globals<rustc_interface[57babec0e12977f3]::interface::run_compiler<(), rustc_driver_impl[50e76e1dd3a4a14e]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[67c42cdc86eeb6b0]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  15:     0x7f8f6716366c - <std[d7d0ddfb10bdc7]::sys::thread::unix::Thread>::new::thread_start
+  16:     0x7f8f60cac798 - <unknown>
+  17:     0x7f8f60d4da7c - <unknown>
+  18:                0x0 - <unknown>
+
+
+rustc version: 1.97.0-nightly (c935696dd 2026-04-29)
+platform: x86_64-unknown-linux-gnu
