@@ -1134,7 +1134,7 @@ async fn process_eager_item(
         // Already decompressed in a prior session. Update progress and skip.
         ctx.downloaded_bytes
             .fetch_add(chunk.chunk_size, Ordering::Relaxed);
-        notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx);
+        notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx, &ctx.output_allocator);
         return Ok(());
     }
 
@@ -1206,7 +1206,7 @@ async fn process_eager_item(
         .fetch_add(chunk.chunk_size, Ordering::Relaxed);
 
     // Notify assembly (for file-level completion tracking via pending_counts).
-    notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx);
+    notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx, &ctx.output_allocator);
 
     Ok(())
 }
@@ -1217,6 +1217,7 @@ fn notify_assembly_ready(
     chunk_entry_offsets: &[u32],
     pending_counts: &[AtomicU32],
     assemble_tx: &mpsc::Sender<(usize, usize)>,
+    output_allocator: &super::output_allocator::OutputAllocator,
 ) {
     let start = chunk_entry_offsets.get(item_idx).copied().unwrap_or(0) as usize;
     let end = chunk_entry_offsets.get(item_idx + 1).copied().unwrap_or(0) as usize;
@@ -1226,12 +1227,14 @@ fn notify_assembly_ready(
 
     for (file_idx, tmp_dir_idx, pending_idx) in &chunk_entries[start..end] {
         let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
-        if prev == 1
-            && let Err(e) = assemble_tx.try_send((*file_idx as usize, *tmp_dir_idx as usize))
-        {
-            log::error!(
-                "Assembly notification dropped for file_idx={file_idx}: {e}. File may not be assembled.",
-            );
+        if prev == 1 {
+            // All chunks written — release the cached FD.
+            output_allocator.close_file(*file_idx as usize);
+            if let Err(e) = assemble_tx.try_send((*file_idx as usize, *tmp_dir_idx as usize)) {
+                log::error!(
+                    "Assembly notification dropped for file_idx={file_idx}: {e}. File may not be assembled.",
+                );
+            }
         }
     }
 }
@@ -1410,6 +1413,7 @@ async fn process_download_item(
         chunk_entry_offsets,
         pending_counts,
         assemble_tx,
+        &ctx.output_allocator,
     );
 
     _chunk_timer.finish(chunk.chunk_size, was_actually_downloaded);
@@ -1716,6 +1720,7 @@ pub async fn install(
     game_code: &str,
     vo_langs: &[String],
 ) -> SophonResult<()> {
+    super::raise_fd_limit();
     let game_dir_arc: Arc<PathBuf> = Arc::new(game_dir.to_path_buf());
     let chunks_dir = Arc::new(game_dir_arc.join("chunks"));
     let game_dir = game_dir_arc.as_path();

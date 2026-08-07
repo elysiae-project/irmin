@@ -447,6 +447,8 @@
         let pending_counts: Vec<AtomicU32> = vec![AtomicU32::new(1)];
         let chunk_entries: Vec<FileEntry> = vec![(0u32, 0u32, 0u32)];
         let chunk_entry_offsets: Vec<u32> = vec![0, 1];
+        let tmp = tempfile::tempdir().unwrap();
+        let alloc = super::output_allocator::OutputAllocator::new(tmp.path());
 
         notify_assembly_ready(
             0,
@@ -454,6 +456,7 @@
             &chunk_entry_offsets,
             &pending_counts,
             &tx,
+            &alloc,
         );
 
         let received = rx.try_recv();
@@ -469,6 +472,8 @@
         let pending_counts: Vec<AtomicU32> = vec![];
         let (tx, rx) = mpsc::channel::<(usize, usize)>(16);
         drop(rx);
+        let tmp = tempfile::tempdir().unwrap();
+        let alloc = super::output_allocator::OutputAllocator::new(tmp.path());
 
         notify_assembly_ready(
             999,
@@ -476,6 +481,7 @@
             &chunk_entry_offsets,
             &pending_counts,
             &tx,
+            &alloc,
         );
     }
 
