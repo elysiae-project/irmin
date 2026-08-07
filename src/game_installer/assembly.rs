@@ -16,7 +16,7 @@ thread_local! {
 }
 
 use super::assembly_opt::{Md5, md5_hex_eq, md5_to_hex, return_md5, take_md5};
-use super::cache::VerificationEntry;
+use super::cache::{VerificationEntry, file_md5_digest};
 use super::error::{SophonError, SophonResult};
 use super::installer::ChunkNameLookup;
 use super::{FILE_WRITE_BUFFER_SIZE, PROGRESS_UPDATE_INTERVAL_MS};
@@ -904,7 +904,22 @@ pub fn run_assembly_task(
                 }
                 false
             } else {
-                true
+                // No verify_cache entry — hash the file to check correctness
+                // (handles eager files that bypassed the cache).
+                match file_md5_digest(&target_path) {
+                    Ok(ref digest) if md5_hex_eq(digest, file_hash_md5) => {
+                        for ci in chunk_range.start..chunk_range.end {
+                            decrement_chunk_refcount(
+                                all_files.chunk(ci as usize).chunk_name,
+                                &chunk_names,
+                                &chunk_refcounts,
+                                &chunks_dir,
+                            );
+                        }
+                        false
+                    }
+                    _ => true,
+                }
             }
         }
         _ => true,
