@@ -1268,6 +1268,26 @@ fn notify_eager_file_complete(
             ctx.output_allocator.close_file(file_idx);
             // Mark file complete (idempotent).
             ctx.completion_flags[file_idx].store(true, Ordering::Release);
+            // Populate verify_cache so resume skips expensive MD5 rehash.
+            if ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES {
+                let file_name = ctx.all_files.file_name(file_idx);
+                let target_path = ctx.game_dir.join(file_name);
+                if let Ok(meta) = target_path.metadata() {
+                    let mtime_secs = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs());
+                    ctx.verify_cache.insert(
+                        file_name.to_string(),
+                        super::cache::VerificationEntry {
+                            size: ctx.all_files.file_size(file_idx),
+                            md5: ctx.all_files.file_hash_md5(file_idx).to_string(),
+                            mtime_secs,
+                        },
+                    );
+                }
+            }
             // Update counters + progress (mirrors assembly coordinator).
             let checked = ctx.checked_files.fetch_add(1, Ordering::Relaxed) + 1;
             let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
