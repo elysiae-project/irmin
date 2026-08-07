@@ -457,7 +457,16 @@ pub fn assemble_file(
                                 chunk.chunk_decompressed_hash_md5,
                             )
                         } else {
-                            debug_assert!(validate_chunk_name(chunk.chunk_name));
+                            if !validate_chunk_name(chunk.chunk_name) {
+                                let mut guard = err.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some(SophonError::PathTraversal(
+                                        chunk.chunk_name.into(),
+                                    ));
+                                }
+                                err_flag.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             chunk_path.push(chunk.chunk_name);
                             chunk_path.set_extension("zstd");
                             let result = write_decompressed_chunk_at(
@@ -545,7 +554,10 @@ pub fn assemble_file(
                 total_written += bytes_written;
             // Old-source chunks were never downloaded.
             } else {
-                debug_assert!(validate_chunk_name(chunk.chunk_name));
+                if !validate_chunk_name(chunk.chunk_name) {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(SophonError::PathTraversal(chunk.chunk_name.into()));
+                }
                 chunk_path.push(chunk.chunk_name);
                 chunk_path.set_extension("zstd");
 
