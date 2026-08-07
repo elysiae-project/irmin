@@ -1235,6 +1235,14 @@ async fn process_eager_item(
     // Mark chunk complete in bitmap.
     ctx.chunk_bitmap.mark_complete(global_chunk_idx);
 
+    // Periodic bitmap sync (same cadence as assembly state saves).
+    let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
+        if let Err(e) = ctx.chunk_bitmap.sync() {
+            log::warn!("Failed to sync chunk bitmap: {e}");
+        }
+    }
+
     // Update progress.
     ctx.downloaded_bytes
         .fetch_add(chunk.chunk_size, Ordering::Relaxed);
@@ -1458,6 +1466,9 @@ async fn process_download_item(
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
         save_assembly_state(ctx).await;
+        if let Err(e) = ctx.chunk_bitmap.sync() {
+            log::warn!("Failed to sync chunk bitmap: {e}");
+        }
     }
 
     let db = if was_actually_downloaded {
@@ -2306,8 +2317,10 @@ pub async fn install(
             let bitmap_path = game_dir.join(".sophon_bitmap");
             let total = all_files.num_chunks();
             Arc::new(if bitmap_path.exists() {
-                super::chunk_bitmap::ChunkBitmap::load(&bitmap_path)
-                    .unwrap_or_else(|_| super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total).unwrap())
+                match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
+                    Ok(bm) if bm.total_chunks() == total => bm,
+                    _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total).unwrap(),
+                }
             } else {
                 super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total).unwrap()
             })
@@ -2413,6 +2426,11 @@ pub async fn install(
 
     // Downloads are done — let assembly run at full speed.
     ctx.adaptive_assembly.set_download_active(false);
+
+    // Final bitmap flush — covers the tail that didn't hit the periodic interval.
+    if let Err(e) = ctx.chunk_bitmap.sync() {
+        log::warn!("Failed final chunk bitmap sync: {e}");
+    }
 
     {
         let total = ctx.total_bytes;
