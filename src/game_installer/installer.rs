@@ -2043,7 +2043,7 @@ pub async fn install(
         let indices_arc: Arc<DashSet<usize>> = Arc::new(DashSet::new());
         let files_to_delete: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let resume_bitmap: Option<Arc<super::chunk_bitmap::ChunkBitmap>> = {
-            let bitmap_path = game_dir.join(".sophon_bitmap");
+            let bitmap_path = game_dir.join(format!(".sophon_bitmap_{}", &current_manifest_hash[..16]));
             if bitmap_path.exists() {
                 super::chunk_bitmap::ChunkBitmap::load(&bitmap_path).ok().map(Arc::new)
             } else {
@@ -2319,7 +2319,19 @@ pub async fn install(
         completion_flags: Arc::clone(&completion_flags),
         output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(game_dir)),
         chunk_bitmap: {
-            let bitmap_path = game_dir.join(".sophon_bitmap");
+            let bitmap_path = game_dir.join(format!(".sophon_bitmap_{}", &current_manifest_hash[..16]));
+            // Remove stale bitmaps from previous manifest versions.
+            if let Ok(entries) = std::fs::read_dir(game_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(".sophon_bitmap")
+                        && name_str != bitmap_path.file_name().unwrap().to_string_lossy()
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
             let total = all_files.num_chunks();
             Arc::new(if bitmap_path.exists() {
                 match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
