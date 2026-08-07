@@ -90,10 +90,10 @@ impl ChunkBitmap {
         self.bits[word_idx].fetch_or(1u64 << bit_idx, Ordering::Release);
 
         let count = self.ops_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count & (SYNC_INTERVAL - 1) == 0 {
-            if let Err(e) = self.sync() {
-                log::warn!("ChunkBitmap auto-sync failed: {e}");
-            }
+        if count & (SYNC_INTERVAL - 1) == 0
+            && let Err(e) = self.sync()
+        {
+            log::warn!("ChunkBitmap auto-sync failed: {e}");
         }
     }
 

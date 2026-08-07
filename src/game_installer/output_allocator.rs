@@ -51,6 +51,7 @@ impl OutputAllocator {
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(&full_path)
                     .map_err(SophonError::Io)?;
 

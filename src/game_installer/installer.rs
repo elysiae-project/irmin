@@ -1237,10 +1237,10 @@ async fn process_eager_item(
 
     // Periodic bitmap sync (same cadence as assembly state saves).
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
-    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-        if let Err(e) = ctx.chunk_bitmap.sync() {
-            log::warn!("Failed to sync chunk bitmap: {e}");
-        }
+    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL)
+        && let Err(e) = ctx.chunk_bitmap.sync()
+    {
+        log::warn!("Failed to sync chunk bitmap: {e}");
     }
 
     // Update progress.
@@ -2107,7 +2107,7 @@ pub async fn install(
                         let is_eager = (chunk_range.start..chunk_range.end)
                             .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
                         if size_ok && is_eager {
-                            resume_bitmap.as_ref().map_or(false, |bm| {
+                            resume_bitmap.as_ref().is_some_and(|bm| {
                                 bm.all_complete_for_range(
                                     chunk_range.start as usize,
                                     chunk_range.end as usize,
