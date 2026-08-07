@@ -273,9 +273,12 @@ pub(crate) fn mmap_shared_read_only(file: &File, len: usize) -> io::Result<MmapG
         return Err(io::Error::last_os_error());
     }
     unsafe {
-        // Pre-fault all pages so the hash loop doesn't pay per-page fault cost.
-        // Linux 5.14+; silently ignored on older kernels.
-        libc::madvise(ptr, len, libc::MADV_POPULATE_READ);
+        // Pre-fault pages so the hash loop doesn't pay per-page fault cost.
+        // Only for files ≤256 MiB; larger files rely on demand-paging to avoid
+        // blocking the thread and spiking RSS.
+        if len <= 256 * 1024 * 1024 {
+            libc::madvise(ptr, len, libc::MADV_POPULATE_READ);
+        }
         libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
     }
     Ok(MmapGuard {
