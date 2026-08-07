@@ -1121,7 +1121,6 @@ async fn process_eager_item(
     chunk_entries: &[FileEntry],
     chunk_entry_offsets: &[u32],
     pending_counts: &[AtomicU32],
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
     handle: &DownloadHandle,
 ) -> SophonResult<()> {
 
@@ -1134,7 +1133,7 @@ async fn process_eager_item(
         // Already decompressed in a prior session. Update progress and skip.
         ctx.downloaded_bytes
             .fetch_add(chunk.chunk_size, Ordering::Relaxed);
-        notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx, &ctx.output_allocator);
+        notify_eager_file_complete(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, ctx);
         return Ok(());
     }
 
@@ -1240,10 +1239,64 @@ async fn process_eager_item(
     ctx.downloaded_bytes
         .fetch_add(chunk.chunk_size, Ordering::Relaxed);
 
-    // Notify assembly (for file-level completion tracking via pending_counts).
-    notify_assembly_ready(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, assemble_tx, &ctx.output_allocator);
+    // Eager files are already fully written — skip assembly, just track completion.
+    notify_eager_file_complete(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, ctx);
 
     Ok(())
+}
+
+/// When all eager chunks for a file complete, mark the file done directly
+/// (no assembly needed since pwrite already placed decompressed data).
+fn notify_eager_file_complete(
+    item_idx: usize,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    ctx: &InstallContext,
+) {
+    let start = chunk_entry_offsets.get(item_idx).copied().unwrap_or(0) as usize;
+    let end = chunk_entry_offsets.get(item_idx + 1).copied().unwrap_or(0) as usize;
+    if start >= end {
+        return;
+    }
+
+    for (file_idx, _tmp_dir_idx, pending_idx) in &chunk_entries[start..end] {
+        let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            let file_idx = *file_idx as usize;
+            // Close the cached output FD.
+            ctx.output_allocator.close_file(file_idx);
+            // Mark file complete (idempotent).
+            ctx.completion_flags[file_idx].store(true, Ordering::Release);
+            // Update counters + progress (mirrors assembly coordinator).
+            let checked = ctx.checked_files.fetch_add(1, Ordering::Relaxed) + 1;
+            let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
+            let total = ctx.total_files;
+            let force = checked == total || assembled == total;
+            if force {
+                (ctx.updater)(SophonProgress::CheckingFiles {
+                    checked_files: checked,
+                    total_files: total,
+                });
+                (ctx.updater)(SophonProgress::Assembling {
+                    assembled_files: assembled,
+                    total_files: total,
+                });
+            } else if let Ok(mut lu) = ctx.last_assembly_update.try_lock()
+                && lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS)
+            {
+                (ctx.updater)(SophonProgress::CheckingFiles {
+                    checked_files: checked,
+                    total_files: total,
+                });
+                (ctx.updater)(SophonProgress::Assembling {
+                    assembled_files: assembled,
+                    total_files: total,
+                });
+                *lu = std::time::Instant::now();
+            }
+        }
+    }
 }
 
 fn notify_assembly_ready(
@@ -1317,7 +1370,6 @@ async fn process_download_item(
             chunk_entries,
             chunk_entry_offsets,
             pending_counts,
-            assemble_tx,
             handle,
         )
         .await;
