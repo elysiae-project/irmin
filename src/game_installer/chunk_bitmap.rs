@@ -9,11 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: u32 = 0x49524D42; // "IRMB"
+                               // ponytail: 1024 = ~100 syncs for 100k chunks, negligible overhead.
+                               // Power of 2 so the modulo is a single bitwise AND.
+const SYNC_INTERVAL: u64 = 1024;
 
 pub struct ChunkBitmap {
     bits: Vec<AtomicU64>,
     path: PathBuf,
     total_chunks: usize,
+    ops_count: AtomicU64,
 }
 
 impl ChunkBitmap {
@@ -35,6 +39,7 @@ impl ChunkBitmap {
             bits,
             path: path.to_path_buf(),
             total_chunks,
+            ops_count: AtomicU64::new(0),
         })
     }
 
@@ -70,15 +75,26 @@ impl ChunkBitmap {
             bits,
             path: path.to_path_buf(),
             total_chunks,
+            ops_count: AtomicU64::new(0),
         })
     }
 
     /// Marks a chunk as complete. Thread-safe (atomic OR).
+    /// Auto-syncs to disk every SYNC_INTERVAL calls.
     pub fn mark_complete(&self, chunk_idx: usize) {
-        debug_assert!(chunk_idx < self.total_chunks);
+        if chunk_idx >= self.total_chunks {
+            return;
+        }
         let word_idx = chunk_idx / 64;
         let bit_idx = chunk_idx % 64;
         self.bits[word_idx].fetch_or(1u64 << bit_idx, Ordering::Release);
+
+        let count = self.ops_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count & (SYNC_INTERVAL - 1) == 0 {
+            if let Err(e) = self.sync() {
+                log::warn!("ChunkBitmap auto-sync failed: {e}");
+            }
+        }
     }
 
     /// Checks if a chunk is marked complete.
