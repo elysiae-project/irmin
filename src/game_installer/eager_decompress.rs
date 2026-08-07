@@ -109,8 +109,9 @@ pub fn eager_decompress_chunk(
     }
 
     // Return pooled resources.
+    // ctx is not pooled: window_log=26 exceeds the pool's 22-bit threshold.
     drop(decoder);
-    assembly_opt::return_dctx(ctx, window_log);
+    drop(ctx);
     assembly_opt::return_eager_buf(buf);
 
     // Verify decompressed size.
