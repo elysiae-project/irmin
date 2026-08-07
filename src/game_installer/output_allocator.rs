@@ -35,33 +35,43 @@ impl OutputAllocator {
         relative_path: &str,
         size: u64,
     ) -> SophonResult<()> {
-        // Use entry API to avoid TOCTOU race (two workers calling simultaneously).
-        if self.handles.contains_key(&file_idx) {
-            return Ok(());
-        }
+        let game_dir = &self.game_dir;
 
-        let full_path = self.game_dir.join(relative_path);
+        // Atomic check-and-insert: closure runs only if key is absent.
+        self.handles
+            .entry(file_idx)
+            .or_try_insert_with(|| -> SophonResult<Arc<File>> {
+                let full_path = game_dir.join(relative_path);
 
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent).map_err(SophonError::Io)?;
-        }
+                if let Some(parent) = full_path.parent() {
+                    fs::create_dir_all(parent).map_err(SophonError::Io)?;
+                }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&full_path)
-            .map_err(SophonError::Io)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(&full_path)
+                    .map_err(SophonError::Io)?;
 
-        file.set_len(size).map_err(SophonError::Io)?;
-        let _ = sysio::preallocate(&file, size);
-        // Random pwrite pattern from multiple workers; disable useless readahead.
-        use std::os::unix::io::AsRawFd;
-        super::assembly_opt::posix_advise(file.as_raw_fd(), 0, size, libc::POSIX_FADV_RANDOM);
+                // Only extend; never shrink (preserves data on resume).
+                let current_len = file.metadata().map_err(SophonError::Io)?.len();
+                if current_len < size {
+                    file.set_len(size).map_err(SophonError::Io)?;
+                    let _ = sysio::preallocate(&file, size);
+                }
 
-        // Only insert if another thread didn't race us.
-        self.handles.entry(file_idx).or_insert(Arc::new(file));
+                use std::os::unix::io::AsRawFd;
+                super::assembly_opt::posix_advise(
+                    file.as_raw_fd(),
+                    0,
+                    size,
+                    libc::POSIX_FADV_RANDOM,
+                );
+
+                Ok(Arc::new(file))
+            })?;
+
         Ok(())
     }
 
