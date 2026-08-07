@@ -2026,6 +2026,14 @@ pub async fn install(
         let completed_chunk_indices_arc: Arc<DashSet<u32>> = Arc::new(DashSet::new());
         let indices_arc: Arc<DashSet<usize>> = Arc::new(DashSet::new());
         let files_to_delete: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let resume_bitmap: Option<Arc<super::chunk_bitmap::ChunkBitmap>> = {
+            let bitmap_path = game_dir.join(".sophon_bitmap");
+            if bitmap_path.exists() {
+                super::chunk_bitmap::ChunkBitmap::load(&bitmap_path).ok().map(Arc::new)
+            } else {
+                None
+            }
+        };
 
         let calc_futures = (0..all_files.num_files()).map(|file_idx| {
             let all_files = Arc::clone(&all_files);
@@ -2039,6 +2047,7 @@ pub async fn install(
             let indices_arc = Arc::clone(&indices_arc);
             let files_to_delete = Arc::clone(&files_to_delete);
             let updater = Arc::clone(&callbacks.updater);
+            let resume_bitmap = resume_bitmap.clone();
 
             async move {
                 let _permit = permit.acquire().await.ok()?;
@@ -2078,10 +2087,24 @@ pub async fn install(
                         .await
                         .ok()?
                     } else {
-                        tokio::fs::metadata(&target_path)
+                        let size_ok = tokio::fs::metadata(&target_path)
                             .await
                             .map(|m| m.len() == file_size)
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        // For eager files (preallocated to full size), size alone is
+                        // insufficient — verify bitmap confirms all chunks were written.
+                        let is_eager = (chunk_range.start..chunk_range.end)
+                            .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+                        if size_ok && is_eager {
+                            resume_bitmap.as_ref().map_or(false, |bm| {
+                                bm.all_complete_for_range(
+                                    chunk_range.start as usize,
+                                    chunk_range.end as usize,
+                                )
+                            })
+                        } else {
+                            size_ok
+                        }
                     };
 
                     if valid {
