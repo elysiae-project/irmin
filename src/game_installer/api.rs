@@ -33,6 +33,13 @@ async fn fetch_json_with_retry<T: serde::de::DeserializeOwned>(
 
         match result {
             Ok(Ok(resp)) => {
+                let status = resp.status();
+                if (status.is_server_error() || status.as_u16() == 429)
+                    && attempt < API_MAX_RETRIES - 1
+                {
+                    tokio::time::sleep(Duration::from_secs(2u64.saturating_pow(attempt))).await;
+                    continue;
+                }
                 let resp = resp.error_for_status()?;
                 return resp.json().await.map_err(|err| err.into());
             }
@@ -166,6 +173,13 @@ pub async fn fetch_patch_build(
 
         match result {
             Ok(Ok(resp)) => {
+                let status = resp.status();
+                if (status.is_server_error() || status.as_u16() == 429)
+                    && attempt + 1 < API_MAX_RETRIES
+                {
+                    tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                    continue;
+                }
                 let resp = resp.error_for_status()?;
                 let resp: SophonPatchBuildResponse = resp.json().await?;
                 let data = resp
