@@ -1147,23 +1147,58 @@ async fn process_eager_item(
             .preallocate_file(file_idx, file_name, file_size)?;
     }
 
-    // Download compressed chunk into memory.
+    // Download compressed chunk into memory (with retries).
     let client = &ctx.installer_clients[item.installer_idx as usize];
     let download_info = &ctx.installer_downloads[item.installer_idx as usize];
     let mut url = String::with_capacity(256);
     download_info.url_for_into(chunk.chunk_name, &mut url);
 
-    let resp = client.get(&url).send().await?;
+    let compressed_data = {
+        let mut attempts: u32 = 0;
+        loop {
+            if handle.is_cancelled() {
+                return Err(SophonError::Cancelled);
+            }
 
-    if !resp.status().is_success() {
-        return Err(SophonError::Io(std::io::Error::other(format!(
-            "HTTP {} for chunk {}",
-            resp.status(),
-            chunk.chunk_name
-        ))));
-    }
+            let result: SophonResult<_> = async {
+                let resp = client.get(&url).send().await?;
+                if !resp.status().is_success() {
+                    return Err(SophonError::Io(std::io::Error::other(format!(
+                        "HTTP {} for chunk {}",
+                        resp.status(),
+                        chunk.chunk_name
+                    ))));
+                }
+                resp.bytes().await.map_err(SophonError::Http)
+            }
+            .await;
 
-    let compressed_data = resp.bytes().await.map_err(SophonError::Http)?;
+            match result {
+                Ok(data) => break data,
+                Err(err) => {
+                    if !err.is_retryable() {
+                        return Err(err);
+                    }
+                    attempts += 1;
+                    if attempts >= MAX_RETRIES {
+                        return Err(SophonError::DownloadFailed {
+                            chunk: chunk.chunk_name.to_string(),
+                            attempts: MAX_RETRIES,
+                            error: err.to_string(),
+                        });
+                    }
+                    log::warn!(
+                        "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}): {err}",
+                        chunk.chunk_name,
+                    );
+                    // ponytail: reuses existing retry_delay + cancelable_sleep
+                    if cancelable_sleep(handle, retry_delay(attempts)).await.is_err() {
+                        return Err(SophonError::Cancelled);
+                    }
+                }
+            }
+        }
+    };
 
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
