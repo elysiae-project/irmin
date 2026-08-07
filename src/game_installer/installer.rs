@@ -1272,6 +1272,11 @@ fn notify_eager_file_complete(
         let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             let file_idx = *file_idx as usize;
+            // Flush output data to disk before marking bitmap — prevents
+            // corruption if power is lost before kernel writeback.
+            if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
+                let _ = handle.sync_data();
+            }
             // Close the cached output FD.
             ctx.output_allocator.close_file(file_idx);
             // Mark file complete (idempotent).
