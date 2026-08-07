@@ -207,7 +207,14 @@ fn tbytes_copy_old_clip_patch(
     if let Some(slice) = old_data {
         // Direct slice write — no seek, no chunked read_exact.
         let start = old_pos as usize;
-        let end = start + add_length as usize;
+        let end = start
+            .checked_add(add_length as usize)
+            .ok_or_else(|| std::io::Error::other("old_pos + add_length overflow"))?;
+        if end > slice.len() {
+            return Err(std::io::Error::other(
+                "patch references old data beyond slice bounds",
+            ));
+        }
         out_cache.write_all(&slice[start..end])?;
     } else {
         input_stream.seek(SeekFrom::Start(old_pos as u64))?;
