@@ -37,7 +37,7 @@ async fn fetch_json_with_retry<T: serde::de::DeserializeOwned>(
                 if (status.is_server_error() || status.as_u16() == 429)
                     && attempt < API_MAX_RETRIES - 1
                 {
-                    tokio::time::sleep(Duration::from_secs(2u64.saturating_pow(attempt))).await;
+                    tokio::time::sleep(super::retry_delay(attempt)).await;
                     continue;
                 }
                 let resp = resp.error_for_status()?;
@@ -56,7 +56,7 @@ async fn fetch_json_with_retry<T: serde::de::DeserializeOwned>(
         }
 
         if attempt < API_MAX_RETRIES - 1 {
-            tokio::time::sleep(Duration::from_secs(2u64.saturating_pow(attempt))).await;
+            tokio::time::sleep(super::retry_delay(attempt)).await;
         }
     }
 
@@ -177,7 +177,7 @@ pub async fn fetch_patch_build(
                 if (status.is_server_error() || status.as_u16() == 429)
                     && attempt + 1 < API_MAX_RETRIES
                 {
-                    tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                    tokio::time::sleep(super::retry_delay(attempt)).await;
                     continue;
                 }
                 let resp = resp.error_for_status()?;
@@ -192,7 +192,7 @@ pub async fn fetch_patch_build(
             }
             Ok(Err(err)) if err.is_timeout() || err.is_connect() => {
                 if attempt + 1 < API_MAX_RETRIES {
-                    tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                    tokio::time::sleep(super::retry_delay(attempt)).await;
                     continue;
                 }
                 return Err(err.into());
@@ -200,6 +200,7 @@ pub async fn fetch_patch_build(
             Ok(Err(err)) => return Err(err.into()),
             Err(_timeout) => {
                 if attempt + 1 < API_MAX_RETRIES {
+                    tokio::time::sleep(super::retry_delay(attempt)).await;
                     continue;
                 }
                 return Err(SophonError::Io(std::io::Error::other(
