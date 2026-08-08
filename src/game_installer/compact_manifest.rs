@@ -226,6 +226,15 @@ impl CompactManifest {
             .sum()
     }
 
+    /// Compute the byte offset of a single chunk within its file. O(chunk_idx).
+    #[inline]
+    pub fn file_chunk_offset(&self, file_idx: usize, chunk_idx: usize) -> u64 {
+        let range = self.file_chunk_range(file_idx);
+        (range.start as usize..range.start as usize + chunk_idx)
+            .map(|i| self.chunk_size_decompressed[i] as u64)
+            .sum()
+    }
+
     /// Precompute file offsets for all chunks in a file. O(chunks_in_file).
     pub fn file_chunk_offsets(&self, file_idx: usize) -> Vec<u64> {
         let range = self.file_chunk_range(file_idx);

@@ -1227,7 +1227,7 @@ async fn process_eager_item(
     }
 
     // Compute chunk offset within the output file.
-    let chunk_offset = ctx.all_files.file_chunk_offsets(file_idx)[item.chunk_idx as usize];
+    let chunk_offset = ctx.all_files.file_chunk_offset(file_idx, item.chunk_idx as usize);
 
     // Decompress and write to output file.
     let out_file = ctx
