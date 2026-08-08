@@ -274,10 +274,12 @@ pub(crate) fn mmap_shared_read_only(file: &File, len: usize) -> io::Result<MmapG
     }
     unsafe {
         // Pre-fault pages so the hash loop doesn't pay per-page fault cost.
-        // Only for files ≤256 MiB; larger files rely on demand-paging to avoid
-        // blocking the thread and spiking RSS.
+        // Only for files ≤256 MiB; larger files use SEQUENTIAL for readahead
+        // without synchronous prefault.
         if len <= 256 * 1024 * 1024 {
             libc::madvise(ptr, len, libc::MADV_POPULATE_READ);
+        } else {
+            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
         }
         libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
     }
