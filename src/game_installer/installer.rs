@@ -1255,6 +1255,10 @@ async fn process_eager_item(
     .await
     .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
 
+    // Ensure decompressed data is on disk before marking bitmap,
+    // so a crash+resume cannot see a "complete" chunk with missing data.
+    out_file.sync_data()?;
+
     // Mark chunk complete in bitmap.
     ctx.chunk_bitmap.mark_complete(global_chunk_idx);
 
