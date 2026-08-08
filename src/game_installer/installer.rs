@@ -901,6 +901,12 @@ fn spawn_assembly_coordinator(
         let mut join_set = tokio::task::JoinSet::new();
         let mut first_file = true;
 
+        // Wait for OnceLock init; files with 0 downloadable chunks can arrive
+        // on the channel before build_download_state sets these values.
+        while ctx.chunk_refcounts.get().is_none() || ctx.chunk_names.get().is_none() {
+            tokio::task::yield_now().await;
+        }
+
         loop {
             let max_concurrency = ctx.adaptive_assembly.current_target();
             while join_set.len() < max_concurrency {
