@@ -613,6 +613,7 @@ fn register_chunks_for_file<'a>(
     pending_counts: &mut Vec<AtomicU32>,
     installer_idx: usize,
     pre_downloaded: &FxHashMap<u32, u64>,
+    eager_tainted_files: &mut rustc_hash::FxHashSet<u32>,
 ) {
     let range = all_files.file_chunk_range(file_idx);
 
@@ -635,9 +636,11 @@ fn register_chunks_for_file<'a>(
             if is_pre {
                 download_items[idx as usize].is_pre_downloaded = true;
             }
-            // Shared chunks must go through the .zstd path so assembly can
-            // serve all files referencing this chunk, not just the first.
-            download_items[idx as usize].use_eager = false;
+            // Shared chunk: both the original file and this file are tainted.
+            // A post-registration pass disables eager for all tainted files.
+            let original_file = download_items[idx as usize].file_idx;
+            eager_tainted_files.insert(original_file);
+            eager_tainted_files.insert(file_idx as u32);
             idx
         } else {
             let idx = download_items.len() as u32;
@@ -691,6 +694,8 @@ async fn build_download_state(
     let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::with_capacity(total_chunks);
     let mut chunk_refcounts: Vec<AtomicU32> = Vec::with_capacity(total_chunks);
     let mut pending_counts: Vec<AtomicU32> = Vec::with_capacity(total_files);
+    let mut eager_tainted_files: rustc_hash::FxHashSet<u32> =
+        rustc_hash::FxHashSet::default();
 
     let mut all_files_index: usize = 0;
 
@@ -724,12 +729,23 @@ async fn build_download_state(
                 &mut pending_counts,
                 tmp_dir_idx,
                 pre_downloaded,
+                &mut eager_tainted_files,
             );
 
             if pending_counts.len() == pending_before {
                 let _ = assemble_tx.send((all_files_index, tmp_dir_idx)).await;
             }
             all_files_index += 1;
+        }
+    }
+
+    // Disable eager for all files that share chunks with other files.
+    // A file must go entirely through eager OR entirely through assembly.
+    if !eager_tainted_files.is_empty() {
+        for item in download_items.iter_mut() {
+            if eager_tainted_files.contains(&item.file_idx) {
+                item.use_eager = false;
+            }
         }
     }
 
