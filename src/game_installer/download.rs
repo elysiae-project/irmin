@@ -272,6 +272,10 @@ async fn verify_existing_file_hash(
     }
     let path = path.to_path_buf();
     let expected_len = expected_hash.len();
+    if expected_len > 32 {
+        log::warn!("Unknown hash format (length={expected_len}) for verification");
+        return Ok(false);
+    }
     let mut hash_buf = [0u8; 32];
     hash_buf[..expected_len].copy_from_slice(expected_hash.as_bytes());
     tokio::task::spawn_blocking(move || match expected_len {
