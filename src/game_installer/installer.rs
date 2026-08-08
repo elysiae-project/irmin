@@ -1190,7 +1190,6 @@ async fn process_eager_item(
                         "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}): {err}",
                         chunk.chunk_name,
                     );
-                    // ponytail: reuses existing retry_delay + cancelable_sleep
                     if cancelable_sleep(handle, retry_delay(attempts)).await.is_err() {
                         return Err(SophonError::Cancelled);
                     }
@@ -2333,14 +2332,17 @@ pub async fn install(
                 }
             }
             let total = all_files.num_chunks();
-            Arc::new(if bitmap_path.exists() {
+            let bm = if bitmap_path.exists() {
                 match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
                     Ok(bm) if bm.total_chunks() == total => bm,
-                    _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total).unwrap(),
+                    _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
+                        .map_err(SophonError::Io)?,
                 }
             } else {
-                super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total).unwrap()
-            })
+                super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
+                    .map_err(SophonError::Io)?
+            };
+            Arc::new(bm)
         },
     });
 
