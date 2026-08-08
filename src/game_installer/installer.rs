@@ -1160,6 +1160,7 @@ async fn process_eager_item(
     let file_idx = item.file_idx as usize;
     if ctx.output_allocator.get_handle(file_idx).is_none() {
         let file_name = ctx.all_files.file_name(file_idx);
+        validate_asset_name(file_name)?;
         let file_size = ctx.all_files.file_size(file_idx);
         ctx.output_allocator
             .preallocate_file(file_idx, file_name, file_size)?;
