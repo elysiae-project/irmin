@@ -655,8 +655,8 @@
             adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
             profiler: Arc::new(super::profiling::PipelineProfiler::new()),
             completion_flags: Arc::from(Vec::<AtomicBool>::new()),
-            output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(std::path::Path::new("/tmp"))),
-            chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&std::env::temp_dir().join(format!("test_bm_{}", std::process::id())), 1).unwrap()),
+            output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
+            chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap()),
         });
 
         let handle = DownloadHandle::new();
@@ -759,8 +759,8 @@
             adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
             profiler: Arc::new(super::profiling::PipelineProfiler::new()),
             completion_flags: Arc::from(Vec::<AtomicBool>::new()),
-            output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(std::path::Path::new("/tmp"))),
-            chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&std::env::temp_dir().join(format!("test_bm_{}", std::process::id())), 1).unwrap()),
+            output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
+            chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap()),
         });
 
         let handle = DownloadHandle::new();
