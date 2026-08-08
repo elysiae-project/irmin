@@ -442,7 +442,7 @@
 
     #[tokio::test]
     async fn notify_assembly_ready_single_file_ready() {
-        let (tx, mut rx) = mpsc::channel::<(usize, usize)>(16);
+        let (tx, mut rx) = mpsc::unbounded_channel::<(usize, usize)>();
 
         let pending_counts: Vec<AtomicU32> = vec![AtomicU32::new(1)];
         let chunk_entries: Vec<FileEntry> = vec![(0u32, 0u32, 0u32)];
@@ -470,7 +470,7 @@
         let chunk_entries: Vec<FileEntry> = vec![];
         let chunk_entry_offsets: Vec<u32> = vec![0];
         let pending_counts: Vec<AtomicU32> = vec![];
-        let (tx, rx) = mpsc::channel::<(usize, usize)>(16);
+        let (tx, rx) = mpsc::unbounded_channel::<(usize, usize)>();
         drop(rx);
         let tmp = tempfile::tempdir().unwrap();
         let alloc = super::output_allocator::OutputAllocator::new(tmp.path());

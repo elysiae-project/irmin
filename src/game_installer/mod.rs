@@ -68,8 +68,6 @@ pub async fn cancelable_sleep(
 }
 /// Max concurrent assembly tasks.
 pub const ASSEMBLY_CONCURRENCY: usize = 4;
-/// Assembly task channel buffer size.
-pub const ASSEMBLY_CHANNEL_SIZE: usize = 4096;
 /// Installed version marker filename.
 pub const VERSION_FILE_NAME: &str = ".sophon_version";
 /// MD5 verification cache filename.

@@ -672,7 +672,7 @@ fn register_chunks_for_file<'a>(
 async fn build_download_state(
     installer_data: Vec<InstallerData>,
     ctx: &InstallContext,
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     completed_indices: Option<&rustc_hash::FxHashSet<usize>>,
     pre_downloaded: &FxHashMap<u32, u64>,
 ) -> SophonResult<(
@@ -731,7 +731,7 @@ async fn build_download_state(
             );
 
             if pending_counts.len() == pending_before {
-                let _ = assemble_tx.send((all_files_index, tmp_dir_idx)).await;
+                let _ = assemble_tx.send((all_files_index, tmp_dir_idx));
             }
             all_files_index += 1;
         }
@@ -886,7 +886,7 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
 #[allow(clippy::let_and_return)]
 fn spawn_assembly_coordinator(
     ctx: &Arc<InstallContext>,
-    assemble_rx: mpsc::Receiver<(usize, usize)>,
+    assemble_rx: mpsc::UnboundedReceiver<(usize, usize)>,
     assembly_cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<SophonResult<()>> {
     let ctx = Arc::clone(ctx);
@@ -1360,7 +1360,7 @@ fn notify_assembly_ready(
     chunk_entries: &[FileEntry],
     chunk_entry_offsets: &[u32],
     pending_counts: &[AtomicU32],
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     output_allocator: &super::output_allocator::OutputAllocator,
 ) {
     let start = chunk_entry_offsets.get(item_idx).copied().unwrap_or(0) as usize;
@@ -1374,11 +1374,7 @@ fn notify_assembly_ready(
         if prev == 1 {
             // All chunks written — release the cached FD.
             output_allocator.close_file(*file_idx as usize);
-            if let Err(e) = assemble_tx.try_send((*file_idx as usize, *tmp_dir_idx as usize)) {
-                log::error!(
-                    "Assembly notification dropped for file_idx={file_idx}: {e}. File may not be assembled.",
-                );
-            }
+            let _ = assemble_tx.send((*file_idx as usize, *tmp_dir_idx as usize));
         }
     }
 }
@@ -1391,7 +1387,7 @@ async fn process_download_item(
     chunk_entries: &[FileEntry],
     chunk_entry_offsets: &[u32],
     pending_counts: &[AtomicU32],
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     handle: &DownloadHandle,
 ) -> SophonResult<()> {
     let mut _chunk_timer = super::profiling::ChunkTimer::new(&ctx.profiler);
@@ -1578,7 +1574,7 @@ async fn run_downloads(
     chunk_entries: Arc<Vec<FileEntry>>,
     chunk_entry_offsets: Arc<Vec<u32>>,
     pending_counts: Arc<Vec<AtomicU32>>,
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     handle: DownloadHandle,
 ) -> DownloadSummary {
     const WORKER_COUNT: usize = super::DOWNLOAD_CONCURRENCY;
@@ -2382,7 +2378,7 @@ pub async fn install(
         });
     }
 
-    let (assemble_tx, assemble_rx) = mpsc::channel::<(usize, usize)>(ASSEMBLY_CHANNEL_SIZE);
+    let (assemble_tx, assemble_rx) = mpsc::unbounded_channel::<(usize, usize)>();
     // Shared cancellation token. Cancelling stops the RAM adjuster and
     // wakes any blocked recv().
     let assembly_cancel_token = tokio_util::sync::CancellationToken::new();
