@@ -186,9 +186,8 @@ pub fn check_file_md5_with_cache_key_and_size(
     if let Some(entry) = cache.get(cache_key)
         && entry.size == expected_size
         && entry.md5 == expected_md5
+        && entry.mtime_secs == mtime
     {
-        // Trust the cache even if mtime changed — avoids re-hashing when
-        // backup software or filesystem operations touch file timestamps.
         return Ok((true, Some(actual_size)));
     }
 
