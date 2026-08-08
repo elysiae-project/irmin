@@ -796,9 +796,7 @@ pub struct AssemblyTaskParams {
     pub last_assembly_update: Arc<Mutex<Instant>>,
     pub total_files: u64,
     pub profiler: Arc<super::profiling::PipelineProfiler>,
-    /// Live file completion bitset indexed by `file_idx`. Replaces the prior
-    /// `Arc<Mutex<HashSet<String>>>` with a constant-memory atomic array: no
-    /// per-file String alloc and zero lock contention.
+    /// Per-file completion bitset indexed by `file_idx`.
     pub completion_flags: Arc<[AtomicBool]>,
 }
 

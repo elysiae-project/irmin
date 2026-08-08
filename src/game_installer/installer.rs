@@ -119,9 +119,7 @@ struct InstallContext {
     state_saver: StateSaver,
     adaptive_assembly: Arc<AdaptiveAssembly>,
     profiler: Arc<super::profiling::PipelineProfiler>,
-    /// Live file completion bitset indexed by `file_idx`. Replaces the prior
-    /// `Arc<Mutex<HashSet<String>>>` with a constant-memory atomic array:
-    /// no per-file String alloc and zero lock contention.
+    /// Per-file completion bitset indexed by `file_idx`.
     completion_flags: Arc<[AtomicBool]>,
     /// Output file handle cache for eager decompression.
     output_allocator: Arc<super::output_allocator::OutputAllocator>,
