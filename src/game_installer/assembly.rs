@@ -252,7 +252,7 @@ pub fn assemble_file(
         if buf.capacity() < FILE_WRITE_BUFFER_SIZE {
             buf = Vec::with_capacity(FILE_WRITE_BUFFER_SIZE);
         }
-        // Safety: buffer is fully overwritten by read() before write_all_at().
+        // Safety: only the portion filled by read_at is subsequently accessed via &buf[..n].
         unsafe { buf.set_len(FILE_WRITE_BUFFER_SIZE) };
         buf
     });

@@ -1,8 +1,8 @@
-//! Output file pre-allocation and handle caching for eager decompression.
+//! Output file allocation and handle caching for eager decompression.
 //!
 //! Manages open file descriptors for output files that receive concurrent
-//! pwrite calls from multiple download workers. Pre-allocates files to their
-//! declared size before downloads begin.
+//! pwrite calls from multiple download workers. Allocates files on-demand
+//! to their declared size during download processing.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -84,11 +84,6 @@ impl OutputAllocator {
     /// Closes and removes the file handle from cache.
     pub fn close_file(&self, file_idx: usize) {
         self.handles.remove(&file_idx);
-    }
-
-    /// Returns the number of open file handles.
-    pub fn open_count(&self) -> usize {
-        self.handles.len()
     }
 }
 
