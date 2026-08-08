@@ -654,6 +654,7 @@ pub fn assemble_file(
         {
             log::warn!("rename EXDEV; falling back to copy + unlink: {err}");
             fs::copy(&tmp_path, &target_path)?;
+            fs::File::open(&target_path)?.sync_data()?;
             let _ = fs::remove_file(&tmp_path);
         } else {
             let _ = fs::remove_file(&tmp_path);
