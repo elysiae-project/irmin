@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 const MAGIC: u32 = 0x49524D42; // "IRMB"
                                // ponytail: 1024 = ~100 syncs for 100k chunks, negligible overhead.
@@ -18,6 +19,7 @@ pub struct ChunkBitmap {
     path: PathBuf,
     total_chunks: usize,
     ops_count: AtomicU64,
+    sync_lock: Mutex<()>,
 }
 
 impl ChunkBitmap {
@@ -40,6 +42,7 @@ impl ChunkBitmap {
             path: path.to_path_buf(),
             total_chunks,
             ops_count: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
         })
     }
 
@@ -76,6 +79,7 @@ impl ChunkBitmap {
             path: path.to_path_buf(),
             total_chunks,
             ops_count: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
         })
     }
 
@@ -121,8 +125,9 @@ impl ChunkBitmap {
         }
     }
 
-    /// Flushes the bitmap to disk.
+    /// Flushes the bitmap to disk. Serialized: concurrent callers block.
     pub fn sync(&self) -> io::Result<()> {
+        let _guard = self.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let word_count = self.bits.len();
         let mut buf = Vec::with_capacity(8 + word_count * 8);
 
