@@ -187,10 +187,8 @@ pub fn check_file_md5_with_cache_key_and_size(
         && entry.size == expected_size
         && entry.md5 == expected_md5
     {
-        if entry.mtime_secs == mtime {
-            return Ok((true, Some(actual_size)));
-        }
-        // Size matches and cache entry matches — trust it.
+        // Trust the cache even if mtime changed — avoids re-hashing when
+        // backup software or filesystem operations touch file timestamps.
         return Ok((true, Some(actual_size)));
     }
 
