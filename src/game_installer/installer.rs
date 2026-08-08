@@ -2051,6 +2051,8 @@ pub async fn install(
     let mut resume_bytes_offset: u64 = 0;
     let mut pre_assembled: u64 = 0;
     let completed_chunk_indices: Arc<DashSet<u32>>;
+    let bitmap_ranges_to_clear: Arc<Mutex<Vec<(usize, usize)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let completed_indices: Option<rustc_hash::FxHashSet<usize>> = if options.is_resume {
         let total = all_files.num_files() as u64;
         (callbacks.updater)(SophonProgress::CalculatingDownloads {
@@ -2085,6 +2087,7 @@ pub async fn install(
             let completed_chunk_indices_arc = Arc::clone(&completed_chunk_indices_arc);
             let indices_arc = Arc::clone(&indices_arc);
             let files_to_delete = Arc::clone(&files_to_delete);
+            let bitmap_ranges_to_clear = Arc::clone(&bitmap_ranges_to_clear);
             let updater = Arc::clone(&callbacks.updater);
             let resume_bitmap = resume_bitmap.clone();
 
@@ -2164,6 +2167,12 @@ pub async fn install(
                         if !needs_old_file {
                             files_to_delete.lock().unwrap().push(target_path);
                         }
+                        // Clear stale bitmap bits so resume doesn't skip
+                        // chunks whose output file was just deleted.
+                        bitmap_ranges_to_clear
+                            .lock()
+                            .unwrap()
+                            .push((chunk_range.start as usize, chunk_range.end as usize));
                     }
                 }
                 let checked = checked_files.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2369,6 +2378,15 @@ pub async fn install(
             Arc::new(bm)
         },
     });
+
+    // Clear stale bitmap bits for files that were deleted during resume
+    // validation. Without this, process_eager_item would skip chunks whose
+    // output file no longer exists.
+    if let Ok(ranges) = bitmap_ranges_to_clear.lock() {
+        for &(start, end) in ranges.iter() {
+            ctx.chunk_bitmap.clear_range(start, end);
+        }
+    }
 
     #[cfg(feature = "sophon-profiling")]
     {
