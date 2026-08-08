@@ -635,6 +635,9 @@ fn register_chunks_for_file<'a>(
             if is_pre {
                 download_items[idx as usize].is_pre_downloaded = true;
             }
+            // Shared chunks must go through the .zstd path so assembly can
+            // serve all files referencing this chunk, not just the first.
+            download_items[idx as usize].use_eager = false;
             idx
         } else {
             let idx = download_items.len() as u32;
