@@ -890,7 +890,7 @@ pub fn run_assembly_task(
     let target_path = game_dir.join(file_name);
     let needs_assembly = match target_path.metadata() {
         Ok(metadata) if metadata.len() == file_size => {
-            if let Some(entry) = verify_cache.get(target_path.to_string_lossy().as_ref())
+            if let Some(entry) = verify_cache.get(file_name)
                 && entry.size == file_size
                 && entry.md5 == file_hash_md5
             {
