@@ -8,15 +8,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Initial number of download workers.
-pub const INITIAL_CONCURRENCY: usize = 8;
+pub const INITIAL_CONCURRENCY: usize = 24;
 /// Maximum download workers (hard ceiling).
-pub const MAX_CONCURRENCY: usize = 48;
+pub const MAX_CONCURRENCY: usize = 64;
 /// Interval between throughput checks.
-const MEASURE_INTERVAL_MS: u64 = 2000;
+const MEASURE_INTERVAL_MS: u64 = 1000;
 /// Scale up when throughput grew by at least this fraction.
-const GROWTH_THRESHOLD: f64 = 0.05;
+const GROWTH_THRESHOLD: f64 = 0.01;
 /// Workers to add per scale-up event.
-const SCALE_STEP: usize = 4;
+const SCALE_STEP: usize = 8;
 
 /// Tracks throughput and decides when to spawn more workers.
 pub struct AdaptiveDownload {
