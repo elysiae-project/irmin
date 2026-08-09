@@ -62,28 +62,89 @@ pub fn eager_decompress_chunk(
         }
     }
 
-    // Decompress and write to output file using pooled DCtx.
+    // Decompress directly into mmap'd output file region (one-shot).
+    // Single DCtx::decompress call — no per-read streaming overhead.
     let need_decompressed_hash = chunk_hash_required(decompressed_hash);
+    let expected_usize = expected_decompressed_size as usize;
+
+    let mut out_mmap = assembly_opt::mmap_read_write(out_file, chunk_offset, expected_usize)
+        .map_err(SophonError::Io)?;
+
+    // Prefault output pages to avoid per-page faults during decompression.
+    unsafe {
+        libc::madvise(
+            out_mmap.map_base,
+            out_mmap.map_len,
+            libc::MADV_POPULATE_WRITE,
+        );
+    }
+
+    let output = out_mmap.as_mut_slice();
+
     let mut ctx = assembly_opt::take_dctx();
     ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
         .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
-    // Use MAX_WINDOW_LOG since we don't know the frame's actual window from metadata.
-    let window_log = assembly_opt::MAX_WINDOW_LOG;
+    let window_log = assembly_opt::window_log_for_size(expected_decompressed_size);
     ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
         .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx WindowLogMax")))?;
     if need_decompressed_hash {
         let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
     }
 
-    let mut decoder = zstd::Decoder::with_context(std::io::Cursor::new(compressed_data), &mut ctx);
+    let written = ctx
+        .decompress(output, compressed_data)
+        .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
+    assembly_opt::return_dctx(ctx, window_log);
 
-    let mut decompressed_hasher: Option<Md5> = if need_decompressed_hash {
-        Some(take_md5()?)
-    } else {
-        None
-    };
+    if written != expected_usize {
+        out_mmap.flush_and_evict();
+        return Err(SophonError::SizeMismatch {
+            item: format!("eager chunk at offset {chunk_offset}"),
+            expected: expected_decompressed_size,
+            actual: written as u64,
+        });
+    }
 
-    // Reuse thread-local buffer to avoid 1 MiB alloc per call.
+    // Verify decompressed hash (Full mode only).
+    if need_decompressed_hash {
+        let mut hasher = take_md5()?;
+        hasher.update(&output[..written])?;
+        let digest = hasher.finish()?;
+        return_md5(hasher);
+        if !md5_hex_eq(&digest, decompressed_hash) {
+            out_mmap.flush_and_evict();
+            return Err(SophonError::Md5Mismatch {
+                item: format!("eager chunk decompressed at offset {chunk_offset}"),
+                expected: decompressed_hash.to_string(),
+                actual: md5_to_hex(&digest),
+            });
+        }
+    }
+
+    out_mmap.flush_and_evict();
+    Ok(written as u64)
+}
+
+/// Streaming variant: decompresses from a sync `Read` source directly to the
+/// output file. Avoids buffering the entire compressed chunk in memory.
+/// Used in non-Full verify modes where no compressed hash is needed.
+pub fn stream_decompress_to_file(
+    reader: impl io::Read,
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+) -> SophonResult<u64> {
+    let mut ctx = assembly_opt::take_dctx();
+    ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
+        .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
+    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+        assembly_opt::MAX_WINDOW_LOG,
+    ))
+    .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx WindowLogMax")))?;
+
+    let mut decoder =
+        zstd::Decoder::with_context(io::BufReader::with_capacity(65536, reader), &mut ctx);
+
     let mut buf = assembly_opt::take_eager_buf();
     let mut bytes_written: u64 = 0;
     let mut write_offset = chunk_offset;
@@ -100,40 +161,20 @@ pub fn eager_decompress_chunk(
             .write_all_at(&buf[..n], write_offset)
             .map_err(SophonError::Io)?;
 
-        if let Some(ref mut h) = decompressed_hasher {
-            h.update(&buf[..n])?;
-        }
-
         write_offset += n as u64;
         bytes_written += n as u64;
     }
 
-    // Return pooled resources.
-    // ctx is not pooled: window_log=26 exceeds the pool's 22-bit threshold.
     drop(decoder);
     drop(ctx);
     assembly_opt::return_eager_buf(buf);
 
-    // Verify decompressed size.
     if bytes_written != expected_decompressed_size {
         return Err(SophonError::SizeMismatch {
-            item: format!("eager chunk at offset {chunk_offset}"),
+            item: format!("stream chunk at offset {chunk_offset}"),
             expected: expected_decompressed_size,
             actual: bytes_written,
         });
-    }
-
-    // Verify decompressed hash.
-    if let Some(mut h) = decompressed_hasher {
-        let digest = h.finish()?;
-        return_md5(h);
-        if !md5_hex_eq(&digest, decompressed_hash) {
-            return Err(SophonError::Md5Mismatch {
-                item: format!("eager chunk decompressed at offset {chunk_offset}"),
-                expected: decompressed_hash.to_string(),
-                actual: md5_to_hex(&digest),
-            });
-        }
     }
 
     Ok(bytes_written)

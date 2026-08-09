@@ -20,7 +20,7 @@ impl DownloadClient {
     pub fn new() -> Self {
         Self(
             reqwest::Client::builder()
-                .pool_max_idle_per_host(24)
+                .pool_max_idle_per_host(crate::game_installer::DOWNLOAD_CONCURRENCY)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .tcp_nodelay(true)
                 .http1_only()
@@ -34,8 +34,4 @@ impl DownloadClient {
 }
 
 /// Thread-safe container for the active download handle.
-pub struct ActiveDownload(
-    pub  tokio::sync::Mutex<
-        Option<crate::game_installer::DownloadHandle>,
-    >,
-);
+pub struct ActiveDownload(pub tokio::sync::Mutex<Option<crate::game_installer::DownloadHandle>>);

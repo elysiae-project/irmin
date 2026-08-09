@@ -1,5 +1,6 @@
 //! Sophon chunk-based game installer.
 mod adaptive_assembly;
+pub mod adaptive_download;
 mod api;
 pub mod assembly;
 mod assembly_opt;
@@ -34,8 +35,8 @@ mod integration_tests;
 pub const MAX_RETRIES: u32 = 5;
 pub const MAX_HASH_RETRIES: u32 = 5;
 
-/// Max concurrent chunk downloads. Matches the HTTP pool idle-per-host limit.
-pub const DOWNLOAD_CONCURRENCY: usize = 24;
+/// Max concurrent chunk downloads (hard ceiling for adaptive scaling).
+pub const DOWNLOAD_CONCURRENCY: usize = adaptive_download::MAX_CONCURRENCY;
 
 use std::time::Duration;
 

@@ -117,6 +117,9 @@ struct InstallContext {
     chunks_since_save: Arc<AtomicU64>,
     last_save: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     state_saver: StateSaver,
+    /// Pre-built chunk name vec indexed by item_idx. Built once at init,
+    /// reused on every state save to avoid per-save String allocations.
+    save_chunk_names: Arc<OnceLock<Vec<String>>>,
     adaptive_assembly: Arc<AdaptiveAssembly>,
     profiler: Arc<super::profiling::PipelineProfiler>,
     /// Per-file completion bitset indexed by `file_idx`.
@@ -618,12 +621,11 @@ fn register_chunks_for_file<'a>(
 ) {
     let range = all_files.file_chunk_range(file_idx);
 
-    // A file qualifies for eager decompression when all its chunks are pure downloads.
-    // In force_eager mode, still require no old_offset chunks — delta copies need
-    // the assembly path to read from the old file.
+    // A file qualifies for eager decompression when all its chunks are
+    // pure downloads (no old_offset chunks requiring the assembly path).
     let all_pure_downloads = (range.start..range.end)
         .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
-    let file_is_eager = all_pure_downloads && (force_eager || all_pure_downloads);
+    let file_is_eager = all_pure_downloads;
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
     for ci in range.start..range.end {
@@ -867,7 +869,7 @@ async fn drain_join_set(join_set: &mut tokio::task::JoinSet<SophonResult<()>>) -
 
 async fn save_assembly_state(ctx: &Arc<InstallContext>) {
     let dc = Arc::clone(&ctx.downloaded_chunks);
-    let cn = Arc::clone(&ctx.chunk_names);
+    let names = Arc::clone(&ctx.save_chunk_names);
     let saver = Arc::clone(&ctx.state_saver);
     let prev_handle = {
         let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
@@ -880,18 +882,15 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
         let _ = h.await;
     }
     let new_handle = tokio::task::spawn_blocking(move || {
-        let map: HashMap<String, u64> = if let (Some(dc), Some(cn)) = (dc.get(), cn.get()) {
-            dc.iter()
-                .enumerate()
-                .filter_map(|(i, v)| {
-                    let val = v.load(Ordering::Relaxed);
-                    if val > 0 {
-                        Some((cn.get(i).to_string(), val as u64))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        let map: HashMap<String, u64> = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+            let mut m = HashMap::with_capacity(dc.len() / 2);
+            for (i, v) in dc.iter().enumerate() {
+                let val = v.load(Ordering::Relaxed);
+                if val > 0 {
+                    m.insert(names[i].clone(), val as u64);
+                }
+            }
+            m
         } else {
             HashMap::new()
         };
@@ -1206,7 +1205,6 @@ async fn process_eager_item(
             if handle.is_cancelled() {
                 return Err(SophonError::Cancelled);
             }
-
             let result: SophonResult<_> = async {
                 let resp = client.get(&url).send().await?;
                 if !resp.status().is_success() {
@@ -1219,7 +1217,6 @@ async fn process_eager_item(
                 resp.bytes().await.map_err(SophonError::Http)
             }
             .await;
-
             match result {
                 Ok(data) => break data,
                 Err(err) => {
@@ -1260,7 +1257,6 @@ async fn process_eager_item(
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
 
     let _decompressed_bytes = tokio::task::spawn_blocking({
-        let compressed = compressed_data;
         let out = Arc::clone(&out_file);
         let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
         let decomp_hash = if skip_hash { String::new() } else { chunk.chunk_decompressed_hash_md5.to_string() };
@@ -1268,7 +1264,7 @@ async fn process_eager_item(
         let expected_size = chunk.chunk_size_decompressed;
         move || {
             super::eager_decompress::eager_decompress_chunk(
-                &compressed,
+                &compressed_data,
                 &out,
                 chunk_offset,
                 expected_size,
@@ -1280,24 +1276,19 @@ async fn process_eager_item(
     .await
     .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
 
-    // Ensure decompressed data is on disk before marking bitmap,
-    // so a crash+resume cannot see a "complete" chunk with missing data.
-    // Skip in non-Full mode: crash-resume is disabled, avoid the syscall.
+    // Mark chunk in bitmap. Durability is batched: sync_data runs every
+    // CHUNK_STATE_SAVE_INTERVAL chunks (not per-chunk) to amortize the
+    // fdatasync cost across many writes. The per-file sync in
+    // notify_eager_file_complete covers final durability.
     if ctx.verify_mode == super::VerifyMode::Full {
-        out_file.sync_data()?;
-    }
+        ctx.chunk_bitmap.mark_complete(global_chunk_idx);
 
-    // Mark chunk complete in bitmap.
-    ctx.chunk_bitmap.mark_complete(global_chunk_idx);
-
-    // Periodic bitmap sync (same cadence as assembly state saves).
-    // Skip in non-Full mode: no crash-resume.
-    if ctx.verify_mode == super::VerifyMode::Full {
         let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL)
-            && let Err(e) = ctx.chunk_bitmap.sync()
-        {
-            log::warn!("Failed to sync chunk bitmap: {e}");
+        if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
+            let _ = out_file.sync_data();
+            if let Err(e) = ctx.chunk_bitmap.sync() {
+                log::warn!("Failed to sync chunk bitmap: {e}");
+            }
         }
     }
 
@@ -1336,15 +1327,21 @@ fn notify_eager_file_complete(
             let file_idx = *file_idx as usize;
             // Flush output data to disk before marking bitmap — prevents
             // corruption if power is lost before kernel writeback.
-            if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
-                let _ = handle.sync_data();
+            // Skip in non-Full mode: crash-resume is disabled.
+            if ctx.verify_mode == super::VerifyMode::Full {
+                if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
+                    let _ = handle.sync_data();
+                }
             }
             // Close the cached output FD.
             ctx.output_allocator.close_file(file_idx);
             // Mark file complete (idempotent).
             ctx.completion_flags[file_idx].store(true, Ordering::Release);
             // Populate verify_cache so resume skips expensive MD5 rehash.
-            if ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES {
+            // Skip in non-Full mode: no crash-resume benefit.
+            if ctx.verify_mode == super::VerifyMode::Full
+                && ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES
+            {
                 let file_name = ctx.all_files.file_name(file_idx);
                 let target_path = ctx.game_dir.join(file_name);
                 if let Ok(meta) = target_path.metadata() {
@@ -1646,8 +1643,8 @@ async fn run_downloads(
     assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     handle: DownloadHandle,
 ) -> DownloadSummary {
-    const WORKER_COUNT: usize = super::DOWNLOAD_CONCURRENCY;
     const RECLAIM_INTERVAL: usize = 100;
+    let adaptive = Arc::new(super::adaptive_download::AdaptiveDownload::new());
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let total: usize = download_items.len();
@@ -1659,7 +1656,8 @@ async fn run_downloads(
 
     ctx.profiler.total_chunks.store(total, Ordering::Relaxed);
 
-    for _ in 0..WORKER_COUNT {
+    // Spawn a worker closure factory to avoid repeating the body.
+    let spawn_worker = |workers: &mut tokio::task::JoinSet<()>| {
         let queue = Arc::clone(&queue);
         let ctx = Arc::clone(&ctx);
         let chunk_entries = Arc::clone(&chunk_entries);
@@ -1718,6 +1716,42 @@ async fn run_downloads(
                 }
             }
         });
+    };
+
+    // Spawn initial workers.
+    let initial = adaptive.current_target().min(total);
+    for _ in 0..initial {
+        spawn_worker(&mut workers);
+    }
+
+    // Adaptive scaling: periodically measure throughput and spawn more workers.
+    let mut spawned = initial;
+    loop {
+        tokio::select! {
+            biased;
+            result = workers.join_next() => {
+                if result.is_none() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                // Measure throughput and possibly increase target.
+                let db = ctx.downloaded_bytes.load(Ordering::Relaxed);
+                adaptive.measure(db);
+
+                let target = adaptive.current_target();
+                let queue_len = queue.lock().unwrap_or_else(|e| e.into_inner()).len();
+                // Spawn up to target, but only if queue has work.
+                while spawned < target && queue_len > spawned {
+                    spawn_worker(&mut workers);
+                    spawned += 1;
+                }
+
+                if remaining.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+            }
+        }
     }
 
     while workers.join_next().await.is_some() {}
@@ -1785,15 +1819,18 @@ async fn finalize_install(
 
     {
         let dc = Arc::clone(&ctx.downloaded_chunks);
-        let cn = Arc::clone(&ctx.chunk_names);
+        let names = Arc::clone(&ctx.save_chunk_names);
         let saver = Arc::clone(&ctx.state_saver);
         tokio::task::spawn_blocking(move || {
-            let map = if let (Some(dc), Some(cn)) = (dc.get(), cn.get()) {
-                dc.iter()
-                    .enumerate()
-                    .filter(|(_, v)| v.load(Ordering::Relaxed) > 0)
-                    .map(|(i, v)| (cn.get(i).to_string(), v.load(Ordering::Relaxed) as u64))
-                    .collect::<HashMap<String, u64>>()
+            let map = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+                let mut m = HashMap::with_capacity(dc.len() / 2);
+                for (i, v) in dc.iter().enumerate() {
+                    let val = v.load(Ordering::Relaxed);
+                    if val > 0 {
+                        m.insert(names[i].clone(), val as u64);
+                    }
+                }
+                m
             } else {
                 HashMap::new()
             };
@@ -2412,6 +2449,7 @@ pub async fn install(
         chunks_since_save: Arc::new(AtomicU64::new(0)),
         last_save: Arc::new(Mutex::new(None)),
         state_saver: callbacks.state_saver,
+        save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::clone(&adaptive_assembly),
         profiler: Arc::new(super::profiling::PipelineProfiler::new()),
         completion_flags: Arc::clone(&completion_flags),
@@ -2514,6 +2552,15 @@ pub async fn install(
 
     let _ = ctx.chunk_refcounts.set(Arc::new(chunk_refcounts_vec));
     let _ = ctx.chunk_names.set(Arc::clone(&chunk_names_lookup));
+
+    // Pre-build chunk name strings for state saves. Built once here,
+    // reused on every save to avoid per-save arena lookups + allocations.
+    {
+        let names: Vec<String> = (0..download_items.len())
+            .map(|i| chunk_names_lookup.get(i).to_owned())
+            .collect();
+        let _ = ctx.save_chunk_names.set(names);
+    }
 
     {
         let downloaded_chunks_vec: Vec<AtomicU32> = (0..download_items.len())
