@@ -619,19 +619,17 @@ fn register_chunks_for_file<'a>(
     let range = all_files.file_chunk_range(file_idx);
 
     // A file qualifies for eager decompression when all its chunks are pure downloads.
-    let file_is_eager = force_eager
-        || (range.start..range.end).all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+    // In force_eager mode, still require no old_offset chunks — delta copies need
+    // the assembly path to read from the old file.
+    let all_pure_downloads = (range.start..range.end)
+        .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+    let file_is_eager = all_pure_downloads && (force_eager || all_pure_downloads);
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
     for ci in range.start..range.end {
         let global_chunk_idx = ci as usize;
         let chunk = all_files.chunk(global_chunk_idx);
         if chunk.chunk_old_offset >= 0 {
-            if force_eager {
-                // In force-eager mode, old-offset chunks can't be handled.
-                // Skip them — they'll be treated as already present.
-                continue;
-            }
             continue;
         }
         pending_counts[pending_idx as usize].fetch_add(1, Ordering::Relaxed);

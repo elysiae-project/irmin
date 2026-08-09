@@ -306,15 +306,18 @@ pub fn assemble_file(
         }
         None
     } else if verify_mode == super::VerifyMode::Deferred {
-        // Deferred: always do file-level hash (it's the only verification)
-        Some(take_md5()?)
+        // Deferred: always do file-level hash (it's the only verification).
+        // In parallel mode, use the mmap hasher thread instead of this sequential hasher.
+        if parallelize { None } else { Some(take_md5()?) }
     } else if all_chunks_have_hashes || parallelize {
         None
     } else {
         Some(take_md5()?)
     };
 
-    let parallel_hashed_file = parallelize && has_file_hash && !all_chunks_have_hashes;
+    // In Deferred mode with parallelize, enable the mmap hasher thread.
+    let parallel_hashed_file = parallelize && has_file_hash
+        && (!all_chunks_have_hashes || verify_mode == super::VerifyMode::Deferred);
     let hasher_result: Mutex<Option<SophonResult<[u8; 16]>>> = Mutex::new(None);
 
     // In non-Full mode, skip per-chunk decompressed hash verification.
