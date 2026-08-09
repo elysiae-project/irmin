@@ -80,6 +80,10 @@ impl DownloadHandle {
         self.state.load(Ordering::Acquire) == STATE_CANCELLED
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::Acquire) == STATE_PAUSED
+    }
+
     pub fn cancelled_future(&self) -> tokio_util::sync::WaitForCancellationFuture<'_> {
         self.cancel_token.cancelled()
     }

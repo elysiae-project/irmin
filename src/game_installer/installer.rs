@@ -1271,8 +1271,12 @@ async fn process_eager_item(
     }
 
     // Update progress.
-    ctx.downloaded_bytes
-        .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+    let db = ctx
+        .downloaded_bytes
+        .fetch_add(chunk.chunk_size, Ordering::Relaxed)
+        + chunk.chunk_size;
+
+    emit_download_progress(ctx, db);
 
     // Eager files are already fully written — skip assembly, just track completion.
     notify_eager_file_complete(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, ctx);
@@ -1383,6 +1387,68 @@ fn notify_assembly_ready(
     }
 }
 
+/// Emit a `SophonProgress::Downloading` event with speed/ETA if enough time
+/// has elapsed since the last emission.  Shared by both the eager and
+/// non-eager download paths.
+///
+/// Uses `compare_exchange` on `last_update` so that exactly one worker wins
+/// the emission slot per interval — prevents 24 concurrent workers from
+/// racing through the speed computation and clobbering the EWMA with zeros.
+fn emit_download_progress(ctx: &InstallContext, db: u64) {
+    let now = now_nanos();
+    let last = ctx.last_update.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < PROGRESS_UPDATE_INTERVAL_MS * 1_000_000 {
+        return;
+    }
+    // Atomically claim this emission slot; losers return immediately.
+    if ctx
+        .last_update
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let last_speed_nanos = ctx.last_speed_time.load(Ordering::Acquire);
+    let window_elapsed = if last_speed_nanos == 0 {
+        0.0
+    } else {
+        now.saturating_sub(last_speed_nanos) as f64 / 1_000_000_000.0
+    };
+    let instant_window_speed = if window_elapsed >= 1.0 {
+        let last_db = ctx.last_speed_bytes.load(Ordering::Relaxed);
+        let window_bytes = db.saturating_sub(last_db);
+        let window_speed = window_bytes as f64 / window_elapsed;
+        ctx.last_speed_bytes.store(db, Ordering::Release);
+        ctx.last_speed_time.store(now, Ordering::Release);
+        window_speed
+    } else {
+        0.0
+    };
+
+    let speed_alpha =
+        1.0 / (SPEED_SMOOTH_WINDOW_SECS * 1000.0 / PROGRESS_UPDATE_INTERVAL_MS as f64);
+    let speed_bps =
+        super::ewma_update(&ctx.smooth_speed_bps, instant_window_speed, speed_alpha);
+
+    let eta_speed_bps = super::compute_eta_speed(&ctx.eta_speed_history, instant_window_speed);
+
+    let remaining_bytes = ctx
+        .total_bytes
+        .saturating_sub(db + ctx.resume_bytes_offset.load(Ordering::Relaxed));
+    let eta_seconds = if eta_speed_bps > 0.0 {
+        remaining_bytes as f64 / eta_speed_bps
+    } else {
+        0.0
+    };
+    (ctx.updater)(SophonProgress::Downloading {
+        downloaded_bytes: db + ctx.resume_bytes_offset.load(Ordering::Relaxed),
+        total_bytes: ctx.total_bytes,
+        speed_bps,
+        eta_seconds,
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_download_item(
     item: DownloadItem,
@@ -1397,6 +1463,7 @@ async fn process_download_item(
     let mut _chunk_timer = super::profiling::ChunkTimer::new(&ctx.profiler);
 
     {
+        let was_paused = handle.is_paused();
         let db = ctx.downloaded_bytes.load(Ordering::Relaxed);
         handle
             .wait_if_paused(
@@ -1405,6 +1472,16 @@ async fn process_download_item(
                 ctx.total_bytes,
             )
             .await?;
+        // Reset speed baseline after a pause so stale timestamps don't
+        // produce near-zero speed readings.
+        if was_paused {
+            let now = now_nanos();
+            ctx.last_speed_time.store(now, Ordering::Relaxed);
+            ctx.last_speed_bytes.store(db, Ordering::Relaxed);
+            ctx.last_update.store(now, Ordering::Relaxed);
+            ctx.smooth_speed_bps.store(0, Ordering::Relaxed);
+            ctx.eta_speed_history.lock().unwrap().clear();
+        }
     }
 
     let chunk = ctx
@@ -1508,50 +1585,7 @@ async fn process_download_item(
         ctx.downloaded_bytes.load(Ordering::Relaxed)
     };
 
-    let now = now_nanos();
-    if now.saturating_sub(ctx.last_update.load(Ordering::Relaxed))
-        >= PROGRESS_UPDATE_INTERVAL_MS * 1_000_000
-    {
-        let last_speed_nanos = ctx.last_speed_time.load(Ordering::Relaxed);
-        let window_elapsed = if last_speed_nanos == 0 {
-            0.0
-        } else {
-            now.saturating_sub(last_speed_nanos) as f64 / 1_000_000_000.0
-        };
-        let instant_window_speed = if window_elapsed >= 1.0 {
-            let last_db = ctx.last_speed_bytes.load(Ordering::Relaxed);
-            let window_bytes = db.saturating_sub(last_db);
-            let window_speed = window_bytes as f64 / window_elapsed;
-            ctx.last_speed_bytes.store(db, Ordering::Relaxed);
-            ctx.last_speed_time.store(now, Ordering::Relaxed);
-            window_speed
-        } else {
-            0.0
-        };
-
-        let speed_alpha =
-            1.0 / (SPEED_SMOOTH_WINDOW_SECS * 1000.0 / PROGRESS_UPDATE_INTERVAL_MS as f64);
-        let speed_bps =
-            super::ewma_update(&ctx.smooth_speed_bps, instant_window_speed, speed_alpha);
-
-        let eta_speed_bps = super::compute_eta_speed(&ctx.eta_speed_history, instant_window_speed);
-
-        let remaining_bytes = ctx
-            .total_bytes
-            .saturating_sub(db + ctx.resume_bytes_offset.load(Ordering::Relaxed));
-        let eta_seconds = if eta_speed_bps > 0.0 {
-            remaining_bytes as f64 / eta_speed_bps
-        } else {
-            0.0
-        };
-        (ctx.updater)(SophonProgress::Downloading {
-            downloaded_bytes: db + ctx.resume_bytes_offset.load(Ordering::Relaxed),
-            total_bytes: ctx.total_bytes,
-            speed_bps,
-            eta_seconds,
-        });
-        ctx.last_update.store(now, Ordering::Relaxed);
-    }
+    emit_download_progress(ctx, db);
 
     notify_assembly_ready(
         item_idx,
