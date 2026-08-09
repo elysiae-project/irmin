@@ -81,7 +81,8 @@ pub enum VerifyMode {
     #[default]
     Full,
     /// Skip per-chunk hashing. Verify only the file-level MD5 after assembly.
-    /// On failure, the file is left incomplete for resume to retry.
+    /// All chunks use the eager path (no .zstd intermediates). Crash-resume is
+    /// disabled — interrupted downloads must re-download incomplete files.
     Deferred,
     /// Skip all hash verification. Size checks only.
     None,
