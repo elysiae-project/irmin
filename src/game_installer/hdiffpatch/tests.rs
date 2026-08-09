@@ -464,9 +464,9 @@ fn compression_mode_all_supported_parse() {
 /// compress_cover_buf_size == 1 triggers padding (whereas > 1 would not).
 #[test]
 fn cover_padding_with_small_compressed_size() {
-    // Padding is applied when compress_cover_buf_size > 0.
-    // compress_cover_buf_size == 1 triggers padding.
-    // compress_cover_buf_size > 1 also triggers padding (different path).
+    // Padding logic is exercised by the v20_zstd and v13_zstd end-to-end tests
+    // which use compressed covers. A dedicated regression would require crafting
+    // a patch with exactly compress_cover_buf_size == 1.
 }
 
 /// Verify the padding logic for all compression modes
@@ -614,9 +614,9 @@ fn compression_mode_default_equals_nocomp() {
 
 #[test]
 fn constants_correct_values() {
-    assert_eq!(MAX_MEM_BUFFER_LEN, 3 << 20);
-    assert_eq!(MAX_MEM_BUFFER_LIMIT, 5 << 20);
-    assert_eq!(MAX_ARRAY_POOL_LEN, 2 << 20);
+    assert_eq!(MAX_MEM_BUFFER_LEN, 1 << 20);
+    assert_eq!(MAX_MEM_BUFFER_LIMIT, 2 << 20);
+    assert_eq!(MAX_ARRAY_POOL_LEN, 1 << 20);
     assert_eq!(MAX_ARRAY_POOL_SECOND_OFFSET, MAX_ARRAY_POOL_LEN / 2);
 }
 
@@ -1148,7 +1148,7 @@ fn encode_7bit_varint(v: i64) -> Vec<u8> {
         return vec![v as u8];
     }
     let bits = 64 - (v as u64).leading_zeros() as usize;
-    let groups = (bits + 6) / 7;
+    let groups = bits.div_ceil(7);
     let mut out = Vec::with_capacity(groups);
     for i in (0..groups).rev() {
         let chunk = ((v >> (i * 7)) & 0x7F) as u8;
@@ -1171,7 +1171,7 @@ fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
     } else {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         let remaining_bits = bits - 6;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x3F) as u8;
         out.push((sign << 7) | 0x40 | first_payload);
@@ -1196,7 +1196,7 @@ fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
     } else {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         let remaining_bits = bits - 5;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x1F) as u8;
         out.push((rle_type << 6) | 0x20 | first_payload);
@@ -1244,7 +1244,7 @@ fn build_v20_nocomp_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -1273,11 +1273,7 @@ fn build_v20_nocomp_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut last_old_end = 0u64;
     let mut last_new_end = 0u64;
     for &(old_pos, new_pos, length) in &covers {
-        let delta = if old_pos >= last_old_end {
-            old_pos - last_old_end
-        } else {
-            last_old_end - old_pos
-        };
+        let delta = old_pos.abs_diff(last_old_end);
         let sign = if old_pos >= last_old_end { 0 } else { 1 };
         cover_buf.extend_from_slice(&encode_tagged_1bit(sign, delta as i64));
         cover_buf.extend_from_slice(&encode_7bit_varint((new_pos - last_new_end) as i64));
@@ -1334,7 +1330,7 @@ fn build_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);

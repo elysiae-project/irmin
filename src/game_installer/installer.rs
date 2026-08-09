@@ -119,10 +119,12 @@ struct InstallContext {
     state_saver: StateSaver,
     adaptive_assembly: Arc<AdaptiveAssembly>,
     profiler: Arc<super::profiling::PipelineProfiler>,
-    /// Live file completion bitset indexed by `file_idx`. Replaces the prior
-    /// `Arc<Mutex<HashSet<String>>>` with a constant-memory atomic array:
-    /// no per-file String alloc and zero lock contention.
+    /// Per-file completion bitset indexed by `file_idx`.
     completion_flags: Arc<[AtomicBool]>,
+    /// Output file handle cache for eager decompression.
+    output_allocator: Arc<super::output_allocator::OutputAllocator>,
+    /// Completion bitmap for eager decompression resume.
+    chunk_bitmap: Arc<super::chunk_bitmap::ChunkBitmap>,
 }
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -144,6 +146,7 @@ struct DownloadItem {
     chunk_idx: u32,
     installer_idx: u32,
     is_pre_downloaded: bool,
+    use_eager: bool,
 }
 
 type FileEntry = (u32, u32, u32);
@@ -608,9 +611,13 @@ fn register_chunks_for_file<'a>(
     pending_counts: &mut Vec<AtomicU32>,
     installer_idx: usize,
     pre_downloaded: &FxHashMap<u32, u64>,
+    eager_tainted_files: &mut rustc_hash::FxHashSet<u32>,
 ) {
     let range = all_files.file_chunk_range(file_idx);
 
+    // A file qualifies for eager decompression when all its chunks are pure downloads.
+    let file_is_eager = (range.start..range.end)
+        .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
     for ci in range.start..range.end {
@@ -627,6 +634,11 @@ fn register_chunks_for_file<'a>(
             if is_pre {
                 download_items[idx as usize].is_pre_downloaded = true;
             }
+            // Shared chunk: both the original file and this file are tainted.
+            // A post-registration pass disables eager for all tainted files.
+            let original_file = download_items[idx as usize].file_idx;
+            eager_tainted_files.insert(original_file);
+            eager_tainted_files.insert(file_idx as u32);
             idx
         } else {
             let idx = download_items.len() as u32;
@@ -635,6 +647,7 @@ fn register_chunks_for_file<'a>(
                 chunk_idx: (global_chunk_idx - range.start as usize) as u32,
                 installer_idx: installer_idx as u32,
                 is_pre_downloaded: is_pre,
+                use_eager: file_is_eager,
             });
             download_items_index.insert(name, idx);
             idx
@@ -659,7 +672,7 @@ fn register_chunks_for_file<'a>(
 async fn build_download_state(
     installer_data: Vec<InstallerData>,
     ctx: &InstallContext,
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     completed_indices: Option<&rustc_hash::FxHashSet<usize>>,
     pre_downloaded: &FxHashMap<u32, u64>,
 ) -> SophonResult<(
@@ -672,12 +685,15 @@ async fn build_download_state(
     Arc<ChunkNameLookup>,
 )> {
     let total_chunks: usize = ctx.all_files.num_chunks();
+    let total_files: usize = ctx.all_files.num_files();
     let mut download_items: Vec<DownloadItem> = Vec::with_capacity(total_chunks);
     let mut download_items_index: FxHashMap<&str, u32> =
         FxHashMap::with_capacity_and_hasher(total_chunks, Default::default());
-    let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::new();
-    let mut chunk_refcounts: Vec<AtomicU32> = Vec::new();
-    let mut pending_counts: Vec<AtomicU32> = Vec::new();
+    let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::with_capacity(total_chunks);
+    let mut chunk_refcounts: Vec<AtomicU32> = Vec::with_capacity(total_chunks);
+    let mut pending_counts: Vec<AtomicU32> = Vec::with_capacity(total_files);
+    let mut eager_tainted_files: rustc_hash::FxHashSet<u32> =
+        rustc_hash::FxHashSet::default();
 
     let mut all_files_index: usize = 0;
 
@@ -711,12 +727,23 @@ async fn build_download_state(
                 &mut pending_counts,
                 tmp_dir_idx,
                 pre_downloaded,
+                &mut eager_tainted_files,
             );
 
             if pending_counts.len() == pending_before {
-                let _ = assemble_tx.send((all_files_index, tmp_dir_idx)).await;
+                let _ = assemble_tx.send((all_files_index, tmp_dir_idx));
             }
             all_files_index += 1;
+        }
+    }
+
+    // Disable eager for all files that share chunks with other files.
+    // A file must go entirely through eager OR entirely through assembly.
+    if !eager_tainted_files.is_empty() {
+        for item in download_items.iter_mut() {
+            if eager_tainted_files.contains(&item.file_idx) {
+                item.use_eager = false;
+            }
         }
     }
 
@@ -859,7 +886,7 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
 #[allow(clippy::let_and_return)]
 fn spawn_assembly_coordinator(
     ctx: &Arc<InstallContext>,
-    assemble_rx: mpsc::Receiver<(usize, usize)>,
+    assemble_rx: mpsc::UnboundedReceiver<(usize, usize)>,
     assembly_cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<SophonResult<()>> {
     let ctx = Arc::clone(ctx);
@@ -873,6 +900,12 @@ fn spawn_assembly_coordinator(
         let cancel = task_cancel;
         let mut join_set = tokio::task::JoinSet::new();
         let mut first_file = true;
+
+        // Wait for OnceLock init; files with 0 downloadable chunks can arrive
+        // on the channel before build_download_state sets these values.
+        while ctx.chunk_refcounts.get().is_none() || ctx.chunk_names.get().is_none() {
+            tokio::task::yield_now().await;
+        }
 
         loop {
             let max_concurrency = ctx.adaptive_assembly.current_target();
@@ -1100,12 +1133,239 @@ async fn download_chunk_with_retries(
     }
 }
 
+/// Eager decompression path: downloads compressed data into memory, decompresses
+/// inline, and writes directly to the output file. Skips .zstd intermediate.
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    handle: &DownloadHandle,
+) -> SophonResult<()> {
+
+    // Check bitmap for resume.
+    let global_chunk_idx = {
+        let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
+        range.start as usize + item.chunk_idx as usize
+    };
+    if ctx.chunk_bitmap.is_complete(global_chunk_idx) {
+        // Already decompressed in a prior session. Update progress and skip.
+        ctx.downloaded_bytes
+            .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+        notify_eager_file_complete(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, ctx);
+        return Ok(());
+    }
+
+    // Ensure output file is pre-allocated.
+    let file_idx = item.file_idx as usize;
+    if ctx.output_allocator.get_handle(file_idx).is_none() {
+        let file_name = ctx.all_files.file_name(file_idx);
+        validate_asset_name(file_name)?;
+        let file_size = ctx.all_files.file_size(file_idx);
+        ctx.output_allocator
+            .preallocate_file(file_idx, file_name, file_size)?;
+    }
+
+    // Download compressed chunk into memory (with retries).
+    let client = &ctx.installer_clients[item.installer_idx as usize];
+    let download_info = &ctx.installer_downloads[item.installer_idx as usize];
+    let mut url = String::with_capacity(256);
+    download_info.url_for_into(chunk.chunk_name, &mut url);
+
+    let compressed_data = {
+        let mut attempts: u32 = 0;
+        loop {
+            if handle.is_cancelled() {
+                return Err(SophonError::Cancelled);
+            }
+
+            let result: SophonResult<_> = async {
+                let resp = client.get(&url).send().await?;
+                if !resp.status().is_success() {
+                    return Err(SophonError::Io(std::io::Error::other(format!(
+                        "HTTP {} for chunk {}",
+                        resp.status(),
+                        chunk.chunk_name
+                    ))));
+                }
+                resp.bytes().await.map_err(SophonError::Http)
+            }
+            .await;
+
+            match result {
+                Ok(data) => break data,
+                Err(err) => {
+                    if !err.is_retryable() {
+                        return Err(err);
+                    }
+                    attempts += 1;
+                    if attempts >= MAX_RETRIES {
+                        return Err(SophonError::DownloadFailed {
+                            chunk: chunk.chunk_name.to_string(),
+                            attempts: MAX_RETRIES,
+                            error: err.to_string(),
+                        });
+                    }
+                    log::warn!(
+                        "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}): {err}",
+                        chunk.chunk_name,
+                    );
+                    if cancelable_sleep(handle, retry_delay(attempts)).await.is_err() {
+                        return Err(SophonError::Cancelled);
+                    }
+                }
+            }
+        }
+    };
+
+    if handle.is_cancelled() {
+        return Err(SophonError::Cancelled);
+    }
+
+    // Compute chunk offset within the output file.
+    let chunk_offset = ctx.all_files.file_chunk_offset(file_idx, item.chunk_idx as usize);
+
+    // Decompress and write to output file.
+    let out_file = ctx
+        .output_allocator
+        .get_handle(file_idx)
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
+
+    let _decompressed_bytes = tokio::task::spawn_blocking({
+        let compressed = compressed_data;
+        let out = Arc::clone(&out_file);
+        let decomp_hash = chunk.chunk_decompressed_hash_md5.to_string();
+        let comp_hash = chunk.chunk_compressed_hash_md5.to_string();
+        let expected_size = chunk.chunk_size_decompressed;
+        move || {
+            super::eager_decompress::eager_decompress_chunk(
+                &compressed,
+                &out,
+                chunk_offset,
+                expected_size,
+                &comp_hash,
+                &decomp_hash,
+            )
+        }
+    })
+    .await
+    .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
+
+    // Ensure decompressed data is on disk before marking bitmap,
+    // so a crash+resume cannot see a "complete" chunk with missing data.
+    out_file.sync_data()?;
+
+    // Mark chunk complete in bitmap.
+    ctx.chunk_bitmap.mark_complete(global_chunk_idx);
+
+    // Periodic bitmap sync (same cadence as assembly state saves).
+    let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL)
+        && let Err(e) = ctx.chunk_bitmap.sync()
+    {
+        log::warn!("Failed to sync chunk bitmap: {e}");
+    }
+
+    // Update progress.
+    ctx.downloaded_bytes
+        .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+
+    // Eager files are already fully written — skip assembly, just track completion.
+    notify_eager_file_complete(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, ctx);
+
+    Ok(())
+}
+
+/// When all eager chunks for a file complete, mark the file done directly
+/// (no assembly needed since pwrite already placed decompressed data).
+fn notify_eager_file_complete(
+    item_idx: usize,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    ctx: &InstallContext,
+) {
+    let start = chunk_entry_offsets.get(item_idx).copied().unwrap_or(0) as usize;
+    let end = chunk_entry_offsets.get(item_idx + 1).copied().unwrap_or(0) as usize;
+    if start >= end {
+        return;
+    }
+
+    for (file_idx, _tmp_dir_idx, pending_idx) in &chunk_entries[start..end] {
+        let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            let file_idx = *file_idx as usize;
+            // Flush output data to disk before marking bitmap — prevents
+            // corruption if power is lost before kernel writeback.
+            if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
+                let _ = handle.sync_data();
+            }
+            // Close the cached output FD.
+            ctx.output_allocator.close_file(file_idx);
+            // Mark file complete (idempotent).
+            ctx.completion_flags[file_idx].store(true, Ordering::Release);
+            // Populate verify_cache so resume skips expensive MD5 rehash.
+            if ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES {
+                let file_name = ctx.all_files.file_name(file_idx);
+                let target_path = ctx.game_dir.join(file_name);
+                if let Ok(meta) = target_path.metadata() {
+                    let mtime_secs = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs());
+                    ctx.verify_cache.insert(
+                        file_name.to_string(),
+                        super::cache::VerificationEntry {
+                            size: ctx.all_files.file_size(file_idx),
+                            md5: ctx.all_files.file_hash_md5(file_idx).to_string(),
+                            mtime_secs,
+                        },
+                    );
+                }
+            }
+            // Update counters + progress (mirrors assembly coordinator).
+            let checked = ctx.checked_files.fetch_add(1, Ordering::Relaxed) + 1;
+            let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
+            let total = ctx.total_files;
+            let force = checked == total || assembled == total;
+            if force {
+                (ctx.updater)(SophonProgress::CheckingFiles {
+                    checked_files: checked,
+                    total_files: total,
+                });
+                (ctx.updater)(SophonProgress::Assembling {
+                    assembled_files: assembled,
+                    total_files: total,
+                });
+            } else if let Ok(mut lu) = ctx.last_assembly_update.try_lock()
+                && lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS)
+            {
+                (ctx.updater)(SophonProgress::CheckingFiles {
+                    checked_files: checked,
+                    total_files: total,
+                });
+                (ctx.updater)(SophonProgress::Assembling {
+                    assembled_files: assembled,
+                    total_files: total,
+                });
+                *lu = std::time::Instant::now();
+            }
+        }
+    }
+}
+
 fn notify_assembly_ready(
     item_idx: usize,
     chunk_entries: &[FileEntry],
     chunk_entry_offsets: &[u32],
     pending_counts: &[AtomicU32],
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
+    output_allocator: &super::output_allocator::OutputAllocator,
 ) {
     let start = chunk_entry_offsets.get(item_idx).copied().unwrap_or(0) as usize;
     let end = chunk_entry_offsets.get(item_idx + 1).copied().unwrap_or(0) as usize;
@@ -1116,7 +1376,9 @@ fn notify_assembly_ready(
     for (file_idx, tmp_dir_idx, pending_idx) in &chunk_entries[start..end] {
         let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            let _ = assemble_tx.try_send((*file_idx as usize, *tmp_dir_idx as usize));
+            // All chunks written — release the cached FD.
+            output_allocator.close_file(*file_idx as usize);
+            let _ = assemble_tx.send((*file_idx as usize, *tmp_dir_idx as usize));
         }
     }
 }
@@ -1125,12 +1387,12 @@ fn notify_assembly_ready(
 async fn process_download_item(
     item: DownloadItem,
     item_idx: usize,
-    ctx: Arc<InstallContext>,
-    chunk_entries: Arc<Vec<FileEntry>>,
-    chunk_entry_offsets: Arc<Vec<u32>>,
-    pending_counts: Arc<Vec<AtomicU32>>,
-    assemble_tx: mpsc::Sender<(usize, usize)>,
-    handle: DownloadHandle,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
+    handle: &DownloadHandle,
 ) -> SophonResult<()> {
     let mut _chunk_timer = super::profiling::ChunkTimer::new(&ctx.profiler);
 
@@ -1152,6 +1414,23 @@ async fn process_download_item(
     if !validate_chunk_name(chunk.chunk_name) {
         return Err(SophonError::PathTraversal(chunk.chunk_name.into()));
     }
+
+    // Eager decompression path: download compressed bytes into memory,
+    // decompress directly to the output file, skip .zstd intermediate.
+    if item.use_eager {
+        return process_eager_item(
+            &item,
+            item_idx,
+            chunk,
+            ctx,
+            chunk_entries,
+            chunk_entry_offsets,
+            pending_counts,
+            handle,
+        )
+        .await;
+    }
+
     let dest = {
         let mut p = ctx.chunks_dir.join(chunk.chunk_name);
         p.set_extension("zstd");
@@ -1186,8 +1465,8 @@ async fn process_download_item(
             &ctx.installer_downloads[item.installer_idx as usize],
             &dest,
             needs_download.1,
-            &ctx,
-            &handle,
+            ctx,
+            handle,
         )
         .await?;
         was_actually_downloaded = true;
@@ -1214,43 +1493,9 @@ async fn process_download_item(
 
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-        let dc = Arc::clone(&ctx.downloaded_chunks);
-        let cn = Arc::clone(&ctx.chunk_names);
-        let saver = Arc::clone(&ctx.state_saver);
-        let prev_handle = {
-            let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-                log::error!("last_save mutex poisoned, recovering");
-                err.into_inner()
-            });
-            guard.take()
-        };
-        if let Some(h) = prev_handle {
-            let _ = h.await;
-        }
-        let new_handle = tokio::task::spawn_blocking(move || {
-            let map: HashMap<String, u64> = if let (Some(dc), Some(cn)) = (dc.get(), cn.get()) {
-                dc.iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| {
-                        let val = v.load(Ordering::Relaxed);
-                        if val > 0 {
-                            Some((cn.get(i).to_string(), val as u64))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            } else {
-                HashMap::new()
-            };
-            saver(&map);
-        });
-        {
-            let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-                log::error!("last_save mutex poisoned, recovering");
-                err.into_inner()
-            });
-            *guard = Some(new_handle);
+        save_assembly_state(ctx).await;
+        if let Err(e) = ctx.chunk_bitmap.sync() {
+            log::warn!("Failed to sync chunk bitmap: {e}");
         }
     }
 
@@ -1310,10 +1555,11 @@ async fn process_download_item(
 
     notify_assembly_ready(
         item_idx,
-        &chunk_entries,
-        &chunk_entry_offsets,
-        &pending_counts,
-        &assemble_tx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        assemble_tx,
+        &ctx.output_allocator,
     );
 
     _chunk_timer.finish(chunk.chunk_size, was_actually_downloaded);
@@ -1332,7 +1578,7 @@ async fn run_downloads(
     chunk_entries: Arc<Vec<FileEntry>>,
     chunk_entry_offsets: Arc<Vec<u32>>,
     pending_counts: Arc<Vec<AtomicU32>>,
-    assemble_tx: &mpsc::Sender<(usize, usize)>,
+    assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     handle: DownloadHandle,
 ) -> DownloadSummary {
     const WORKER_COUNT: usize = super::DOWNLOAD_CONCURRENCY;
@@ -1381,12 +1627,12 @@ async fn run_downloads(
                 let result = process_download_item(
                     item,
                     item_idx,
-                    Arc::clone(&ctx),
-                    Arc::clone(&chunk_entries),
-                    Arc::clone(&chunk_entry_offsets),
-                    Arc::clone(&pending_counts),
-                    assemble_tx.clone(),
-                    handle.clone(),
+                    &ctx,
+                    &chunk_entries,
+                    &chunk_entry_offsets,
+                    &pending_counts,
+                    &assemble_tx,
+                    &handle,
                 )
                 .await;
                 if let Err(err) = result {
@@ -1467,13 +1713,9 @@ async fn finalize_install(
         let assembled = ctx.assembled_files.load(Ordering::Relaxed);
         let total = ctx.total_files;
         if assembled != total {
-            log::warn!(
-                "Sophon install completed but assembled_files ({assembled}) != total_files ({total}). {missing} files may be missing!",
-                missing = total - assembled,
-            );
-        } else {
-            log::info!("Sophon install: all {total} files assembled successfully");
+            return Err(SophonError::AssemblyIncomplete { assembled, total });
         }
+        log::info!("Sophon install: all {total} files assembled successfully");
     }
 
     {
@@ -1624,6 +1866,7 @@ pub async fn install(
     game_code: &str,
     vo_langs: &[String],
 ) -> SophonResult<()> {
+    super::raise_fd_limit();
     let game_dir_arc: Arc<PathBuf> = Arc::new(game_dir.to_path_buf());
     let chunks_dir = Arc::new(game_dir_arc.join("chunks"));
     let game_dir = game_dir_arc.as_path();
@@ -1631,22 +1874,32 @@ pub async fn install(
 
     // Create directories before `build_installer_data` filters them out,
     // so new directories from updates exist on disk.
-    for installer in &installers {
-        for asset in &installer.manifest.assets {
-            if asset.is_directory() {
-                if let Err(err) = validate_asset_name(&asset.asset_name) {
+    {
+        let dirs: Vec<std::path::PathBuf> = installers
+            .iter()
+            .flat_map(|inst| inst.manifest.assets.iter())
+            .filter(|a| a.is_directory())
+            .filter_map(|a| {
+                if let Err(err) = validate_asset_name(&a.asset_name) {
                     log::warn!(
                         "Skipping directory with invalid asset_name \"{name}\": {err}",
-                        name = asset.asset_name
+                        name = a.asset_name
                     );
-                    continue;
+                    None
+                } else {
+                    Some(game_dir.join(&a.asset_name))
                 }
-                let dir_path = game_dir.join(&asset.asset_name);
-                let dp = dir_path.clone();
-                tokio::task::spawn_blocking(move || fs::create_dir_all(&dp))
-                    .await?
-                    .map_err(SophonError::from)?;
-            }
+            })
+            .collect();
+        if !dirs.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                for dir in &dirs {
+                    fs::create_dir_all(dir)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await?
+            .map_err(SophonError::from)?;
         }
     }
 
@@ -1664,17 +1917,38 @@ pub async fn install(
             let chunks_dir_validate = Arc::clone(&chunks_dir);
             prev_downloaded_chunks = tokio::task::spawn_blocking(move || {
                 let before = prev_downloaded_chunks.len();
-                prev_downloaded_chunks.retain(|chunk_name, chunk_size| {
-                    chunk_still_valid_for_resume(chunk_name, *chunk_size, &chunks_dir_validate)
+                let num_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let chunks_vec: Vec<_> = prev_downloaded_chunks.into_iter().collect();
+                let chunk_size = chunks_vec.len().div_ceil(num_threads);
+                let validated: rustc_hash::FxHashMap<String, u64> = std::thread::scope(|s| {
+                    let handles: Vec<_> = chunks_vec
+                        .chunks(chunk_size.max(1))
+                        .map(|batch| {
+                            let dir = &chunks_dir_validate;
+                            s.spawn(move || {
+                                batch
+                                    .iter()
+                                    .filter(|(name, size)| chunk_still_valid_for_resume(name, *size, dir))
+                                    .map(|(name, size)| (name.clone(), *size))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap_or_default())
+                        .collect()
                 });
-                let removed = before - prev_downloaded_chunks.len();
+                let removed = before - validated.len();
                 if removed > 0 {
                     log::warn!(
                         "Removed {removed}/{before} stale chunk entries from resume state (chunks dir: {dir})",
                         dir = chunks_dir_validate.display()
                     );
                 }
-                prev_downloaded_chunks
+                validated
             })
             .await?;
         }
@@ -1777,6 +2051,8 @@ pub async fn install(
     let mut resume_bytes_offset: u64 = 0;
     let mut pre_assembled: u64 = 0;
     let completed_chunk_indices: Arc<DashSet<u32>>;
+    let bitmap_ranges_to_clear: Arc<Mutex<Vec<(usize, usize)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let completed_indices: Option<rustc_hash::FxHashSet<usize>> = if options.is_resume {
         let total = all_files.num_files() as u64;
         (callbacks.updater)(SophonProgress::CalculatingDownloads {
@@ -1791,6 +2067,14 @@ pub async fn install(
         let completed_chunk_indices_arc: Arc<DashSet<u32>> = Arc::new(DashSet::new());
         let indices_arc: Arc<DashSet<usize>> = Arc::new(DashSet::new());
         let files_to_delete: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let resume_bitmap: Option<Arc<super::chunk_bitmap::ChunkBitmap>> = {
+            let bitmap_path = game_dir.join(format!(".sophon_bitmap_{}", &current_manifest_hash[..16]));
+            if bitmap_path.exists() {
+                super::chunk_bitmap::ChunkBitmap::load(&bitmap_path).ok().map(Arc::new)
+            } else {
+                None
+            }
+        };
 
         let calc_futures = (0..all_files.num_files()).map(|file_idx| {
             let all_files = Arc::clone(&all_files);
@@ -1803,7 +2087,9 @@ pub async fn install(
             let completed_chunk_indices_arc = Arc::clone(&completed_chunk_indices_arc);
             let indices_arc = Arc::clone(&indices_arc);
             let files_to_delete = Arc::clone(&files_to_delete);
+            let bitmap_ranges_to_clear = Arc::clone(&bitmap_ranges_to_clear);
             let updater = Arc::clone(&callbacks.updater);
+            let resume_bitmap = resume_bitmap.clone();
 
             async move {
                 let _permit = permit.acquire().await.ok()?;
@@ -1843,10 +2129,24 @@ pub async fn install(
                         .await
                         .ok()?
                     } else {
-                        tokio::fs::metadata(&target_path)
+                        let size_ok = tokio::fs::metadata(&target_path)
                             .await
                             .map(|m| m.len() == file_size)
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        // For eager files (preallocated to full size), size alone is
+                        // insufficient — verify bitmap confirms all chunks were written.
+                        let is_eager = (chunk_range.start..chunk_range.end)
+                            .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+                        if size_ok && is_eager {
+                            resume_bitmap.as_ref().is_some_and(|bm| {
+                                bm.all_complete_for_range(
+                                    chunk_range.start as usize,
+                                    chunk_range.end as usize,
+                                )
+                            })
+                        } else {
+                            size_ok
+                        }
                     };
 
                     if valid {
@@ -1867,6 +2167,12 @@ pub async fn install(
                         if !needs_old_file {
                             files_to_delete.lock().unwrap().push(target_path);
                         }
+                        // Clear stale bitmap bits so resume doesn't skip
+                        // chunks whose output file was just deleted.
+                        bitmap_ranges_to_clear
+                            .lock()
+                            .unwrap()
+                            .push((chunk_range.start as usize, chunk_range.end as usize));
                     }
                 }
                 let checked = checked_files.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2043,7 +2349,44 @@ pub async fn install(
         adaptive_assembly: Arc::clone(&adaptive_assembly),
         profiler: Arc::new(super::profiling::PipelineProfiler::new()),
         completion_flags: Arc::clone(&completion_flags),
+        output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(game_dir)),
+        chunk_bitmap: {
+            let bitmap_path = game_dir.join(format!(".sophon_bitmap_{}", &current_manifest_hash[..16]));
+            // Remove stale bitmaps from previous manifest versions.
+            if let Ok(entries) = std::fs::read_dir(game_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(".sophon_bitmap")
+                        && name_str != bitmap_path.file_name().unwrap().to_string_lossy()
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            let total = all_files.num_chunks();
+            let bm = if bitmap_path.exists() {
+                match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
+                    Ok(bm) if bm.total_chunks() == total => bm,
+                    _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
+                        .map_err(SophonError::Io)?,
+                }
+            } else {
+                super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
+                    .map_err(SophonError::Io)?
+            };
+            Arc::new(bm)
+        },
     });
+
+    // Clear stale bitmap bits for files that were deleted during resume
+    // validation. Without this, process_eager_item would skip chunks whose
+    // output file no longer exists.
+    if let Ok(ranges) = bitmap_ranges_to_clear.lock() {
+        for &(start, end) in ranges.iter() {
+            ctx.chunk_bitmap.clear_range(start, end);
+        }
+    }
 
     #[cfg(feature = "sophon-profiling")]
     {
@@ -2057,7 +2400,7 @@ pub async fn install(
         });
     }
 
-    let (assemble_tx, assemble_rx) = mpsc::channel::<(usize, usize)>(ASSEMBLY_CHANNEL_SIZE);
+    let (assemble_tx, assemble_rx) = mpsc::unbounded_channel::<(usize, usize)>();
     // Shared cancellation token. Cancelling stops the RAM adjuster and
     // wakes any blocked recv().
     let assembly_cancel_token = tokio_util::sync::CancellationToken::new();
@@ -2144,6 +2487,11 @@ pub async fn install(
 
     // Downloads are done — let assembly run at full speed.
     ctx.adaptive_assembly.set_download_active(false);
+
+    // Final bitmap flush — covers the tail that didn't hit the periodic interval.
+    if let Err(e) = ctx.chunk_bitmap.sync() {
+        log::warn!("Failed final chunk bitmap sync: {e}");
+    }
 
     {
         let total = ctx.total_bytes;

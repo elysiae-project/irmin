@@ -77,6 +77,7 @@ pub(crate) fn get_clip_stream(
                 }
                 let tight_log = window_log_for_size(length);
                 let mut ctx = take_dctx();
+                let mut used_window_log = tight_log;
 
                 let out = {
                     ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
@@ -100,6 +101,7 @@ pub(crate) fn get_clip_stream(
                 let out = if !out.is_empty() {
                     out
                 } else {
+                    used_window_log = MAX_WINDOW_LOG;
                     ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
                         .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
                     ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(MAX_WINDOW_LOG))
@@ -120,7 +122,7 @@ pub(crate) fn get_clip_stream(
                     out
                 };
 
-                return_dctx(ctx);
+                return_dctx(ctx, used_window_log);
                 Ok((Box::new(Cursor::new(out)), file_bytes))
             } else {
                 let mut decoder = zstd::stream::read::Decoder::new(limited)?;
@@ -141,7 +143,8 @@ pub(crate) fn get_clip_stream(
                 file,
                 remaining: comp_length,
             };
-            let mut decoder = DeflateDecoder::new(limited);
+            let mut decoder =
+                DeflateDecoder::new(std::io::BufReader::with_capacity(256 * 1024, limited));
 
             if is_buffered {
                 if length > MAX_BUFFERED_SIZE {
@@ -161,7 +164,8 @@ pub(crate) fn get_clip_stream(
                 file,
                 remaining: comp_length,
             };
-            let mut decoder = lz4::Decoder::new(limited)?;
+            let mut decoder =
+                lz4::Decoder::new(std::io::BufReader::with_capacity(256 * 1024, limited))?;
 
             if is_buffered {
                 if length > MAX_BUFFERED_SIZE {

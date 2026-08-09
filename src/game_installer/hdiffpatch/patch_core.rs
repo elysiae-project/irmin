@@ -16,6 +16,45 @@ pub(crate) fn write_cover_stream_to_output(
     header_info: &HeaderInfo,
     on_progress: Option<&dyn Fn(u64)>,
 ) -> std::io::Result<()> {
+    write_cover_stream_inner(
+        clips,
+        input_stream,
+        None,
+        output_stream,
+        header_info,
+        on_progress,
+    )
+}
+
+/// Variant with direct old-data slice access, bypassing seek+read_exact.
+pub(crate) fn write_cover_stream_to_output_with_slice(
+    clips: &mut [Box<dyn Read>],
+    old_data: &[u8],
+    output_stream: &mut dyn Write,
+    header_info: &HeaderInfo,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> std::io::Result<()> {
+    // dummy never read when old_data is Some
+    let mut dummy = Cursor::new(&[][..]);
+    write_cover_stream_inner(
+        clips,
+        &mut dummy,
+        Some(old_data),
+        output_stream,
+        header_info,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cover_stream_inner(
+    clips: &mut [Box<dyn Read>],
+    input_stream: &mut dyn SeekableRead,
+    old_data: Option<&[u8]>,
+    output_stream: &mut dyn Write,
+    header_info: &HeaderInfo,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> std::io::Result<()> {
     // Safety: every index 0..MAX_ARRAY_POOL_LEN is populated by read_exact
     // or write_all before being read in the RLE decode loop.
     #[allow(clippy::uninit_vec)]
@@ -81,6 +120,7 @@ pub(crate) fn write_cover_stream_to_output(
         tbytes_copy_old_clip_patch(
             &mut cache,
             input_stream,
+            old_data,
             &mut rle_struct,
             cover.old_pos,
             cover.cover_length,
@@ -152,6 +192,7 @@ fn write_cache_to_output(
 fn tbytes_copy_old_clip_patch(
     out_cache: &mut Cursor<Vec<u8>>,
     input_stream: &mut dyn SeekableRead,
+    old_data: Option<&[u8]>,
     rle_loader: &mut RleRefClip,
     old_pos: i64,
     add_length: i64,
@@ -163,8 +204,22 @@ fn tbytes_copy_old_clip_patch(
         return Err(std::io::Error::other("add_length is negative"));
     }
     let last_pos = out_cache.position();
-    input_stream.seek(SeekFrom::Start(old_pos as u64))?;
-    tbytes_copy_stream_inner(input_stream, out_cache, shared_buffer, add_length as usize)?;
+    if let Some(slice) = old_data {
+        // Direct slice write — no seek, no chunked read_exact.
+        let start = old_pos as usize;
+        let end = start
+            .checked_add(add_length as usize)
+            .ok_or_else(|| std::io::Error::other("old_pos + add_length overflow"))?;
+        if end > slice.len() {
+            return Err(std::io::Error::other(
+                "patch references old data beyond slice bounds",
+            ));
+        }
+        out_cache.write_all(&slice[start..end])?;
+    } else {
+        input_stream.seek(SeekFrom::Start(old_pos as u64))?;
+        tbytes_copy_stream_inner(input_stream, out_cache, shared_buffer, add_length as usize)?;
+    }
     out_cache.seek(SeekFrom::Start(last_pos))?;
     tbytes_determine_rle_type(
         rle_loader,
@@ -287,13 +342,15 @@ pub(crate) fn tbytes_set_rle(
         .mem_copy_length
         .min(*copy_length)
         .min(MAX_ARRAY_POOL_SECOND_OFFSET as i64) as usize;
-    let last_pos = out_cache.position();
+    let last_pos = out_cache.position() as usize;
     rle_code_stream.read_exact(&mut shared_buffer[..decode_step])?;
-    out_cache.read_exact(
-        &mut shared_buffer
-            [MAX_ARRAY_POOL_SECOND_OFFSET..MAX_ARRAY_POOL_SECOND_OFFSET + decode_step],
-    )?;
-    out_cache.seek(SeekFrom::Start(last_pos))?;
+    // Direct cache read — avoids Cursor::read_exact overhead.
+    let cache_data = out_cache.get_ref();
+    if last_pos + decode_step > cache_data.len() {
+        return Err(std::io::Error::other("RLE vector: cache underflow"));
+    }
+    shared_buffer[MAX_ARRAY_POOL_SECOND_OFFSET..MAX_ARRAY_POOL_SECOND_OFFSET + decode_step]
+        .copy_from_slice(&cache_data[last_pos..last_pos + decode_step]);
     tbytes_set_rle_vector_software(
         rle_loader,
         out_cache,
@@ -320,19 +377,18 @@ pub(crate) fn tbytes_set_rle_single(
         .min(shared_buffer.len() as i64);
 
     if rle_loader.mem_set_value != 0 {
-        let last_pos = out_cache.position();
+        // Operate directly on the cache Vec — avoids two memcpys through shared_buffer.
+        let pos = out_cache.position() as usize;
         let len = mem_set_step as usize;
-        out_cache.read_exact(&mut shared_buffer[..len])?;
-        out_cache.seek(SeekFrom::Start(last_pos))?;
-        // Use slice iterator form so LLVM can emit a broadcast-add
-        // (vpaddb with broadcast on x86_64 AVX2). Iteration direction is
-        // safe in either way because each index only reads and writes
-        // itself.
+        let cache_data = out_cache.get_mut();
+        if pos + len > cache_data.len() {
+            return Err(std::io::Error::other("RLE single: cache underflow"));
+        }
         let v = rle_loader.mem_set_value;
-        shared_buffer[..len]
+        cache_data[pos..pos + len]
             .iter_mut()
             .for_each(|b| *b = b.wrapping_add(v));
-        out_cache.write_all(&shared_buffer[..len])?;
+        out_cache.set_position((pos + len) as u64);
     } else {
         let cur = out_cache.position();
         out_cache.set_position(cur + mem_set_step as u64);
@@ -351,11 +407,7 @@ pub(crate) fn tbytes_set_rle_vector_software(
     rle_idx: usize,
     old_idx: usize,
 ) -> std::io::Result<()> {
-    // Use split_at_mut to obtain two non-overlapping mutable slices from
-    // buf. The pattern relies on the invariant that rle_idx and
-    // (old_idx + decode_step) split the buffer so the two ranges are
-    // disjoint ,  true for all callers in this codebase. Iter-zip form
-    // enables LLVM autovectorization (vpaddb/AVX2).
+    // XOR rle data (at rle_idx) with old cache data (at old_idx) in shared_buffer.
     if rle_idx + decode_step <= old_idx || old_idx + decode_step <= rle_idx {
         if rle_idx < old_idx {
             let (lo, rest) = buf.split_at_mut(old_idx);
@@ -372,16 +424,26 @@ pub(crate) fn tbytes_set_rle_vector_software(
                 *d = d.wrapping_add(*s);
             }
         }
-        out_cache.write_all(&buf[rle_idx..rle_idx + decode_step])?;
     } else {
-        // Overlapping ranges: read immediately before write at the same
-        // index so the add is well-defined serially.
         for i in 0..decode_step {
             let v = buf[old_idx + i];
             buf[rle_idx + i] = buf[rle_idx + i].wrapping_add(v);
         }
-        out_cache.write_all(&buf[rle_idx..rle_idx + decode_step])?;
     }
+    // Write result directly into cache Vec, bypassing Cursor::write_all.
+    let pos = out_cache.position() as usize;
+    let cache_data = out_cache.get_mut();
+    let result = &buf[rle_idx..rle_idx + decode_step];
+    if pos + decode_step <= cache_data.len() {
+        cache_data[pos..pos + decode_step].copy_from_slice(result);
+    } else {
+        // Extend if writing past current length (rare: initial fill).
+        if pos > cache_data.len() {
+            cache_data.resize(pos, 0);
+        }
+        cache_data.extend_from_slice(result);
+    }
+    out_cache.set_position((pos + decode_step) as u64);
     rle_loader.mem_copy_length -= decode_step as i64;
     *copy_length -= decode_step as i64;
     Ok(())
@@ -763,9 +825,10 @@ mod tests {
         // 0x00 + 0xFF = 0xFF (255)
         // 0x7F (127) + 0xFF (255) = 382 mod 256 = 126 = 0x7E
         // 0x80 (128) + 0xFF (255) = 383 mod 256 = 127 = 0x7F
-        assert_eq!(shared_buffer[0], 0xFF, "byte 0 should be 0xFF");
-        assert_eq!(shared_buffer[1], 0x7E, "byte 1 should be 0x7E");
-        assert_eq!(shared_buffer[2], 0x7F, "byte 2 should be 0x7F");
+        let data = cache.get_ref();
+        assert_eq!(data[0], 0xFF, "byte 0 should be 0xFF");
+        assert_eq!(data[1], 0x7E, "byte 1 should be 0x7E");
+        assert_eq!(data[2], 0x7F, "byte 2 should be 0x7F");
     }
 
     /// Test wrapping_add behavior at boundary (0xFF + 0x01 = 0x00)
@@ -792,10 +855,11 @@ mod tests {
         assert!(result.is_ok(), "tbytes_set_rle_single should succeed");
         // 0xFF + 0x01 = 0x00 (wrapped), 0xFF + 0x01 = 0x00, 0x00 + 0x01 = 0x01, 0x7F +
         // 0x01 = 0x80
-        assert_eq!(shared_buffer[0], 0x00, "0xFF + 0x01 should wrap to 0x00");
-        assert_eq!(shared_buffer[1], 0x00, "0xFF + 0x01 should wrap to 0x00");
-        assert_eq!(shared_buffer[2], 0x01, "0x00 + 0x01 should be 0x01");
-        assert_eq!(shared_buffer[3], 0x80, "0x7F + 0x01 should be 0x80");
+        let data = cache.get_ref();
+        assert_eq!(data[0], 0x00, "0xFF + 0x01 should wrap to 0x00");
+        assert_eq!(data[1], 0x00, "0xFF + 0x01 should wrap to 0x00");
+        assert_eq!(data[2], 0x01, "0x00 + 0x01 should be 0x01");
+        assert_eq!(data[3], 0x80, "0x7F + 0x01 should be 0x80");
     }
 
     /// Test mem_set_length > copy_length: should only process copy_length bytes
@@ -1270,9 +1334,10 @@ mod tests {
 
         assert!(result.is_ok());
         // 0x10 + 0x10 = 0x20, 0x20 + 0x10 = 0x30, 0x30 + 0x10 = 0x40
-        assert_eq!(shared_buffer[0], 0x20);
-        assert_eq!(shared_buffer[1], 0x30);
-        assert_eq!(shared_buffer[2], 0x40);
+        let data = cache.get_ref();
+        assert_eq!(data[0], 0x20);
+        assert_eq!(data[1], 0x30);
+        assert_eq!(data[2], 0x40);
     }
 
     /// tbytes_set_rle_single with single byte addition (minimum non-trivial
@@ -1301,7 +1366,7 @@ mod tests {
             rle_loader.mem_set_length, 0,
             "mem_set_length should be exhausted"
         );
-        assert_eq!(shared_buffer[0], 0x01, "0x00 + 0x01 = 0x01");
+        assert_eq!(cache.get_ref()[0], 0x01, "0x00 + 0x01 = 0x01");
     }
 
     /// tbytes_set_rle_single with non-zero mem_set_value capped by a small
@@ -1331,9 +1396,10 @@ mod tests {
             rle_loader.mem_set_length, 96,
             "mem_set_length should have 96 remaining"
         );
-        // Verify the bytes were modified (non-zero code path)
-        assert_eq!(shared_buffer[0], 0x10, "0x00 + 0x10 = 0x10");
-        assert_eq!(shared_buffer[3], 0x10, "0x00 + 0x10 = 0x10");
+        // Verify the cache bytes were modified (non-zero code path)
+        let data = cache.get_ref();
+        assert_eq!(data[0], 0x10, "0x00 + 0x10 = 0x10");
+        assert_eq!(data[3], 0x10, "0x00 + 0x10 = 0x10");
     }
 
     /// tbytes_set_rle_single with mem_set_value = 0x80 and data = 0x80 tests
@@ -1357,6 +1423,6 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        assert_eq!(shared_buffer[0], 0x00, "0x80 + 0x80 should wrap to 0x00");
+        assert_eq!(cache.get_ref()[0], 0x00, "0x80 + 0x80 should wrap to 0x00");
     }
 }

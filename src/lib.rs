@@ -166,7 +166,7 @@ pub async fn sophon_preinstall(
 
     game_installer::preinstall_download(
         client,
-        &plan,
+        plan,
         &game_dir,
         game_id,
         vo_lang,

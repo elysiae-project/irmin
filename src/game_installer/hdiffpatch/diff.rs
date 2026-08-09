@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use super::header::{DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo};
@@ -116,13 +116,15 @@ impl HDiff {
         }
 
         // Newfile patch: old_data_size == 0 means source is optional.
-        let mut old_file: File;
+        let mut source_mmap = None;
+        let mut old_file_fallback: Option<File> = None;
+        let mut source_cursor: Option<Cursor<&[u8]>> = None;
+
         if header_info.old_data_size == 0 && !std::path::Path::new(&self.source_path).exists() {
-            // Use /dev/null as empty source for newfile patches.
-            old_file = File::open("/dev/null")?;
+            old_file_fallback = Some(File::open("/dev/null")?);
         } else {
-            old_file = File::open(&self.source_path)?;
-            let old_len = old_file.metadata()?.len() as i64;
+            let f = File::open(&self.source_path)?;
+            let old_len = f.metadata()?.len() as i64;
             if old_len != header_info.old_data_size {
                 return Err(format!(
                     "input file size mismatch: expected {expected} bytes, got {old_len} bytes",
@@ -130,7 +132,44 @@ impl HDiff {
                 )
                 .into());
             }
+            // mmap source for zero-syscall random access in cover operations.
+            // Falls back to File if mmap fails.
+            if old_len > 0 {
+                match unsafe {
+                    crate::game_installer::assembly_opt::mmap_read_only_unchecked(
+                        &f,
+                        old_len as usize,
+                    )
+                } {
+                    Ok(guard) => {
+                        unsafe {
+                            libc::madvise(guard.map_base, guard.map_len, libc::MADV_RANDOM);
+                            // Pre-fault source pages only when small enough to
+                            // avoid blocking the thread on multi-GB files.
+                            if guard.map_len <= 256 * 1024 * 1024 {
+                                libc::madvise(
+                                    guard.map_base,
+                                    guard.map_len,
+                                    libc::MADV_POPULATE_READ,
+                                );
+                            }
+                        }
+                        source_mmap = Some(guard);
+                        source_cursor = Some(Cursor::new(source_mmap.as_ref().unwrap().as_slice()));
+                    }
+                    Err(_) => {
+                        old_file_fallback = Some(f);
+                    }
+                }
+            } else {
+                old_file_fallback = Some(f);
+            }
         }
+
+        let old_source: &mut dyn SeekableRead = match source_cursor.as_mut() {
+            Some(c) => c,
+            None => old_file_fallback.as_mut().unwrap(),
+        };
 
         let expected_size = header_info.new_data_size;
         if expected_size < 0 {
@@ -138,23 +177,48 @@ impl HDiff {
         }
 
         let out_file = File::create(&self.dest_path)?;
+        if expected_size > 0 {
+            out_file.set_len(expected_size as u64)?;
+            let _ = crate::game_installer::sysio::preallocate(&out_file, expected_size as u64);
+        }
         let mut out_writer =
             BufWriter::with_capacity(super::super::FILE_WRITE_BUFFER_SIZE, out_file);
 
         if header_info.is_single_compressed_diff {
-            super::patch_sf::PatchSF::new(header_info).patch(
-                &mut old_file,
-                &mut out_writer,
-                &self.diff_path,
-                on_progress,
-            )?;
+            // Direct slice path avoids seek+read_exact vtable dispatch per cover chunk.
+            let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
+            if let Some(slice) = old_slice {
+                super::patch_sf::PatchSF::new(header_info).patch_with_slice(
+                    slice,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            } else {
+                super::patch_sf::PatchSF::new(header_info).patch(
+                    old_source,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            }
         } else {
-            super::patch_single::PatchSingle::new(header_info).patch(
-                &mut old_file,
-                &mut out_writer,
-                &self.diff_path,
-                on_progress,
-            )?;
+            let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
+            if let Some(slice) = old_slice {
+                super::patch_single::PatchSingle::new(header_info).patch_with_slice(
+                    slice,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            } else {
+                super::patch_single::PatchSingle::new(header_info).patch(
+                    old_source,
+                    &mut out_writer,
+                    &self.diff_path,
+                    on_progress,
+                )?;
+            }
         }
         out_writer.flush()?;
 

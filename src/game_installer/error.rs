@@ -124,6 +124,9 @@ pub enum SophonError {
 
     #[error("Request timed out after {0} seconds")]
     Timeout(u64),
+
+    #[error("Assembly incomplete: {assembled} of {total} files assembled")]
+    AssemblyIncomplete { assembled: u64, total: u64 },
 }
 
 impl SophonError {
@@ -158,7 +161,8 @@ impl SophonError {
             | Self::AssemblyFailed { .. }
             | Self::IndexOutOfBounds { .. }
             | Self::InvalidSizeString(_)
-            | Self::Timeout(_) => false,
+            | Self::Timeout(_)
+            | Self::AssemblyIncomplete { .. } => false,
         }
     }
 }
@@ -535,5 +539,12 @@ mod tests {
         );
         assert!(!SophonError::OriginalFileMissing("f".into()).is_retryable());
         assert!(!SophonError::ApiError(400, "bad".into()).is_retryable());
+        assert!(
+            !SophonError::AssemblyIncomplete {
+                assembled: 99,
+                total: 100
+            }
+            .is_retryable()
+        );
     }
 }

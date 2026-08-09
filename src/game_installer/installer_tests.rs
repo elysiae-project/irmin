@@ -442,11 +442,13 @@
 
     #[tokio::test]
     async fn notify_assembly_ready_single_file_ready() {
-        let (tx, mut rx) = mpsc::channel::<(usize, usize)>(16);
+        let (tx, mut rx) = mpsc::unbounded_channel::<(usize, usize)>();
 
         let pending_counts: Vec<AtomicU32> = vec![AtomicU32::new(1)];
         let chunk_entries: Vec<FileEntry> = vec![(0u32, 0u32, 0u32)];
         let chunk_entry_offsets: Vec<u32> = vec![0, 1];
+        let tmp = tempfile::tempdir().unwrap();
+        let alloc = super::output_allocator::OutputAllocator::new(tmp.path());
 
         notify_assembly_ready(
             0,
@@ -454,6 +456,7 @@
             &chunk_entry_offsets,
             &pending_counts,
             &tx,
+            &alloc,
         );
 
         let received = rx.try_recv();
@@ -467,8 +470,10 @@
         let chunk_entries: Vec<FileEntry> = vec![];
         let chunk_entry_offsets: Vec<u32> = vec![0];
         let pending_counts: Vec<AtomicU32> = vec![];
-        let (tx, rx) = mpsc::channel::<(usize, usize)>(16);
+        let (tx, rx) = mpsc::unbounded_channel::<(usize, usize)>();
         drop(rx);
+        let tmp = tempfile::tempdir().unwrap();
+        let alloc = super::output_allocator::OutputAllocator::new(tmp.path());
 
         notify_assembly_ready(
             999,
@@ -476,6 +481,7 @@
             &chunk_entry_offsets,
             &pending_counts,
             &tx,
+            &alloc,
         );
     }
 
@@ -513,7 +519,7 @@
         std::fs::write(&file_path, data).unwrap();
 
         let md5_hex = {
-            let mut hasher = md5::Md5::new();
+            let mut hasher = fast_md5::Md5::new();
             hasher.update(data);
             hex::encode(hasher.finalize())
         };
@@ -571,7 +577,7 @@
 
         let server = MockServer::start().await;
         let data = b"chunk payload".to_vec();
-        let expected_md5 = hex::encode(md5::Md5::digest(&data));
+        let expected_md5 = hex::encode(fast_md5::digest(&data));
 
         let data_len = data.len() as u64;
         let chunk = SophonManifestAssetChunk {
@@ -649,6 +655,8 @@
             adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
             profiler: Arc::new(super::profiling::PipelineProfiler::new()),
             completion_flags: Arc::from(Vec::<AtomicBool>::new()),
+            output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
+            chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap()),
         });
 
         let handle = DownloadHandle::new();
@@ -679,7 +687,7 @@
         // Intentionally wrong hash so the chunk always fails MD5 verification.
         let _wrong_md5 = "00000000000000000000000000000000";
 
-        let wrong_md5 = hex::encode(md5::Md5::digest(b"wrong_data"));
+        let wrong_md5 = hex::encode(fast_md5::digest(b"wrong_data"));
         let data_len = data.len() as u64;
         let chunk = SophonManifestAssetChunk {
             chunk_name: "discard_partial_chunk".to_string(),
@@ -751,6 +759,8 @@
             adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
             profiler: Arc::new(super::profiling::PipelineProfiler::new()),
             completion_flags: Arc::from(Vec::<AtomicBool>::new()),
+            output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
+            chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap()),
         });
 
         let handle = DownloadHandle::new();

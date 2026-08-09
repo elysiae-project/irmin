@@ -138,47 +138,7 @@ pub enum CommandError {
 
 impl From<SophonError> for CommandError {
     fn from(e: SophonError) -> Self {
-        match e {
-            SophonError::Cancelled => CommandError::Cancelled,
-            SophonError::NoSpaceAvailable {
-                path,
-                needed,
-                available,
-            } => CommandError::NoSpaceAvailable {
-                path,
-                needed,
-                available,
-            },
-            SophonError::Md5Mismatch { item, .. } => CommandError::Md5Mismatch { item },
-            SophonError::SizeMismatch {
-                item,
-                expected,
-                actual,
-            } => CommandError::SizeMismatch {
-                item,
-                expected,
-                actual,
-            },
-            SophonError::OriginalFileMissing(path) => CommandError::OriginalFileMissing { path },
-            SophonError::DownloadFailed {
-                chunk, attempts, ..
-            } => CommandError::DownloadFailed { chunk, attempts },
-            SophonError::HDiffPatchFailed { file, .. } => CommandError::HdiffPatchFailed { file },
-            SophonError::AssemblyFailed { file, .. } => CommandError::AssemblyFailed { file },
-            SophonError::NoGameManifest => CommandError::NoGameManifest,
-            SophonError::NoVoiceManifest(locale) => CommandError::NoVoiceManifest { locale },
-            SophonError::InvalidAssetName(name) => CommandError::InvalidAssetName { name },
-            SophonError::PathTraversal(path) => CommandError::PathTraversal {
-                path: path.to_string_lossy().to_string(),
-            },
-            SophonError::ApiError(retcode, message) => CommandError::ApiError { retcode, message },
-            SophonError::PluginValidationFailed(name) => {
-                CommandError::PluginValidationFailed { name }
-            }
-            _ => CommandError::Generic {
-                message: e.to_string(),
-            },
-        }
+        CommandError::from(&e)
     }
 }
 

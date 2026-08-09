@@ -1,8 +1,10 @@
 use std::fs::File;
-use std::io::{Cursor, Read, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{Read, SeekFrom, Write};
 
 use super::compression::get_clip_stream;
-use super::parser::BinaryExtensions;
+use super::parser::{read_long_7bit_from_slice, BinaryExtensions};
 use super::{BufferPool, HeaderInfo, SeekableRead};
 
 const MAX_STEP_SIZE: usize = 16 * 1024 * 1024;
@@ -23,6 +25,36 @@ impl PatchSF {
     pub fn patch(
         &self,
         input_stream: &mut dyn SeekableRead,
+        output_stream: &mut dyn Write,
+        patch_path: &str,
+        on_progress: Option<&dyn Fn(u64)>,
+    ) -> std::io::Result<()> {
+        self.patch_inner(input_stream, None, output_stream, patch_path, on_progress)
+    }
+
+    /// Patch with direct slice access to old data, bypassing seek+read_exact.
+    pub fn patch_with_slice(
+        &self,
+        old_data: &[u8],
+        output_stream: &mut dyn Write,
+        patch_path: &str,
+        on_progress: Option<&dyn Fn(u64)>,
+    ) -> std::io::Result<()> {
+        // dummy cursor never actually read when old_data is Some
+        let mut dummy = std::io::Cursor::new(&[][..]);
+        self.patch_inner(
+            &mut dummy,
+            Some(old_data),
+            output_stream,
+            patch_path,
+            on_progress,
+        )
+    }
+
+    fn patch_inner(
+        &self,
+        input_stream: &mut dyn SeekableRead,
+        old_data: Option<&[u8]>,
         output_stream: &mut dyn Write,
         patch_path: &str,
         on_progress: Option<&dyn Fn(u64)>,
@@ -69,6 +101,7 @@ impl PatchSF {
         let result = patch_loop(
             &mut diff,
             input_stream,
+            old_data,
             output_stream,
             cover_count,
             new_data_size,
@@ -77,7 +110,7 @@ impl PatchSF {
             on_progress,
         );
         WORK_BUF_POOL.return_buf(io_buf);
-        STEP_BUF_POOL.return_buf_shrunken(step_buf, IO_BUF_SIZE);
+        STEP_BUF_POOL.return_buf(step_buf);
         result
     }
 }
@@ -86,6 +119,7 @@ impl PatchSF {
 fn patch_loop(
     mut diff: &mut dyn Read,
     old: &mut dyn SeekableRead,
+    old_data: Option<&[u8]>,
     out: &mut dyn Write,
     mut cover_count: u64,
     new_data_size: u64,
@@ -121,14 +155,17 @@ fn patch_loop(
         diff.read_exact(&mut step_buf[..step_end])?;
 
         let (covers_slice, rle_slice) = step_buf[..step_end].split_at(buf_cover_size);
-        let mut covers = Cursor::new(covers_slice);
-        let covers_len = covers_slice.len() as u64;
+        let mut covers_off = 0usize;
         let mut rle0 = Rle0Decoder::new(rle_slice);
 
-        while covers.position() < covers_len && cover_count > 0 {
+        while covers_off < covers_slice.len() && cover_count > 0 {
             let prev_new_end = last_new_end;
-            let (old_pos, new_pos, length) =
-                decode_cover(&mut covers, &mut last_old_end, &mut last_new_end)?;
+            let (old_pos, new_pos, length) = decode_cover(
+                covers_slice,
+                &mut covers_off,
+                &mut last_old_end,
+                &mut last_new_end,
+            )?;
             if new_pos < prev_new_end {
                 return Err(std::io::Error::other(
                     "backward or overlapping covers in single-frame patch",
@@ -138,26 +175,61 @@ fn patch_loop(
                 let gap = new_pos - prev_new_end;
                 copy_n(&mut *diff, out, gap, io_buf)?;
                 total_written += gap;
-                if let Some(ref cb) = on_progress {
-                    cb(total_written);
-                }
             }
             cover_count -= 1;
 
+            // length==0 covers are near-nonexistent in real patches;
+            // keeping the branch for correctness but the predictor will skip it.
             if length > 0 {
-                old.seek(SeekFrom::Start(old_pos))?;
-                let mut rem = length;
-                while rem > 0 {
-                    let take = (io_buf.len() as u64).min(rem) as usize;
-                    old.read_exact(&mut io_buf[..take])?;
-                    rle0.add(&mut io_buf[..take])?;
-                    out.write_all(&io_buf[..take])?;
-                    rem -= take as u64;
+                if let Some(slice) = old_data {
+                    // Direct slice access — no seek, no vtable dispatch.
+                    let start = old_pos as usize;
+                    let end = start + length as usize;
+                    if end > slice.len() {
+                        return Err(std::io::Error::other(
+                            "cover old_pos+length exceeds old data size",
+                        ));
+                    }
+                    let src = &slice[start..end];
+                    if length <= usize::MAX as u64 && rle0.try_skip_zeros(length as usize)? {
+                        // Zero-run: write old data directly without io_buf copy.
+                        out.write_all(src)?;
+                    } else {
+                        // XOR from source slice into io_buf without prior memcpy.
+                        let mut off = 0usize;
+                        let len = length as usize;
+                        while off < len {
+                            let take = io_buf.len().min(len - off);
+                            rle0.add_from_source(&src[off..off + take], &mut io_buf[..take])?;
+                            out.write_all(&io_buf[..take])?;
+                            off += take;
+                        }
+                    }
+                } else {
+                    old.seek(SeekFrom::Start(old_pos))?;
+                    if length <= usize::MAX as u64 && rle0.try_skip_zeros(length as usize)? {
+                        let mut rem = length;
+                        while rem > 0 {
+                            let take = (io_buf.len() as u64).min(rem) as usize;
+                            old.read_exact(&mut io_buf[..take])?;
+                            out.write_all(&io_buf[..take])?;
+                            rem -= take as u64;
+                        }
+                    } else {
+                        let mut rem = length;
+                        while rem > 0 {
+                            let take = (io_buf.len() as u64).min(rem) as usize;
+                            old.read_exact(&mut io_buf[..take])?;
+                            rle0.add(&mut io_buf[..take])?;
+                            out.write_all(&io_buf[..take])?;
+                            rem -= take as u64;
+                        }
+                    }
                 }
                 total_written += length;
-                if let Some(ref cb) = on_progress {
-                    cb(total_written);
-                }
+            }
+            if let Some(ref cb) = on_progress {
+                cb(total_written);
             }
         }
     }
@@ -173,15 +245,18 @@ fn patch_loop(
 }
 
 fn decode_cover(
-    covers: &mut Cursor<&[u8]>,
+    covers: &[u8],
+    offset: &mut usize,
     last_old_end: &mut u64,
     last_new_end: &mut u64,
 ) -> std::io::Result<(u64, u64, u64)> {
-    let mut b = [0u8; 1];
-    covers.read_exact(&mut b)?;
-    let first = b[0];
+    if *offset >= covers.len() {
+        return Err(std::io::Error::other("cover: buffer underflow"));
+    }
+    let first = covers[*offset];
+    *offset += 1;
     let sign = first >> 7;
-    let delta_raw = covers.read_long_7bit_tagged(1, first)?;
+    let delta_raw = read_long_7bit_from_slice(covers, offset, 1, first)?;
     if delta_raw < 0 {
         return Err(std::io::Error::other("negative delta in cover header"));
     }
@@ -195,14 +270,14 @@ fn decode_cover(
             .checked_sub(delta)
             .ok_or_else(|| std::io::Error::other("old_pos underflow"))?
     };
-    let new_pos_raw = covers.read_long_7bit()?;
+    let new_pos_raw = read_long_7bit_from_slice(covers, offset, 0, 0)?;
     if new_pos_raw < 0 {
         return Err(std::io::Error::other("negative new_pos gap in cover"));
     }
     let new_pos = last_new_end
         .checked_add(new_pos_raw as u64)
         .ok_or_else(|| std::io::Error::other("new_pos overflow"))?;
-    let length_raw = covers.read_long_7bit()?;
+    let length_raw = read_long_7bit_from_slice(covers, offset, 0, 0)?;
     if length_raw < 0 {
         return Err(std::io::Error::other("negative cover length in cover"));
     }
@@ -235,6 +310,30 @@ impl<'a> Rle0Decoder<'a> {
         }
     }
 
+    /// If the decoder is currently in a zero-run of at least `n` bytes,
+    /// consume those bytes (leaving data untouched) and return true.
+    /// Otherwise return false and consume nothing.
+    // hot fast-path for large unchanged regions; avoids io_buf chunking entirely.
+    fn try_skip_zeros(&mut self, n: usize) -> std::io::Result<bool> {
+        // Ensure we're in the len0 state. If we just finished a lenv and
+        // need_decode0 is true with lenv==0, decode the next len0 first.
+        if self.len0 == 0 && self.lenv == 0 && self.need_decode0 {
+            self.need_decode0 = false;
+            match rle_varint(self.buf, &mut self.pos) {
+                Some(v) => self.len0 = v,
+                None => {
+                    return Err(std::io::Error::other("truncated RLE varint in RLE0 (len0)"));
+                }
+            }
+        }
+        if self.len0 >= n {
+            self.len0 -= n;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn add(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         let mut dp = 0usize;
         let mut rem = data.len();
@@ -257,6 +356,62 @@ impl<'a> Rle0Decoder<'a> {
                 // Iter-zip form enables LLVM autovectorization (vpaddb).
                 for (d, s) in dst.iter_mut().zip(src.iter()) {
                     *d = d.wrapping_add(*s);
+                }
+                self.pos += to_read;
+                self.lenv -= to_read;
+                dp += to_read;
+                rem -= to_read;
+            } else if self.need_decode0 {
+                self.need_decode0 = false;
+                match rle_varint(self.buf, &mut self.pos) {
+                    Some(v) => self.len0 = v,
+                    None => {
+                        return Err(std::io::Error::other("truncated RLE varint in RLE0 (len0)"));
+                    }
+                }
+            } else {
+                self.need_decode0 = true;
+                match rle_varint(self.buf, &mut self.pos) {
+                    Some(v) => self.lenv = v,
+                    None => {
+                        return Err(std::io::Error::other("truncated RLE varint in RLE0 (lenv)"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply RLE decoding from a read-only source into a separate output buffer.
+    /// Equivalent to copying `source` into `out` then calling `add(out)`, but
+    /// avoids the initial memcpy for the zero-run (len0) regions.
+    fn add_from_source(&mut self, source: &[u8], out: &mut [u8]) -> std::io::Result<()> {
+        debug_assert_eq!(source.len(), out.len());
+        let mut dp = 0usize;
+        let mut rem = source.len();
+        while rem > 0 {
+            if self.len0 > 0 {
+                let take = self.len0.min(rem);
+                // Zero-run: output = source unchanged, no copy_from_slice needed
+                // if caller writes out[..] to the writer.
+                out[dp..dp + take].copy_from_slice(&source[dp..dp + take]);
+                self.len0 -= take;
+                dp += take;
+                rem -= take;
+            } else if self.lenv > 0 {
+                let available = self.buf.len().saturating_sub(self.pos);
+                if self.lenv > available {
+                    return Err(std::io::Error::other(
+                        "RLE0 diff data exceeds remaining code buffer",
+                    ));
+                }
+                let to_read = self.lenv.min(rem);
+                let rle_src = &self.buf[self.pos..self.pos + to_read];
+                let old_src = &source[dp..dp + to_read];
+                let dst = &mut out[dp..dp + to_read];
+                // source[i] + rle[i] directly into output, no prior copy needed.
+                for ((d, o), r) in dst.iter_mut().zip(old_src.iter()).zip(rle_src.iter()) {
+                    *d = o.wrapping_add(*r);
                 }
                 self.pos += to_read;
                 self.lenv -= to_read;
@@ -313,6 +468,7 @@ fn rle_varint(buf: &[u8], pos: &mut usize) -> Option<usize> {
     Some(val as usize)
 }
 
+#[inline]
 fn copy_n(
     src: &mut dyn Read,
     dst: &mut dyn Write,
@@ -479,6 +635,28 @@ mod tests {
         assert_eq!(data[..10], [0x00u8; 10]);
         assert_eq!(data[10], 0x11);
         assert_eq!(data[11], 0x22);
+    }
+
+    #[test]
+    fn rle0decoder_add_from_source_matches_add() {
+        // Same pattern as rle0decoder_large_skip but using add_from_source.
+        let rle_buf = vec![10u8, 2u8, 0x11u8, 0x22u8];
+        let source = [0xAAu8; 12];
+
+        let mut rle0 = Rle0Decoder::new(&rle_buf);
+        let mut out = [0u8; 12];
+        rle0.add_from_source(&source, &mut out).unwrap();
+        // First 10 bytes: source unchanged (0xAA)
+        assert_eq!(out[..10], [0xAA; 10]);
+        // Last 2: source + rle = 0xAA + 0x11, 0xAA + 0x22
+        assert_eq!(out[10], 0xAAu8.wrapping_add(0x11));
+        assert_eq!(out[11], 0xAAu8.wrapping_add(0x22));
+
+        // Verify equivalence with copy+add approach
+        let mut rle0b = Rle0Decoder::new(&rle_buf);
+        let mut data = source;
+        rle0b.add(&mut data).unwrap();
+        assert_eq!(out, data);
     }
 
     #[test]

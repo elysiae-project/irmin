@@ -92,7 +92,8 @@ async fn download_zip(
         .error_for_status()?;
     let total_bytes = resp.content_length().unwrap_or(0);
 
-    let mut file = tokio::fs::File::create(dest).await?;
+    let raw_file = tokio::fs::File::create(dest).await?;
+    let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, raw_file);
     let mut stream = resp.bytes_stream();
     let needs_hash = !expected_md5.is_empty();
     let mut hasher = if needs_hash {
@@ -359,7 +360,12 @@ async fn install_single_plugin(
 
     download_zip(client, &pkg.url, &zip_path, &pkg.md5, updater).await?;
 
-    if let Err(err) = extract_zip(&zip_path, game_dir) {
+    let zp = zip_path.clone();
+    let gd = game_dir.to_path_buf();
+    if let Err(err) = tokio::task::spawn_blocking(move || extract_zip(&zp, &gd))
+        .await
+        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))?
+    {
         let _ = fs::remove_file(&zip_path);
         return Err(err);
     }
@@ -463,7 +469,12 @@ async fn install_single_sdk(
     )
     .await?;
 
-    if let Err(err) = extract_zip(&zip_path, game_dir) {
+    let zp = zip_path.clone();
+    let gd = game_dir.to_path_buf();
+    if let Err(err) = tokio::task::spawn_blocking(move || extract_zip(&zp, &gd))
+        .await
+        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))?
+    {
         let _ = fs::remove_file(&zip_path);
         return Err(err);
     }

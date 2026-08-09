@@ -49,6 +49,8 @@ pub fn copy_file_range(
 /// Copy a region from an open source file into `dst_file` at `dst_off` using
 /// `copy_file_range`. Applies `POSIX_FADV_DONTNEED` on the source region
 /// once copied so the source pages do not stay resident.
+/// Copy a region from `src` to `dst` using `copy_file_range`. Evicts source
+/// pages after the copy. Callers handle destination eviction.
 pub fn copy_file_from(
     src: &File,
     src_off: u64,
@@ -64,22 +66,6 @@ pub fn copy_file_from(
             src_fd,
             src_off as libc::off_t,
             len as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    let _ = unsafe {
-        libc::sync_file_range(
-            dst_fd,
-            dst_off as libc::off64_t,
-            copied as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WRITE,
-        )
-    };
-    let _ = unsafe {
-        libc::posix_fadvise(
-            dst_fd,
-            dst_off as libc::off_t,
-            copied as libc::off_t,
             libc::POSIX_FADV_DONTNEED,
         )
     };
@@ -101,13 +87,17 @@ pub fn copy_file_region_to(
 }
 
 /// Pre-allocate disk blocks for `file` up to `len` bytes using
-/// `posix_fallocate(2)`. Improves sequential write performance by
-/// avoiding fragmentation and CoW overhead on copy-on-write filesystems.
+/// `fallocate(2)` with `FALLOC_FL_KEEP_SIZE`. Allocates extents without
+/// zeroing or changing file size. Silently ignores unsupported filesystems.
 pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::posix_fallocate(fd, 0, len as libc::off_t) };
+    let ret = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len as libc::off_t) };
     if ret != 0 {
-        return Err(std::io::Error::last_os_error());
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EOPNOTSUPP | libc::ENOSYS) => {}
+            _ => return Err(e),
+        }
     }
     Ok(())
 }

@@ -7,13 +7,13 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use super::FILE_WRITE_BUFFER_SIZE;
 use super::error::{SophonError, SophonResult};
 use super::sysio;
+use super::FILE_WRITE_BUFFER_SIZE;
 
-const ASSEMBLY_BUFFER_SIZE: usize = 256 * 1024;
+const ASSEMBLY_BUFFER_SIZE: usize = 1024 * 1024;
 
-const ONESHOT_MAX_SIZE: usize = 16 * 1024 * 1024;
+const ONESHOT_MAX_SIZE: usize = 64 * 1024 * 1024;
 
 const EMPTY_MD5: &str = "00000000000000000000000000000000";
 
@@ -149,6 +149,27 @@ fn hex_nibble(b: u8) -> Option<u8> {
 thread_local! {
     static OPT_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ZSTD_DCTX: RefCell<Option<zstd::zstd_safe::DCtx<'static>>> = const { RefCell::new(None) };
+    static EAGER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take the thread-local eager decompression buffer (1 MiB).
+pub(crate) fn take_eager_buf() -> Vec<u8> {
+    EAGER_BUF.with(|cell| {
+        let mut buf = std::mem::take(&mut *cell.borrow_mut());
+        if buf.capacity() < super::eager_decompress::EAGER_BUFFER_SIZE {
+            buf = Vec::with_capacity(super::eager_decompress::EAGER_BUFFER_SIZE);
+        }
+        unsafe { buf.set_len(super::eager_decompress::EAGER_BUFFER_SIZE) };
+        buf
+    })
+}
+
+/// Return the eager buffer to the thread-local pool.
+pub(crate) fn return_eager_buf(mut buf: Vec<u8>) {
+    buf.clear();
+    EAGER_BUF.with(|cell| {
+        *cell.borrow_mut() = buf;
+    });
 }
 
 pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
@@ -159,15 +180,19 @@ pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
     })
 }
 
-pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>) {
+pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, window_log_used: u32) {
+    // Drops contexts with window > 4 MB to avoid retaining large buffers.
+    if window_log_used > 22 {
+        return;
+    }
     ZSTD_DCTX.with(|cell| cell.borrow_mut().replace(ctx));
 }
 
 pub(crate) struct MmapGuard {
-    ptr: *mut libc::c_void,
-    len: usize,
-    map_base: *mut libc::c_void,
-    map_len: usize,
+    pub(crate) ptr: *mut libc::c_void,
+    pub(crate) len: usize,
+    pub(crate) map_base: *mut libc::c_void,
+    pub(crate) map_len: usize,
 }
 
 impl MmapGuard {
@@ -180,8 +205,9 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
+        // MADV_DONTNEED on MAP_SHARED dirty pages triggers writeback implicitly.
+        // msync(MS_ASYNC) is redundant on Linux >= 2.6.17 for shared mappings.
         unsafe {
-            libc::msync(self.map_base, self.map_len, libc::MS_ASYNC);
             libc::madvise(self.map_base, self.map_len, libc::MADV_DONTNEED);
         }
     }
@@ -214,6 +240,9 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
     }
     unsafe {
         libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+        if len >= 2 * 1024 * 1024 {
+            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+        }
     }
     Ok(MmapGuard {
         ptr,
@@ -223,12 +252,56 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
     })
 }
 
+/// MAP_SHARED read-only mapping: sees concurrent pwrite updates to the file's
+/// page cache. Used by the parallel hasher thread to hash assembling output
+/// without per-chunk read_at syscalls. `MADV_POPULATE_READ` pre-faults pages.
+pub(crate) fn mmap_shared_read_only(file: &File, len: usize) -> io::Result<MmapGuard> {
+    if len == 0 {
+        return Err(io::Error::other("empty file"));
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        // Pre-fault pages so the hash loop doesn't pay per-page fault cost.
+        // Only for files ≤256 MiB; larger files use SEQUENTIAL for readahead
+        // without synchronous prefault.
+        if len <= 256 * 1024 * 1024 {
+            libc::madvise(ptr, len, libc::MADV_POPULATE_READ);
+        } else {
+            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+        }
+        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+    }
+    Ok(MmapGuard {
+        ptr,
+        len,
+        map_base: ptr,
+        map_len: len,
+    })
+}
+
+fn page_size() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize)
+}
+
 pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Result<MmapGuard> {
     if len == 0 {
         return Err(io::Error::other("zero-length mmap"));
     }
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
-    let page_mask = !(page_size - 1);
+    let ps = page_size();
+    let page_mask = !(ps - 1);
     let map_offset = offset & page_mask as u64;
     let ptr_offset = (offset - map_offset) as usize;
     let map_len = len + ptr_offset;
@@ -244,6 +317,10 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        // Hint transparent hugepages for regions >= 2 MiB to reduce TLB pressure.
+        if map_len >= 2 * 1024 * 1024 {
+            libc::madvise(base, map_len, libc::MADV_HUGEPAGE);
+        }
         Ok(MmapGuard {
             ptr: base.add(ptr_offset),
             len,
@@ -251,6 +328,33 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
             map_len,
         })
     }
+}
+
+// Thread-local reusable buffer for reading compressed chunk data via pread.
+// Grows to fit the largest chunk seen on this thread (up to ONESHOT_MAX_SIZE)
+// and is reused across calls, avoiding mmap/munmap syscall overhead per chunk.
+thread_local! {
+    static COMPRESSED_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take the thread-local compressed buffer, growing it if needed.
+/// Caller must return it via [`return_compressed_buf`] when done.
+fn take_compressed_buf(len: usize) -> Vec<u8> {
+    COMPRESSED_BUF.with(|cell| {
+        let mut buf = std::mem::take(&mut *cell.borrow_mut());
+        if buf.capacity() < len {
+            buf.reserve(len - buf.len());
+        }
+        // Safety: pread will overwrite these bytes; avoid zeroing cost.
+        unsafe { buf.set_len(len) };
+        buf
+    })
+}
+
+fn return_compressed_buf(buf: Vec<u8>) {
+    COMPRESSED_BUF.with(|cell| {
+        *cell.borrow_mut() = buf;
+    });
 }
 
 fn decompress_chunk_oneshot(
@@ -271,21 +375,52 @@ fn decompress_chunk_oneshot(
     if compressed_size == 0 {
         return Err(SophonError::Io(io::Error::other("empty chunk")));
     }
-    let mmap = unsafe { mmap_read_only_unchecked(&f, compressed_size) }?;
-    let compressed = mmap.as_slice();
+
+    // pread into thread-local buffer instead of mmap; saves ~5 syscalls/chunk.
+    // Upgrade path: if chunks exceed ONESHOT_MAX_SIZE, fall back to mmap or streaming.
+    let mut compressed_buf = take_compressed_buf(compressed_size);
+    let n = f.read_at(&mut compressed_buf[..compressed_size], 0)?;
+    if n != compressed_size {
+        return_compressed_buf(compressed_buf);
+        return Err(SophonError::Io(io::Error::other(
+            "short read on compressed chunk",
+        )));
+    }
+    let compressed = &compressed_buf[..compressed_size];
 
     let mut out_mmap = mmap_read_write(out_file, offset, expected_usize)?;
+
+    // Prefault output pages in a single kernel batch. Avoids per-page faults
+    // during decompression. EINVAL means kernel < 5.14; silently degrade.
+    unsafe {
+        let ret = libc::madvise(
+            out_mmap.map_base,
+            out_mmap.map_len,
+            libc::MADV_POPULATE_WRITE,
+        );
+        if ret != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINVAL) {
+                return Err(SophonError::Io(e));
+            }
+        }
+    }
+
     let output = out_mmap.as_mut_slice();
 
     let result = (|| {
         let mut ctx = take_dctx();
         ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
             .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
+        // Only skip frame checksum when MD5 verification covers integrity.
+        if chunk_hash_required(chunk_decompressed_hash_md5) || file_hasher.is_some() {
+            let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+        }
 
         let written = ctx
             .decompress(output, compressed)
             .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
-        return_dctx(ctx);
+        return_dctx(ctx, window_log_for_size(expected_size));
 
         if written != expected_usize {
             return Err(SophonError::SizeMismatch {
@@ -317,6 +452,10 @@ fn decompress_chunk_oneshot(
         Ok(expected_size)
     })();
 
+    return_compressed_buf(compressed_buf);
+    // Evict compressed chunk pages from page cache.
+    posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+    drop(f);
     out_mmap.flush_and_evict();
     drop(out_mmap);
     result
@@ -344,7 +483,7 @@ pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, le
             fd,
             offset as libc::off64_t,
             len as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WRITE,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
         )
     };
     posix_advise(fd, offset, len, libc::POSIX_FADV_DONTNEED);
@@ -387,13 +526,6 @@ pub fn write_chunk_from_mmap(
     }
 
     let file_len = old_file.metadata().map_err(SophonError::Io)?.len();
-    posix_advise(
-        old_file.as_raw_fd(),
-        old_offset,
-        expected_size,
-        libc::POSIX_FADV_SEQUENTIAL,
-    );
-
     if old_offset + expected_size > file_len {
         return Err(SophonError::SizeMismatch {
             item: old_file_path.display().to_string(),
@@ -401,6 +533,13 @@ pub fn write_chunk_from_mmap(
             actual: file_len.saturating_sub(old_offset),
         });
     }
+
+    posix_advise(
+        old_file.as_raw_fd(),
+        old_offset,
+        expected_size,
+        libc::POSIX_FADV_SEQUENTIAL,
+    );
 
     let expected_size_u = expected_size as usize;
 
@@ -448,7 +587,6 @@ pub fn write_chunk_from_mmap(
     );
 
     let bytes_written = (expected_size_u - remaining) as u64;
-    sync_and_evict_range(out_file.as_raw_fd(), new_offset, bytes_written);
 
     buf.clear();
     OPT_BUFFER.with(|cell| cell.replace(buf));
@@ -502,10 +640,14 @@ pub fn decompress_chunk_optimized(
             &mut file_hasher,
             chunk_decompressed_hash_md5,
         );
-        if result.is_ok() {
-            return result;
+        match &result {
+            Ok(_) => return result,
+            // Hash mismatches indicate corrupt data; retrying with streaming won't help.
+            Err(SophonError::Md5Mismatch { .. }) => return result,
+            Err(SophonError::SizeMismatch { .. }) => return result,
+            // Decompression/IO errors may succeed with streaming (different window, buffering).
+            Err(_) => {}
         }
-        // Fall through to streaming decompression on any error.
     }
 
     let dynamic_log = window_log_for_size(expected_size);
@@ -561,6 +703,9 @@ fn decompress_chunk_with_window(
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx reset")))?;
         ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax")))?;
+        if chunk_hash_required(chunk_decompressed_hash_md5) || file_hasher.is_some() {
+            let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+        }
 
         let (bytes, chunk_hasher) = {
             let buf_reader = BufReader::with_capacity(FILE_WRITE_BUFFER_SIZE, f);
@@ -617,12 +762,11 @@ fn decompress_chunk_with_window(
             (bytes, chunk_hasher)
         }; // decoder dropped, ctx borrow released
 
-        return_dctx(ctx);
+        return_dctx(ctx, window_log);
         (bytes, chunk_hasher)
     };
 
     posix_advise(compressed_fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-    sync_and_evict_range(out_file.as_raw_fd(), offset, bytes_written);
 
     if bytes_written != expected_size {
         return Err(SophonError::SizeMismatch {

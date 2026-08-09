@@ -12,7 +12,7 @@ pub use dashmap::DashMap as VerificationCache;
 pub(crate) const VERIFICATION_CACHE_MAX_ENTRIES: usize = 5_000;
 
 #[cfg(test)]
-use md5::{Digest, Md5};
+use fast_md5;
 use serde::{Deserialize, Serialize};
 
 use super::VERIFICATION_CACHE_FILE;
@@ -111,6 +111,7 @@ pub fn save_verification_cache(
         let mut writer = std::io::BufWriter::with_capacity(super::FILE_WRITE_BUFFER_SIZE, f);
         serde_json::to_writer(&mut writer, &serializable)?;
         writer.flush()?;
+        writer.get_ref().sync_data()?;
     }
     fs::rename(&tmp_path, &cache_path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp_path);
@@ -169,6 +170,13 @@ pub fn check_file_md5_with_cache_key_and_size(
         Err(err) => return Err(err),
     };
     let actual_size = metadata.len();
+
+    // Fast rejection: skip DashMap lookup if size doesn't match.
+    if actual_size != expected_size {
+        cache.remove(cache_key);
+        return Ok((false, Some(actual_size)));
+    }
+
     let mtime = metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
@@ -178,18 +186,9 @@ pub fn check_file_md5_with_cache_key_and_size(
     if let Some(entry) = cache.get(cache_key)
         && entry.size == expected_size
         && entry.md5 == expected_md5
+        && entry.mtime_secs == mtime
     {
-        if entry.mtime_secs == mtime {
-            return Ok((true, Some(actual_size)));
-        }
-        if actual_size == expected_size {
-            return Ok((true, Some(actual_size)));
-        }
-    }
-
-    if actual_size != expected_size {
-        cache.remove(cache_key);
-        return Ok((false, Some(actual_size)));
+        return Ok((true, Some(actual_size)));
     }
 
     let actual = file_md5_digest(path)?;

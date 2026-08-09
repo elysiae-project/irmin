@@ -4,8 +4,10 @@ mod api;
 pub mod assembly;
 mod assembly_opt;
 pub mod cache;
+pub mod chunk_bitmap;
 pub mod compact_manifest;
 mod download;
+pub mod eager_decompress;
 mod error;
 mod game_filters;
 mod handle;
@@ -14,6 +16,7 @@ pub mod hdiffpatch;
 #[cfg(not(feature = "benchmark"))]
 mod hdiffpatch;
 pub mod installer;
+pub mod output_allocator;
 mod plugin_api;
 mod plugin_install;
 mod preinstall;
@@ -22,6 +25,8 @@ mod update;
 mod profiling;
 pub mod sysio;
 
+#[cfg(test)]
+mod eager_integration_tests;
 #[cfg(test)]
 mod integration_tests;
 
@@ -63,8 +68,6 @@ pub async fn cancelable_sleep(
 }
 /// Max concurrent assembly tasks.
 pub const ASSEMBLY_CONCURRENCY: usize = 4;
-/// Assembly task channel buffer size.
-pub const ASSEMBLY_CHANNEL_SIZE: usize = 4096;
 /// Installed version marker filename.
 pub const VERSION_FILE_NAME: &str = ".sophon_version";
 /// MD5 verification cache filename.
@@ -115,13 +118,18 @@ pub fn compute_eta_speed(
     if samples.len() < ETA_MIN_SAMPLES {
         return 0.0;
     }
-    let mut sorted: Vec<f64> = samples.iter().copied().collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
+    let n = samples.len();
+    let mut buf = [0.0f64; ETA_WINDOW_SAMPLES];
+    let slice = samples.make_contiguous();
+    buf[..n].copy_from_slice(slice);
+    let mid = n / 2;
+    buf[..n].select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    if n.is_multiple_of(2) {
+        // For even count, average the two middle elements.
+        let left_max = buf[..mid].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (left_max + buf[mid]) / 2.0
     } else {
-        sorted[mid]
+        buf[mid]
     }
 }
 
@@ -175,6 +183,18 @@ pub fn reclaim_memory() {
     #[cfg(feature = "sophon-profiling")]
     {
         let _ = tikv_jemalloc_ctl::epoch::advance();
+    }
+}
+
+/// Raise RLIMIT_NOFILE to the hard limit. The eager decompression path may
+/// open many output files concurrently. Call early in process startup.
+pub fn raise_fd_limit() {
+    unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
+            rlim.rlim_cur = rlim.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
     }
 }
 

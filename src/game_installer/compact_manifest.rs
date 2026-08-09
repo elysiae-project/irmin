@@ -7,6 +7,7 @@
 
 use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
 
 impl<'a> From<&'a SophonManifestAssetChunk> for ChunkRef<'a> {
     fn from(chunk: &'a SophonManifestAssetChunk) -> Self {
@@ -25,10 +26,11 @@ impl<'a> From<&'a SophonManifestAssetChunk> for ChunkRef<'a> {
 /// `String` and referenced by offset. Length is derived from consecutive
 /// offsets, so each string costs 4 bytes (u32 offset) instead of 8.
 #[derive(Default)]
+#[allow(clippy::len_without_is_empty)]
 pub struct StringArena {
     data: String,
     offsets: Vec<u32>,
-    dedup: FxHashMap<String, u32>,
+    dedup: FxHashMap<u64, u32>,
 }
 
 impl StringArena {
@@ -36,7 +38,7 @@ impl StringArena {
         Self {
             data: String::with_capacity(total_bytes),
             offsets: Vec::with_capacity(spans + 1),
-            dedup: FxHashMap::default(),
+            dedup: FxHashMap::with_capacity_and_hasher(spans / 2, Default::default()),
         }
     }
 
@@ -47,15 +49,20 @@ impl StringArena {
         idx
     }
 
-    /// Intern a string, returning the index of an existing identical string
-    /// if one was already interned. Saves memory when many chunks share the
-    /// same hash (e.g., empty `chunk_compressed_hash_md5`).
+    /// Intern a string, returning an existing index if an identical string
+    /// was already interned. Uses a hash key to avoid per-entry String allocs.
     pub fn intern_dedup(&mut self, s: &str) -> u32 {
-        if let Some(&idx) = self.dedup.get(s) {
-            return idx;
+        let mut h = rustc_hash::FxHasher::default();
+        s.hash(&mut h);
+        let key = h.finish();
+        if let Some(&idx) = self.dedup.get(&key) {
+            // Verify match to handle (rare) hash collisions.
+            if self.get(idx) == s {
+                return idx;
+            }
         }
         let idx = self.intern(s);
-        self.dedup.insert(s.to_string(), idx);
+        self.dedup.insert(key, idx);
         idx
     }
 
@@ -73,12 +80,6 @@ impl StringArena {
     #[inline]
     pub fn len(&self) -> usize {
         self.offsets.len()
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
     }
 
     #[inline]
@@ -153,8 +154,8 @@ impl CompactManifest {
         self.arena.get(self.file_hash_idx[file_idx])
     }
 
+    #[cfg(test)]
     #[inline]
-    #[allow(dead_code)]
     pub fn file_type(&self, file_idx: usize) -> u32 {
         self.file_type[file_idx] as u32
     }
@@ -225,6 +226,15 @@ impl CompactManifest {
             .sum()
     }
 
+    /// Compute the byte offset of a single chunk within its file. O(chunk_idx).
+    #[inline]
+    pub fn file_chunk_offset(&self, file_idx: usize, chunk_idx: usize) -> u64 {
+        let range = self.file_chunk_range(file_idx);
+        (range.start as usize..range.start as usize + chunk_idx)
+            .map(|i| self.chunk_size_decompressed[i] as u64)
+            .sum()
+    }
+
     /// Precompute file offsets for all chunks in a file. O(chunks_in_file).
     pub fn file_chunk_offsets(&self, file_idx: usize) -> Vec<u64> {
         let range = self.file_chunk_range(file_idx);
@@ -254,7 +264,7 @@ impl CompactManifest {
 }
 
 impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
-    fn from(properties: Vec<SophonManifestAssetProperty>) -> Self {
+    fn from(mut properties: Vec<SophonManifestAssetProperty>) -> Self {
         let total_files = properties.len();
         let total_chunks: usize = properties.iter().map(|f| f.asset_chunks.len()).sum();
         let estimated_string_bytes: usize = properties
@@ -292,13 +302,13 @@ impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
         let mut chunk_size_decompressed = Vec::with_capacity(total_chunks);
         let mut chunk_old_offset = Vec::with_capacity(total_chunks);
 
-        for file in &properties {
+        for file in properties.drain(..) {
             file_name_idx.push(arena.intern(&file.asset_name));
             file_hash_idx.push(arena.intern_dedup(&file.asset_hash_md5));
             file_type.push(file.asset_type as u8);
             file_size.push(file.asset_size);
             file_chunk_start.push(chunk_name_idx.len() as u32);
-            for chunk in &file.asset_chunks {
+            for chunk in file.asset_chunks {
                 chunk_name_idx.push(arena.intern(&chunk.chunk_name));
                 chunk_decomp_hash_idx.push(arena.intern_dedup(&chunk.chunk_decompressed_hash_md5));
                 chunk_comp_hash_idx.push(arena.intern_dedup(&chunk.chunk_compressed_hash_md5));

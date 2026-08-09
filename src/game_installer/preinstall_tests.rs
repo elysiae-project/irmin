@@ -1,5 +1,5 @@
 use super::*;
-use md5::Digest;
+use fast_md5;
 
 #[test]
 fn patch_method_serialization() {
@@ -120,7 +120,7 @@ fn verify_chunk_md5_correct() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_chunk");
     let data = b"hello world";
-    let md5_hex = hex::encode(md5::Md5::digest(data));
+    let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
     assert!(verify_chunk_md5(&path, &md5_hex));
 }
@@ -145,7 +145,7 @@ fn verify_file_hash_md5_uppercase_expected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_md5_file");
     let data = b"hello world";
-    let md5_hex_lower = hex::encode(md5::Md5::digest(data));
+    let md5_hex_lower = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
     assert!(verify_file_hash(&path, &md5_hex_lower.to_uppercase()));
 }
@@ -207,7 +207,7 @@ fn verify_file_hash_md5_lowercase_expected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_md5_lower");
     let data = b"hello world";
-    let md5_lower = hex::encode(md5::Md5::digest(data));
+    let md5_lower = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
     assert!(verify_file_hash(&path, &md5_lower));
 }
@@ -415,7 +415,7 @@ fn is_file_already_patched_valid() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.bin");
     let data = b"hello world";
-    let md5_hex = hex::encode(md5::Md5::digest(data));
+    let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
     assert!(is_file_already_patched(&path, data.len() as u64, &md5_hex));
 }
@@ -464,7 +464,7 @@ fn is_file_already_patched_returns_true_when_size_and_md5_match() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("match.bin");
     let data = b"hello world";
-    let expected_md5 = hex::encode(md5::Md5::digest(data));
+    let expected_md5 = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
 
     let result = is_file_already_patched(&path, data.len() as u64, &expected_md5);
@@ -639,7 +639,7 @@ fn apply_copy_over_writes_file() {
     fs::create_dir_all(&chunks_dir).unwrap();
 
     let data = b"new file content";
-    let md5_hex = hex::encode(md5::Md5::digest(data));
+    let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(chunks_dir.join("patch_0"), data).unwrap();
 
     let asset = PatchAssetInfo {
@@ -674,7 +674,7 @@ fn apply_copy_over_with_offset_reads_subrange() {
     fs::write(chunks_dir.join("patch_1"), full_data).unwrap();
 
     let target_data = &full_data[5..21];
-    let md5_hex = hex::encode(md5::Md5::digest(target_data));
+    let md5_hex = hex::encode(fast_md5::digest(target_data));
 
     let asset = PatchAssetInfo {
         target_file_path: "GameData/sliced.bin".to_string(),
@@ -735,7 +735,7 @@ fn apply_copy_over_small_chunk_below_magic_len() {
     fs::create_dir_all(&chunks_dir).unwrap();
 
     let data = b"ab";
-    let md5_hex = hex::encode(md5::Md5::digest(data));
+    let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(chunks_dir.join("small_chunk"), data).unwrap();
 
     let asset = PatchAssetInfo {
@@ -769,7 +769,7 @@ fn apply_copy_over_exact_magic_len_non_hdiff() {
     let data = b"ABCDE";
     assert_eq!(data.len(), HDIFF_MAGIC.len());
     assert_ne!(&data[..], HDIFF_MAGIC.as_ref());
-    let md5_hex = hex::encode(md5::Md5::digest(data));
+    let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(chunks_dir.join("exact_chunk"), data).unwrap();
 
     let asset = PatchAssetInfo {
@@ -805,7 +805,7 @@ fn apply_copy_over_with_offset_non_hdiff_seeks_back() {
 
     let target_data = &full_data[10..25];
     assert!(target_data.starts_with(b"HelloHDIFF"));
-    let md5_hex = hex::encode(md5::Md5::digest(target_data));
+    let md5_hex = hex::encode(fast_md5::digest(target_data));
 
     let asset = PatchAssetInfo {
         target_file_path: "GameData/offset.bin".to_string(),
@@ -1500,7 +1500,7 @@ fn verify_chunk_md5_large_file_multi_buffer() {
     let data: Vec<u8> = (0..524288u32)
         .map(|i| (i.wrapping_mul(7) ^ (i >> 3)) as u8)
         .collect();
-    let md5_hex = hex::encode(md5::Md5::digest(&data));
+    let md5_hex = hex::encode(fast_md5::digest(&data));
     fs::write(&path, &data).unwrap();
 
     assert!(

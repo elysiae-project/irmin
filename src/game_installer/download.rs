@@ -19,13 +19,17 @@ use crate::api_scrape::DownloadInfo;
 pub(crate) struct EvictingWriter {
     inner: BufWriter<tokio::fs::File>,
     written: u64,
+    last_evicted: u64,
 }
+
+const EVICT_INTERVAL: u64 = 4 * 1024 * 1024;
 
 impl EvictingWriter {
     pub(crate) fn new(file: tokio::fs::File) -> Self {
         Self {
             inner: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_SIZE, file),
             written: 0,
+            last_evicted: 0,
         }
     }
 
@@ -33,12 +37,25 @@ impl EvictingWriter {
         Self {
             inner: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_SIZE, file),
             written: offset,
+            last_evicted: offset,
         }
     }
 
     pub(crate) async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         self.inner.write_all(buf).await?;
         self.written += buf.len() as u64;
+        // Periodically evict written pages to reduce page cache pressure.
+        if self.written - self.last_evicted >= EVICT_INTERVAL {
+            self.inner.flush().await?;
+            let fd = self.inner.get_ref().as_raw_fd();
+            posix_advise(
+                fd,
+                self.last_evicted,
+                self.written - self.last_evicted,
+                libc::POSIX_FADV_DONTNEED,
+            );
+            self.last_evicted = self.written;
+        }
         Ok(())
     }
 
@@ -53,61 +70,47 @@ impl EvictingWriter {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn written(&self) -> u64 {
         self.written
     }
 }
 
 fn get_available_space(path: &Path) -> Option<u64> {
-    use rustc_hash::FxHashMap;
     use std::cell::RefCell;
     use std::os::unix::ffi::OsStrExt;
-    use std::rc::Rc;
     use std::time::Instant;
 
     thread_local! {
-        static CSTRING_CACHE: RefCell<FxHashMap<Rc<Path>, Rc<std::ffi::CString>>> = RefCell::new(FxHashMap::default());
-        static SPACE_CACHE: RefCell<Option<(Instant, u64)>> = const { RefCell::new(None) };
+        static SPACE_CACHE: RefCell<Option<(Instant, u64, std::ffi::CString)>> = const { RefCell::new(None) };
     }
 
     const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
-    if let Some((checked_at, space)) = SPACE_CACHE.with(|cell| *cell.borrow())
-        && checked_at.elapsed() < CACHE_TTL
-    {
+    let path_bytes = path.as_os_str().as_bytes();
+    let hit = SPACE_CACHE.with(|cell| {
+        let b = cell.borrow();
+        match b.as_ref() {
+            Some((ts, space, cs))
+                if ts.elapsed() < CACHE_TTL && cs.as_bytes() == path_bytes =>
+            {
+                Some(*space)
+            }
+            _ => None,
+        }
+    });
+    if let Some(space) = hit {
         return Some(space);
     }
 
-    let key: Rc<Path> = Rc::from(path.to_path_buf());
-    let cpath_opt = CSTRING_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        if let Some(existing) = cache.get(&key).cloned() {
-            Some(existing)
-        } else {
-            let bytes = path.as_os_str().as_bytes();
-            match std::ffi::CString::new(bytes) {
-                Ok(s) => {
-                    let new = Rc::new(s);
-                    cache.insert(key.clone(), new.clone());
-                    if cache.len() > 16 {
-                        cache.clear();
-                    }
-                    Some(new)
-                }
-                Err(_) => None,
-            }
-        }
-    });
-    let cpath = cpath_opt?;
-
+    let cpath = std::ffi::CString::new(path_bytes).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
     if ret != 0 {
         return None;
     }
     let space = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
-    SPACE_CACHE.with(|cell| *cell.borrow_mut() = Some((Instant::now(), space)));
+    SPACE_CACHE.with(|cell| *cell.borrow_mut() = Some((Instant::now(), space, cpath)));
     Some(space)
 }
 
@@ -269,6 +272,10 @@ async fn verify_existing_file_hash(
     }
     let path = path.to_path_buf();
     let expected_len = expected_hash.len();
+    if expected_len > 32 {
+        log::warn!("Unknown hash format (length={expected_len}) for verification");
+        return Ok(false);
+    }
     let mut hash_buf = [0u8; 32];
     hash_buf[..expected_len].copy_from_slice(expected_hash.as_bytes());
     tokio::task::spawn_blocking(move || match expected_len {
@@ -425,6 +432,147 @@ async fn do_download_chunk(
     download_full_file_with_response(resp, chunk, dest, handle).await
 }
 
+/// Shared streaming loop: reads bytes from a response stream, writes to an
+/// EvictingWriter, updates hashers, checks size, handles cancellation.
+/// Returns Ok(()) after verifying the final hash matches.
+#[allow(clippy::too_many_arguments)]
+async fn stream_and_verify(
+    file: &mut EvictingWriter,
+    resp: reqwest::Response,
+    hasher: &mut Option<super::assembly_opt::Md5>,
+    xxh64_hasher: &mut Option<xxhash_rust::xxh64::Xxh64>,
+    expected_total: u64,
+    starting_len: u64,
+    chunk_name: &str,
+    compressed_hash: &str,
+    dest: &Path,
+    handle: Option<&DownloadHandle>,
+) -> SophonResult<()> {
+    let mut stream = resp.bytes_stream();
+    let mut total_len = starting_len;
+
+    loop {
+        let next_chunk = stream.next();
+        let result = if let Some(handle) = handle {
+            tokio::select! {
+                biased;
+                _ = handle.cancelled_future() => {
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(SophonError::Cancelled);
+                }
+                result = next_chunk => result,
+            }
+        } else {
+            next_chunk.await
+        };
+
+        match result {
+            Some(Ok(bytes)) => {
+                if bytes.is_empty() && total_len < expected_total {
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(SophonError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "corrupted compressed data: empty chunk while data remaining",
+                    )));
+                }
+                total_len += bytes.len() as u64;
+                if total_len > expected_total {
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(SophonError::SizeMismatch {
+                        item: chunk_name.to_string(),
+                        expected: expected_total,
+                        actual: total_len,
+                    });
+                }
+                if let Err(err) = file.write_all(&bytes).await {
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(SophonError::Io(err));
+                }
+                if let Some(h) = hasher.as_mut() {
+                    h.update(&bytes)?;
+                }
+                if let Some(h) = xxh64_hasher.as_mut() {
+                    h.update(&bytes);
+                }
+            }
+            Some(Err(e)) => {
+                let _ = tokio::fs::remove_file(dest).await;
+                return Err(e.into());
+            }
+            None => break,
+        }
+    }
+
+    if let Err(err) = file.flush().await {
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(SophonError::Io(err));
+    }
+
+    if total_len != expected_total {
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(SophonError::SizeMismatch {
+            item: chunk_name.to_string(),
+            expected: expected_total,
+            actual: total_len,
+        });
+    }
+
+    if !compressed_hash.is_empty() {
+        match compressed_hash.len() {
+            32 => {
+                let digest: [u8; 16] = hasher
+                    .as_mut()
+                    .expect("hasher present when compressed hash is non-empty")
+                    .finish()
+                    .map_err(SophonError::Io)?;
+                if !md5_hex_eq(&digest, compressed_hash) {
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(SophonError::Md5Mismatch {
+                        item: chunk_name.to_string(),
+                        expected: compressed_hash.to_string(),
+                        actual: md5_to_hex(&digest),
+                    });
+                }
+            }
+            16 => {
+                let digest = xxh64_hasher
+                    .as_ref()
+                    .expect("xxh64_hasher present when hash len == 16")
+                    .digest();
+                if !xxh64_hex_eq(digest, compressed_hash) {
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(SophonError::Md5Mismatch {
+                        item: chunk_name.to_string(),
+                        expected: compressed_hash.to_string(),
+                        actual: format!("{:016x}", digest),
+                    });
+                }
+            }
+            _ => {
+                log::warn!(
+                    "Unknown compressed hash format (length={len}) for chunk {name}",
+                    len = compressed_hash.len(),
+                    name = chunk_name
+                );
+            }
+        }
+    } else {
+        log::warn!(
+            "Chunk {name} downloaded without compressed hash verification",
+            name = chunk_name
+        );
+    }
+
+    file.flush_and_evict_all().await.ok();
+    if let Some(h) = hasher.take() {
+        return_md5(h);
+    }
+    if let Some(h) = xxh64_hasher.take() {
+        super::assembly_opt::return_xxh64(h);
+    }
+    Ok(())
+}
+
 /// Download a full file, streaming body chunks to disk with MD5/XXH64 hashing.
 async fn download_full_file_with_response(
     resp: reqwest::Response,
@@ -446,147 +594,37 @@ async fn download_full_file_with_response(
     check_available_space(dest, chunk.chunk_size)?;
 
     let file = tokio::fs::File::create(dest).await?;
+    // Pre-allocate to prevent fragmentation and detect ENOSPC early.
+    {
+        let std_file = file.try_clone().await?.into_std().await;
+        let _ = super::sysio::preallocate(&std_file, chunk.chunk_size);
+    }
     let mut file = EvictingWriter::new(file);
-    let mut stream = resp.bytes_stream();
-    let needs_hash = !chunk.chunk_compressed_hash_md5.is_empty();
-    let mut hasher = if needs_hash { Some(take_md5()?) } else { None };
+    let mut hasher = if chunk.chunk_compressed_hash_md5.len() == 32 {
+        Some(take_md5()?)
+    } else {
+        None
+    };
     let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> =
-        if needs_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
+        if chunk.chunk_compressed_hash_md5.len() == 16 {
             Some(super::assembly_opt::take_xxh64())
         } else {
             None
         };
-    let mut total_len = 0u64;
 
-    loop {
-        let next_chunk = stream.next();
-        let result = if let Some(handle) = handle {
-            tokio::select! {
-                biased;
-                _ = handle.cancelled_future() => {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Cancelled);
-                }
-                result = next_chunk => result,
-            }
-        } else {
-            next_chunk.await
-        };
-
-        match result {
-            Some(Ok(bytes)) => {
-                if bytes.is_empty() && total_len < chunk.chunk_size {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "corrupted compressed data: empty chunk while data remaining",
-                    )));
-                }
-                total_len += bytes.len() as u64;
-                if total_len > chunk.chunk_size {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::SizeMismatch {
-                        item: chunk.chunk_name.to_string(),
-                        expected: chunk.chunk_size,
-                        actual: total_len,
-                    });
-                }
-                if let Some(ref mut h) = hasher {
-                    h.update(&bytes)?;
-                }
-                if let Some(ref mut h) = xxh64_hasher {
-                    h.update(&bytes);
-                }
-                if let Err(err) = file.write_all(&bytes).await {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Io(err));
-                }
-            }
-            Some(Err(e)) => {
-                let _ = tokio::fs::remove_file(dest).await;
-                return Err(e.into());
-            }
-            None => break,
-        }
-    }
-
-    if let Err(err) = file.flush().await {
-        let _ = tokio::fs::remove_file(dest).await;
-        return Err(SophonError::Io(err));
-    }
-
-    if total_len != chunk.chunk_size {
-        let _ = tokio::fs::remove_file(dest).await;
-        return Err(SophonError::SizeMismatch {
-            item: chunk.chunk_name.to_string(),
-            expected: chunk.chunk_size,
-            actual: total_len,
-        });
-    }
-
-    if !chunk.chunk_compressed_hash_md5.is_empty() {
-        let expected = &chunk.chunk_compressed_hash_md5;
-        match expected.len() {
-            32 => {
-                let digest: [u8; 16] = hasher
-                    .as_mut()
-                    .expect("hasher present when compressed hash is non-empty")
-                    .finish()
-                    .map_err(SophonError::Io)?;
-                if !md5_hex_eq(&digest, expected) {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Md5Mismatch {
-                        item: chunk.chunk_name.to_string(),
-                        expected: expected.to_string(),
-                        actual: md5_to_hex(&digest),
-                    });
-                }
-            }
-            16 => {
-                let matched = if let Some(ref h) = xxh64_hasher {
-                    let digest = h.digest();
-                    xxh64_hex_eq(digest, expected)
-                } else {
-                    file.flush().await?;
-                    verify_existing_file_hash(dest, expected, Some(total_len)).await?
-                };
-                if !matched {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    let actual = xxh64_hasher
-                        .as_ref()
-                        .map(|h| format!("{:016x}", h.digest()))
-                        .unwrap_or_else(|| expected.to_string());
-                    return Err(SophonError::Md5Mismatch {
-                        item: chunk.chunk_name.to_string(),
-                        expected: expected.to_string(),
-                        actual,
-                    });
-                }
-            }
-            _ => {
-                log::warn!(
-                    "Unknown compressed hash format (length={len}) for chunk {name}",
-                    len = expected.len(),
-                    name = chunk.chunk_name
-                );
-            }
-        }
-    } else {
-        log::warn!(
-            "Chunk {name} downloaded without compressed hash verification",
-            name = chunk.chunk_name
-        );
-    }
-
-    file.flush_and_evict_all().await.ok();
-    drop(file);
-    if let Some(h) = hasher {
-        return_md5(h);
-    }
-    if let Some(h) = xxh64_hasher {
-        super::assembly_opt::return_xxh64(h);
-    }
-    Ok(())
+    stream_and_verify(
+        &mut file,
+        resp,
+        &mut hasher,
+        &mut xxh64_hasher,
+        chunk.chunk_size,
+        0,
+        chunk.chunk_name,
+        chunk.chunk_compressed_hash_md5,
+        dest,
+        handle,
+    )
+    .await
 }
 
 async fn download_with_resume(
@@ -619,24 +657,37 @@ async fn download_with_resume(
 
     check_available_space(dest, remaining)?;
 
-    let needs_hash = !chunk.chunk_compressed_hash_md5.is_empty();
-    let mut hasher = if needs_hash { Some(take_md5()?) } else { None };
-    let needs_xxh64 = needs_hash && chunk.chunk_compressed_hash_md5.len() == 16;
-    let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> = if needs_xxh64 {
-        Some(super::assembly_opt::take_xxh64())
+    let mut hasher = if chunk.chunk_compressed_hash_md5.len() == 32 {
+        Some(take_md5()?)
     } else {
         None
     };
-    if needs_hash {
-        pread_hash_slice(dest, existing_size, &mut |chunk| {
-            if let Some(ref mut h) = hasher {
-                h.update(chunk)?;
-            }
-            if let Some(ref mut h) = xxh64_hasher {
-                h.update(chunk);
-            }
-            Ok(())
-        })?;
+    let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> =
+        if chunk.chunk_compressed_hash_md5.len() == 16 {
+            Some(super::assembly_opt::take_xxh64())
+        } else {
+            None
+        };
+    if hasher.is_some() || xxh64_hasher.is_some() {
+        let dest_owned = dest.to_path_buf();
+        let mut h = hasher.take();
+        let mut xh = xxh64_hasher.take();
+        let result = tokio::task::spawn_blocking(move || {
+            pread_hash_slice(&dest_owned, existing_size, &mut |chunk| {
+                if let Some(ref mut hasher) = h {
+                    hasher.update(chunk)?;
+                }
+                if let Some(ref mut xxh) = xh {
+                    xxh.update(chunk);
+                }
+                Ok(())
+            })?;
+            Ok::<_, SophonError>((h, xh))
+        })
+        .await
+        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
+        hasher = result.0;
+        xxh64_hasher = result.1;
     }
 
     let file = tokio::fs::OpenOptions::new()
@@ -644,138 +695,20 @@ async fn download_with_resume(
         .open(dest)
         .await?;
     let mut file = EvictingWriter::with_offset(file, existing_size);
-    let mut stream = resp.bytes_stream();
-    let mut total_len = existing_size;
 
-    loop {
-        let next_chunk = stream.next();
-        let result = if let Some(handle) = handle {
-            tokio::select! {
-                biased;
-                _ = handle.cancelled_future() => {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Cancelled);
-                }
-                result = next_chunk => result,
-            }
-        } else {
-            next_chunk.await
-        };
-
-        match result {
-            Some(Ok(bytes)) => {
-                if bytes.is_empty() && total_len < expected_total {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "corrupted compressed data: empty chunk while data remaining",
-                    )));
-                }
-                total_len += bytes.len() as u64;
-                if total_len > expected_total {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::SizeMismatch {
-                        item: chunk.chunk_name.to_string(),
-                        expected: expected_total,
-                        actual: total_len,
-                    });
-                }
-                if let Err(err) = file.write_all(&bytes).await {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Io(err));
-                }
-                if let Some(ref mut h) = hasher {
-                    h.update(&bytes)?;
-                }
-                if let Some(ref mut h) = xxh64_hasher {
-                    h.update(&bytes);
-                }
-            }
-            Some(Err(e)) => {
-                let _ = tokio::fs::remove_file(dest).await;
-                return Err(e.into());
-            }
-            None => break,
-        }
-    }
-
-    if let Err(err) = file.flush().await {
-        let _ = tokio::fs::remove_file(dest).await;
-        return Err(SophonError::Io(err));
-    }
-
-    if total_len != expected_total {
-        let _ = tokio::fs::remove_file(dest).await;
-        return Err(SophonError::SizeMismatch {
-            item: chunk.chunk_name.to_string(),
-            expected: expected_total,
-            actual: total_len,
-        });
-    }
-
-    if !chunk.chunk_compressed_hash_md5.is_empty() {
-        let expected = &chunk.chunk_compressed_hash_md5;
-        match expected.len() {
-            32 => {
-                let digest: [u8; 16] = hasher
-                    .as_mut()
-                    .expect("hasher present when compressed hash is non-empty")
-                    .finish()
-                    .map_err(SophonError::Io)?;
-                if !md5_hex_eq(&digest, expected) {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Md5Mismatch {
-                        item: chunk.chunk_name.to_string(),
-                        expected: expected.to_string(),
-                        actual: md5_to_hex(&digest),
-                    });
-                }
-            }
-            16 => {
-                let matched = if let Some(ref h) = xxh64_hasher {
-                    let digest = h.digest();
-                    xxh64_hex_eq(digest, expected)
-                } else {
-                    file.flush().await?;
-                    verify_existing_file_hash(dest, expected, Some(total_len)).await?
-                };
-                if !matched {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    let actual = xxh64_hasher
-                        .as_ref()
-                        .map(|h| format!("{:016x}", h.digest()))
-                        .unwrap_or_else(|| expected.to_string());
-                    return Err(SophonError::Md5Mismatch {
-                        item: chunk.chunk_name.to_string(),
-                        expected: expected.to_string(),
-                        actual,
-                    });
-                }
-            }
-            _ => {
-                log::warn!(
-                    "Unknown compressed hash format (length={len}) for chunk {name}",
-                    len = expected.len(),
-                    name = chunk.chunk_name
-                );
-            }
-        }
-    } else {
-        log::warn!(
-            "Chunk {name} downloaded without compressed hash verification",
-            name = chunk.chunk_name
-        );
-    }
-
-    file.flush_and_evict_all().await.ok();
-    drop(file);
-    if let Some(h) = hasher {
-        return_md5(h);
-    }
-    if let Some(h) = xxh64_hasher {
-        super::assembly_opt::return_xxh64(h);
-    }
-    Ok(())
+    stream_and_verify(
+        &mut file,
+        resp,
+        &mut hasher,
+        &mut xxh64_hasher,
+        expected_total,
+        existing_size,
+        chunk.chunk_name,
+        chunk.chunk_compressed_hash_md5,
+        dest,
+        handle,
+    )
+    .await
 }
 
 #[cfg(test)]
