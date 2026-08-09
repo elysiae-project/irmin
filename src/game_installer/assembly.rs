@@ -167,6 +167,7 @@ pub fn assemble_file(
     chunk_refcounts: &[AtomicU32],
     verify_cache: &DashMap<String, VerificationEntry>,
     skip_md5_check: bool,
+    verify_mode: super::VerifyMode,
 ) -> SophonResult<()> {
     let file_name = all_files.file_name(file_idx);
     let file_size = all_files.file_size(file_idx);
@@ -296,14 +297,17 @@ pub fn assemble_file(
 
     let parallelize =
         num_workers > 1 && total_chunks >= 4 && (all_chunks_have_hashes || has_file_hash);
-    let mut file_hasher = if file_hash_md5.is_empty() {
-        if !is_dir {
+    let mut file_hasher = if verify_mode == super::VerifyMode::None || file_hash_md5.is_empty() {
+        if !is_dir && file_hash_md5.is_empty() {
             log::warn!(
                 "File '{name}' has no asset_hash_md5; assembled without file-level verification",
                 name = file_name
             );
         }
         None
+    } else if verify_mode == super::VerifyMode::Deferred {
+        // Deferred: always do file-level hash (it's the only verification)
+        Some(take_md5()?)
     } else if all_chunks_have_hashes || parallelize {
         None
     } else {
@@ -312,6 +316,9 @@ pub fn assemble_file(
 
     let parallel_hashed_file = parallelize && has_file_hash && !all_chunks_have_hashes;
     let hasher_result: Mutex<Option<SophonResult<[u8; 16]>>> = Mutex::new(None);
+
+    // In non-Full mode, skip per-chunk decompressed hash verification.
+    let skip_chunk_hash = verify_mode != super::VerifyMode::Full;
 
     let old_file: Option<File> = if has_old_chunks {
         Some(File::open(&target_path).map_err(SophonError::Io)?)
@@ -454,7 +461,7 @@ pub fn assemble_file(
                                 chunk.chunk_size_decompressed,
                                 None,
                                 &mut transfer_buf,
-                                chunk.chunk_decompressed_hash_md5,
+                                if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
                             )
                         } else {
                             if !validate_chunk_name(chunk.chunk_name) {
@@ -475,7 +482,7 @@ pub fn assemble_file(
                                 offset,
                                 chunk.chunk_size_decompressed,
                                 None,
-                                chunk.chunk_decompressed_hash_md5,
+                                if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
                             );
                             chunk_path.pop();
                             result
@@ -546,7 +553,7 @@ pub fn assemble_file(
                     chunk.chunk_size_decompressed,
                     file_hasher.as_mut(),
                     &mut transfer_buffer,
-                    chunk.chunk_decompressed_hash_md5,
+                    if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -567,7 +574,7 @@ pub fn assemble_file(
                     offset,
                     chunk.chunk_size_decompressed,
                     file_hasher.as_mut(),
-                    chunk.chunk_decompressed_hash_md5,
+                    if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -799,6 +806,7 @@ pub struct AssemblyTaskParams {
     pub profiler: Arc<super::profiling::PipelineProfiler>,
     /// Per-file completion bitset indexed by `file_idx`.
     pub completion_flags: Arc<[AtomicBool]>,
+    pub verify_mode: super::VerifyMode,
 }
 
 pub fn run_assembly_task(
@@ -821,6 +829,7 @@ pub fn run_assembly_task(
         total_files,
         profiler,
         completion_flags,
+        verify_mode,
     } = params;
 
     let _assembly_timer = super::profiling::AssemblyTimer::new(&profiler);
@@ -972,6 +981,7 @@ pub fn run_assembly_task(
         &chunk_refcounts,
         &verify_cache,
         true,
+        verify_mode,
     );
     if let Err(err) = result {
         // Release the claim so a later retry can reprocess this file_idx.

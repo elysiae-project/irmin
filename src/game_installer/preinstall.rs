@@ -968,6 +968,7 @@ async fn download_chunk_with_retries(
             dest,
             None,
             Some(handle),
+            false, // preinstall always uses full verification
         )
         .await
         {
@@ -2296,6 +2297,7 @@ async fn apply_download_over(
                 &chunk_refcounts,
                 &vc,
                 false,
+                super::VerifyMode::Full, // preinstall always uses full verification
             );
             if let Err(err) = fs::remove_dir_all(&tmp_dir) {
                 log::warn!(

@@ -73,6 +73,20 @@ pub const VERSION_FILE_NAME: &str = ".sophon_version";
 /// MD5 verification cache filename.
 pub const VERIFICATION_CACHE_FILE: &str = ".sophon_verify_cache";
 
+/// Controls how aggressively the installer verifies data integrity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyMode {
+    /// Hash compressed stream during download, decompressed data during
+    /// assembly, and file-level hash where applicable. Maximum safety.
+    #[default]
+    Full,
+    /// Skip per-chunk hashing. Verify only the file-level MD5 after assembly.
+    /// On failure, the file is left incomplete for resume to retry.
+    Deferred,
+    /// Skip all hash verification. Size checks only.
+    None,
+}
+
 /// File write buffer during assembly (zstd streaming input + output).
 pub const FILE_WRITE_BUFFER_SIZE: usize = 256 * 1024;
 /// File write buffer during chunk downloads.
