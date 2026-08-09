@@ -1195,11 +1195,58 @@ async fn process_eager_item(
     }
 
     // Download compressed chunk into memory (with retries).
-    // In non-Full mode, streaming is used instead (below), so skip buffered download.
     let client = &ctx.installer_clients[item.installer_idx as usize];
     let download_info = &ctx.installer_downloads[item.installer_idx as usize];
     let mut url = String::with_capacity(256);
     download_info.url_for_into(chunk.chunk_name, &mut url);
+
+    let compressed_data = {
+        let mut attempts: u32 = 0;
+        loop {
+            if handle.is_cancelled() {
+                return Err(SophonError::Cancelled);
+            }
+            let result: SophonResult<_> = async {
+                let resp = client.get(&url).send().await?;
+                if !resp.status().is_success() {
+                    return Err(SophonError::Io(std::io::Error::other(format!(
+                        "HTTP {} for chunk {}",
+                        resp.status(),
+                        chunk.chunk_name
+                    ))));
+                }
+                resp.bytes().await.map_err(SophonError::Http)
+            }
+            .await;
+            match result {
+                Ok(data) => break data,
+                Err(err) => {
+                    if !err.is_retryable() {
+                        return Err(err);
+                    }
+                    attempts += 1;
+                    if attempts >= MAX_RETRIES {
+                        return Err(SophonError::DownloadFailed {
+                            chunk: chunk.chunk_name.to_string(),
+                            attempts: MAX_RETRIES,
+                            error: err.to_string(),
+                        });
+                    }
+                    log::warn!(
+                        "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}): {err}",
+                        chunk.chunk_name,
+                    );
+                    if cancelable_sleep(handle, retry_delay(attempts)).await.is_err() {
+                        return Err(SophonError::Cancelled);
+                    }
+                }
+            }
+        }
+    };
+
+    if handle.is_cancelled() {
+        return Err(SophonError::Cancelled);
+    }
 
     // Compute chunk offset within the output file.
     let chunk_offset = ctx.all_files.file_chunk_offset(file_idx, item.chunk_idx as usize);
@@ -1210,153 +1257,36 @@ async fn process_eager_item(
         .get_handle(file_idx)
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
 
-    if ctx.verify_mode == super::VerifyMode::Full {
-        // Full mode: buffer entire chunk for hash verification.
-        let compressed_data = {
-            let mut attempts: u32 = 0;
-            loop {
-                if handle.is_cancelled() {
-                    return Err(SophonError::Cancelled);
-                }
-                let result: SophonResult<_> = async {
-                    let resp = client.get(&url).send().await?;
-                    if !resp.status().is_success() {
-                        return Err(SophonError::Io(std::io::Error::other(format!(
-                            "HTTP {} for chunk {}",
-                            resp.status(),
-                            chunk.chunk_name
-                        ))));
-                    }
-                    resp.bytes().await.map_err(SophonError::Http)
-                }
-                .await;
-                match result {
-                    Ok(data) => break data,
-                    Err(err) => {
-                        if !err.is_retryable() {
-                            return Err(err);
-                        }
-                        attempts += 1;
-                        if attempts >= MAX_RETRIES {
-                            return Err(SophonError::DownloadFailed {
-                                chunk: chunk.chunk_name.to_string(),
-                                attempts: MAX_RETRIES,
-                                error: err.to_string(),
-                            });
-                        }
-                        log::warn!(
-                            "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}): {err}",
-                            chunk.chunk_name,
-                        );
-                        if cancelable_sleep(handle, retry_delay(attempts)).await.is_err() {
-                            return Err(SophonError::Cancelled);
-                        }
-                    }
-                }
-            }
-        };
-
-        let _decompressed_bytes = tokio::task::spawn_blocking({
-            let out = Arc::clone(&out_file);
-            let decomp_hash = chunk.chunk_decompressed_hash_md5.to_string();
-            let comp_hash = chunk.chunk_compressed_hash_md5.to_string();
-            let expected_size = chunk.chunk_size_decompressed;
-            move || {
-                super::eager_decompress::eager_decompress_chunk(
-                    &compressed_data,
-                    &out,
-                    chunk_offset,
-                    expected_size,
-                    &comp_hash,
-                    &decomp_hash,
-                )
-            }
-        })
-        .await
-        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
-    } else {
-        // Deferred/None: stream HTTP directly through zstd to disk.
-        // No full-chunk buffer — memory per worker is ~64KB + 1MB output buf.
-        let resp = {
-            let mut attempts: u32 = 0;
-            loop {
-                if handle.is_cancelled() {
-                    return Err(SophonError::Cancelled);
-                }
-                let result = client.get(&url).send().await;
-                match result {
-                    Ok(r) if r.status().is_success() => break r,
-                    Ok(r) => {
-                        let status = r.status();
-                        attempts += 1;
-                        if attempts >= MAX_RETRIES {
-                            return Err(SophonError::DownloadFailed {
-                                chunk: chunk.chunk_name.to_string(),
-                                attempts: MAX_RETRIES,
-                                error: format!("HTTP {status}"),
-                            });
-                        }
-                        log::warn!(
-                            "Eager chunk {} HTTP {status} (attempt {attempts}/{MAX_RETRIES})",
-                            chunk.chunk_name,
-                        );
-                        if cancelable_sleep(handle, retry_delay(attempts)).await.is_err() {
-                            return Err(SophonError::Cancelled);
-                        }
-                    }
-                    Err(e) => {
-                        let err = SophonError::Http(e);
-                        if !err.is_retryable() { return Err(err); }
-                        attempts += 1;
-                        if attempts >= MAX_RETRIES {
-                            return Err(SophonError::DownloadFailed {
-                                chunk: chunk.chunk_name.to_string(),
-                                attempts: MAX_RETRIES,
-                                error: err.to_string(),
-                            });
-                        }
-                        if cancelable_sleep(handle, retry_delay(attempts)).await.is_err() {
-                            return Err(SophonError::Cancelled);
-                        }
-                    }
-                }
-            }
-        };
-
-        use futures_util::TryStreamExt;
-        let body_stream = resp
-            .bytes_stream()
-            .map_err(|e| std::io::Error::other(e.to_string()));
-        let async_reader = tokio_util::io::StreamReader::new(body_stream);
+    let _decompressed_bytes = tokio::task::spawn_blocking({
         let out = Arc::clone(&out_file);
+        let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
+        let decomp_hash = if skip_hash { String::new() } else { chunk.chunk_decompressed_hash_md5.to_string() };
+        let comp_hash = if skip_hash { String::new() } else { chunk.chunk_compressed_hash_md5.to_string() };
         let expected_size = chunk.chunk_size_decompressed;
-
-        tokio::task::spawn_blocking(move || {
-            let sync_reader = tokio_util::io::SyncIoBridge::new(async_reader);
-            super::eager_decompress::stream_decompress_to_file(
-                sync_reader,
+        move || {
+            super::eager_decompress::eager_decompress_chunk(
+                &compressed_data,
                 &out,
                 chunk_offset,
                 expected_size,
+                &comp_hash,
+                &decomp_hash,
             )
-        })
-        .await
-        .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
-    }
+        }
+    })
+    .await
+    .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
 
     // Ensure decompressed data is on disk before marking bitmap,
     // so a crash+resume cannot see a "complete" chunk with missing data.
     // Skip in non-Full mode: crash-resume is disabled, avoid the syscall.
     if ctx.verify_mode == super::VerifyMode::Full {
         out_file.sync_data()?;
-    }
 
-    // Mark chunk complete in bitmap.
-    ctx.chunk_bitmap.mark_complete(global_chunk_idx);
+        // Mark chunk complete in bitmap.
+        ctx.chunk_bitmap.mark_complete(global_chunk_idx);
 
-    // Periodic bitmap sync (same cadence as assembly state saves).
-    // Skip in non-Full mode: no crash-resume.
-    if ctx.verify_mode == super::VerifyMode::Full {
+        // Periodic bitmap sync (same cadence as assembly state saves).
         let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL)
             && let Err(e) = ctx.chunk_bitmap.sync()
@@ -1400,15 +1330,21 @@ fn notify_eager_file_complete(
             let file_idx = *file_idx as usize;
             // Flush output data to disk before marking bitmap — prevents
             // corruption if power is lost before kernel writeback.
-            if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
-                let _ = handle.sync_data();
+            // Skip in non-Full mode: crash-resume is disabled.
+            if ctx.verify_mode == super::VerifyMode::Full {
+                if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
+                    let _ = handle.sync_data();
+                }
             }
             // Close the cached output FD.
             ctx.output_allocator.close_file(file_idx);
             // Mark file complete (idempotent).
             ctx.completion_flags[file_idx].store(true, Ordering::Release);
             // Populate verify_cache so resume skips expensive MD5 rehash.
-            if ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES {
+            // Skip in non-Full mode: no crash-resume benefit.
+            if ctx.verify_mode == super::VerifyMode::Full
+                && ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES
+            {
                 let file_name = ctx.all_files.file_name(file_idx);
                 let target_path = ctx.game_dir.join(file_name);
                 if let Ok(meta) = target_path.metadata() {
