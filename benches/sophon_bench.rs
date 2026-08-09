@@ -23,7 +23,7 @@ use irmin::game_installer::{
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
     installer::ChunkNameLookup,
-    sysio,
+    sysio, VerifyMode,
 };
 use irmin::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 
@@ -307,6 +307,7 @@ fn bench_assembly_e2e(c: &mut Criterion) {
         &refcounts,
         &cache,
         true,
+        VerifyMode::Full,
     )
     .expect("warmup assemble");
     let assembled = fs::read(game_dir.join("assembled.bin")).unwrap();
@@ -328,6 +329,7 @@ fn bench_assembly_e2e(c: &mut Criterion) {
                 &refcounts,
                 &cache,
                 true,
+                VerifyMode::Full,
             )
             .expect("assemble");
         });
@@ -348,6 +350,7 @@ fn bench_assembly_e2e(c: &mut Criterion) {
         &refcounts,
         &cache,
         true,
+        VerifyMode::Full,
     )
     .expect("warmup assemble (chunk hashes)");
     let assembled_ch = fs::read(game_dir2.join("assembled.bin")).unwrap();
@@ -372,6 +375,7 @@ fn bench_assembly_e2e(c: &mut Criterion) {
                     &refcounts,
                     &cache,
                     true,
+                    VerifyMode::Full,
                 )
                 .expect("assemble");
             });

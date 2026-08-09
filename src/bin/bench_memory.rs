@@ -15,8 +15,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -26,8 +26,8 @@ use irmin::game_installer::{
     assembly::{assemble_file, chunk_filename},
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
-    installer::{ChunkNameLookup, intern_old_chunk_offsets},
-    sysio,
+    installer::{intern_old_chunk_offsets, ChunkNameLookup},
+    sysio, VerifyMode,
 };
 use irmin::proto_parse::{
     SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
@@ -66,18 +66,16 @@ impl RssSampler {
         let peak = Arc::new(AtomicU64::new(rss_kib()));
         let stop = Arc::new(AtomicBool::new(false));
         let (p, s) = (Arc::clone(&peak), Arc::clone(&stop));
-        let handle = thread::spawn(move || {
-            loop {
-                let r = rss_kib();
-                let cur = p.load(Ordering::Relaxed);
-                if r > cur {
-                    p.store(r, Ordering::Relaxed);
-                }
-                if s.load(Ordering::Relaxed) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(SAMPLE_MS));
+        let handle = thread::spawn(move || loop {
+            let r = rss_kib();
+            let cur = p.load(Ordering::Relaxed);
+            if r > cur {
+                p.store(r, Ordering::Relaxed);
             }
+            if s.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(SAMPLE_MS));
         });
         RssSampler {
             peak,
@@ -268,6 +266,7 @@ fn op_assembly_e2e(dir: &Path) {
         &refcounts,
         &cache,
         true,
+        VerifyMode::Full,
     )
     .expect("assemble");
 }
@@ -298,6 +297,7 @@ fn op_assembly_e2e_parallel(dir: &Path) {
         &refcounts,
         &cache,
         true,
+        VerifyMode::Full,
     )
     .expect("assemble");
 }
@@ -328,6 +328,7 @@ fn op_assembly_e2e_small(dir: &Path) {
         &refcounts,
         &cache,
         true,
+        VerifyMode::Full,
     )
     .expect("assemble");
 }

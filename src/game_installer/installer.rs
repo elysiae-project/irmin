@@ -1277,21 +1277,19 @@ async fn process_eager_item(
     .await
     .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
 
-    // Ensure decompressed data is on disk before marking bitmap,
-    // so a crash+resume cannot see a "complete" chunk with missing data.
-    // Skip in non-Full mode: crash-resume is disabled, avoid the syscall.
+    // Mark chunk in bitmap. Durability is batched: sync_data runs every
+    // CHUNK_STATE_SAVE_INTERVAL chunks (not per-chunk) to amortize the
+    // fdatasync cost across many writes. The per-file sync in
+    // notify_eager_file_complete covers final durability.
     if ctx.verify_mode == super::VerifyMode::Full {
-        out_file.sync_data()?;
-
-        // Mark chunk complete in bitmap.
         ctx.chunk_bitmap.mark_complete(global_chunk_idx);
 
-        // Periodic bitmap sync (same cadence as assembly state saves).
         let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL)
-            && let Err(e) = ctx.chunk_bitmap.sync()
-        {
-            log::warn!("Failed to sync chunk bitmap: {e}");
+        if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
+            let _ = out_file.sync_data();
+            if let Err(e) = ctx.chunk_bitmap.sync() {
+                log::warn!("Failed to sync chunk bitmap: {e}");
+            }
         }
     }
 
