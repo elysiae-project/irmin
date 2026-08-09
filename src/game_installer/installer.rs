@@ -1179,6 +1179,9 @@ async fn process_eager_item(
         // Already decompressed in a prior session. Update progress and skip.
         ctx.downloaded_bytes
             .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+        if let Some(dc) = ctx.downloaded_chunks.get() {
+            dc[item_idx].store(chunk.chunk_size as u32, Ordering::Relaxed);
+        }
         notify_eager_file_complete(item_idx, chunk_entries, chunk_entry_offsets, pending_counts, ctx);
         return Ok(());
     }
@@ -1282,10 +1285,16 @@ async fn process_eager_item(
     // notify_eager_file_complete covers final durability.
     if ctx.verify_mode == super::VerifyMode::Full {
         ctx.chunk_bitmap.mark_complete(global_chunk_idx);
+        // Record in `downloaded_chunks` so the periodic state save tracks
+        // eager chunks the same way the non-eager path does.
+        if let Some(dc) = ctx.downloaded_chunks.get() {
+            dc[item_idx].store(chunk.chunk_size as u32, Ordering::Relaxed);
+        }
 
         let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
             let _ = out_file.sync_data();
+            save_assembly_state(ctx).await;
             if let Err(e) = ctx.chunk_bitmap.sync() {
                 log::warn!("Failed to sync chunk bitmap: {e}");
             }
