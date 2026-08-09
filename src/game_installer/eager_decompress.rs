@@ -139,6 +139,61 @@ pub fn eager_decompress_chunk(
     Ok(bytes_written)
 }
 
+/// Streaming variant: decompresses from a sync `Read` source directly to the
+/// output file. Avoids buffering the entire compressed chunk in memory.
+/// Used in non-Full verify modes where no compressed hash is needed.
+pub fn stream_decompress_to_file(
+    reader: impl io::Read,
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+) -> SophonResult<u64> {
+    let mut ctx = assembly_opt::take_dctx();
+    ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
+        .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
+    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+        assembly_opt::MAX_WINDOW_LOG,
+    ))
+    .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx WindowLogMax")))?;
+
+    let mut decoder =
+        zstd::Decoder::with_context(io::BufReader::with_capacity(65536, reader), &mut ctx);
+
+    let mut buf = assembly_opt::take_eager_buf();
+    let mut bytes_written: u64 = 0;
+    let mut write_offset = chunk_offset;
+
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
+        if n == 0 {
+            break;
+        }
+
+        out_file
+            .write_all_at(&buf[..n], write_offset)
+            .map_err(SophonError::Io)?;
+
+        write_offset += n as u64;
+        bytes_written += n as u64;
+    }
+
+    drop(decoder);
+    drop(ctx);
+    assembly_opt::return_eager_buf(buf);
+
+    if bytes_written != expected_decompressed_size {
+        return Err(SophonError::SizeMismatch {
+            item: format!("stream chunk at offset {chunk_offset}"),
+            expected: expected_decompressed_size,
+            actual: bytes_written,
+        });
+    }
+
+    Ok(bytes_written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
