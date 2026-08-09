@@ -119,7 +119,7 @@ struct InstallContext {
     state_saver: StateSaver,
     /// Pre-built chunk name vec indexed by item_idx. Built once at init,
     /// reused on every state save to avoid per-save String allocations.
-    save_chunk_names: Arc<OnceLock<Arc<Vec<String>>>>,
+    save_chunk_names: Arc<OnceLock<Vec<String>>>,
     adaptive_assembly: Arc<AdaptiveAssembly>,
     profiler: Arc<super::profiling::PipelineProfiler>,
     /// Per-file completion bitset indexed by `file_idx`.
@@ -621,12 +621,11 @@ fn register_chunks_for_file<'a>(
 ) {
     let range = all_files.file_chunk_range(file_idx);
 
-    // A file qualifies for eager decompression when all its chunks are pure downloads.
-    // In force_eager mode, still require no old_offset chunks — delta copies need
-    // the assembly path to read from the old file.
+    // A file qualifies for eager decompression when all its chunks are
+    // pure downloads (no old_offset chunks requiring the assembly path).
     let all_pure_downloads = (range.start..range.end)
         .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
-    let file_is_eager = all_pure_downloads && (force_eager || all_pure_downloads);
+    let file_is_eager = all_pure_downloads;
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
     for ci in range.start..range.end {
@@ -2560,7 +2559,7 @@ pub async fn install(
         let names: Vec<String> = (0..download_items.len())
             .map(|i| chunk_names_lookup.get(i).to_owned())
             .collect();
-        let _ = ctx.save_chunk_names.set(Arc::new(names));
+        let _ = ctx.save_chunk_names.set(names);
     }
 
     {

@@ -5,7 +5,8 @@
 //! or the ceiling is reached. Workers die naturally when the queue empties.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::time::Instant;
 
 /// Initial number of download workers.
 pub const INITIAL_CONCURRENCY: usize = 24;
@@ -100,11 +101,10 @@ impl AdaptiveDownload {
     }
 }
 
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
 fn now_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    EPOCH.elapsed().as_nanos() as u64
 }
 
 #[cfg(test)]
@@ -125,21 +125,18 @@ mod tests {
 
     #[test]
     fn measure_scales_up_on_growth() {
+        // Force EPOCH init early so elapsed > MEASURE_INTERVAL by test time.
+        let _ = now_nanos();
+        std::thread::sleep(std::time::Duration::from_millis(MEASURE_INTERVAL_MS + 10));
+
         let ad = AdaptiveDownload::new();
-        // Simulate first measurement window
-        ad.last_time.store(
-            now_nanos() - (MEASURE_INTERVAL_MS as u64 + 100) * 1_000_000,
-            Ordering::Relaxed,
-        );
         ad.last_bytes.store(0, Ordering::Relaxed);
+        ad.last_time.store(0, Ordering::Relaxed);
         // First call sets baseline
         assert_eq!(ad.measure(100_000_000), None);
 
-        // Simulate second window with growth
-        ad.last_time.store(
-            now_nanos() - (MEASURE_INTERVAL_MS as u64 + 100) * 1_000_000,
-            Ordering::Relaxed,
-        );
+        // Reset last_time to 0 so next measure sees elapsed > interval.
+        ad.last_time.store(0, Ordering::Relaxed);
         let result = ad.measure(250_000_000);
         assert!(result.is_some());
         assert!(ad.current_target() > INITIAL_CONCURRENCY);
@@ -147,14 +144,14 @@ mod tests {
 
     #[test]
     fn measure_caps_at_max() {
+        let _ = now_nanos();
+        std::thread::sleep(std::time::Duration::from_millis(MEASURE_INTERVAL_MS + 10));
+
         let ad = AdaptiveDownload::new();
         ad.target.store(MAX_CONCURRENCY, Ordering::Relaxed);
-        ad.last_time.store(
-            now_nanos() - (MEASURE_INTERVAL_MS as u64 + 100) * 1_000_000,
-            Ordering::Relaxed,
-        );
         ad.last_throughput.store(1000 * 1000, Ordering::Relaxed);
         ad.last_bytes.store(0, Ordering::Relaxed);
+        ad.last_time.store(0, Ordering::Relaxed);
         assert_eq!(ad.measure(999_999_999), None);
     }
 }
