@@ -19,6 +19,7 @@ use types::{DownloadState, ResumeInfo};
 
 pub use client::DownloadClient;
 pub use game_installer::DownloadHandle;
+pub use game_installer::VerifyMode;
 pub use manifest::compute_content_manifest_hash;
 pub use progress::SophonProgress;
 pub use types::CHUNK_STATE_SAVE_INTERVAL;
@@ -47,6 +48,9 @@ pub fn load_download_state(state_dir: &str) -> Option<DownloadState> {
 /// Downloads a fresh game installation. The caller supplies the
 /// [`DownloadHandle`] so it can pause/resume/cancel the in-flight
 /// download from another task.
+///
+/// `verify_mode` controls the trade-off between integrity checking and
+/// CPU/IO overhead. See [`VerifyMode`] for details.
 pub async fn sophon_download(
     client: &reqwest::Client,
     game_id: &str,
@@ -54,6 +58,7 @@ pub async fn sophon_download(
     output_path: &str,
     handle: &DownloadHandle,
     on_progress: ProgressUpdater,
+    verify_mode: VerifyMode,
 ) -> Result<(), SophonError> {
     let game_dir = PathBuf::from(output_path);
     on_progress(SophonProgress::FetchingManifest);
@@ -65,6 +70,7 @@ pub async fn sophon_download(
         is_preinstall: false,
         is_resume: false,
         handle: handle.clone(),
+        verify_mode,
     };
     let callbacks = InstallCallbacks {
         updater: on_progress.clone(),
@@ -96,7 +102,7 @@ pub async fn sophon_download(
 }
 
 /// Updates an existing game installation. See [`sophon_download`] for the
-/// `handle` parameter.
+/// `handle` and `verify_mode` parameters.
 pub async fn sophon_update(
     client: &reqwest::Client,
     game_id: &str,
@@ -104,6 +110,7 @@ pub async fn sophon_update(
     output_path: &str,
     handle: &DownloadHandle,
     on_progress: ProgressUpdater,
+    verify_mode: VerifyMode,
 ) -> Result<(), SophonError> {
     let game_dir = PathBuf::from(output_path);
     let current_tag = game_installer::read_installed_tag(&game_dir)
@@ -119,6 +126,7 @@ pub async fn sophon_update(
         is_preinstall: false,
         is_resume: false,
         handle: handle.clone(),
+        verify_mode,
     };
     let callbacks = InstallCallbacks {
         updater: on_progress.clone(),

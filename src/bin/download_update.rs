@@ -145,6 +145,7 @@ async fn async_main() {
             is_preinstall: false,
             is_resume: false,
             handle,
+            verify_mode: game_installer::VerifyMode::Full,
         },
         game_installer::InstallCallbacks {
             updater: Arc::new(progress),

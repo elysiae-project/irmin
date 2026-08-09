@@ -22,7 +22,7 @@ Add the crate and call the high-level convenience functions:
 
 ```rust
 use std::sync::Arc;
-use irmin::{sophon_download, DownloadHandle, SophonProgress};
+use irmin::{sophon_download, DownloadHandle, SophonProgress, VerifyMode};
 
 let client = reqwest::Client::new();
 let handle = DownloadHandle::new();
@@ -30,10 +30,22 @@ let on_progress: irmin::ProgressUpdater = Arc::new(|p: SophonProgress| {
     println!("{p:?}");
 });
 
-sophon_download(&client, "hk4e", "en-us", "/path/to/game", &handle, on_progress).await?;
+sophon_download(&client, "hk4e", "en-us", "/path/to/game", &handle, on_progress, VerifyMode::Full).await?;
 ```
 
 The convenience functions take a `&reqwest::Client` explicitly, so you control connection pooling. Each download function also takes a `&DownloadHandle`; clone it before the call and you can `handle.pause()`, `handle.resume()`, or `handle.cancel()` the in-flight download from any other task. There is no global active-download registry. For lower-level control, the `game_installer` module exposes `build_installers`, `install`, `preinstall_download`, `apply_preinstall`, `check_update`, and `verify_integrity` directly.
+
+### Verification modes
+
+The `VerifyMode` parameter controls how aggressively irmin checks data integrity during download:
+
+| Mode | Behavior | Crash-resume | CPU cost |
+|------|----------|-------------|----------|
+| `Full` | Hash every chunk during download and assembly. Full crash-resume via bitmap. | Yes | ~6.8 s/GiB |
+| `Deferred` | Skip per-chunk hashing. Verify only the final assembled file. All-eager pipeline (no intermediate .zstd files). No crash-resume. | No | ~3.4 s/GiB |
+| `None` | Size-only checks. No hashing at all. No crash-resume. | No | ~3.0 s/GiB |
+
+In `Deferred` and `None` modes, if the download is interrupted, incomplete files must be re-downloaded from scratch on the next run. `Full` mode resumes from where it left off.
 
 Supported game identifiers:
 
@@ -54,7 +66,7 @@ Supported voice pack locales:
 
 ## How the pipeline works
 
-A download starts by fetching a manifest from the game's delivery API. The manifest lists every file, its size, and the chunks that compose it. Irmin checks what is already on disk, decides which chunks it still needs, and pulls them in parallel. Chunks arrive zstd-compressed; Irmin writes them to temp files, and the assembler then stitches those chunks into final files, runs integrity checks, and installs any plugins or SDKs the manifest requests.
+A download starts by fetching a manifest from the game's delivery API. The manifest lists every file, its size, and the chunks that compose it. Irmin checks what is already on disk, decides which chunks it still needs, and pulls them in parallel. In `Full` mode, chunks arrive zstd-compressed and are written to temp files; the assembler then stitches those chunks into final files, runs integrity checks, and installs any plugins or SDKs the manifest requests. In `Deferred`/`None` modes, chunks are decompressed inline and written directly to their final positions (the "eager" path), eliminating intermediate IO.
 
 Updates skip unchanged files by comparing the installed version tag against the remote tag. Preinstall goes one step further and downloads the next version's patch ahead of time, so when the server flips over to that version you just apply the patch and you are running.
 
@@ -64,13 +76,14 @@ For testing from the terminal, the crate ships with three command-line mirrors. 
 
 ```sh
 cargo run --release --features download-cli --bin download_version -- hk4e en-us 6.7.0 /path/to/game
+cargo run --release --features download-cli --bin download_version -- hk4e en-us 6.7.0 /path/to/game --verify-mode deferred
 cargo run --release --features download-cli --bin download_update -- hk4e en-us 6.7.0 /path/to/game
 cargo run --release --features download-cli --bin download_preinstall -- hk4e en-us /path/to/game
 ```
 
-`download_version` takes a game ID, voice locale, tag, and game directory. `download_update` works the same way but the tag argument is your current installed version. `download_preinstall` skips the tag since it pulls the latest remote version directly.
+`download_version` takes a game ID, voice locale, tag, and game directory. Pass `--verify-mode deferred` or `--verify-mode none` to trade crash-resume for lower CPU usage. `download_update` works the same way but the tag argument is your current installed version. `download_preinstall` skips the tag since it pulls the latest remote version directly.
 
-All three write a state file next to the game directory. If a run is interrupted partway, the next invocation picks up where it left off.
+All three write a state file next to the game directory. If a run is interrupted partway (in `Full` mode), the next invocation picks up where it left off.
 
 ## Benchmarks
 

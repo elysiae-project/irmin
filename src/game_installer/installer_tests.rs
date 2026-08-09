@@ -657,6 +657,7 @@
             completion_flags: Arc::from(Vec::<AtomicBool>::new()),
             output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
             chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap()),
+            verify_mode: super::VerifyMode::Full,
         });
 
         let handle = DownloadHandle::new();
@@ -761,6 +762,7 @@
             completion_flags: Arc::from(Vec::<AtomicBool>::new()),
             output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
             chunk_bitmap: Arc::new(super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap()),
+            verify_mode: super::VerifyMode::Full,
         });
 
         let handle = DownloadHandle::new();

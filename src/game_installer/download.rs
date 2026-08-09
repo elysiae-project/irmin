@@ -308,6 +308,7 @@ pub async fn download_chunk(
     dest: &Path,
     existing_size: Option<u64>,
     handle: Option<&super::handle::DownloadHandle>,
+    skip_hash: bool,
 ) -> SophonResult<()> {
     if !super::assembly::validate_chunk_name(chunk.chunk_name) {
         return Err(SophonError::PathTraversal(chunk.chunk_name.into()));
@@ -315,7 +316,7 @@ pub async fn download_chunk(
 
     let mut url = String::with_capacity(256);
     chunk_download.url_for_into(chunk.chunk_name, &mut url);
-    do_download_chunk(client, &url, chunk, dest, existing_size, handle).await
+    do_download_chunk(client, &url, chunk, dest, existing_size, handle, skip_hash).await
 }
 
 async fn do_download_chunk(
@@ -325,6 +326,7 @@ async fn do_download_chunk(
     dest: &Path,
     existing_size: Option<u64>,
     handle: Option<&super::handle::DownloadHandle>,
+    skip_hash: bool,
 ) -> SophonResult<()> {
     let mut existing_size = match existing_size {
         Some(s) => s,
@@ -418,7 +420,7 @@ async fn do_download_chunk(
                 })
                 .unwrap_or(false);
             if range_header_valid {
-                return download_with_resume(resp, chunk, dest, existing_size, handle).await;
+                return download_with_resume(resp, chunk, dest, existing_size, handle, skip_hash).await;
             }
             let _ = tokio::fs::remove_file(dest).await;
         } else {
@@ -429,7 +431,7 @@ async fn do_download_chunk(
     // Fresh download
     let resp = client.get(url).send().await?;
     let resp = resp.error_for_status()?;
-    download_full_file_with_response(resp, chunk, dest, handle).await
+    download_full_file_with_response(resp, chunk, dest, handle, skip_hash).await
 }
 
 /// Shared streaming loop: reads bytes from a response stream, writes to an
@@ -579,6 +581,7 @@ async fn download_full_file_with_response(
     chunk: ChunkRef<'_>,
     dest: &Path,
     handle: Option<&DownloadHandle>,
+    skip_hash: bool,
 ) -> SophonResult<()> {
     let content_length = resp.content_length();
     if let Some(len) = content_length
@@ -600,13 +603,13 @@ async fn download_full_file_with_response(
         let _ = super::sysio::preallocate(&std_file, chunk.chunk_size);
     }
     let mut file = EvictingWriter::new(file);
-    let mut hasher = if chunk.chunk_compressed_hash_md5.len() == 32 {
+    let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
         Some(take_md5()?)
     } else {
         None
     };
     let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> =
-        if chunk.chunk_compressed_hash_md5.len() == 16 {
+        if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
             Some(super::assembly_opt::take_xxh64())
         } else {
             None
@@ -620,7 +623,7 @@ async fn download_full_file_with_response(
         chunk.chunk_size,
         0,
         chunk.chunk_name,
-        chunk.chunk_compressed_hash_md5,
+        if skip_hash { "" } else { chunk.chunk_compressed_hash_md5 },
         dest,
         handle,
     )
@@ -633,6 +636,7 @@ async fn download_with_resume(
     dest: &Path,
     existing_size: u64,
     handle: Option<&DownloadHandle>,
+    skip_hash: bool,
 ) -> SophonResult<()> {
     if resp.status() == reqwest::StatusCode::OK {
         let _ = tokio::fs::remove_file(dest).await;
@@ -657,13 +661,13 @@ async fn download_with_resume(
 
     check_available_space(dest, remaining)?;
 
-    let mut hasher = if chunk.chunk_compressed_hash_md5.len() == 32 {
+    let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
         Some(take_md5()?)
     } else {
         None
     };
     let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> =
-        if chunk.chunk_compressed_hash_md5.len() == 16 {
+        if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
             Some(super::assembly_opt::take_xxh64())
         } else {
             None
@@ -704,7 +708,7 @@ async fn download_with_resume(
         expected_total,
         existing_size,
         chunk.chunk_name,
-        chunk.chunk_compressed_hash_md5,
+        if skip_hash { "" } else { chunk.chunk_compressed_hash_md5 },
         dest,
         handle,
     )
