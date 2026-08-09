@@ -1615,8 +1615,8 @@ async fn run_downloads(
     assemble_tx: &mpsc::UnboundedSender<(usize, usize)>,
     handle: DownloadHandle,
 ) -> DownloadSummary {
-    const WORKER_COUNT: usize = super::DOWNLOAD_CONCURRENCY;
     const RECLAIM_INTERVAL: usize = 100;
+    let adaptive = Arc::new(super::adaptive_download::AdaptiveDownload::new());
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let total: usize = download_items.len();
@@ -1628,7 +1628,8 @@ async fn run_downloads(
 
     ctx.profiler.total_chunks.store(total, Ordering::Relaxed);
 
-    for _ in 0..WORKER_COUNT {
+    // Spawn a worker closure factory to avoid repeating the body.
+    let spawn_worker = |workers: &mut tokio::task::JoinSet<()>| {
         let queue = Arc::clone(&queue);
         let ctx = Arc::clone(&ctx);
         let chunk_entries = Arc::clone(&chunk_entries);
@@ -1687,6 +1688,42 @@ async fn run_downloads(
                 }
             }
         });
+    };
+
+    // Spawn initial workers.
+    let initial = adaptive.current_target().min(total);
+    for _ in 0..initial {
+        spawn_worker(&mut workers);
+    }
+
+    // Adaptive scaling: periodically measure throughput and spawn more workers.
+    let mut spawned = initial;
+    loop {
+        tokio::select! {
+            biased;
+            result = workers.join_next() => {
+                if result.is_none() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                // Measure throughput and possibly increase target.
+                let db = ctx.downloaded_bytes.load(Ordering::Relaxed);
+                adaptive.measure(db);
+
+                let target = adaptive.current_target();
+                let queue_len = queue.lock().unwrap_or_else(|e| e.into_inner()).len();
+                // Spawn up to target, but only if queue has work.
+                while spawned < target && queue_len > spawned {
+                    spawn_worker(&mut workers);
+                    spawned += 1;
+                }
+
+                if remaining.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+            }
+        }
     }
 
     while workers.join_next().await.is_some() {}
