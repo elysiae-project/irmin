@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use irmin::SophonProgress;
 use irmin::game_installer::{
-    self, DownloadHandle, InstallCallbacks, InstallOptions, ResumeContext,
+    self, DownloadHandle, InstallCallbacks, InstallOptions, ResumeContext, VerifyMode,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Builder;
@@ -89,15 +89,25 @@ fn main() {
 
 async fn async_main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
+    if args.len() < 5 || args.len() > 7 {
         let program = &args[0];
-        eprintln!("Usage: {program} <game_id> <vo_lang> <tag> <game_dir>");
+        eprintln!("Usage: {program} <game_id> <vo_lang> <tag> <game_dir> [--verify-mode full|deferred|none]");
         std::process::exit(1);
     }
     let game_id = &args[1];
     let vo_lang = &args[2];
     let tag = &args[3];
     let game_dir = Path::new(&args[4]);
+
+    let verify_mode = args.iter().position(|a| a == "--verify-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| match v.as_str() {
+            "deferred" => VerifyMode::Deferred,
+            "none" => VerifyMode::None,
+            _ => VerifyMode::Full,
+        })
+        .unwrap_or(VerifyMode::Full);
+
     let sf = state_file(game_dir);
 
     let (prev_manifest_hash, prev_downloaded_chunks, is_resume) = if sf.exists() {
@@ -182,6 +192,7 @@ async fn async_main() {
             is_preinstall: false,
             is_resume,
             handle,
+            verify_mode,
         },
         InstallCallbacks {
             updater: Arc::new(progress),

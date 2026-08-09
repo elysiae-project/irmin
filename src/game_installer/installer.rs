@@ -125,6 +125,8 @@ struct InstallContext {
     output_allocator: Arc<super::output_allocator::OutputAllocator>,
     /// Completion bitmap for eager decompression resume.
     chunk_bitmap: Arc<super::chunk_bitmap::ChunkBitmap>,
+    /// Verification mode controlling hash overhead.
+    verify_mode: super::VerifyMode,
 }
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -612,12 +614,16 @@ fn register_chunks_for_file<'a>(
     installer_idx: usize,
     pre_downloaded: &FxHashMap<u32, u64>,
     eager_tainted_files: &mut rustc_hash::FxHashSet<u32>,
+    force_eager: bool,
 ) {
     let range = all_files.file_chunk_range(file_idx);
 
     // A file qualifies for eager decompression when all its chunks are pure downloads.
-    let file_is_eager = (range.start..range.end)
+    // In force_eager mode, still require no old_offset chunks — delta copies need
+    // the assembly path to read from the old file.
+    let all_pure_downloads = (range.start..range.end)
         .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+    let file_is_eager = all_pure_downloads && (force_eager || all_pure_downloads);
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
     for ci in range.start..range.end {
@@ -630,26 +636,40 @@ fn register_chunks_for_file<'a>(
         let name = chunk.chunk_name;
         let is_pre = pre_downloaded.contains_key(&(global_chunk_idx as u32));
 
-        let item_idx = if let Some(&idx) = download_items_index.get(name) {
-            if is_pre {
-                download_items[idx as usize].is_pre_downloaded = true;
+        // When force_eager, skip dedup — create independent DownloadItems per file.
+        // Shared chunks get downloaded multiple times but avoid .zstd intermediates.
+        let item_idx = if !force_eager {
+            if let Some(&idx) = download_items_index.get(name) {
+                if is_pre {
+                    download_items[idx as usize].is_pre_downloaded = true;
+                }
+                // Shared chunk: both the original file and this file are tainted.
+                let original_file = download_items[idx as usize].file_idx;
+                eager_tainted_files.insert(original_file);
+                eager_tainted_files.insert(file_idx as u32);
+                idx
+            } else {
+                let idx = download_items.len() as u32;
+                download_items.push(DownloadItem {
+                    file_idx: file_idx as u32,
+                    chunk_idx: (global_chunk_idx - range.start as usize) as u32,
+                    installer_idx: installer_idx as u32,
+                    is_pre_downloaded: is_pre,
+                    use_eager: file_is_eager,
+                });
+                download_items_index.insert(name, idx);
+                idx
             }
-            // Shared chunk: both the original file and this file are tainted.
-            // A post-registration pass disables eager for all tainted files.
-            let original_file = download_items[idx as usize].file_idx;
-            eager_tainted_files.insert(original_file);
-            eager_tainted_files.insert(file_idx as u32);
-            idx
         } else {
+            // force_eager: always create a new item, skip dedup index
             let idx = download_items.len() as u32;
             download_items.push(DownloadItem {
                 file_idx: file_idx as u32,
                 chunk_idx: (global_chunk_idx - range.start as usize) as u32,
                 installer_idx: installer_idx as u32,
                 is_pre_downloaded: is_pre,
-                use_eager: file_is_eager,
+                use_eager: true,
             });
-            download_items_index.insert(name, idx);
             idx
         };
 
@@ -728,6 +748,7 @@ async fn build_download_state(
                 tmp_dir_idx,
                 pre_downloaded,
                 &mut eager_tainted_files,
+                ctx.verify_mode != super::VerifyMode::Full,
             );
 
             if pending_counts.len() == pending_before {
@@ -739,7 +760,8 @@ async fn build_download_state(
 
     // Disable eager for all files that share chunks with other files.
     // A file must go entirely through eager OR entirely through assembly.
-    if !eager_tainted_files.is_empty() {
+    // Skip when force_eager (non-Full mode): all chunks are independent.
+    if !eager_tainted_files.is_empty() && ctx.verify_mode == super::VerifyMode::Full {
         for item in download_items.iter_mut() {
             if eager_tainted_files.contains(&item.file_idx) {
                 item.use_eager = false;
@@ -814,6 +836,7 @@ fn make_assembly_params(
         total_files: ctx.total_files,
         profiler: Arc::clone(&ctx.profiler),
         completion_flags: Arc::clone(&ctx.completion_flags),
+        verify_mode: ctx.verify_mode,
     }
 }
 
@@ -1072,6 +1095,7 @@ async fn download_chunk_with_retries(
             dest,
             existing_size,
             Some(handle),
+            ctx.verify_mode != super::VerifyMode::Full,
         )
         .await
         {
@@ -1238,8 +1262,9 @@ async fn process_eager_item(
     let _decompressed_bytes = tokio::task::spawn_blocking({
         let compressed = compressed_data;
         let out = Arc::clone(&out_file);
-        let decomp_hash = chunk.chunk_decompressed_hash_md5.to_string();
-        let comp_hash = chunk.chunk_compressed_hash_md5.to_string();
+        let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
+        let decomp_hash = if skip_hash { String::new() } else { chunk.chunk_decompressed_hash_md5.to_string() };
+        let comp_hash = if skip_hash { String::new() } else { chunk.chunk_compressed_hash_md5.to_string() };
         let expected_size = chunk.chunk_size_decompressed;
         move || {
             super::eager_decompress::eager_decompress_chunk(
@@ -1257,17 +1282,23 @@ async fn process_eager_item(
 
     // Ensure decompressed data is on disk before marking bitmap,
     // so a crash+resume cannot see a "complete" chunk with missing data.
-    out_file.sync_data()?;
+    // Skip in non-Full mode: crash-resume is disabled, avoid the syscall.
+    if ctx.verify_mode == super::VerifyMode::Full {
+        out_file.sync_data()?;
+    }
 
     // Mark chunk complete in bitmap.
     ctx.chunk_bitmap.mark_complete(global_chunk_idx);
 
     // Periodic bitmap sync (same cadence as assembly state saves).
-    let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
-    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL)
-        && let Err(e) = ctx.chunk_bitmap.sync()
-    {
-        log::warn!("Failed to sync chunk bitmap: {e}");
+    // Skip in non-Full mode: no crash-resume.
+    if ctx.verify_mode == super::VerifyMode::Full {
+        let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL)
+            && let Err(e) = ctx.chunk_bitmap.sync()
+        {
+            log::warn!("Failed to sync chunk bitmap: {e}");
+        }
     }
 
     // Update progress.
@@ -1865,6 +1896,7 @@ pub struct InstallOptions {
     pub is_preinstall: bool,
     pub is_resume: bool,
     pub handle: DownloadHandle,
+    pub verify_mode: super::VerifyMode,
 }
 
 pub struct InstallCallbacks {
@@ -2411,6 +2443,7 @@ pub async fn install(
             };
             Arc::new(bm)
         },
+        verify_mode: options.verify_mode,
     });
 
     // Clear stale bitmap bits for files that were deleted during resume
@@ -2823,7 +2856,7 @@ pub async fn verify_integrity(
                     chunk_old_offset: -1,
                 };
                 let result =
-                    download::download_chunk(&client, &dl_info, chunk_ref, &chunk_path, None, None)
+                    download::download_chunk(&client, &dl_info, chunk_ref, &chunk_path, None, None, false)
                         .await;
                 if result.is_ok() {
                     dl_completed.fetch_add(1, Ordering::Relaxed);
@@ -2975,6 +3008,7 @@ fn reassemble_single_asset(
         &chunk_refcounts,
         verify_cache,
         true,
+        super::VerifyMode::Full, // verify_integrity always uses full verification
     );
     let _ = fs::remove_dir_all(&tmp_dir);
     result
