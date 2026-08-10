@@ -1454,6 +1454,52 @@ fn hdiff_e2e_v20_nocomp_applies_correctly() {
     assert_eq!(result, new, "v20 nocomp output mismatch");
 }
 
+/// An RLE run longer than the 1MB decode buffer must be drained in multiple
+/// steps before the next ctrl byte is read. Regression: single 3MB cover
+/// produced from an identical old/new pair previously desynchronized the
+/// ctrl stream and failed with "failed to fill whole buffer".
+#[test]
+fn hdiff_e2e_v13_zstd_rle_run_exceeds_buffer_applies_correctly() {
+    let old = test_prng_data(4000, 3 * 1024 * 1024);
+    let new = old.clone();
+
+    let patch = build_v13_zstd_patch(&old, &new);
+    assert_eq!(
+        hdiff_e2e_apply(&old, &patch),
+        new,
+        "oversized RLE run output mismatch"
+    );
+}
+
+/// Shared apply helper for e2e tests.
+#[cfg(test)]
+fn hdiff_e2e_apply(old: &[u8], patch: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, old).unwrap();
+    fs::write(&patch_path, patch).unwrap();
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().to_string(),
+        patch_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+    );
+    assert!(
+        hdiff.apply(None),
+        "hdiff apply failed: {}/{}",
+        old.len(),
+        patch.len()
+    );
+    let mut result = Vec::new();
+    fs::File::open(&out_path)
+        .unwrap()
+        .read_to_end(&mut result)
+        .unwrap();
+    result
+}
+
 #[test]
 fn hdiff_e2e_v13_zstd_applies_correctly() {
     let old = test_prng_data(200, 8192);

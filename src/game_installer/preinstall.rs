@@ -2015,6 +2015,9 @@ fn apply_hdiff_patch(
     if let Some(parent) = temp_output.parent() {
         fs::create_dir_all(parent)?;
     }
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     let effective_original = diff_ref_guard.0.as_deref().unwrap_or(&original_path);
     let op = effective_original.to_string_lossy().into_owned();
@@ -2113,6 +2116,9 @@ fn apply_hdiff_patch_from_files(
     let temp_output = game_dir.join(format!("patching/{safe_path}_{safe_hash}.tmp.out"));
     let _ = fs::remove_file(&temp_output);
     if let Some(parent) = temp_output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
