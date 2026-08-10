@@ -1328,24 +1328,13 @@ pub async fn apply_preinstall(
             continue;
         }
 
-        if regenerate_pkg_version.is_some() && is_hk4e_pkg_version(&asset.target_file_path) {
+        if super::game_filters::is_sophon_synthesized_asset(
+            &state.game_id,
+            &asset.target_file_path,
+        ) {
             applied_files.fetch_add(1, Ordering::Relaxed);
             log::warn!(
-                "Regenerating hk4e pkg_version (skipping CDN patch): {path}",
-                path = asset.target_file_path,
-            );
-            continue;
-        }
-
-        if regenerate_pkg_version.is_some()
-            && asset
-                .target_file_path
-                .to_lowercase()
-                .ends_with("ctable_streaming.dat")
-        {
-            applied_files.fetch_add(1, Ordering::Relaxed);
-            log::warn!(
-                "Skipping hk4e Linux-filtered asset: {path}",
+                "Skipping CDN patch for sophon-synthesized asset: {path}",
                 path = asset.target_file_path,
             );
             continue;
@@ -1577,22 +1566,13 @@ pub async fn apply_preinstall(
     Ok(())
 }
 
-const HK4E_PKG_VERSION_FILES: &[&str] = &["pkg_version", "beyond_pkg_version"];
-
-fn is_hk4e_pkg_version(target_file_path: &str) -> bool {
-    let name = target_file_path.rsplit('/').next().unwrap_or(target_file_path);
-    HK4E_PKG_VERSION_FILES
-        .iter()
-        .any(|suffix| name == *suffix || name.starts_with("Audio_") && name.ends_with(suffix))
-}
-
 fn regenerate_hk4e_pkg_version(
     game_dir: &Path,
     context: &DownloadOverContext,
     vo_lang: &[String],
 ) -> SophonResult<()> {
     let mut assets: Vec<SophonManifestAssetProperty> = Vec::new();
-    for (_, (_, proto)) in &context.manifests {
+    for (_, proto) in context.manifests.values() {
         for asset in &proto.assets {
             if !asset.is_directory() {
                 assets.push(asset.clone());

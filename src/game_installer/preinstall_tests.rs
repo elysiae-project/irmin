@@ -1610,17 +1610,3 @@ fn preinstall_state_golden_json_field_names() {
         vec![("game".to_string(), "manifest_hash_123".to_string())]
     );
 }
-
-#[test]
-fn test_is_hk4e_pkg_version() {
-    use super::is_hk4e_pkg_version;
-
-    assert!(is_hk4e_pkg_version("pkg_version"));
-    assert!(is_hk4e_pkg_version("beyond_pkg_version"));
-    assert!(is_hk4e_pkg_version("Audio_English(US)_pkg_version"));
-    assert!(is_hk4e_pkg_version("data/Audio_Japanese_pkg_version"));
-    assert!(!is_hk4e_pkg_version("GenshinImpact.exe"));
-    assert!(!is_hk4e_pkg_version("pkg_versions.txt"));
-    assert!(!is_hk4e_pkg_version("Audio_English(US).pck"));
-    assert!(!is_hk4e_pkg_version(""));
-}
