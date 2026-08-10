@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -690,9 +690,10 @@ pub async fn preinstall_download(
         return Err(SophonError::Cancelled);
     }
 
+    let total: usize = plan.unique_chunks.len();
     let queue: Arc<Mutex<VecDeque<PatchChunkInfo>>> =
         Arc::new(Mutex::new(plan.unique_chunks.into()));
-    const WORKER_COUNT: usize = super::DOWNLOAD_CONCURRENCY;
+    let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(total));
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let mut workers = tokio::task::JoinSet::new();
@@ -763,10 +764,12 @@ pub async fn preinstall_download(
         });
     }
 
-    for _ in 0..WORKER_COUNT {
+    // Spawn a worker closure factory to avoid repeating the body.
+    let spawn_worker = |workers: &mut tokio::task::JoinSet<()>| {
         let queue = Arc::clone(&queue);
         let cancelled = Arc::clone(&cancelled);
         let first_error = Arc::clone(&first_error);
+        let remaining = Arc::clone(&remaining);
         let ctx = PreinstallWorkerCtx {
             client: download_client.clone(),
             diff_downloads: diff_downloads.clone(),
@@ -829,8 +832,48 @@ pub async fn preinstall_download(
                         *guard = Some(err);
                     }
                 }
+                if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    break;
+                }
             }
         });
+    };
+
+    // Spawn initial workers and scale up while throughput keeps growing,
+    // mirroring the main installer's adaptive download scheduler.
+    let adaptive = super::adaptive_download::AdaptiveDownload::new();
+    let initial = adaptive.current_target().min(total);
+    let mut spawned = 0;
+    for _ in 0..initial {
+        spawn_worker(&mut workers);
+        spawned += 1;
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            result = workers.join_next() => {
+                if result.is_none() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                let db = downloaded_bytes.load(Ordering::Relaxed);
+                adaptive.measure(db);
+
+                let target = adaptive.current_target();
+                let queue_len = queue.lock().unwrap_or_else(|e| e.into_inner()).len();
+                // Spawn up to target, but only if queue has work.
+                while spawned < target && queue_len > spawned {
+                    spawn_worker(&mut workers);
+                    spawned += 1;
+                }
+
+                if remaining.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+            }
+        }
     }
 
     while workers.join_next().await.is_some() {}
