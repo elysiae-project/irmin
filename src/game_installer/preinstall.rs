@@ -37,7 +37,8 @@ use crate::api_scrape::{
     DownloadInfo, SophonBuildData, SophonManifestMeta, SophonPatchManifestMeta,
 };
 use crate::proto_parse::{
-    SophonManifestAssetChunk, SophonManifestProto, SophonPatchAssetChunk, SophonPatchAssetProperty,
+    SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
+    SophonPatchAssetChunk, SophonPatchAssetProperty,
 };
 
 const HDIFF_MAGIC: &[u8; 5] = b"HDIFF";
@@ -1311,12 +1312,41 @@ pub async fn apply_preinstall(
     let download_over_context =
         fetch_download_over_context(client, &state.game_id, &state.vo_lang).await?;
 
+    let regenerate_pkg_version = if state.game_id == "hk4e" {
+        Some(download_over_context.clone())
+    } else {
+        None
+    };
+
     for asset in &state.patch_assets {
         if asset.patch_method == PatchMethod::Skip {
             applied_files.fetch_add(1, Ordering::Relaxed);
             log::warn!(
                 "Skipping patch for removed feature asset: {path}",
                 path = asset.target_file_path
+            );
+            continue;
+        }
+
+        if regenerate_pkg_version.is_some() && is_hk4e_pkg_version(&asset.target_file_path) {
+            applied_files.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "Regenerating hk4e pkg_version (skipping CDN patch): {path}",
+                path = asset.target_file_path,
+            );
+            continue;
+        }
+
+        if regenerate_pkg_version.is_some()
+            && asset
+                .target_file_path
+                .to_lowercase()
+                .ends_with("ctable_streaming.dat")
+        {
+            applied_files.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "Skipping hk4e Linux-filtered asset: {path}",
+                path = asset.target_file_path,
             );
             continue;
         }
@@ -1501,6 +1531,15 @@ pub async fn apply_preinstall(
         }
     }
 
+    if let Some(context) = regenerate_pkg_version {
+        let gd = game_dir.to_path_buf();
+        let vo = state.vo_lang.clone();
+        tokio::task::spawn_blocking(move || {
+            regenerate_hk4e_pkg_version(&gd, &context, &[vo])
+        })
+        .await??;
+    }
+
     {
         let gd = game_dir.to_path_buf();
         let df = state.deleted_files.clone();
@@ -1535,6 +1574,40 @@ pub async fn apply_preinstall(
         .await??;
     }
 
+    Ok(())
+}
+
+const HK4E_PKG_VERSION_FILES: &[&str] = &["pkg_version", "beyond_pkg_version"];
+
+fn is_hk4e_pkg_version(target_file_path: &str) -> bool {
+    let name = target_file_path.rsplit('/').next().unwrap_or(target_file_path);
+    HK4E_PKG_VERSION_FILES
+        .iter()
+        .any(|suffix| name == *suffix || name.starts_with("Audio_") && name.ends_with(suffix))
+}
+
+fn regenerate_hk4e_pkg_version(
+    game_dir: &Path,
+    context: &DownloadOverContext,
+    vo_lang: &[String],
+) -> SophonResult<()> {
+    let mut assets: Vec<SophonManifestAssetProperty> = Vec::new();
+    for (_, (_, proto)) in &context.manifests {
+        for asset in &proto.assets {
+            if !asset.is_directory() {
+                assets.push(asset.clone());
+            }
+        }
+    }
+
+    super::game_filters::filter_hk4e_asset_list(
+        game_dir,
+        &mut assets,
+        vo_lang,
+    );
+
+    let manifest = Arc::new(super::compact_manifest::CompactManifest::from(assets));
+    super::game_filters::write_pkg_version_from_manifest(game_dir, &manifest, vo_lang)?;
     Ok(())
 }
 
@@ -1960,10 +2033,9 @@ fn apply_hdiff_patch(
                 return Ok(());
             }
             log::warn!(
-                "Original file size mismatch for {path}: expected {expected_size}, got {actual_size}, deleting and falling back to DownloadOver",
+                "Original file size mismatch for {path}: expected {expected_size}, got {actual_size}, falling back to DownloadOver (keeping file for old-chunk reuse)",
                 path = original_path.display(),
             );
-            let _ = fs::remove_file(&original_path);
             return Err(SophonError::OriginalFileMissing(format!(
                 "{path} (Size mismatch: expected {expected_size}, got {actual_size})",
                 path = original_path.display(),
@@ -1991,10 +2063,9 @@ fn apply_hdiff_patch(
         && !is_filtered_asset(cache, asset)
     {
         log::warn!(
-            "Original file MD5 mismatch for {path}, deleting and falling back to DownloadOver",
+            "Original file MD5 mismatch for {path}, falling back to DownloadOver (keeping file for old-chunk reuse)",
             path = original_path.display()
         );
-        let _ = fs::remove_file(&original_path);
         return Err(SophonError::OriginalFileMissing(
             original_path.to_string_lossy().to_string(),
         ));
