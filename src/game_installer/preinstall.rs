@@ -608,6 +608,7 @@ pub async fn preinstall_download(
     });
     let checked_arc = Arc::new(AtomicU64::new(0));
     let resume_offset_arc = Arc::new(AtomicU64::new(0));
+    let last_check_emit = Arc::new(AtomicU64::new(now_nanos()));
     {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
         let map = Arc::clone(&chunk_bytes_map);
@@ -618,6 +619,7 @@ pub async fn preinstall_download(
             let offset = Arc::clone(&resume_offset_arc);
             let map = Arc::clone(&map);
             let upd = Arc::clone(&upd);
+            let last_emit = Arc::clone(&last_check_emit);
             let chunks_dir = chunks_dir.clone();
             async move {
                 let _permit = permit.acquire().await.ok()?;
@@ -632,7 +634,13 @@ pub async fn preinstall_download(
                     offset.fetch_add(chunk.patch_size, Ordering::Relaxed);
                 }
                 let checked = checked.fetch_add(1, Ordering::Relaxed) + 1;
-                if checked.is_multiple_of(500) {
+                // Emit by elapsed time (not a fixed file multiple) so the bar
+                // advances even for short preinstall manifests.
+                let now = now_nanos();
+                if now.saturating_sub(last_emit.load(Ordering::Relaxed))
+                    >= super::PROGRESS_UPDATE_INTERVAL_MS * 1_000_000
+                {
+                    last_emit.store(now, Ordering::Relaxed);
                     upd(SophonProgress::CalculatingDownloads {
                         checked_files: checked,
                         total_files,
