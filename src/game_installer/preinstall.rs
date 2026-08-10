@@ -512,19 +512,13 @@ struct PreinstallWorkerCtx {
     total_bytes: u64,
     chunk_bytes_map: Arc<DashMap<String, u64>>,
     state_saver: super::installer::StateSaver,
-    last_update: Arc<AtomicU64>,
     chunks_since_save: Arc<AtomicUsize>,
-    last_speed_bytes: Arc<AtomicU64>,
-    last_speed_time: Arc<AtomicU64>,
-    smooth_speed_bps: Arc<AtomicU64>,
-    eta_speed_history: Arc<Mutex<VecDeque<f64>>>,
 }
 
 async fn process_preinstall_chunk(
     chunk_info: PatchChunkInfo,
     ctx: &PreinstallWorkerCtx,
     diff_download: &Arc<DownloadInfo>,
-    already_downloaded: bool,
 ) -> SophonResult<()> {
     if ctx.handle.is_cancelled() {
         return Err(SophonError::Cancelled);
@@ -542,78 +536,20 @@ async fn process_preinstall_chunk(
 
     let chunk_path = ctx.chunks_dir.join(&chunk_info.patch_name);
 
-    let needs_download = if verify_file_hash(&chunk_path, &chunk_info.patch_md5) {
-        ctx.downloaded_bytes.fetch_add(chunk_info.patch_size, Ordering::Relaxed);
-        if !already_downloaded {
-            ctx.chunk_bytes_map.insert(chunk_info.patch_name.clone(), chunk_info.patch_size);
-        }
-        false
-    } else {
-        true
-    };
+    download_patch_chunk_with_retries(
+        &ctx.client,
+        diff_download,
+        &chunk_info.patch_name,
+        &chunk_path,
+        &chunk_info.patch_md5,
+        super::MAX_RETRIES,
+        &ctx.handle,
+        &ctx.downloaded_bytes,
+    )
+    .await?;
 
-    if needs_download {
-        download_patch_chunk_with_retries(
-            &ctx.client,
-            diff_download,
-            &chunk_info.patch_name,
-            &chunk_path,
-            &chunk_info.patch_md5,
-            super::MAX_RETRIES,
-            &ctx.handle,
-        )
-        .await?;
-
-        ctx.downloaded_bytes.fetch_add(chunk_info.patch_size, Ordering::Relaxed);
-        ctx.chunk_bytes_map.insert(chunk_info.patch_name.clone(), chunk_info.patch_size);
-    }
-
-    let db = ctx.downloaded_bytes.load(Ordering::Relaxed) + ctx.resume_offset;
-    {
-        let now = now_nanos();
-        if now.saturating_sub(ctx.last_update.load(Ordering::Relaxed))
-            >= super::PROGRESS_UPDATE_INTERVAL_MS * 1_000_000
-        {
-            let last_speed_nanos = ctx.last_speed_time.load(Ordering::Relaxed);
-            let window_elapsed = if last_speed_nanos == 0 {
-                0.0
-            } else {
-                now.saturating_sub(last_speed_nanos) as f64 / 1_000_000_000.0
-            };
-            let instant_window_speed = if window_elapsed >= 1.0 {
-                let window_bytes = db.saturating_sub(ctx.last_speed_bytes.load(Ordering::Relaxed));
-                let window_speed = window_bytes as f64 / window_elapsed;
-                ctx.last_speed_bytes.store(db, Ordering::Relaxed);
-                ctx.last_speed_time.store(now, Ordering::Relaxed);
-                window_speed
-            } else {
-                0.0
-            };
-
-            let speed_alpha = 1.0
-                / (super::SPEED_SMOOTH_WINDOW_SECS * 1000.0
-                    / super::PROGRESS_UPDATE_INTERVAL_MS as f64);
-
-            let speed_bps =
-                super::ewma_update(&ctx.smooth_speed_bps, instant_window_speed, speed_alpha);
-            let eta_speed_bps = super::compute_eta_speed(&ctx.eta_speed_history, instant_window_speed);
-
-            let remaining = ctx.total_bytes.saturating_sub(db);
-            let eta = if eta_speed_bps > 0.0 {
-                remaining as f64 / eta_speed_bps
-            } else {
-                0.0
-            };
-
-            (ctx.updater)(SophonProgress::Downloading {
-                downloaded_bytes: db,
-                total_bytes: ctx.total_bytes,
-                speed_bps,
-                eta_seconds: eta,
-            });
-            ctx.last_update.store(now, Ordering::Relaxed);
-        }
-    }
+    ctx.chunk_bytes_map
+        .insert(chunk_info.patch_name.clone(), chunk_info.patch_size);
 
     let save_count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if save_count
@@ -655,20 +591,66 @@ pub async fn preinstall_download(
         .map(|c| c.patch_size)
         .fold(0u64, |acc, x| acc.saturating_add(x));
     let downloaded_bytes = Arc::new(AtomicU64::new(0));
-    let resume_offset: u64 = {
-        let existing: u64 = plan
-            .unique_chunks
-            .iter()
-            .filter(|c| resume_chunks.contains_key(&c.patch_name))
-            .map(|c| c.patch_size)
-            .fold(0u64, |acc, x| acc.saturating_add(x));
-        existing
-    };
 
     let chunk_bytes_map: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
     for (k, v) in resume_chunks {
         chunk_bytes_map.insert(k, v);
     }
+
+    // Phase 1 — checking existing files. Files that already exist with a
+    // matching hash are folded into the baseline offset, NOT into
+    // `downloaded_bytes`, so the download phase only counts bytes actually
+    // streamed over the network.
+    let total_files = plan.unique_chunks.len() as u64;
+    updater(SophonProgress::CalculatingDownloads {
+        checked_files: 0,
+        total_files,
+    });
+    let checked_arc = Arc::new(AtomicU64::new(0));
+    let resume_offset_arc = Arc::new(AtomicU64::new(0));
+    {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+        let map = Arc::clone(&chunk_bytes_map);
+        let upd = Arc::clone(&updater);
+        let futures = plan.unique_chunks.iter().cloned().map(|chunk| {
+            let permit = Arc::clone(&semaphore);
+            let checked = Arc::clone(&checked_arc);
+            let offset = Arc::clone(&resume_offset_arc);
+            let map = Arc::clone(&map);
+            let upd = Arc::clone(&upd);
+            let chunks_dir = chunks_dir.clone();
+            async move {
+                let _permit = permit.acquire().await.ok()?;
+                let path = chunks_dir.join(&chunk.patch_name);
+                let ok = tokio::task::spawn_blocking(move || {
+                    verify_file_hash(&path, &chunk.patch_md5)
+                })
+                .await
+                .ok()?;
+                if ok {
+                    map.insert(chunk.patch_name.clone(), chunk.patch_size);
+                    offset.fetch_add(chunk.patch_size, Ordering::Relaxed);
+                }
+                let checked = checked.fetch_add(1, Ordering::Relaxed) + 1;
+                if checked.is_multiple_of(500) {
+                    upd(SophonProgress::CalculatingDownloads {
+                        checked_files: checked,
+                        total_files,
+                    });
+                }
+                Some(())
+            }
+        });
+        futures_util::stream::iter(futures)
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+    }
+    updater(SophonProgress::CalculatingDownloads {
+        checked_files: total_files,
+        total_files,
+    });
+    let resume_offset = resume_offset_arc.load(Ordering::Relaxed);
 
     super::download::check_available_space(&chunks_dir, total_bytes)?;
 
@@ -679,21 +661,22 @@ pub async fn preinstall_download(
         eta_seconds: 0.0,
     });
 
-    let last_update = Arc::new(AtomicU64::new(now_nanos()));
     let chunks_since_save = Arc::new(AtomicUsize::new(0usize));
-    let last_speed_bytes = Arc::new(AtomicU64::new(0));
-    let last_speed_time = Arc::new(AtomicU64::new(now_nanos()));
-    let smooth_speed_bps = Arc::new(AtomicU64::new(0));
-    let eta_speed_history = Arc::new(Mutex::new(VecDeque::new()));
 
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
     }
 
     let total: usize = plan.unique_chunks.len();
-    let queue: Arc<Mutex<VecDeque<PatchChunkInfo>>> =
-        Arc::new(Mutex::new(plan.unique_chunks.into()));
-    let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(total));
+    let queue: Arc<Mutex<VecDeque<PatchChunkInfo>>> = Arc::new(Mutex::new(
+        plan.unique_chunks
+            .into_iter()
+            .filter(|c| !chunk_bytes_map.contains_key(&c.patch_name))
+            .collect(),
+    ));
+    let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(
+        queue.lock().unwrap_or_else(|e| e.into_inner()).len(),
+    ));
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let mut workers = tokio::task::JoinSet::new();
@@ -781,12 +764,7 @@ pub async fn preinstall_download(
             total_bytes,
             chunk_bytes_map: Arc::clone(&chunk_bytes_map),
             state_saver: Arc::clone(&state_saver),
-            last_update: Arc::clone(&last_update),
             chunks_since_save: Arc::clone(&chunks_since_save),
-            last_speed_bytes: Arc::clone(&last_speed_bytes),
-            last_speed_time: Arc::clone(&last_speed_time),
-            smooth_speed_bps: Arc::clone(&smooth_speed_bps),
-            eta_speed_history: Arc::clone(&eta_speed_history),
         };
 
         workers.spawn(async move {
@@ -801,7 +779,6 @@ pub async fn preinstall_download(
                         None => break,
                     }
                 };
-                let already_downloaded = ctx.chunk_bytes_map.contains_key(&chunk_info.patch_name);
                 let diff_download = ctx.diff_downloads
                     .get(&chunk_info.matching_field)
                     .cloned()
@@ -820,7 +797,6 @@ pub async fn preinstall_download(
                     chunk_info,
                     &ctx,
                     &diff_download,
-                    already_downloaded,
                 )
                 .await;
                 if let Err(err) = result {
@@ -949,6 +925,7 @@ async fn download_patch_chunk_with_retries(
     expected_md5: &str,
     max_retries: u32,
     handle: &DownloadHandle,
+    progress: &Arc<AtomicU64>,
 ) -> SophonResult<()> {
     validate_patch_name(patch_name)?;
     let url = diff_download.url_for(patch_name);
@@ -958,7 +935,7 @@ async fn download_patch_chunk_with_retries(
         if handle.is_cancelled() {
             return Err(SophonError::Cancelled);
         }
-        match download_patch_chunk_inner(client, &url, dest, expected_md5, handle).await {
+        match download_patch_chunk_inner(client, &url, dest, expected_md5, handle, progress).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = err.to_string();
@@ -1055,6 +1032,7 @@ async fn download_patch_chunk_inner(
     dest: &Path,
     expected_md5: &str,
     handle: &DownloadHandle,
+    progress: &Arc<AtomicU64>,
 ) -> SophonResult<()> {
     let resp = client.get(url).send().await?;
     if resp.status().is_client_error() {
@@ -1088,6 +1066,7 @@ async fn download_patch_chunk_inner(
         let result = tokio::select! {
             biased;
             _ = handle.cancelled_future() => {
+                progress.fetch_sub(total_len, Ordering::Relaxed);
                 let _ = tokio::fs::remove_file(dest).await;
                 return Err(SophonError::Cancelled);
             }
@@ -1097,6 +1076,7 @@ async fn download_patch_chunk_inner(
         match result {
             Some(Ok(bytes)) => {
                 if bytes.is_empty() && content_length.is_none_or(|expected| total_len < expected) {
+                    progress.fetch_sub(total_len, Ordering::Relaxed);
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -1107,6 +1087,7 @@ async fn download_patch_chunk_inner(
                 if let Some(expected_len) = content_length
                     && total_len > expected_len
                 {
+                    progress.fetch_sub(total_len, Ordering::Relaxed);
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::SizeMismatch {
                         item: dest.display().to_string(),
@@ -1115,11 +1096,21 @@ async fn download_patch_chunk_inner(
                     });
                 }
                 if let Some(ref mut h) = hasher {
-                    h.update(&bytes)?;
+                    if let Err(e) = h.update(&bytes) {
+                        progress.fetch_sub(total_len, Ordering::Relaxed);
+                        let _ = tokio::fs::remove_file(dest).await;
+                        return Err(e.into());
+                    }
                 }
-                file.write_all(&bytes).await?;
+                if let Err(e) = file.write_all(&bytes).await {
+                    progress.fetch_sub(total_len, Ordering::Relaxed);
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(e.into());
+                }
+                progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             }
             Some(Err(e)) => {
+                progress.fetch_sub(total_len, Ordering::Relaxed);
                 let _ = tokio::fs::remove_file(dest).await;
                 return Err(e.into());
             }
@@ -1131,6 +1122,7 @@ async fn download_patch_chunk_inner(
     if let Some(expected_len) = content_length
         && total_len != expected_len
     {
+        progress.fetch_sub(total_len, Ordering::Relaxed);
         let _ = tokio::fs::remove_file(dest).await;
         return Err(SophonError::SizeMismatch {
             item: dest.display().to_string(),
@@ -1142,6 +1134,7 @@ async fn download_patch_chunk_inner(
     if needs_hash {
         let digest: [u8; 16] = hasher.as_mut().unwrap().finish()?;
         if !md5_hex_eq(&digest, expected_md5) {
+            progress.fetch_sub(total_len, Ordering::Relaxed);
             let _ = tokio::fs::remove_file(dest).await;
             return Err(SophonError::Md5Mismatch {
                 item: dest.display().to_string(),
