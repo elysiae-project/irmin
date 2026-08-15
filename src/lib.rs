@@ -7,6 +7,7 @@ pub mod game_installer;
 pub mod manifest;
 pub mod progress;
 pub mod proto_parse;
+pub mod sophon;
 pub mod types;
 
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ pub use game_installer::DownloadHandle;
 pub use game_installer::VerifyMode;
 pub use manifest::compute_content_manifest_hash;
 pub use progress::SophonProgress;
+pub use sophon::{ProgressFn, Sophon, SophonBuilder};
 pub use types::CHUNK_STATE_SAVE_INTERVAL;
 
 /// Progress callback for download and assembly events.
