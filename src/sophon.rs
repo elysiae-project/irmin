@@ -428,3 +428,123 @@ fn atomic_write(target: &Path, data: &[u8]) {
     }
     let _ = std::fs::rename(&tmp, target);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    fn make_sophon(game_id: &str, game_dir: &Path, state_dir: &Path) -> Sophon {
+        Sophon::builder(game_id.to_string(), game_dir.to_path_buf())
+            .state_dir(state_dir.to_path_buf())
+            .build()
+    }
+
+    fn write_state(s: &Sophon, state: &DownloadState) {
+        let json = serde_json::to_vec_pretty(state).unwrap();
+        atomic_write(&s.state_file(), &json);
+    }
+
+    fn sample_state(
+        game_id: &str,
+        vo_lang: &str,
+        output_path: &str,
+        hash: &str,
+        chunks: HashMap<String, u64>,
+    ) -> DownloadState {
+        DownloadState {
+            game_id: game_id.to_string(),
+            vo_lang: vo_lang.to_string(),
+            output_path: output_path.to_string(),
+            download_type: DownloadType::Fresh,
+            current_tag: None,
+            manifest_hash: hash.to_string(),
+            downloaded_chunks: chunks,
+            completed_files: CompletedFiles::default(),
+        }
+    }
+
+    #[test]
+    fn state_file_isolates_per_game() {
+        let tmp = tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let a = make_sophon("gameA", &tmp.path().join("a"), &state);
+        let b = make_sophon("gameB", &tmp.path().join("b"), &state);
+        assert_ne!(a.state_file(), b.state_file());
+    }
+
+    #[test]
+    fn load_state_round_trips() {
+        let tmp = tempdir().unwrap();
+        let game_dir = tmp.path().join("game");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let s = make_sophon("gameA", &game_dir, &state_dir);
+
+        let mut chunks = HashMap::new();
+        chunks.insert("c0".to_string(), 10);
+        write_state(&s, &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "h", chunks));
+
+        let loaded = s.load_state().expect("state loads");
+        assert_eq!(loaded.game_id, "gameA");
+        assert_eq!(loaded.manifest_hash, "h");
+        assert_eq!(loaded.downloaded_chunks.get("c0"), Some(&10));
+    }
+
+    #[test]
+    fn resolve_resume_reuses_when_hash_matches() {
+        let tmp = tempdir().unwrap();
+        let game_dir = tmp.path().join("game");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(game_dir.join("chunks")).unwrap();
+        std::fs::write(game_dir.join("chunks").join("c0.zstd"), b"x").unwrap();
+
+        let s = make_sophon("gameA", &game_dir, &state_dir);
+        let mut chunks = HashMap::new();
+        chunks.insert("c0".to_string(), 10);
+        write_state(&s, &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "h", chunks));
+
+        let (resume, options) = s.resolve_resume(&DownloadHandle::new(), DownloadType::Fresh, "h");
+        assert!(options.is_resume);
+        assert_eq!(resume.prev_manifest_hash, "h");
+        assert_eq!(resume.prev_downloaded_chunks.get("c0"), Some(&10));
+        assert!(game_dir.join("chunks").exists(), "chunks dir untouched on reuse");
+    }
+
+    #[test]
+    fn resolve_resume_discards_chunks_when_hash_differs() {
+        let tmp = tempdir().unwrap();
+        let game_dir = tmp.path().join("game");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let chunks_dir = game_dir.join("chunks");
+        std::fs::create_dir_all(&chunks_dir).unwrap();
+        std::fs::write(chunks_dir.join("old.zstd"), b"x").unwrap();
+
+        let s = make_sophon("gameA", &game_dir, &state_dir);
+        write_state(&s, &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "old", HashMap::new()));
+
+        let (resume, options) = s.resolve_resume(&DownloadHandle::new(), DownloadType::Fresh, "new");
+        assert!(!options.is_resume);
+        assert!(resume.prev_manifest_hash.is_empty());
+        assert!(resume.prev_downloaded_chunks.is_empty());
+        assert!(!chunks_dir.exists(), "stale chunks dir removed on mismatch");
+    }
+
+    #[test]
+    fn resolve_resume_ignores_mismatched_vo_lang() {
+        let tmp = tempdir().unwrap();
+        let game_dir = tmp.path().join("game");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let s = make_sophon("gameA", &game_dir, &state_dir);
+        write_state(&s, &sample_state("gameA", "zh-CN", &game_dir.to_string_lossy(), "h", HashMap::new()));
+
+        let (resume, options) = s.resolve_resume(&DownloadHandle::new(), DownloadType::Fresh, "h");
+        assert!(!options.is_resume);
+        assert!(resume.prev_manifest_hash.is_empty());
+    }
+}
