@@ -14,38 +14,45 @@ A Rust library that downloads Chinese anime games. Manifest-based chunk download
 
 - [Rust](https://rustup.rs) 1.92 or newer
 
-Irmin is intended for use on Linux.
+Irmin targets Linux.
 
 ## Use it from Rust
 
-Add the crate and call the high-level convenience functions:
+Add the crate and build a `Sophon`:
 
 ```rust
-use std::sync::Arc;
-use irmin::{sophon_download, DownloadHandle, SophonProgress, VerifyMode};
+use irmin::{Sophon, DownloadHandle, SophonProgress, VerifyMode};
 
-let client = reqwest::Client::new();
 let handle = DownloadHandle::new();
-let on_progress: irmin::ProgressUpdater = Arc::new(|p: SophonProgress| {
-    println!("{p:?}");
-});
+let sophon = Sophon::builder("hk4e", "/path/to/game")
+    .vo_lang("en-us")
+    .verify_mode(VerifyMode::Full)
+    .build();
 
-sophon_download(&client, "hk4e", "en-us", "/path/to/game", &handle, on_progress, VerifyMode::Full).await?;
+sophon
+    .download(&handle, |p: SophonProgress| {
+        println!("{p:?}");
+    })
+    .await?;
 ```
 
-The convenience functions take a `&reqwest::Client` explicitly, so you control connection pooling. Each download function also takes a `&DownloadHandle`; clone it before the call and you can `handle.pause()`, `handle.resume()`, or `handle.cancel()` the in-flight download from any other task. There is no global active-download registry. For lower-level control, the `game_installer` module exposes `build_installers`, `install`, `preinstall_download`, `apply_preinstall`, `check_update`, and `verify_integrity` directly.
+`Sophon` owns the manifest-fetch client, the game identity, the install path, the resume-state directory, and the verify mode. Build it once and call any of `download`, `update`, `preinstall`, `apply_preinstall`, `check_update`, or `verify_integrity`. The builder defaults the client to a tuned HTTP/1.1 connection pool, `vo_lang` to `en-US`, `state_dir` to the install dir, and `verify_mode` to `Full`. Override any of them with `.client(...)`, `.vo_lang(...)`, `.state_dir(...)`, or `.verify_mode(...)`. Pass a `DownloadHandle` to any download operation. Clone the handle before the call and you can `handle.pause()`, `handle.resume()`, or `handle.cancel()` the in-flight operation from another task. No global registry tracks active downloads.
+
+Each download, update, and preinstall writes a per-game state file into `state_dir`. irmin reuses the on-disk chunks when the remote manifest hash matches, and starts a fresh download when the hash or any identity field differs. irmin removes the state file on success. To inspect that state without a `Sophon`, call `irmin::load_download_state` or `irmin::state_file_path`.
+
+For lower-level control, the `game_installer` module exposes `build_installers`, `install`, `preinstall_download`, `apply_preinstall`, `check_update`, and `verify_integrity`.
 
 ### Verification modes
 
-The `VerifyMode` parameter controls how aggressively irmin checks data integrity during download:
+The `VerifyMode` parameter sets how much integrity checking irmin performs during download:
 
 | Mode | Behavior | Crash-resume | CPU cost |
 |------|----------|-------------|----------|
 | `Full` | Hash every chunk during download and assembly. Full crash-resume via bitmap. | Yes | ~6.8 s/GiB |
 | `Deferred` | Skip per-chunk hashing. Verify only the final assembled file. All-eager pipeline (no intermediate .zstd files). No crash-resume. | No | ~3.4 s/GiB |
-| `None` | Size-only checks. No hashing at all. No crash-resume. | No | ~3.0 s/GiB |
+| `None` | Size-only checks. No hashing. No crash-resume. | No | ~3.0 s/GiB |
 
-In `Deferred` and `None` modes, if the download is interrupted, incomplete files must be re-downloaded from scratch on the next run. `Full` mode resumes from where it left off.
+Interrupt a `Deferred` or `None` download and irmin re-downloads the incomplete files from scratch on the next run. `Full` mode resumes from where it left off.
 
 Supported game identifiers:
 
@@ -62,28 +69,13 @@ Supported voice pack locales:
 - `ko-kr`
 - `ja-jp`
 
-`SophonProgress` is a serde-serializable enum. Each variant reports the relevant counters; `Finished` signals a clean end. Errors come back as `SophonError` from the underlying pipeline.
+`SophonProgress` is a serde-serializable enum. Each variant reports the relevant counters; `Finished` signals a clean end. Errors come back as `SophonError` from the pipeline.
 
 ## How the pipeline works
 
-A download starts by fetching a manifest from the game's delivery API. The manifest lists every file, its size, and the chunks that compose it. Irmin checks what is already on disk, decides which chunks it still needs, and pulls them in parallel. In `Full` mode, chunks arrive zstd-compressed and are written to temp files; the assembler then stitches those chunks into final files, runs integrity checks, and installs any plugins or SDKs the manifest requests. In `Deferred`/`None` modes, chunks are decompressed inline and written directly to their final positions (the "eager" path), eliminating intermediate IO.
+A download starts by fetching a manifest from the game's delivery API. The manifest lists every file, its size, and the chunks that compose it. Irmin checks what is already on disk, decides which chunks it still needs, and pulls them in parallel. In `Full` mode, chunks arrive zstd-compressed and irmin writes them to temp files. The assembler stitches them into final files, runs integrity checks, and installs any plugins or SDKs the manifest requests. In `Deferred`/`None` modes, irmin decompresses chunks inline into their final positions (the "eager" path), skipping intermediate IO.
 
-Updates skip unchanged files by comparing the installed version tag against the remote tag. Preinstall goes one step further and downloads the next version's patch ahead of time, so when the server flips over to that version you just apply the patch and you are running.
-
-## Command-line binaries
-
-For testing from the terminal, the crate ships with three command-line mirrors. Build them with `--features download-cli`:
-
-```sh
-cargo run --release --features download-cli --bin download_version -- hk4e en-us 6.7.0 /path/to/game
-cargo run --release --features download-cli --bin download_version -- hk4e en-us 6.7.0 /path/to/game --verify-mode deferred
-cargo run --release --features download-cli --bin download_update -- hk4e en-us 6.7.0 /path/to/game
-cargo run --release --features download-cli --bin download_preinstall -- hk4e en-us /path/to/game
-```
-
-`download_version` takes a game ID, voice locale, tag, and game directory. Pass `--verify-mode deferred` or `--verify-mode none` to trade crash-resume for lower CPU usage. `download_update` works the same way but the tag argument is your current installed version. `download_preinstall` skips the tag since it pulls the latest remote version directly.
-
-All three write a state file next to the game directory. If a run is interrupted partway (in `Full` mode), the next invocation picks up where it left off.
+Updates skip unchanged files by comparing the installed version tag against the remote tag. Preinstall downloads the next version's patch before release. When the server switches to that version, apply the patch and the game runs.
 
 ## Benchmarks
 
@@ -91,7 +83,7 @@ All three write a state file next to the game directory. If a run is interrupted
 cargo bench --features benchmark
 ```
 
-`benches/sophon_bench.rs` measures the hot paths: manifest parsing, chunk scheduling, assembly, and HDiff patching. `src/bin/bench_memory.rs` samples peak RSS during install operations. For deeper memory inspection, enable the `sophon-profiling` cargo feature to turn on jemalloc allocator stats.
+`benches/sophon_bench.rs` measures the hot paths: manifest parsing, chunk scheduling, assembly, and HDiff patching. `src/bin/bench_memory.rs` samples peak RSS during installs. Enable the `sophon-profiling` cargo feature for jemalloc allocator stats.
 
 ## License
 
