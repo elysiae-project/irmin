@@ -16,15 +16,15 @@ use std::sync::{Arc, OnceLock};
 use game_installer::SophonError;
 use game_installer::installer::{InstallCallbacks, InstallOptions, ResumeContext};
 use game_installer::UpdateInfo;
-use types::{DownloadState, ResumeInfo};
 
 pub use client::DownloadClient;
 pub use game_installer::DownloadHandle;
 pub use game_installer::VerifyMode;
 pub use manifest::compute_content_manifest_hash;
 pub use progress::SophonProgress;
-pub use sophon::{ProgressFn, Sophon, SophonBuilder};
+pub use sophon::{ProgressFn, Sophon, SophonBuilder, load_download_state, state_file_path};
 pub use types::CHUNK_STATE_SAVE_INTERVAL;
+pub use types::{DownloadState, DownloadType, ResumeInfo};
 
 /// Progress callback for download and assembly events.
 pub type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
@@ -35,17 +35,6 @@ pub type StateSaver = Arc<dyn Fn(&std::collections::HashMap<String, u64>) + Send
 #[cfg(all(unix, feature = "sophon-profiling"))]
 #[global_allocator]
 static GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-/// Filename of the persisted download state within the state directory.
-const DOWNLOAD_STATE_FILE: &str = ".sophon_download_state";
-
-/// Load persisted download state from `state_dir`. Returns `None` if the
-/// file is missing or unparseable.
-pub fn load_download_state(state_dir: &str) -> Option<DownloadState> {
-    let path = PathBuf::from(state_dir).join(DOWNLOAD_STATE_FILE);
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
-}
 
 /// Downloads a fresh game installation. The caller supplies the
 /// [`DownloadHandle`] so it can pause/resume/cancel the in-flight
@@ -213,19 +202,6 @@ pub async fn sophon_check_update(
 ) -> Result<UpdateInfo, SophonError> {
     let game_dir = PathBuf::from(output_path);
     game_installer::check_update(client, game_id, vo_lang, &game_dir).await
-}
-
-/// Checks if there is a resumable download state.
-pub fn sophon_has_resume_state(state_dir: &str) -> bool {
-    load_download_state(state_dir).is_some()
-}
-
-/// Returns details about the resumable download state, if any.
-pub fn sophon_get_resume_info(state_dir: &str) -> Option<ResumeInfo> {
-    load_download_state(state_dir).map(|s| ResumeInfo {
-        game_id: s.game_id,
-        download_type: s.download_type,
-    })
 }
 
 /// Verifies the integrity of installed game files and re-downloads any

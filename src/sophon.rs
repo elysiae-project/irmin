@@ -274,12 +274,12 @@ impl Sophon {
 
     /// `true` iff a parseable resume state for this game exists in `state_dir`.
     pub fn has_resume_state(&self) -> bool {
-        self.load_state().is_some()
+        load_download_state(&self.state_dir, &self.game_id).is_some()
     }
 
     /// Resume state summary, if a parseable state exists.
     pub fn resume_info(&self) -> Option<ResumeInfo> {
-        self.load_state()
+        load_download_state(&self.state_dir, &self.game_id)
             .map(|s| ResumeInfo { game_id: s.game_id, download_type: s.download_type })
     }
 
@@ -289,13 +289,11 @@ impl Sophon {
     }
 
     fn state_file(&self) -> PathBuf {
-        self.state_dir
-            .join(format!("{}{}{}", STATE_FILE_PREFIX, self.game_id, STATE_FILE_SUFFIX))
+        state_file_path(&self.state_dir, &self.game_id)
     }
 
     fn load_state(&self) -> Option<DownloadState> {
-        let content = std::fs::read_to_string(self.state_file()).ok()?;
-        serde_json::from_str(&content).ok()
+        load_download_state(&self.state_dir, &self.game_id)
     }
 
     /// Decide whether the persisted state can resume the fresh manifest. Reuses
@@ -427,6 +425,18 @@ fn atomic_write(target: &Path, data: &[u8]) {
         return;
     }
     let _ = std::fs::rename(&tmp, target);
+}
+
+/// Per-game resume-state file path under `state_dir`.
+pub fn state_file_path(state_dir: &Path, game_id: &str) -> PathBuf {
+    state_dir.join(format!("{}{}{}", STATE_FILE_PREFIX, game_id, STATE_FILE_SUFFIX))
+}
+
+/// Load the persisted resume state for `game_id` from `state_dir`. Returns
+/// `None` when the file is missing or unparseable. Pure file read; no HTTP.
+pub fn load_download_state(state_dir: &Path, game_id: &str) -> Option<DownloadState> {
+    let content = std::fs::read_to_string(state_file_path(state_dir, game_id)).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 #[cfg(test)]
