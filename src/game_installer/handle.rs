@@ -88,7 +88,7 @@ impl DownloadHandle {
         self.cancel_token.cancelled()
     }
 
-    fn get_state(&self) -> ControlState {
+    pub fn get_state(&self) -> ControlState {
         match self.state.load(Ordering::Acquire) {
             STATE_RUNNING => ControlState::Running,
             STATE_PAUSED => ControlState::Paused,
