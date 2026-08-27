@@ -191,6 +191,7 @@ pub use installer::{
 pub use plugin_install::{install_channel_sdks, install_plugins};
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
 pub use update::{UpdateInfo, check_update};
+pub use handle::ControlState;
 
 /// Advance jemalloc epoch and trigger a background decay pass. Call after
 /// major sophon phase transitions (download → assembly, etc.) to reduce

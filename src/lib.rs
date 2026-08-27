@@ -11,7 +11,7 @@ pub mod sophon;
 pub mod types;
 
 pub use client::DownloadClient;
-pub use game_installer::DownloadHandle;
+pub use game_installer::{DownloadHandle,ControlState};
 pub use game_installer::VerifyMode;
 pub use manifest::compute_content_manifest_hash;
 pub use progress::SophonProgress;
