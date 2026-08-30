@@ -324,7 +324,22 @@ pub fn assemble_file(
     let skip_chunk_hash = verify_mode != super::VerifyMode::Full;
 
     let old_file: Option<File> = if has_old_chunks {
-        Some(File::open(&target_path).map_err(SophonError::Io)?)
+        match File::open(&target_path) {
+            Ok(f) => Some(f),
+            Err(err) => {
+                log::warn!(
+                    "assemble_file: old-source file missing for old-chunk reuse: {path} ({err}); continuing with downloaded chunks only",
+                    path = target_path.display(),
+                );
+                return Err(SophonError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "old-source file for old-chunk reuse is missing: {path} ({err})",
+                        path = target_path.display()
+                    ),
+                )));
+            }
+        }
     } else {
         None
     };
