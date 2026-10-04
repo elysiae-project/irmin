@@ -261,6 +261,29 @@ fn tbytes_copy_stream_inner(
     Ok(())
 }
 
+/// Drain the currently pending set/copy RLE run before reading another ctrl
+/// byte. RLE ctrl records encode run lengths that can span many buffer-sized
+/// decode steps (and even multiple covers), so the loop must keep applying
+/// the pending run until it is exhausted or `copy_length` is consumed.
+fn drain_rle_pending(
+    rle_loader: &mut RleRefClip,
+    out_cache: &mut Cursor<Vec<u8>>,
+    copy_length: &mut i64,
+    shared_buffer: &mut [u8],
+    rle_code_stream: &mut dyn Read,
+) -> std::io::Result<()> {
+    while *copy_length > 0 && (rle_loader.mem_set_length > 0 || rle_loader.mem_copy_length > 0) {
+        tbytes_set_rle(
+            rle_loader,
+            out_cache,
+            copy_length,
+            shared_buffer,
+            rle_code_stream,
+        )?;
+    }
+    Ok(())
+}
+
 fn tbytes_determine_rle_type(
     rle_loader: &mut RleRefClip,
     out_cache: &mut Cursor<Vec<u8>>,
@@ -269,7 +292,9 @@ fn tbytes_determine_rle_type(
     mut rle_ctrl_stream: &mut dyn Read,
     rle_code_stream: &mut dyn Read,
 ) -> std::io::Result<()> {
-    tbytes_set_rle(
+    // Drain any run left pending from a previous cover before consuming the
+    // next ctrl record.
+    drain_rle_pending(
         rle_loader,
         out_cache,
         &mut copy_length,
@@ -290,32 +315,17 @@ fn tbytes_determine_rle_type(
 
         if rle_type == 3 {
             rle_loader.mem_copy_length = length;
-            tbytes_set_rle(
-                rle_loader,
-                out_cache,
-                &mut copy_length,
-                shared_buffer,
-                rle_code_stream,
-            )?;
-            continue;
+        } else {
+            rle_loader.mem_set_length = length;
+            if rle_type == 2 {
+                let mut val = [0u8; 1];
+                rle_code_stream.read_exact(&mut val)?;
+                rle_loader.mem_set_value = val[0];
+            } else {
+                rle_loader.mem_set_value = (0u8).wrapping_sub(rle_type);
+            }
         }
-
-        rle_loader.mem_set_length = length;
-        if rle_type == 2 {
-            let mut val = [0u8; 1];
-            rle_code_stream.read_exact(&mut val)?;
-            rle_loader.mem_set_value = val[0];
-            tbytes_set_rle(
-                rle_loader,
-                out_cache,
-                &mut copy_length,
-                shared_buffer,
-                rle_code_stream,
-            )?;
-            continue;
-        }
-        rle_loader.mem_set_value = (0u8).wrapping_sub(rle_type);
-        tbytes_set_rle(
+        drain_rle_pending(
             rle_loader,
             out_cache,
             &mut copy_length,

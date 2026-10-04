@@ -13,6 +13,23 @@ pub use hkrpg::{
 };
 pub use nap::{filter_nap_asset_list, filter_nap_installers, write_nap_audio_lang_records};
 
+/// True when `target_file_path` is a CDN-shipped file that sophon regenerates
+/// locally (filtered or rewritten), so a byte-level CDN patch for it can never
+/// apply and must be skipped during preinstall apply.
+pub fn is_sophon_synthesized_asset(game_code: &str, target_file_path: &str) -> bool {
+    let name = target_file_path.rsplit('/').next().unwrap_or(target_file_path);
+    match game_code {
+        "hk4e" => {
+            name == "pkg_version"
+                || name == "beyond_pkg_version"
+                || name.starts_with("Audio_") && name.ends_with("_pkg_version")
+                || name.to_lowercase().ends_with("ctable_streaming.dat")
+        }
+        "hkrpg" => name == "app.info",
+        _ => false,
+    }
+}
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -58,6 +75,63 @@ pub(crate) fn write_lang_file(
 mod tests {
     use super::*;
     use std::fs;
+
+    // is_sophon_synthesized_asset
+    #[test]
+    fn test_is_sophon_synthesized_asset_hk4e_pkg_version() {
+        assert!(is_sophon_synthesized_asset("hk4e", "pkg_version"));
+        assert!(is_sophon_synthesized_asset("hk4e", "beyond_pkg_version"));
+        assert!(is_sophon_synthesized_asset(
+            "hk4e",
+            "Audio_English(US)_pkg_version"
+        ));
+        assert!(is_sophon_synthesized_asset(
+            "hk4e",
+            "data/Audio_Japanese_pkg_version"
+        ));
+    }
+
+    #[test]
+    fn test_is_sophon_synthesized_asset_hk4e_ctable() {
+        assert!(is_sophon_synthesized_asset(
+            "hk4e",
+            "GenshinImpact_Data/StreamingAssets/ctable_streaming.dat"
+        ));
+        assert!(is_sophon_synthesized_asset(
+            "hk4e",
+            "GenshinImpact_Data/StreamingAssets/CTABLE_STREAMING.DAT"
+        ));
+        assert!(!is_sophon_synthesized_asset(
+            "hk4e",
+            "GenshinImpact_Data/StreamingAssets/normal.dat"
+        ));
+    }
+
+    #[test]
+    fn test_is_sophon_synthesized_asset_hkrpg_app_info() {
+        assert!(is_sophon_synthesized_asset(
+            "hkrpg",
+            "StarRail_Data/app.info"
+        ));
+        assert!(!is_sophon_synthesized_asset(
+            "hkrpg",
+            "StarRail_Data/StreamingAssets/BinaryVersion.bytes"
+        ));
+    }
+
+    #[test]
+    fn test_is_sophon_synthesized_asset_other_games_false() {
+        assert!(!is_sophon_synthesized_asset("nap", "pkg_version"));
+        assert!(!is_sophon_synthesized_asset("bh3", "ZenlessZoneZero_Data/app.info"));
+        assert!(!is_sophon_synthesized_asset("np", "GenshinImpact.exe"));
+    }
+
+    #[test]
+    fn test_is_sophon_synthesized_asset_regular_files_false() {
+        assert!(!is_sophon_synthesized_asset("hk4e", "GenshinImpact.exe"));
+        assert!(!is_sophon_synthesized_asset("hk4e", "pkg_version.txt"));
+        assert!(!is_sophon_synthesized_asset("hk4e", ""));
+    }
 
     // write_lang_file
     #[test]

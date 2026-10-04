@@ -1084,6 +1084,50 @@ fn apply_hdiff_patch_blank_original_by_hash_ignores_size() {
     );
 }
 
+/// New subdirectories introduced by a patch must be created before the
+/// temp output is renamed into place; otherwise fs::rename fails with
+/// ENOENT ("No such file or directory").
+#[test]
+fn apply_hdiff_patch_creates_nested_target_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks_dir = dir.path().join("patching/chunk");
+    fs::create_dir_all(&chunks_dir).unwrap();
+
+    // Dummy chunk file so the patch chunk exists check passes. Patch apply
+    // will fail (not real HDiff), but the nested dir creation happens first.
+    fs::write(
+        chunks_dir.join("patch_chunk_nested.bin"),
+        b"dummy chunk data",
+    )
+    .unwrap();
+
+    let asset = PatchAssetInfo {
+        target_file_path: "new_dir/sub_dir/nested.bin".to_string(),
+        target_file_size: 0,
+        target_file_hash: String::new(),
+        patch_method: PatchMethod::Patch,
+        patch_name: "patch_chunk_nested.bin".to_string(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 20,
+        patch_chunk_length: 20,
+        original_file_path: Some("nonexistent_nested.bin".to_string()),
+        original_file_hash: Some(BLANK_FILE_MD5.to_string()),
+        original_file_size: Some(0),
+        matching_field: "game".to_string(),
+    };
+
+    let cache = FilterCache::new(dir.path());
+    let result = apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &cache);
+
+    // Apply itself may fail (dummy chunk), but the nested parent dir must
+    // already exist or the later rename would hit ENOENT.
+    assert!(
+        dir.path().join("new_dir/sub_dir").is_dir(),
+        "nested target parent directory not created (result={result:?})"
+    );
+}
+
 #[test]
 fn apply_hdiff_patch_from_files_blank_diff_ref_hash_matches() {
     let dir = tempfile::tempdir().unwrap();
