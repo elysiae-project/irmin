@@ -168,8 +168,7 @@ pub async fn fetch_patch_build(
     );
 
     for attempt in 0..API_MAX_RETRIES {
-        let result =
-            tokio::time::timeout(Duration::from_secs(35), client.post(&url).send()).await;
+        let result = tokio::time::timeout(Duration::from_secs(35), client.post(&url).send()).await;
 
         match result {
             Ok(Ok(resp)) => {
@@ -339,7 +338,10 @@ mod tests {
         ] {
             assert_eq!(normalize_vo_locale(alias), None);
             for field in ["en-us", "zh-cn", "zh-tw", "ja-jp", "ko-kr", "game"] {
-                assert!(!vo_lang_matches(field, alias), "field={field}, alias={alias}");
+                assert!(
+                    !vo_lang_matches(field, alias),
+                    "field={field}, alias={alias}"
+                );
             }
         }
     }

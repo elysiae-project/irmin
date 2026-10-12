@@ -2,7 +2,6 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-
 use super::write_lang_file;
 use crate::game_installer::api::normalize_vo_locale;
 use crate::proto_parse::SophonManifestAssetProperty;

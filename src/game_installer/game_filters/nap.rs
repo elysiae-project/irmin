@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 
-
 use super::write_lang_file;
 use crate::game_installer::api::normalize_vo_locale;
 use crate::game_installer::installer::InstallerData;
