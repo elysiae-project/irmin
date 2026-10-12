@@ -2721,6 +2721,15 @@ pub async fn verify_integrity(
         })
         .collect();
 
+    verify_assets(client, all_assets, game_dir, emit).await
+}
+
+async fn verify_assets(
+    client: &Client,
+    all_assets: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)>,
+    game_dir: &Path,
+    mut emit: impl FnMut(SophonProgress) + Send,
+) -> SophonResult<()> {
     let total_files = all_assets.len() as u64;
     let verify_cache = Arc::new(cache::load_verification_cache(game_dir));
     let chunks_dir = game_dir.join("chunks");
@@ -2746,12 +2755,8 @@ pub async fn verify_integrity(
         let error_count = Arc::clone(&error_count);
 
         verify_stream.push(async move {
-            let _permit = permit.acquire().await.ok()?;
-
-            if let Err(err) = validate_asset_name(&asset.asset_name) {
-                log::warn!("Skipping file with invalid asset_name during verification: {err}");
-                return None;
-            }
+            let _permit = permit.acquire().await.map_err(|_| SophonError::Cancelled)?;
+            validate_asset_name(&asset.asset_name)?;
 
             let file_path = game_dir.join(&asset.asset_name);
             let asset_size = asset.asset_size;
@@ -2767,22 +2772,20 @@ pub async fn verify_integrity(
                         &game_dir,
                         &verify_cache,
                     )
-                    .unwrap_or(false)
                 }
             })
-            .await
-            .ok()?;
+            .await??;
 
             let scanned = scanned_count.fetch_add(1, Ordering::Relaxed) + 1;
 
             if !is_valid {
                 error_count.fetch_add(1, Ordering::Relaxed);
-                Some((asset, chunk_download, file_path))
+                Ok::<_, SophonError>(Some((asset, chunk_download, file_path)))
             } else {
                 if scanned.is_multiple_of(100) {
                     log::debug!("Verified {scanned}/{total_files} files");
                 }
-                None
+                Ok(None)
             }
         });
     }
@@ -2792,9 +2795,14 @@ pub async fn verify_integrity(
         Arc<DownloadInfo>,
         std::path::PathBuf,
     )> = Vec::new();
+    let mut scan_error = None;
     while let Some(result) = verify_stream.next().await {
-        if let Some(failed) = result {
-            failed_verifications.push(failed);
+        match result {
+            Ok(Some(failed)) => failed_verifications.push(failed),
+            Ok(None) => {}
+            Err(err) => {
+                scan_error.get_or_insert(err);
+            }
         }
         if last_emit.elapsed() >= Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
             emit(SophonProgress::Verifying {
@@ -2806,8 +2814,11 @@ pub async fn verify_integrity(
         }
     }
 
+    if let Some(err) = scan_error {
+        return Err(err);
+    }
     emit(SophonProgress::Verifying {
-        scanned_files: total_files,
+        scanned_files: scanned_count.load(Ordering::Relaxed),
         total_files,
         error_count: error_count.load(Ordering::Relaxed),
     });
@@ -2974,7 +2985,9 @@ pub async fn verify_integrity(
                     &file_path,
                     &verify_cache,
                 );
-                reassembled.fetch_add(1, Ordering::Relaxed);
+                if result.is_ok() {
+                    reassembled.fetch_add(1, Ordering::Relaxed);
+                }
                 result
             }
         });
@@ -2982,6 +2995,7 @@ pub async fn verify_integrity(
     let mut asm_join = tokio::task::JoinSet::new();
     let mut asm_iter = asm_futures;
     let mut asm_draining = false;
+    let mut assembly_error = None;
     loop {
         if !asm_draining {
             while asm_join.len() < 4 {
@@ -3000,10 +3014,10 @@ pub async fn verify_integrity(
             break;
         }
         if let Some(res) = asm_join.join_next().await {
-            if let Err(err) = res {
-                log::error!("Re-assembly task panicked: {err}");
-            } else if let Err(err) = res.unwrap() {
-                log::error!("Re-assembly task failed: {err}");
+            if let Err(err) = res.map_err(SophonError::from).and_then(|result| result) {
+                assembly_error.get_or_insert(err);
+                // Stop scheduling new work, but join every task already started.
+                asm_draining = true;
             }
         }
         if last_emit.elapsed() >= Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
@@ -3019,6 +3033,9 @@ pub async fn verify_integrity(
         assembled_files: reassembled.load(Ordering::Relaxed),
         total_files: failed_count,
     });
+    if let Some(err) = assembly_error {
+        return Err(err);
+    }
 
     emit(SophonProgress::Finished);
     Ok(())
@@ -3073,3 +3090,7 @@ fn reassemble_single_asset(
 #[cfg(test)]
 #[path = "installer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "repair_tests.rs"]
+mod repair_tests;
