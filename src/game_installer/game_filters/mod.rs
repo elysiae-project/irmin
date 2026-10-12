@@ -133,6 +133,52 @@ mod tests {
         assert!(!is_sophon_synthesized_asset("hk4e", ""));
     }
 
+    #[test]
+    fn audio_metadata_normalizes_only_supported_locale_aliases() {
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["en-US", "en-us", "en", "EN"], "English(US)\n", "En\n"),
+            (
+                &["zh-CN", "zh-cn", "zh-TW", "zh-tw", "cn", "CN"],
+                "Chinese\n",
+                "Cn\n",
+            ),
+            (&["ja-JP", "ja-jp", "jp", "JP"], "Japanese\n", "Jp\n"),
+            (&["ko-KR", "ko-kr", "kr", "KR"], "Korean\n", "Kr\n"),
+            (
+                &[
+                    "fr-fr", "en-GB", "zh-HK", "zh", "tw", "ja", "ko", "en_US", " en-us ", "",
+                ],
+                "",
+                "",
+            ),
+        ];
+        for &(aliases, full_name, abbreviation) in cases {
+            for alias in aliases {
+                let dir = tempfile::tempdir().unwrap();
+                let vo_langs = [alias.to_string()];
+                write_hk4e_audio_lang_record(dir.path(), &vo_langs).unwrap();
+                write_hkrpg_audio_lang_record(dir.path(), &vo_langs).unwrap();
+                write_nap_audio_lang_records(dir.path(), &vo_langs).unwrap();
+
+                for (path, expected) in [
+                    ("GenshinImpact_Data/Persistent/audio_lang_14", full_name),
+                    ("StarRail_Data/Persistent/AudioLaucherRecord.txt", full_name),
+                    (
+                        "ZenlessZoneZero_Data/Persistent/audio_lang_launcher",
+                        full_name,
+                    ),
+                    ("ZenlessZoneZero_Data/Persistent/audio_lang", abbreviation),
+                ] {
+                    assert_eq!(
+                        fs::read_to_string(dir.path().join(path)).unwrap(),
+                        expected,
+                        "path={path}, alias={alias}",
+                    );
+                }
+            }
+        }
+    }
+
     // write_lang_file
     #[test]
     fn test_write_lang_file_new_file() {

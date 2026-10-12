@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use super::write_lang_file;
+use crate::game_installer::api::normalize_vo_locale;
 use crate::game_installer::compact_manifest::CompactManifest;
 use crate::proto_parse::SophonManifestAssetProperty;
 
@@ -100,11 +101,11 @@ pub fn write_audio_lang_record(game_dir: &Path, vo_langs: &[String]) -> std::io:
 }
 
 fn locale_code_to_audio_lang_name(locale: &str) -> Option<&'static str> {
-    match locale {
-        "zh-cn" | "cn" | "zh-tw" => Some("Chinese"),
-        "en-us" | "en" => Some("English(US)"),
-        "ja-jp" | "jp" => Some("Japanese"),
-        "ko-kr" | "kr" => Some("Korean"),
+    match normalize_vo_locale(locale)? {
+        "zh-cn" => Some("Chinese"),
+        "en-us" => Some("English(US)"),
+        "ja-jp" => Some("Japanese"),
+        "ko-kr" => Some("Korean"),
         _ => None,
     }
 }
@@ -272,6 +273,82 @@ mod tests {
     fn test_locale_code_to_audio_lang_name_unknown() {
         assert_eq!(locale_code_to_audio_lang_name("fr-fr"), None);
         assert_eq!(locale_code_to_audio_lang_name(""), None);
+    }
+
+    #[test]
+    fn default_vo_locale_retains_english_and_generates_audio_metadata_without_record() {
+        let default_locale = crate::Sophon::builder("hk4e", ".")
+            .build()
+            .vo_lang()
+            .to_string();
+        assert_eq!(default_locale, "en-US");
+        for locale in [default_locale.as_str(), "en-us", "en"] {
+            let dir = tempfile::tempdir().unwrap();
+            let vo_langs = [locale.to_string()];
+            let english_path = "data/asset_bundle/English(US)/file.pck";
+            let common_path = "data/asset_bundle/common.bin";
+            let mut assets: Vec<_> = [
+                english_path,
+                common_path,
+                "data/asset_bundle/Chinese/file.pck",
+                "data/asset_bundle/Japanese/file.pck",
+                "data/asset_bundle/Korean/file.pck",
+                "data/asset_bundle/English(US)/ctable_streaming.dat",
+            ]
+            .into_iter()
+            .map(|name| SophonManifestAssetProperty {
+                asset_name: name.into(),
+                asset_chunks: vec![],
+                asset_type: 0,
+                asset_size: 100,
+                asset_hash_md5: "0123456789abcdef0123456789abcdef".into(),
+            })
+            .collect();
+
+            assert!(!persistent_dir(dir.path()).exists());
+            filter_hk4e_asset_list(dir.path(), &mut assets, &vo_langs);
+            assert_eq!(
+                assets
+                    .iter()
+                    .map(|asset| asset.asset_name.as_str())
+                    .collect::<Vec<_>>(),
+                [english_path, common_path],
+                "locale={locale}",
+            );
+
+            let assets = Arc::new(CompactManifest::from(assets));
+            write_audio_lang_record(dir.path(), &vo_langs).unwrap();
+            write_pkg_version_from_manifest(dir.path(), &assets, &vo_langs).unwrap();
+            assert_eq!(
+                fs::read_to_string(persistent_dir(dir.path()).join(AUDIO_LANG_FILE)).unwrap(),
+                "English(US)\n",
+            );
+            let audio_pkg =
+                fs::read_to_string(dir.path().join("Audio_English(US)_pkg_version")).unwrap();
+            assert_eq!(audio_pkg.lines().count(), 1);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&audio_pkg).unwrap(),
+                serde_json::json!({
+                    "remoteName": english_path,
+                    "md5": "0123456789abcdef0123456789abcdef",
+                    "fileSize": 100,
+                }),
+            );
+            assert_eq!(
+                fs::read_to_string(dir.path().join("pkg_version"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2,
+            );
+            for language in ["Chinese", "Japanese", "Korean"] {
+                assert!(
+                    !dir.path()
+                        .join(format!("Audio_{language}_pkg_version"))
+                        .exists()
+                );
+            }
+        }
     }
 
     // filter_hk4e_asset_list

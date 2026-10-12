@@ -3,6 +3,7 @@ use std::path::Path;
 
 
 use super::write_lang_file;
+use crate::game_installer::api::normalize_vo_locale;
 use crate::game_installer::installer::InstallerData;
 use crate::proto_parse::SophonManifestAssetProperty;
 
@@ -84,21 +85,21 @@ pub fn write_nap_audio_lang_records(game_dir: &Path, vo_langs: &[String]) -> std
 }
 
 fn locale_code_to_audio_lang_name(locale: &str) -> Option<&'static str> {
-    match locale {
-        "zh-cn" | "cn" | "zh-tw" => Some("Chinese"),
-        "en-us" | "en" => Some("English(US)"),
-        "ja-jp" | "jp" => Some("Japanese"),
-        "ko-kr" | "kr" => Some("Korean"),
+    match normalize_vo_locale(locale)? {
+        "zh-cn" => Some("Chinese"),
+        "en-us" => Some("English(US)"),
+        "ja-jp" => Some("Japanese"),
+        "ko-kr" => Some("Korean"),
         _ => None,
     }
 }
 
 fn locale_code_to_abbrev_lang_name(locale: &str) -> Option<&'static str> {
-    match locale {
-        "zh-cn" | "cn" | "zh-tw" => Some("Cn"),
-        "en-us" | "en" => Some("En"),
-        "ja-jp" | "jp" => Some("Jp"),
-        "ko-kr" | "kr" => Some("Kr"),
+    match normalize_vo_locale(locale)? {
+        "zh-cn" => Some("Cn"),
+        "en-us" => Some("En"),
+        "ja-jp" => Some("Jp"),
+        "ko-kr" => Some("Kr"),
         _ => None,
     }
 }

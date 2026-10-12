@@ -256,21 +256,26 @@ pub async fn fetch_patch_manifest(
     })
 }
 
+/// Normalize supported VO locales and short aliases, ignoring ASCII case.
+/// Both Chinese locales share the same VO language and normalize to `zh-cn`.
+/// Unknown locales are not inferred from language prefixes.
+pub(crate) fn normalize_vo_locale(locale: &str) -> Option<&'static str> {
+    match locale.to_ascii_lowercase().as_str() {
+        "zh-cn" | "zh-tw" | "cn" => Some("zh-cn"),
+        "en-us" | "en" => Some("en-us"),
+        "ja-jp" | "jp" => Some("ja-jp"),
+        "ko-kr" | "kr" => Some("ko-kr"),
+        _ => None,
+    }
+}
+
 #[inline]
 pub fn vo_lang_matches(matching_field: &str, vo_lang: &str) -> bool {
-    let vo = vo_lang.as_bytes();
-    let lower = matching_field.to_ascii_lowercase();
-    if vo.eq_ignore_ascii_case(b"cn") {
-        lower.contains("zh")
-    } else if vo.eq_ignore_ascii_case(b"en") {
-        lower.contains("en")
-    } else if vo.eq_ignore_ascii_case(b"jp") {
-        lower.contains("ja")
-    } else if vo.eq_ignore_ascii_case(b"kr") {
-        lower.contains("ko")
-    } else {
-        false
-    }
+    let Some(locale) = normalize_vo_locale(vo_lang) else {
+        return false;
+    };
+    // Preserve language-prefix substring matching for decorated manifest fields.
+    matching_field.to_ascii_lowercase().contains(&locale[..2])
 }
 
 #[inline]
@@ -287,4 +292,55 @@ pub fn is_known_vo_locale(matching_field: &str) -> bool {
 pub fn parse_size(s: &str) -> SophonResult<u64> {
     s.parse()
         .map_err(|_| SophonError::InvalidSizeString(s.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vo_locale_aliases_select_only_the_requested_audio() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["en-US", "en-us", "en", "EN"], &["en-us"]),
+            (
+                &["zh-CN", "zh-cn", "zh-TW", "zh-tw", "cn", "CN"],
+                &["zh-cn", "zh-tw"],
+            ),
+            (&["ja-JP", "ja-jp", "jp", "JP"], &["ja-jp"]),
+            (&["ko-KR", "ko-kr", "kr", "KR"], &["ko-kr"]),
+        ];
+        for &(aliases, expected_fields) in cases {
+            for alias in aliases {
+                assert_eq!(normalize_vo_locale(alias), Some(expected_fields[0]));
+                for field in ["en-us", "zh-cn", "zh-tw", "ja-jp", "ko-kr"] {
+                    let expected = expected_fields.contains(&field);
+                    for matching_field in [
+                        field.to_string(),
+                        format!("VO_{}_PACK", field.to_ascii_uppercase()),
+                    ] {
+                        assert!(is_known_vo_locale(&matching_field));
+                        assert_eq!(
+                            vo_lang_matches(&matching_field, alias),
+                            expected,
+                            "field={matching_field}, alias={alias}",
+                        );
+                    }
+                }
+                assert!(!vo_lang_matches("game", alias));
+                assert!(!vo_lang_matches("", alias));
+            }
+        }
+    }
+
+    #[test]
+    fn vo_locale_matching_rejects_unsupported_aliases() {
+        for alias in [
+            "fr-fr", "en-GB", "zh-HK", "zh", "tw", "ja", "ko", "en_US", " en-us ", "",
+        ] {
+            assert_eq!(normalize_vo_locale(alias), None);
+            for field in ["en-us", "zh-cn", "zh-tw", "ja-jp", "ko-kr", "game"] {
+                assert!(!vo_lang_matches(field, alias), "field={field}, alias={alias}");
+            }
+        }
+    }
 }
