@@ -2540,6 +2540,91 @@ async fn successful_apply_removes_only_its_package_state_not_shared_patch_payloa
 }
 
 #[tokio::test]
+async fn cached_package_discovery_accepts_equivalent_voice_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_state(
+        &[("game", "empty", b""), ("en-us", "voice", b"")],
+        "http://localhost",
+    );
+    save_preinstall_state(dir.path(), &state).unwrap();
+    for alias in ["en", "en-us", "en-US", "EN"] {
+        let info = super::super::update::check_update_with_branches(
+            "nap",
+            alias,
+            dir.path(),
+            Some("1.0".into()),
+            test_branch("main", "2.0"),
+            None,
+            |_, _| async { Err(SophonError::NoManifests) },
+        )
+        .await
+        .unwrap();
+        assert!(
+            info.preinstall_downloaded,
+            "alias {alias} hid the completed package"
+        );
+        assert_eq!(info.preinstall_tag.as_deref(), Some("2.0"));
+    }
+    assert!(cached_preinstall(dir.path(), "2.0", "nap", "jp", Some("1.0")).is_none());
+}
+
+#[test]
+fn legacy_discovery_rejects_invalid_patch_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut state, _) = patch_download_fixture("http://localhost");
+    state.target_snapshot = None;
+    state.downloaded_chunks.insert("patch".into());
+    save_preinstall_state(dir.path(), &state).unwrap();
+    assert!(cached_preinstall(dir.path(), "2.0", "nap", "en", Some("1.0")).is_some());
+    for offset in [1, u64::MAX] {
+        state.patch_assets[0].patch_offset = offset;
+        save_preinstall_state(dir.path(), &state).unwrap();
+        assert!(cached_preinstall(dir.path(), "2.0", "nap", "en", Some("1.0")).is_none());
+    }
+}
+
+#[tokio::test]
+async fn snapshot_without_chunk_hashes_uses_authoritative_file_hash() {
+    let server = wiremock::MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let fields: &[(&str, &str, &[u8])] = &[("game", "data.bin", b"whole-file verified")];
+    let mut state = snapshot_state(fields, &server.uri());
+    serve_target_chunks(&server, &mut state, fields).await;
+    let chunk = &mut state.target_snapshot.as_mut().unwrap().manifests[0]
+        .manifest
+        .assets[0]
+        .asset_chunks[0];
+    chunk.chunk_compressed_hash_md5.clear();
+    chunk.chunk_decompressed_hash_md5.clear();
+    reseal(&mut state);
+    save_preinstall_state(dir.path(), &state).unwrap();
+    // Empty optional hashes are supported; malformed supplied hashes are not.
+    let mut malformed = state.clone();
+    malformed.target_snapshot.as_mut().unwrap().manifests[0]
+        .manifest
+        .assets[0]
+        .asset_chunks[0]
+        .chunk_compressed_hash_md5 = "not a hash".into();
+    reseal(&mut malformed);
+    assert!(save_preinstall_state(dir.path(), &malformed).is_err());
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), fields[0].2);
+    assert_eq!(
+        super::super::read_installed_tag(dir.path()).as_deref(),
+        Some("2.0")
+    );
+}
+
+#[tokio::test]
 async fn planning_captures_each_selected_manifest_once_with_its_download_descriptor() {
     use prost::Message;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};

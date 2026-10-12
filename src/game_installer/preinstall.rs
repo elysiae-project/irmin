@@ -164,6 +164,21 @@ fn valid_hash(hash: &str) -> bool {
     matches!(hash.len(), 16 | 32) && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn validate_patch_range(asset: &PatchAssetInfo) -> SophonResult<()> {
+    validate_patch_name(&asset.patch_name)?;
+    if asset
+        .patch_offset
+        .checked_add(asset.patch_chunk_length)
+        .is_none_or(|end| end > asset.patch_size)
+    {
+        return Err(invalid_state(format!(
+            "Invalid patch range: {}",
+            asset.target_file_path
+        )));
+    }
+    Ok(())
+}
+
 impl TargetSnapshot {
     fn seal(&mut self, assets: &[PatchAssetInfo], deleted: &[String]) -> SophonResult<()> {
         self.manifests
@@ -277,7 +292,9 @@ impl TargetSnapshot {
                         || chunk.chunk_size == 0
                         || chunk.chunk_size > i64::MAX as u64
                         || (chunk.chunk_size_decompressed == 0 && file.asset_size != 0)
-                        || (!valid_hash(&chunk.chunk_decompressed_hash_md5)
+                        || (!chunk.chunk_decompressed_hash_md5.is_empty()
+                            && !valid_hash(&chunk.chunk_decompressed_hash_md5))
+                        || (!chunk.chunk_compressed_hash_md5.is_empty()
                             && !valid_hash(&chunk.chunk_compressed_hash_md5))
                     {
                         return Err(invalid_state(format!(
@@ -317,17 +334,7 @@ impl TargetSnapshot {
                 asset.patch_method,
                 PatchMethod::CopyOver | PatchMethod::Patch
             ) {
-                validate_patch_name(&asset.patch_name)?;
-                if asset
-                    .patch_offset
-                    .checked_add(asset.patch_chunk_length)
-                    .is_none_or(|end| end > asset.patch_size)
-                {
-                    return Err(invalid_state(format!(
-                        "Invalid patch range: {}",
-                        asset.target_file_path
-                    )));
-                }
+                validate_patch_range(asset)?;
             }
             let file = files.get(&(
                 asset.matching_field.as_str(),
@@ -420,8 +427,15 @@ pub(super) fn cached_preinstall(
     installed_tag: Option<&str>,
 ) -> Option<PreinstallState> {
     let state = load_preinstall_state(game_dir, tag).ok()?;
+    let same_locale = match (
+        super::api::normalize_vo_locale(&state.vo_lang),
+        super::api::normalize_vo_locale(vo_lang),
+    ) {
+        (Some(saved), Some(requested)) => saved == requested,
+        _ => state.vo_lang.eq_ignore_ascii_case(vo_lang),
+    };
     if state.game_id != game_id
-        || !state.vo_lang.eq_ignore_ascii_case(vo_lang)
+        || !same_locale
         || Some(state.installed_tag.as_str()) != installed_tag
     {
         return None;
@@ -458,7 +472,7 @@ pub(super) fn cached_preinstall(
                 asset.patch_method,
                 PatchMethod::CopyOver | PatchMethod::Patch
             ) {
-                validate_patch_name(&asset.patch_name).ok()?;
+                validate_patch_range(asset).ok()?;
                 if !state.downloaded_chunks.contains(&asset.patch_name) {
                     return None;
                 }
