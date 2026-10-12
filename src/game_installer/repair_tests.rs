@@ -382,6 +382,7 @@ async fn repair_default_english_without_record_repairs_voice_and_regenerates_ind
         empty_asset("data/ctable_streaming.dat"),
         generated,
         empty_asset("beyond_pkg_version"),
+        empty_asset("Audio_Japanese_pkg_version"),
     ];
     let mut events = vec![];
     verify_installers(
@@ -401,6 +402,10 @@ async fn repair_default_english_without_record_repairs_voice_and_regenerates_ind
     assert!(!dir.path().join("data/Chinese/missing.pck").exists());
     assert!(!dir.path().join("data/ctable_streaming.dat").exists());
     assert!(dir.path().join("beyond_pkg_version").is_file());
+    assert_eq!(
+        fs::read(dir.path().join("Audio_Japanese_pkg_version")).unwrap(),
+        b""
+    );
     assert!(
         fs::read_to_string(dir.path().join("pkg_version"))
             .unwrap()
@@ -420,6 +425,62 @@ async fn repair_default_english_without_record_repairs_voice_and_regenerates_ind
         "English(US)\n"
     );
     assert!(matches!(events.last(), Some(SophonProgress::Finished)));
+}
+
+#[tokio::test]
+async fn repair_rejects_conflicting_destination_aliases_before_mutation() {
+    for second_name in ["a/file", "a/./file", "a//file"] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/file"), b"first requirement").unwrap();
+        let (first, _) = chunk_asset("a/file", b"first requirement");
+        let (second, compressed) = chunk_asset(second_name, b"second requirement");
+        cache_chunk(dir.path(), &compressed);
+        let mut events = vec![];
+        let result = verify_assets(
+            &Client::new(),
+            vec![(first, download_info()), (second, download_info())],
+            dir.path(),
+            |p| events.push(p),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "conflicting destination {second_name} was accepted"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("a/file")).unwrap(),
+            b"first requirement"
+        );
+        assert!(!events.iter().any(|p| matches!(p, SophonProgress::Finished)));
+    }
+}
+
+#[tokio::test]
+async fn repair_deduplicates_compatible_destination_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, compressed) = chunk_asset("a/file", b"same bytes");
+    let mut second = first.clone();
+    second.asset_name = "a/./file".into();
+    second.asset_hash_md5.make_ascii_uppercase();
+    cache_chunk(dir.path(), &compressed);
+    let mut events = vec![];
+    verify_assets(
+        &Client::new(),
+        vec![(first, download_info()), (second, download_info())],
+        dir.path(),
+        |p| events.push(p),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(dir.path().join("a/file")).unwrap(), b"same bytes");
+    assert!(events.iter().any(|p| matches!(
+        p,
+        SophonProgress::Assembling {
+            assembled_files: 1,
+            total_files: 1
+        }
+    )));
 }
 
 #[tokio::test]

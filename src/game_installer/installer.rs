@@ -167,12 +167,7 @@ impl SophonInstaller {
         let result =
             super::api::fetch_manifest(client, &meta.manifest_download, &meta.manifest.id).await?;
         let mut manifest = result.manifest;
-        // Fresh install: all chunks must be downloaded (no old-file reuse)
-        for asset in &mut manifest.assets {
-            for chunk in &mut asset.asset_chunks {
-                chunk.chunk_old_offset = -1;
-            }
-        }
+        crate::proto_parse::normalize_full_download_manifest(&mut manifest);
         Ok(Self {
             manifest,
             chunk_download: meta.chunk_download.clone(),
@@ -2764,6 +2759,7 @@ async fn verify_installers(
     let mut index_assets = Vec::new();
     let mut has_binary_version = false;
     for mut installer in installers {
+        crate::proto_parse::normalize_full_download_manifest(&mut installer.manifest);
         let assets = &mut installer.manifest.assets;
         match game_code {
             "hk4e" => super::game_filters::filter_hk4e_asset_list(game_dir, assets, &vo_langs),
@@ -2790,10 +2786,7 @@ async fn verify_installers(
             }
             let generated = match game_code {
                 "hk4e" => {
-                    asset.asset_name == "pkg_version"
-                        || (asset.asset_name.starts_with("Audio_")
-                            && asset.asset_name.ends_with("_pkg_version")
-                            && !asset.asset_name.contains('/'))
+                    super::game_filters::is_generated_pkg_version(&asset.asset_name, &vo_langs)
                 }
                 "hkrpg" => asset.asset_name == "StarRail_Data/app.info",
                 _ => false,
@@ -2839,16 +2832,37 @@ async fn repair_assets(
     mut emit: impl FnMut(SophonProgress) + Send,
 ) -> SophonResult<()> {
     all_assets.retain(|(asset, _)| !asset.is_directory());
-    for (asset, _) in &mut all_assets {
+    let mut identities = FxHashMap::<PathBuf, usize>::default();
+    let mut unique: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)> = Vec::new();
+    for (asset, download) in all_assets {
         validate_asset_name(&asset.asset_name)?;
-        for chunk in &mut asset.asset_chunks {
+        let identity: PathBuf = Path::new(&asset.asset_name).components().collect();
+        if identity.as_os_str().is_empty() {
+            return Err(SophonError::InvalidAssetName(asset.asset_name));
+        }
+        if let Some(&index) = identities.get(&identity) {
+            let previous = &unique[index].0;
+            if previous.asset_size != asset.asset_size
+                || !previous
+                    .asset_hash_md5
+                    .eq_ignore_ascii_case(&asset.asset_hash_md5)
+            {
+                return Err(SophonError::AssemblyFailed {
+                    file: asset.asset_name,
+                    error: "Conflicting manifest requirements for one destination".into(),
+                });
+            }
+            continue;
+        }
+        for chunk in &asset.asset_chunks {
             if !validate_chunk_name(&chunk.chunk_name) {
                 return Err(SophonError::PathTraversal(chunk.chunk_name.clone().into()));
             }
-            // Repair must not reuse bytes from the damaged destination.
-            chunk.chunk_old_offset = -1;
         }
+        identities.insert(identity, unique.len());
+        unique.push((asset, download));
     }
+    let all_assets = unique;
     let total_files = all_assets.len() as u64;
     // Explicit repair hashes bytes, never persisted size/mtime cache hits.
     let verify_cache = Arc::new(DashMap::new());

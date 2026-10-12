@@ -2,6 +2,7 @@ mod hk4e;
 mod hkrpg;
 mod nap;
 
+pub(crate) use hk4e::is_generated_pkg_version;
 pub use hk4e::{
     filter_hk4e_asset_list, find_hk4e_persistent_dir,
     write_audio_lang_record as write_hk4e_audio_lang_record, write_pkg_version_from_manifest,
@@ -17,7 +18,10 @@ pub use nap::{filter_nap_asset_list, filter_nap_installers, write_nap_audio_lang
 /// locally (filtered or rewritten), so a byte-level CDN patch for it can never
 /// apply and must be skipped during preinstall apply.
 pub fn is_sophon_synthesized_asset(game_code: &str, target_file_path: &str) -> bool {
-    let name = target_file_path.rsplit('/').next().unwrap_or(target_file_path);
+    let name = target_file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(target_file_path);
     match game_code {
         "hk4e" => {
             name == "pkg_version"
@@ -122,7 +126,10 @@ mod tests {
     #[test]
     fn test_is_sophon_synthesized_asset_other_games_false() {
         assert!(!is_sophon_synthesized_asset("nap", "pkg_version"));
-        assert!(!is_sophon_synthesized_asset("bh3", "ZenlessZoneZero_Data/app.info"));
+        assert!(!is_sophon_synthesized_asset(
+            "bh3",
+            "ZenlessZoneZero_Data/app.info"
+        ));
         assert!(!is_sophon_synthesized_asset("np", "GenshinImpact.exe"));
     }
 

@@ -110,6 +110,19 @@ fn locale_code_to_audio_lang_name(locale: &str) -> Option<&'static str> {
     }
 }
 
+/// Exactly the root indexes rebuilt by `write_pkg_version_from_manifest`.
+pub(crate) fn is_generated_pkg_version(filename: &str, vo_langs: &[String]) -> bool {
+    filename == "pkg_version"
+        || filename
+            .strip_prefix("Audio_")
+            .and_then(|name| name.strip_suffix("_pkg_version"))
+            .is_some_and(|audio| {
+                vo_langs
+                    .iter()
+                    .any(|locale| locale_code_to_audio_lang_name(locale) == Some(audio))
+            })
+}
+
 #[derive(Serialize)]
 #[allow(non_snake_case)]
 struct PkgVersionEntry {
