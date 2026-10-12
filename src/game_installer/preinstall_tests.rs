@@ -55,6 +55,7 @@ fn preinstall_state_roundtrip() {
         game_id: "hk4e".to_string(),
         vo_lang: "en".to_string(),
         installed_tag: "4.8.0".to_string(),
+        target_snapshot: None,
         patch_assets: vec![PatchAssetInfo {
             target_file_path: "test.pak".to_string(),
             target_file_size: 100,
@@ -106,12 +107,16 @@ fn preinstall_state_paths() {
     let dir = tempfile::tempdir().unwrap();
     let state_path = PreinstallState::state_file_path(dir.path(), "5.0.0");
     let marker_path = PreinstallState::marker_file_path(dir.path(), "5.0.0");
-    assert!(state_path
-        .to_string_lossy()
-        .contains(".sophon_preinstall_5.0.0.json"));
-    assert!(marker_path
-        .to_string_lossy()
-        .contains(".sophon_preinstall_5.0.0"));
+    assert!(
+        state_path
+            .to_string_lossy()
+            .contains(".sophon_preinstall_5.0.0.json")
+    );
+    assert!(
+        marker_path
+            .to_string_lossy()
+            .contains(".sophon_preinstall_5.0.0")
+    );
     assert!(!marker_path.to_string_lossy().contains(".json"));
 }
 
@@ -526,6 +531,7 @@ fn filter_patch_assets_skips_filtered_download_over() {
         game_id: "nap".to_string(),
         vo_lang: "en".to_string(),
         installed_tag: "1.0.0".to_string(),
+        target_snapshot: None,
         patch_assets: vec![
             PatchAssetInfo {
                 target_file_path: "game_data.bin".to_string(),
@@ -600,6 +606,7 @@ fn filter_patch_assets_no_filter_when_no_kdel() {
         game_id: "nap".to_string(),
         vo_lang: "en".to_string(),
         installed_tag: "1.0.0".to_string(),
+        target_snapshot: None,
         patch_assets: vec![PatchAssetInfo {
             target_file_path: "data.bin".to_string(),
             target_file_size: 100,
@@ -1198,6 +1205,7 @@ fn save_preinstall_state_atomic_write() {
         game_id: "hk4e".to_string(),
         vo_lang: "en".to_string(),
         installed_tag: "4.8.0".to_string(),
+        target_snapshot: None,
         patch_assets: vec![],
         deleted_files: vec![],
         downloaded_chunks: rustc_hash::FxHashSet::default(),
@@ -1609,4 +1617,355 @@ fn preinstall_state_golden_json_field_names() {
         state.main_manifest_ids,
         vec![("game".to_string(), "manifest_hash_123".to_string())]
     );
+    assert!(state.target_snapshot.is_none());
+    assert!(
+        !serde_json::to_string(&state)
+            .unwrap()
+            .contains("targetSnapshot")
+    );
+}
+
+fn snapshot_state(fields: &[(&str, &str, &[u8])], url: &str) -> PreinstallState {
+    let mut state = PreinstallState {
+        tag: "2.0".into(),
+        game_id: "nap".into(),
+        vo_lang: "en".into(),
+        installed_tag: "1.0".into(),
+        patch_assets: vec![],
+        deleted_files: vec![],
+        downloaded_chunks: Default::default(),
+        diff_downloads: Default::default(),
+        main_chunk_download: make_download_info(),
+        main_manifest_ids: vec![],
+        target_snapshot: None,
+    };
+    let mut manifests = vec![];
+    for &(field, path, data) in fields {
+        let hash = hex::encode(fast_md5::digest(data));
+        let chunk_download = DownloadInfo {
+            url_prefix: url.into(),
+            url_suffix: field.into(),
+            ..make_download_info()
+        };
+        let manifest_id = format!("manifest-{field}");
+        state
+            .main_manifest_ids
+            .push((field.into(), manifest_id.clone()));
+        state.patch_assets.push(PatchAssetInfo {
+            target_file_path: path.into(),
+            target_file_size: data.len() as u64,
+            target_file_hash: hash.clone(),
+            patch_method: PatchMethod::DownloadOver,
+            patch_name: String::new(),
+            patch_hash: String::new(),
+            patch_offset: 0,
+            patch_size: 0,
+            patch_chunk_length: 0,
+            original_file_path: None,
+            original_file_hash: None,
+            original_file_size: None,
+            matching_field: field.into(),
+        });
+        manifests.push(TargetManifest {
+            matching_field: field.into(),
+            manifest_id,
+            chunk_download,
+            manifest: SophonManifestProto {
+                assets: vec![SophonManifestAssetProperty {
+                    asset_name: path.into(),
+                    asset_size: data.len() as u64,
+                    asset_type: 0,
+                    asset_hash_md5: hash.clone(),
+                    asset_chunks: if data.is_empty() {
+                        vec![]
+                    } else {
+                        vec![SophonManifestAssetChunk {
+                            chunk_name: format!("chunk-{field}"),
+                            chunk_on_file_offset: 0,
+                            chunk_size: data.len() as u64,
+                            chunk_size_decompressed: data.len() as u64,
+                            chunk_compressed_hash_md5: hash.clone(),
+                            chunk_decompressed_hash_md5: hash,
+                            chunk_compressed_hash_xxh: 0,
+                            chunk_old_offset: 0,
+                        }]
+                    },
+                }],
+            },
+        });
+    }
+    state.target_snapshot = Some(TargetSnapshot {
+        version: 1,
+        game_id: state.game_id.clone(),
+        vo_lang: state.vo_lang.clone(),
+        installed_tag: state.installed_tag.clone(),
+        tag: state.tag.clone(),
+        build_id: "exact-build".into(),
+        legacy_coverage: false,
+        manifests,
+        digest: String::new(),
+    });
+    reseal(&mut state);
+    state
+}
+
+fn reseal(state: &mut PreinstallState) {
+    state
+        .target_snapshot
+        .as_mut()
+        .unwrap()
+        .seal(&state.patch_assets, &state.deleted_files)
+        .unwrap();
+}
+
+fn plan_from_state(state: PreinstallState, unique_chunks: Vec<PatchChunkInfo>) -> PreinstallPlan {
+    PreinstallPlan {
+        patch_assets: state.patch_assets,
+        deleted_files: state.deleted_files,
+        unique_chunks,
+        diff_downloads: state.diff_downloads,
+        main_chunk_download: state.main_chunk_download,
+        tag: state.tag,
+        installed_tag: state.installed_tag,
+        main_manifest_ids: state.main_manifest_ids,
+        target_snapshot: state.target_snapshot.unwrap(),
+    }
+}
+
+#[test]
+fn snapshot_roundtrip_integrity_identity_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_state(
+        &[
+            ("game", "data.bin", b"target"),
+            ("en-us", "vo.bin", b"voice"),
+        ],
+        "http://localhost",
+    );
+    save_preinstall_state(dir.path(), &state).unwrap();
+    let loaded = load_preinstall_state(dir.path(), "2.0").unwrap();
+    assert_eq!(loaded.target_snapshot.as_ref().unwrap().manifests.len(), 2);
+    assert_eq!(
+        loaded.target_snapshot.as_ref().unwrap().manifests[0]
+            .manifest
+            .assets[0]
+            .asset_chunks[0]
+            .chunk_old_offset,
+        -1
+    );
+    let mut corrupt = state.clone();
+    corrupt.target_snapshot.as_mut().unwrap().manifests[0]
+        .chunk_download
+        .url_suffix = "wrong".into();
+    assert!(save_preinstall_state(dir.path(), &corrupt).is_err());
+    corrupt = state.clone();
+    corrupt.target_snapshot.as_mut().unwrap().tag = "3.0".into();
+    reseal(&mut corrupt);
+    assert!(save_preinstall_state(dir.path(), &corrupt).is_err());
+    corrupt = state.clone();
+    corrupt.target_snapshot.as_mut().unwrap().manifests.pop();
+    reseal(&mut corrupt);
+    assert!(save_preinstall_state(dir.path(), &corrupt).is_err());
+    corrupt = state.clone();
+    corrupt.patch_assets[0].target_file_hash = BLANK_FILE_MD5.into();
+    reseal(&mut corrupt);
+    assert!(save_preinstall_state(dir.path(), &corrupt).is_err());
+    corrupt = state.clone();
+    corrupt.patch_assets[0].target_file_size += 1;
+    reseal(&mut corrupt);
+    assert!(save_preinstall_state(dir.path(), &corrupt).is_err());
+    // Wrong filename cannot redirect the installed target tag.
+    fs::copy(
+        PreinstallState::state_file_path(dir.path(), "2.0"),
+        PreinstallState::state_file_path(dir.path(), "3.0"),
+    )
+    .unwrap();
+    assert!(load_preinstall_state(dir.path(), "3.0").is_err());
+}
+
+#[test]
+fn snapshot_rejects_paths_gaps_overflows_and_missing_chunks() {
+    let state = snapshot_state(&[("game", "data.bin", b"target")], "http://localhost");
+    for case in 0..5 {
+        let mut bad = state.clone();
+        let file = &mut bad.target_snapshot.as_mut().unwrap().manifests[0]
+            .manifest
+            .assets[0];
+        match case {
+            0 => file.asset_name = "../escape".into(),
+            1 => file.asset_chunks[0].chunk_name = "../escape".into(),
+            2 => file.asset_chunks[0].chunk_on_file_offset = 1,
+            3 => file.asset_chunks[0].chunk_size_decompressed = u64::MAX,
+            _ => file.asset_chunks.clear(),
+        }
+        reseal(&mut bad);
+        assert!(
+            bad.target_snapshot
+                .as_ref()
+                .unwrap()
+                .validate(&bad)
+                .is_err(),
+            "case {case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn publication_saves_valid_state_before_marker_and_rejects_changed_source() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let state = snapshot_state(&[("game", "empty", b"")], "http://localhost");
+    // No patch bytes required. State publication failure must not create a marker.
+    let state_path = PreinstallState::state_file_path(dir.path(), &state.tag);
+    fs::create_dir(&state_path).unwrap();
+    let result = preinstall_download(
+        &Client::new(),
+        plan_from_state(state.clone(), vec![]),
+        dir.path(),
+        "nap",
+        "en",
+        DownloadHandle::new(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        HashMap::new(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!PreinstallState::marker_file_path(dir.path(), &state.tag).exists());
+    fs::remove_dir(state_path).unwrap();
+    let gd = dir.path().to_owned();
+    let change_source = Arc::new(move |_: &HashMap<String, u64>| {
+        super::super::write_installed_tag(&gd, "changed").unwrap();
+    });
+    let result = preinstall_download(
+        &Client::new(),
+        plan_from_state(state.clone(), vec![]),
+        dir.path(),
+        "nap",
+        "en",
+        DownloadHandle::new(),
+        Arc::new(|_| {}),
+        change_source,
+        HashMap::new(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(SophonError::PreinstallStateInvalid(_))
+    ));
+    assert!(!PreinstallState::marker_file_path(dir.path(), &state.tag).exists());
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    preinstall_download(
+        &Client::new(),
+        plan_from_state(state.clone(), vec![]),
+        dir.path(),
+        "nap",
+        "en",
+        DownloadHandle::new(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        load_preinstall_state(dir.path(), &state.tag)
+            .unwrap()
+            .target_snapshot
+            .is_some()
+    );
+    assert!(PreinstallState::marker_file_path(dir.path(), &state.tag).exists());
+}
+
+fn patch_download_fixture(url: &str) -> (PreinstallState, PatchChunkInfo) {
+    let mut state = snapshot_state(&[("game", "data.bin", b"target")], url);
+    let asset = &mut state.patch_assets[0];
+    asset.patch_method = PatchMethod::CopyOver;
+    asset.patch_name = "patch".into();
+    asset.patch_hash = hex::encode(fast_md5::digest(b"target"));
+    asset.patch_size = 6;
+    asset.patch_chunk_length = 6;
+    let chunk = PatchChunkInfo {
+        patch_name: "patch".into(),
+        patch_size: 6,
+        patch_md5: asset.patch_hash.clone(),
+        matching_field: "game".into(),
+    };
+    state.diff_downloads.insert(
+        "game".into(),
+        Arc::new(DownloadInfo {
+            url_prefix: url.into(),
+            url_suffix: "patches".into(),
+            ..make_download_info()
+        }),
+    );
+    reseal(&mut state);
+    (state, chunk)
+}
+
+#[tokio::test]
+async fn resumed_missing_or_corrupt_patch_chunks_are_downloaded_before_ready() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    let server = MockServer::start().await;
+    Mock::given(path("/patches/patch"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"target".to_vec()))
+        .expect(2)
+        .mount(&server)
+        .await;
+    for corrupt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+        fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
+        if corrupt {
+            fs::write(patching_chunk_dir(dir.path()).join("patch"), b"broken").unwrap();
+        }
+        let (state, chunk) = patch_download_fixture(&server.uri());
+        preinstall_download(
+            &Client::new(),
+            plan_from_state(state, vec![chunk]),
+            dir.path(),
+            "nap",
+            "en",
+            DownloadHandle::new(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            HashMap::from([("patch".into(), 6)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read(patching_chunk_dir(dir.path()).join("patch")).unwrap(),
+            b"target"
+        );
+        assert!(load_preinstall_state(dir.path(), "2.0").is_ok());
+    }
+}
+
+#[tokio::test]
+async fn download_worker_panic_cannot_publish_ready_state() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let (state, chunk) = patch_download_fixture("http://localhost");
+    let handle = DownloadHandle::new();
+    handle.pause();
+    let updater = Arc::new(|p| {
+        if matches!(p, SophonProgress::Paused { .. }) {
+            panic!("worker callback panic");
+        }
+    });
+    let result = preinstall_download(
+        &Client::new(),
+        plan_from_state(state, vec![chunk]),
+        dir.path(),
+        "nap",
+        "en",
+        handle,
+        updater,
+        Arc::new(|_| {}),
+        HashMap::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(SophonError::JoinError(_))));
+    assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
+    assert!(!PreinstallState::state_file_path(dir.path(), "2.0").exists());
 }

@@ -1,15 +1,16 @@
 // Sophon protobuf manifest
 use prost::Message;
+use serde::{Deserialize, Serialize};
 
 // Top-level manifest
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct SophonManifestProto {
     #[prost(message, repeated, tag = "1")]
     pub assets: Vec<SophonManifestAssetProperty>,
 }
 
 // Asset properties
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct SophonManifestAssetProperty {
     /// Asset path relative to the game directory.
     #[prost(string, tag = "1")]
@@ -41,7 +42,7 @@ impl SophonManifestAssetProperty {
 }
 
 // Chunk properties
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct SophonManifestAssetChunk {
     /// CDN object name for the download URL.
     #[prost(string, tag = "1")]
@@ -75,6 +76,16 @@ pub struct SophonManifestAssetChunk {
     /// reuse.
     #[prost(int64, tag = "8")]
     pub chunk_old_offset: i64,
+}
+
+/// Normal manifests describe CDN data, not reusable offsets in an old installation.
+/// Keep this separate from protobuf decoding, where omitted int64 fields remain zero.
+pub(crate) fn normalize_full_download_manifest(manifest: &mut SophonManifestProto) {
+    for asset in &mut manifest.assets {
+        for chunk in &mut asset.asset_chunks {
+            chunk.chunk_old_offset = -1;
+        }
+    }
 }
 
 #[inline]
