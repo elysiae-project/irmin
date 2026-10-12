@@ -1825,23 +1825,28 @@ where
     let snapshot = state.target_snapshot.as_ref().expect("resolved snapshot");
     snapshot.validate(&state)?;
     let legacy_coverage = snapshot.legacy_coverage;
-    let represented_vo: Vec<String> = snapshot
-        .manifests
-        .iter()
-        .filter(|m| is_known_vo_locale(&m.matching_field))
-        .map(|m| m.matching_field.to_ascii_lowercase())
+    // Generators accept canonical locales, not decorated manifest field names.
+    // Non-VO fields such as `cutscenes` must not satisfy English's `en` matcher.
+    let represented_vo: Vec<String> = ["zh-cn", "en-us", "ja-jp", "ko-kr"]
+        .into_iter()
+        .filter(|locale| {
+            snapshot.manifests.iter().any(|m| {
+                is_known_vo_locale(&m.matching_field) && vo_lang_matches(&m.matching_field, locale)
+            })
+        })
+        .map(str::to_string)
         .collect();
     if legacy_coverage
-        && !snapshot.manifests.iter().any(|m| {
-            m.matching_field.eq_ignore_ascii_case(&state.vo_lang)
-                || vo_lang_matches(&m.matching_field, &state.vo_lang)
-        })
+        && !represented_vo
+            .iter()
+            .any(|locale| vo_lang_matches(locale, &state.vo_lang))
     {
-        log::warn!(
+        let message = format!(
             "Legacy preinstall {} omits requested VO {}. Preserving its recorded scope; run a normal update/repair afterwards for that voice pack.",
-            state.tag,
-            state.vo_lang
+            state.tag, state.vo_lang,
         );
+        log::warn!("{message}");
+        updater(SophonProgress::Warning { message });
     }
     let download_over_context = DownloadOverContext::from_snapshot(snapshot);
 

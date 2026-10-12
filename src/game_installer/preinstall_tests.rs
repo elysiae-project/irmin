@@ -2255,11 +2255,17 @@ async fn legacy_exact_recovery_preserves_en_us_omitted_voice_and_migrates_before
     assert_eq!(migrated.main_manifest_ids.len(), 2);
     assert!(migrated.target_snapshot.as_ref().unwrap().legacy_coverage);
     assert!(!dir.path().join("data.bin").exists());
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&warnings);
     apply_preinstall(
         &client,
         dir.path(),
         "2.0",
-        Arc::new(|_| {}),
+        Arc::new(move |event| {
+            if let SophonProgress::Warning { message } = event {
+                captured.lock().unwrap().push(message);
+            }
+        }),
         &DownloadHandle::new(),
     )
     .await
@@ -2273,6 +2279,14 @@ async fn legacy_exact_recovery_preserves_en_us_omitted_voice_and_migrates_before
         b"keep old index"
     );
     assert!(!dir.path().join("voice.bin").exists());
+    assert!(
+        warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.contains("omits requested VO en-US")
+                && message.contains("update/repair"))
+    );
 }
 
 #[tokio::test]
