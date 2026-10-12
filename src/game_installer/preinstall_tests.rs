@@ -1969,3 +1969,435 @@ async fn download_worker_panic_cannot_publish_ready_state() {
     assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
     assert!(!PreinstallState::state_file_path(dir.path(), "2.0").exists());
 }
+
+async fn serve_target_chunks(
+    server: &wiremock::MockServer,
+    state: &mut PreinstallState,
+    fields: &[(&str, &str, &[u8])],
+) {
+    use wiremock::{Mock, ResponseTemplate, matchers::path};
+    for entry in &mut state.target_snapshot.as_mut().unwrap().manifests {
+        let data = fields
+            .iter()
+            .find(|(field, _, _)| *field == entry.matching_field)
+            .unwrap()
+            .2;
+        if data.is_empty() {
+            continue;
+        }
+        let compressed = zstd::encode_all(data, 1).unwrap();
+        let chunk = &mut entry.manifest.assets[0].asset_chunks[0];
+        chunk.chunk_size = compressed.len() as u64;
+        chunk.chunk_compressed_hash_md5 = hex::encode(fast_md5::digest(&compressed));
+        entry.chunk_download.compression = crate::api_scrape::Compression::Zstd;
+        Mock::given(path(format!(
+            "/{}/{}",
+            entry.matching_field, chunk.chunk_name
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed))
+        .expect(1)
+        .mount(server)
+        .await;
+    }
+    reseal(state);
+}
+
+#[tokio::test]
+async fn completed_snapshot_applies_without_metadata_even_after_branch_removal_or_advance() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    for advanced in [false, true] {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+        let fields: &[(&str, &str, &[u8])] = &[
+            ("game", "data.bin", b"new-game"),
+            ("en-us", "voice.bin", b"new-voice"),
+            ("cutscenes", "movie.bin", b"new-movie"),
+        ];
+        let mut state = snapshot_state(fields, &server.uri());
+        serve_target_chunks(&server, &mut state, fields).await;
+        preinstall_download(
+            &Client::new(),
+            plan_from_state(state, vec![]),
+            dir.path(),
+            "nap",
+            "en",
+            DownloadHandle::new(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        // Every modern metadata dependency is behind the legacy-only resolver.
+        Mock::given(path("/metadata"))
+            .respond_with(if advanced {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tag":"3.0"}))
+            } else {
+                ResponseTemplate::new(404)
+            })
+            .expect(0)
+            .mount(&server)
+            .await;
+        let calls = AtomicUsize::new(0);
+        apply_preinstall_with_resolver(
+            &Client::new(),
+            dir.path(),
+            "2.0",
+            Arc::new(|_| {}),
+            &DownloadHandle::new(),
+            |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(invalid_state("metadata must not be consulted"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        for &(_, path, data) in fields {
+            assert_eq!(fs::read(dir.path().join(path)).unwrap(), data);
+        }
+        assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("2.0"));
+        assert!(!PreinstallState::state_file_path(dir.path(), "2.0").exists());
+    }
+}
+
+#[tokio::test]
+async fn snapshot_fallbacks_ignore_damaged_old_offsets_and_regenerate_hk4e_indexes() {
+    let server = wiremock::MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let fields: &[(&str, &str, &[u8])] = &[
+        ("game", "data.bin", b"new-game"),
+        ("en-us", "Audio/English(US)/voice.bin", b"new-voice"),
+        ("cutscenes", "movie.bin", b"new-movie"),
+    ];
+    let mut state = snapshot_state(fields, &server.uri());
+    state.game_id = "hk4e".into();
+    state.target_snapshot.as_mut().unwrap().game_id = "hk4e".into();
+    serve_target_chunks(&server, &mut state, fields).await;
+    state.patch_assets[0].patch_method = PatchMethod::CopyOver;
+    state.patch_assets[0].patch_name = "missing-copy".into();
+    state.patch_assets[1].patch_method = PatchMethod::Patch;
+    state.patch_assets[1].patch_name = "missing-hdiff".into();
+    state.patch_assets[1].original_file_path = Some("missing-old-voice".into());
+    // Force an old-file temptation: downloaded data must win, not offset zero.
+    fs::write(dir.path().join("data.bin"), b"bad-game").unwrap();
+    reseal(&mut state);
+    save_preinstall_state(dir.path(), &state).unwrap();
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+    for &(_, path, data) in fields {
+        assert_eq!(fs::read(dir.path().join(path)).unwrap(), data);
+    }
+    let pkg = fs::read_to_string(dir.path().join("pkg_version")).unwrap();
+    assert!(pkg.contains("data.bin") && pkg.contains("movie.bin") && pkg.contains("voice.bin"));
+    let audio = fs::read_to_string(dir.path().join("Audio_English(US)_pkg_version")).unwrap();
+    assert!(audio.contains("voice.bin") && !audio.contains("movie.bin"));
+    assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("2.0"));
+}
+
+fn test_branch(name: &str, tag: &str) -> PackageBranch {
+    PackageBranch {
+        package_id: "package".into(),
+        branch: name.into(),
+        password: String::new(),
+        tag: tag.into(),
+    }
+}
+
+fn build_from_snapshot(snapshot: &TargetSnapshot, url: &str) -> SophonBuildData {
+    SophonBuildData {
+        build_id: snapshot.build_id.clone(),
+        tag: snapshot.tag.clone(),
+        manifests: snapshot
+            .manifests
+            .iter()
+            .map(|entry| SophonManifestMeta {
+                category_id: String::new(),
+                category_name: String::new(),
+                matching_field: entry.matching_field.clone(),
+                manifest: crate::api_scrape::ManifestFileInfo {
+                    id: entry.manifest_id.clone(),
+                    checksum: String::new(),
+                    compressed_size: "0".into(),
+                    uncompressed_size: "0".into(),
+                },
+                chunk_download: entry.chunk_download.clone(),
+                manifest_download: DownloadInfo {
+                    url_prefix: url.into(),
+                    url_suffix: "manifests".into(),
+                    ..make_download_info()
+                },
+                stats: crate::api_scrape::Stats {
+                    compressed_size: "0".into(),
+                    uncompressed_size: "0".into(),
+                    file_count: "0".into(),
+                    chunk_count: "0".into(),
+                },
+                deduplicated_stats: None,
+            })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn legacy_exact_recovery_preserves_en_us_omitted_voice_and_migrates_before_mutation() {
+    use prost::Message;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let fields: &[(&str, &str, &[u8])] = &[
+        ("game", "data.bin", b"new-game"),
+        ("cutscenes", "movie.bin", b"new-movie"),
+    ];
+    let mut state = snapshot_state(fields, &server.uri());
+    state.vo_lang = "en-US".into();
+    state.game_id = "hk4e".into();
+    let snapshot = state.target_snapshot.as_mut().unwrap();
+    snapshot.vo_lang = "en-US".into();
+    snapshot.game_id = "hk4e".into();
+    serve_target_chunks(&server, &mut state, fields).await;
+    // An available English target must not broaden this old package's historical scope.
+    let extra = snapshot_state(
+        &[("game", "unused", b""), ("en-us", "voice.bin", b"new")],
+        &server.uri(),
+    );
+    let mut build = build_from_snapshot(state.target_snapshot.as_ref().unwrap(), &server.uri());
+    build.manifests.push(
+        build_from_snapshot(extra.target_snapshot.as_ref().unwrap(), &server.uri())
+            .manifests
+            .pop()
+            .unwrap(),
+    );
+    for entry in &state.target_snapshot.as_ref().unwrap().manifests {
+        Mock::given(path(format!("/manifests/{}", entry.manifest_id)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(entry.manifest.encode_to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(path("/manifests/manifest-en-us"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&server)
+        .await;
+    state.target_snapshot = None;
+    state.deleted_files.push("Audio/English(US)/old.bin".into());
+    fs::create_dir_all(dir.path().join("Audio/English(US)")).unwrap();
+    fs::write(
+        dir.path().join("Audio/English(US)/old.bin"),
+        b"keep old voice",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Audio_English(US)_pkg_version"),
+        b"keep old index",
+    )
+    .unwrap();
+    save_preinstall_state(dir.path(), &state).unwrap();
+    let requests = Mutex::new(Vec::new());
+    let client = Client::new();
+    // Cancel immediately after exact recovery: migration must persist before the
+    // first game-file mutation, and the retry must need no metadata at all.
+    let handle = DownloadHandle::new();
+    let result = apply_preinstall_with_resolver(
+        &client,
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &handle,
+        |old| {
+            let client = &client;
+            let requests = &requests;
+            let handle = &handle;
+            async move {
+                let recovered = recover_legacy_from_branches(
+                    client,
+                    &old,
+                    vec![test_branch("main", "2.0"), test_branch("pre", "3.0")],
+                    |branch, tag| {
+                        requests
+                            .lock()
+                            .unwrap()
+                            .push((branch.branch.clone(), tag.clone()));
+                        let build = build.clone();
+                        async move {
+                            if branch.branch == "main" {
+                                Err(SophonError::NoManifests)
+                            } else {
+                                Ok(build)
+                            }
+                        }
+                    },
+                )
+                .await?;
+                handle.cancel();
+                Ok(recovered)
+            }
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(SophonError::Cancelled)));
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![("main".into(), "2.0".into()), ("pre".into(), "2.0".into())]
+    );
+    let migrated = load_preinstall_state(dir.path(), "2.0").unwrap();
+    assert_eq!(migrated.main_manifest_ids.len(), 2);
+    assert!(migrated.target_snapshot.as_ref().unwrap().legacy_coverage);
+    assert!(!dir.path().join("data.bin").exists());
+    apply_preinstall(
+        &client,
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("Audio/English(US)/old.bin")).unwrap(),
+        b"keep old voice"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("Audio_English(US)_pkg_version")).unwrap(),
+        b"keep old index"
+    );
+    assert!(!dir.path().join("voice.bin").exists());
+}
+
+#[tokio::test]
+async fn missing_legacy_metadata_and_failed_migration_keep_payloads_and_version() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let mut state = snapshot_state(&[("game", "data.bin", b"target")], "http://localhost");
+    let mut snapshot = state.target_snapshot.take().unwrap();
+    snapshot.legacy_coverage = true;
+    snapshot
+        .seal(&state.patch_assets, &state.deleted_files)
+        .unwrap();
+    save_preinstall_state(dir.path(), &state).unwrap();
+    fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
+    let payload = patching_chunk_dir(dir.path()).join("keep");
+    fs::write(&payload, b"cached payload").unwrap();
+    let result = apply_preinstall_with_resolver(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+        |_| async { Err(invalid_state("exact manifest no longer available")) },
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("normal update/repair")
+    );
+    // Force the atomic migration write to fail without touching the original JSON.
+    fs::create_dir(PreinstallState::state_file_path(dir.path(), "2.0").with_extension("json.tmp"))
+        .unwrap();
+    assert!(
+        apply_preinstall_with_resolver(
+            &Client::new(),
+            dir.path(),
+            "2.0",
+            Arc::new(|_| {}),
+            &DownloadHandle::new(),
+            |_| async { Ok(snapshot) }
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        load_preinstall_state(dir.path(), "2.0")
+            .unwrap()
+            .target_snapshot
+            .is_none()
+    );
+    assert!(payload.exists());
+    assert!(!dir.path().join("data.bin").exists());
+    assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("1.0"));
+}
+
+#[tokio::test]
+async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
+    let server = wiremock::MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let fields: &[(&str, &str, &[u8])] = &[("game", "data.bin", b"target")];
+    let mut state = snapshot_state(fields, &server.uri());
+    serve_target_chunks(&server, &mut state, fields).await;
+    let wrong_hash = hex::encode(fast_md5::digest(b"wrong!"));
+    state.patch_assets[0].target_file_hash = wrong_hash.clone();
+    state.target_snapshot.as_mut().unwrap().manifests[0]
+        .manifest
+        .assets[0]
+        .asset_hash_md5 = wrong_hash;
+    reseal(&mut state);
+    save_preinstall_state(dir.path(), &state).unwrap();
+    fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
+    fs::write(patching_chunk_dir(dir.path()).join("keep"), b"patch").unwrap();
+    let handle = DownloadHandle::new();
+    handle.cancel();
+    assert!(matches!(
+        apply_preinstall(&Client::new(), dir.path(), "2.0", Arc::new(|_| {}), &handle).await,
+        Err(SophonError::Cancelled)
+    ));
+    assert!(load_preinstall_state(dir.path(), "2.0").is_ok());
+    let result = apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(SophonError::AssemblyFailed { .. })),
+        "{result:?}"
+    );
+    assert!(load_preinstall_state(dir.path(), "2.0").is_ok());
+    assert!(patching_chunk_dir(dir.path()).join("keep").exists());
+    assert!(dir.path().join("chunks/chunk-game.zstd").exists());
+    assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("1.0"));
+}
+
+#[tokio::test]
+async fn legacy_recovery_rejects_substituted_target_and_manifest_ids() {
+    let state = snapshot_state(&[("game", "empty", b"")], "http://localhost");
+    let build = build_from_snapshot(state.target_snapshot.as_ref().unwrap(), "http://localhost");
+    for wrong_tag in [true, false] {
+        let mut bad_build = build.clone();
+        if wrong_tag {
+            bad_build.tag = "newer".into();
+        } else {
+            bad_build.manifests[0].manifest.id = "different-id".into();
+        }
+        let result = recover_legacy_from_branches(
+            &Client::new(),
+            &state,
+            vec![test_branch("main", "3.0")],
+            |_, tag| {
+                assert_eq!(tag, "2.0");
+                let build = bad_build.clone();
+                async { Ok(build) }
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SophonError::PreinstallStateInvalid(_))
+        ));
+    }
+}

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -35,7 +35,7 @@ use super::handle::DownloadHandle;
 use super::read_installed_tag;
 use super::{MAX_RETRIES, cancelable_sleep, retry_delay};
 use crate::api_scrape::{
-    DownloadInfo, SophonBuildData, SophonManifestMeta, SophonPatchManifestMeta,
+    DownloadInfo, PackageBranch, SophonBuildData, SophonManifestMeta, SophonPatchManifestMeta,
 };
 use crate::proto_parse::{
     SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
@@ -1623,6 +1623,29 @@ pub async fn apply_preinstall(
     updater: ProgressUpdater,
     handle: &DownloadHandle,
 ) -> SophonResult<()> {
+    apply_preinstall_with_resolver(client, game_dir, preinstall_tag, updater, handle, |state| {
+        recover_legacy_snapshot(client, state)
+    })
+    .await
+}
+
+// The production resolver is only invoked for legacy packages. Tests can make
+// any metadata access fail, without redirecting the client's TLS/network stack.
+async fn apply_preinstall_with_resolver<F, Fut>(
+    client: &Client,
+    game_dir: &Path,
+    preinstall_tag: &str,
+    updater: ProgressUpdater,
+    handle: &DownloadHandle,
+    recover: F,
+) -> SophonResult<()>
+where
+    F: FnOnce(PreinstallState) -> Fut,
+    Fut: std::future::Future<Output = SophonResult<TargetSnapshot>>,
+{
+    if handle.is_cancelled() {
+        return Err(SophonError::Cancelled);
+    }
     let mut state = load_preinstall_state(game_dir, preinstall_tag)?;
 
     let current_tag = read_installed_tag(game_dir).ok_or(SophonError::NoInstalledVersion)?;
@@ -1635,19 +1658,46 @@ pub async fn apply_preinstall(
         )));
     }
 
+    if state.target_snapshot.is_none() {
+        let snapshot = recover(state.clone()).await.map_err(|err| invalid_state(format!(
+            "Exact metadata for legacy preinstall {} is unavailable ({err}). Keep the cached package; retry when that release metadata is available, or use a normal update/repair.", state.tag
+        )))?;
+        state.target_snapshot = Some(snapshot);
+        // Migration is durable before any file changes, including filtered assets.
+        save_preinstall_state(game_dir, &state)?;
+    }
+    let snapshot = state.target_snapshot.as_ref().expect("resolved snapshot");
+    snapshot.validate(&state)?;
+    let legacy_coverage = snapshot.legacy_coverage;
+    let represented_vo: Vec<String> = snapshot
+        .manifests
+        .iter()
+        .filter(|m| is_known_vo_locale(&m.matching_field))
+        .map(|m| m.matching_field.to_ascii_lowercase())
+        .collect();
+    if legacy_coverage
+        && !snapshot
+            .manifests
+            .iter()
+            .any(|m| vo_lang_matches(&m.matching_field, &state.vo_lang))
+    {
+        log::warn!(
+            "Legacy preinstall {} omits requested VO {}. Preserving its recorded scope; run a normal update/repair afterwards for that voice pack.",
+            state.tag,
+            state.vo_lang
+        );
+    }
+    let download_over_context = DownloadOverContext::from_snapshot(snapshot);
+
     let chunks_dir = patching_chunk_dir(game_dir);
     let total_files = state.patch_assets.len() as u64;
     let applied_files = Arc::new(AtomicU64::new(0u64));
     let last_apply_update = AtomicU64::new(0);
 
     let game_dir_owned = game_dir.to_path_buf();
-    let filter_cache = tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned))
-        .await
-        .unwrap_or_else(|_| FilterCache::new(game_dir));
+    let filter_cache =
+        tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned)).await?;
     filter_patch_assets_for_removed_features(&filter_cache, &mut state.patch_assets);
-
-    let download_over_context =
-        fetch_download_over_context(client, &state.game_id, &state.vo_lang).await?;
 
     let regenerate_pkg_version = if state.game_id == "hk4e" {
         Some(download_over_context.clone())
@@ -1656,6 +1706,9 @@ pub async fn apply_preinstall(
     };
 
     for asset in &state.patch_assets {
+        if handle.is_cancelled() {
+            return Err(SophonError::Cancelled);
+        }
         if asset.patch_method == PatchMethod::Skip {
             applied_files.fetch_add(1, Ordering::Relaxed);
             log::warn!(
@@ -1717,7 +1770,7 @@ pub async fn apply_preinstall(
                                 skip_progress = true;
                                 break;
                             }
-                            if attempt == COPY_MAX_RETRIES {
+                            if attempt == COPY_MAX_RETRIES || !err.is_retryable() {
                                 log::warn!(
                                     "CopyOver failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
                                     path = asset.target_file_path,
@@ -1786,7 +1839,7 @@ pub async fn apply_preinstall(
                                 skip_progress = true;
                                 break;
                             }
-                            if attempt == PATCH_MAX_RETRIES {
+                            if attempt == PATCH_MAX_RETRIES || !err.is_retryable() {
                                 log::warn!(
                                     "HDiff patch failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
                                     path = asset.target_file_path,
@@ -1855,14 +1908,19 @@ pub async fn apply_preinstall(
         }
     }
 
+    if handle.is_cancelled() {
+        return Err(SophonError::Cancelled);
+    }
     if let Some(context) = regenerate_pkg_version {
         let gd = game_dir.to_path_buf();
-        let vo = state.vo_lang.clone();
-        tokio::task::spawn_blocking(move || regenerate_hk4e_pkg_version(&gd, &context, &[vo]))
-            .await??;
+        // Never overwrite an omitted VO pack's index with an empty target index.
+        tokio::task::spawn_blocking(move || {
+            regenerate_hk4e_pkg_version(&gd, &context, &represented_vo)
+        })
+        .await??;
     }
 
-    {
+    if !legacy_coverage {
         let gd = game_dir.to_path_buf();
         let df = state.deleted_files.clone();
         tokio::task::spawn_blocking(move || {
@@ -1881,6 +1939,11 @@ pub async fn apply_preinstall(
         .await?;
     }
 
+    // Legacy deleted_files lack matching-field provenance. Preserve them rather
+    // than risk removing an unrepresented VO pack; a normal update can reconcile.
+    if handle.is_cancelled() {
+        return Err(SophonError::Cancelled);
+    }
     {
         let gd = game_dir.to_path_buf();
         let tag = state.tag.clone();
@@ -2562,40 +2625,103 @@ fn apply_hdiff_patch_from_files(
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct DownloadOverContext {
-    pub build: SophonBuildData,
-    pub manifests: rustc_hash::FxHashMap<String, (DownloadInfo, SophonManifestProto)>,
+struct DownloadOverContext {
+    manifests: rustc_hash::FxHashMap<String, (DownloadInfo, SophonManifestProto)>,
 }
 
-pub async fn fetch_download_over_context(
-    client: &Client,
-    game_id: &str,
-    vo_lang: &str,
-) -> SophonResult<DownloadOverContext> {
-    let (_, pre_branch) = fetch_front_door(client, game_id).await?;
-    let pre_branch = pre_branch.ok_or(SophonError::NoPreinstallAvailable)?;
-    let build = fetch_build(client, &pre_branch, None).await?;
-
-    let mut manifests = rustc_hash::FxHashMap::default();
-    for meta in &build.manifests {
-        let should_fetch = meta.matching_field == "game"
-            || vo_lang_matches(&meta.matching_field, vo_lang)
-            || !is_known_vo_locale(&meta.matching_field);
-
-        if !should_fetch {
-            continue;
+impl DownloadOverContext {
+    fn from_snapshot(snapshot: &TargetSnapshot) -> Self {
+        Self {
+            manifests: snapshot
+                .manifests
+                .iter()
+                .map(|entry| {
+                    let mut manifest = entry.manifest.clone();
+                    normalize_full_download_manifest(&mut manifest);
+                    (
+                        entry.matching_field.clone(),
+                        (entry.chunk_download.clone(), manifest),
+                    )
+                })
+                .collect(),
         }
-
-        let manifest_result =
-            fetch_manifest(client, &meta.manifest_download, &meta.manifest.id).await?;
-        manifests.insert(
-            meta.matching_field.clone(),
-            (meta.chunk_download.clone(), manifest_result.manifest),
-        );
     }
+}
 
-    Ok(DownloadOverContext { build, manifests })
+async fn recover_legacy_snapshot(
+    client: &Client,
+    state: PreinstallState,
+) -> SophonResult<TargetSnapshot> {
+    let (branch, pre) = fetch_front_door(client, &state.game_id).await?;
+    let branches = branch.main.into_iter().chain(pre).collect();
+    recover_legacy_from_branches(client, &state, branches, |branch, tag| async move {
+        fetch_build(client, &branch, Some(&tag)).await
+    })
+    .await
+}
+
+async fn recover_legacy_from_branches<F, Fut>(
+    client: &Client,
+    state: &PreinstallState,
+    branches: Vec<PackageBranch>,
+    mut fetch_exact_build: F,
+) -> SophonResult<TargetSnapshot>
+where
+    F: FnMut(PackageBranch, String) -> Fut,
+    Fut: std::future::Future<Output = SophonResult<SophonBuildData>>,
+{
+    if state.main_manifest_ids.is_empty() {
+        return Err(invalid_state(
+            "Legacy package contains no saved target manifest IDs",
+        ));
+    }
+    let mut last_error = invalid_state("No main/pre branch available for the exact saved target");
+    for branch in branches {
+        let result = async {
+            let build = fetch_exact_build(branch, state.tag.clone()).await?;
+            if build.tag != state.tag {
+                return Err(invalid_state("Server substituted a different target tag"));
+            }
+            let mut manifests = Vec::with_capacity(state.main_manifest_ids.len());
+            // Saved IDs, NOT the corrected locale selector, define legacy scope.
+            for (field, id) in &state.main_manifest_ids {
+                let meta = build
+                    .manifests
+                    .iter()
+                    .find(|m| &m.matching_field == field && &m.manifest.id == id)
+                    .ok_or_else(|| {
+                        invalid_state(format!("Saved target manifest {field}/{id} is unavailable"))
+                    })?;
+                let result = fetch_manifest(client, &meta.manifest_download, id).await?;
+                manifests.push(TargetManifest {
+                    matching_field: field.clone(),
+                    manifest_id: id.clone(),
+                    chunk_download: meta.chunk_download.clone(),
+                    manifest: result.manifest,
+                });
+            }
+            let mut snapshot = TargetSnapshot {
+                version: 1,
+                game_id: state.game_id.clone(),
+                vo_lang: state.vo_lang.clone(),
+                installed_tag: state.installed_tag.clone(),
+                tag: state.tag.clone(),
+                build_id: build.build_id,
+                legacy_coverage: true,
+                manifests,
+                digest: String::new(),
+            };
+            snapshot.seal(&state.patch_assets, &state.deleted_files)?;
+            snapshot.validate(state)?;
+            Ok(snapshot)
+        }
+        .await;
+        match result {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err) => last_error = err,
+        }
+    }
+    Err(last_error)
 }
 
 async fn apply_download_over_with_retry(
@@ -2679,20 +2805,25 @@ async fn apply_download_over(
     }
 
     let download_semaphore = Arc::new(tokio::sync::Semaphore::new(super::DOWNLOAD_CONCURRENCY));
-    let chunk_futures = file_entry.asset_chunks.iter().map(|chunk| {
-        let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
-        chunk_path.set_extension("zstd");
-        let client = client.clone();
-        let chunk_download = chunk_download.clone();
-        let chunk = chunk.clone();
-        let handle = handle.clone();
-        let permit = Arc::clone(&download_semaphore);
-        async move {
-            let _permit = permit.acquire().await.expect("semaphore not closed");
-            download_chunk_with_retries(&client, &chunk_download, &chunk, &chunk_path, &handle)
-                .await
-        }
-    });
+    let mut seen_chunks = rustc_hash::FxHashSet::default();
+    let chunk_futures = file_entry
+        .asset_chunks
+        .iter()
+        .filter(|chunk| seen_chunks.insert(chunk.chunk_name.as_str()))
+        .map(|chunk| {
+            let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
+            chunk_path.set_extension("zstd");
+            let client = client.clone();
+            let chunk_download = chunk_download.clone();
+            let chunk = chunk.clone();
+            let handle = handle.clone();
+            let permit = Arc::clone(&download_semaphore);
+            async move {
+                let _permit = permit.acquire().await.expect("semaphore not closed");
+                download_chunk_with_retries(&client, &chunk_download, &chunk, &chunk_path, &handle)
+                    .await
+            }
+        });
     try_join_all(chunk_futures).await?;
 
     {
@@ -2704,19 +2835,11 @@ async fn apply_download_over(
             let tmp_dir = gd.join("tmp-patch-downloadover");
             fs::create_dir_all(&tmp_dir)?;
             let manifest = super::compact_manifest::CompactManifest::from(vec![file_entry]);
-            let chunk_count =
-                (manifest.file_chunk_range(0).end - manifest.file_chunk_range(0).start) as usize;
-            let total_bytes: usize = (0..chunk_count)
-                .map(|i| manifest.chunk(i).chunk_name.len())
-                .sum();
-            let mut chunk_arena =
-                super::compact_manifest::StringArena::with_capacity(chunk_count, total_bytes);
-            for ci in 0..chunk_count {
-                chunk_arena.intern(manifest.chunk(ci).chunk_name);
-            }
-            let chunk_lookup = super::installer::ChunkNameLookup::from_arena(chunk_arena);
-            let chunk_refcounts: Vec<AtomicU32> =
-                (0..chunk_count).map(|_| AtomicU32::new(1)).collect();
+            // No deletion ownership: these are shared cached payloads. Keep
+            // them on failure/cancellation and for other packages' fallback.
+            let chunk_lookup = super::installer::ChunkNameLookup::from_arena(
+                super::compact_manifest::StringArena::with_capacity(0, 0),
+            );
             let result = super::assembly::assemble_file(
                 &manifest,
                 0,
@@ -2724,7 +2847,7 @@ async fn apply_download_over(
                 &cd,
                 &tmp_dir,
                 &chunk_lookup,
-                &chunk_refcounts,
+                &[],
                 &vc,
                 false,
                 super::VerifyMode::Full, // preinstall always uses full verification
@@ -2735,7 +2858,15 @@ async fn apply_download_over(
                     path = tmp_dir.display(),
                 );
             }
-            result
+            result?;
+            let path = gd.join(manifest.file_name(0));
+            if !is_file_already_patched(&path, manifest.file_size(0), manifest.file_hash_md5(0)) {
+                return Err(SophonError::AssemblyFailed {
+                    file: manifest.file_name(0).into(),
+                    error: "DownloadOver output failed whole-file size/hash verification".into(),
+                });
+            }
+            Ok(())
         })
         .await??;
     }
