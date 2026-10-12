@@ -190,7 +190,9 @@ fn write_single_pkg_version(
         file.write_all(line.as_bytes())?;
     }
 
-    Ok(())
+    // BufWriter's drop ignores flush errors; repair must not report success
+    // when the final buffered bytes could not be written.
+    file.flush()
 }
 
 fn write_single_pkg_version_from_indices(

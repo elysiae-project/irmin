@@ -3,6 +3,33 @@ use crate::api_scrape::Compression;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+fn installer(
+    field: &str,
+    assets: Vec<SophonManifestAssetProperty>,
+    info: DownloadInfo,
+) -> SophonInstaller {
+    SophonInstaller {
+        manifest: SophonManifestProto { assets },
+        chunk_download: info,
+        label: field.into(),
+        matching_field: field.into(),
+        manifest_hash: String::new(),
+    }
+}
+
+async fn verify_assets(
+    client: &Client,
+    assets: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)>,
+    game_dir: &Path,
+    emit: impl FnMut(SophonProgress) + Send,
+) -> SophonResult<()> {
+    let installers = assets
+        .into_iter()
+        .map(|(asset, info)| installer("game", vec![asset], (*info).clone()))
+        .collect();
+    verify_installers(client, installers, "fixture", "en-US", game_dir, emit).await
+}
+
 fn empty_asset(name: &str) -> SophonManifestAssetProperty {
     SophonManifestAssetProperty {
         asset_name: name.into(),
@@ -337,6 +364,171 @@ async fn repair_nonempty_file_becomes_empty_but_directory_is_not_a_file() {
     .unwrap();
     assert_eq!(fs::read(dir.path().join("empty")).unwrap(), b"");
     assert!(!dir.path().join("directory").is_file());
+}
+
+#[tokio::test]
+async fn repair_default_english_without_record_repairs_voice_and_regenerates_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let voice_path = "data/English(US)/voice.pck";
+    let (voice, compressed) = chunk_asset(voice_path, b"english audio");
+    cache_chunk(dir.path(), &compressed);
+    fs::create_dir_all(dir.path().join("data/English(US)")).unwrap();
+    fs::write(dir.path().join(voice_path), b"damaged audio").unwrap();
+    let mut generated = empty_asset("pkg_version");
+    generated.asset_size = 123; // This CDN hash/size must not be used locally.
+    let assets = vec![
+        voice,
+        empty_asset("data/Chinese/missing.pck"),
+        empty_asset("data/ctable_streaming.dat"),
+        generated,
+        empty_asset("beyond_pkg_version"),
+    ];
+    let mut events = vec![];
+    verify_installers(
+        &Client::new(),
+        vec![installer("game", assets, (*download_info()).clone())],
+        "hk4e",
+        "en-US",
+        dir.path(),
+        |p| events.push(p),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read(dir.path().join(voice_path)).unwrap(),
+        b"english audio"
+    );
+    assert!(!dir.path().join("data/Chinese/missing.pck").exists());
+    assert!(!dir.path().join("data/ctable_streaming.dat").exists());
+    assert!(dir.path().join("beyond_pkg_version").is_file());
+    assert!(
+        fs::read_to_string(dir.path().join("pkg_version"))
+            .unwrap()
+            .contains(voice_path)
+    );
+    assert!(
+        fs::read_to_string(dir.path().join("Audio_English(US)_pkg_version"))
+            .unwrap()
+            .contains(voice_path)
+    );
+    assert_eq!(
+        fs::read_to_string(
+            dir.path()
+                .join("GenshinImpact_Data/Persistent/audio_lang_14")
+        )
+        .unwrap(),
+        "English(US)\n"
+    );
+    assert!(matches!(events.last(), Some(SophonProgress::Finished)));
+}
+
+#[tokio::test]
+async fn repair_preserves_star_rail_blacklist_and_rebuilds_app_info() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("StarRail_Data/Persistent")).unwrap();
+    fs::write(
+        dir.path()
+            .join("StarRail_Data/Persistent/DownloadBlacklist.json"),
+        "{\"fileName\":\"StarRail_Data/StreamingAssets/removed.pak\"}\n",
+    )
+    .unwrap();
+    let mut app = empty_asset("StarRail_Data/app.info");
+    app.asset_size = 100;
+    let assets = vec![
+        app,
+        empty_asset("StarRail_Data/StreamingAssets/removed.pak"),
+    ];
+    verify_installers(
+        &Client::new(),
+        vec![installer("game", assets, (*download_info()).clone())],
+        "hkrpg",
+        "en-US",
+        dir.path(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(
+        !dir.path()
+            .join("StarRail_Data/StreamingAssets/removed.pak")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("StarRail_Data/app.info")).unwrap(),
+        "Cognosphere\nhkrpg_global\n"
+    );
+}
+
+#[tokio::test]
+async fn repair_does_not_reinstall_removed_nap_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("ZenlessZoneZero_Data/Persistent")).unwrap();
+    fs::write(
+        dir.path()
+            .join("ZenlessZoneZero_Data/Persistent/KDelResource"),
+        "old-scenes",
+    )
+    .unwrap();
+    let installers = vec![
+        installer(
+            "game",
+            vec![empty_asset("active")],
+            (*download_info()).clone(),
+        ),
+        installer(
+            "old-scenes",
+            vec![empty_asset("removed")],
+            (*download_info()).clone(),
+        ),
+    ];
+    verify_installers(
+        &Client::new(),
+        installers,
+        "nap",
+        "en-US",
+        dir.path(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(dir.path().join("active").is_file());
+    assert!(!dir.path().join("removed").exists());
+}
+
+#[tokio::test]
+async fn repair_generation_failure_does_not_emit_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("pkg_version")).unwrap();
+    let mut events = vec![];
+    let result = verify_installers(&Client::new(), vec![], "hk4e", "en-US", dir.path(), |p| {
+        events.push(p)
+    })
+    .await;
+    assert!(matches!(result, Err(SophonError::Io(_))));
+    assert!(!events.iter().any(|p| matches!(p, SophonProgress::Finished)));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn repair_generation_flush_failure_does_not_emit_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/dev/full", dir.path().join("pkg_version")).unwrap();
+    let mut events = vec![];
+    let result = verify_installers(
+        &Client::new(),
+        vec![installer(
+            "game",
+            vec![empty_asset("empty")],
+            (*download_info()).clone(),
+        )],
+        "hk4e",
+        "en-US",
+        dir.path(),
+        |p| events.push(p),
+    )
+    .await;
+    assert!(matches!(result, Err(SophonError::Io(_))));
+    assert!(!events.iter().any(|p| matches!(p, SophonProgress::Finished)));
 }
 
 #[tokio::test]

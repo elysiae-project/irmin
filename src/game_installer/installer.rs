@@ -2730,45 +2730,109 @@ pub async fn verify_integrity(
     )
     .await?;
 
-    let qualifying: Vec<&SophonManifestMeta> = build
-        .manifests
-        .iter()
-        .filter(|m| {
-            m.matching_field == "game"
-                || api::vo_lang_matches(&m.matching_field, vo_lang)
-                || !api::is_known_vo_locale(&m.matching_field)
-        })
-        .collect();
-
-    if qualifying.is_empty() {
-        return Err(SophonError::NoGameManifest);
-    }
-
-    let mut manifest_results: Vec<SophonManifestProto> = Vec::with_capacity(qualifying.len());
-    let mut chunk_downloads: Vec<Arc<DownloadInfo>> = Vec::with_capacity(qualifying.len());
-    for meta in &qualifying {
-        let result =
-            api::fetch_manifest(client, &meta.manifest_download, &meta.manifest.id).await?;
-        manifest_results.push(result.manifest);
-        chunk_downloads.push(Arc::new(meta.chunk_download.clone()));
-    }
-
-    let all_assets: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)> = manifest_results
-        .into_iter()
-        .zip(chunk_downloads)
-        .flat_map(|(manifest, dl)| {
-            manifest
-                .assets
-                .into_iter()
-                .filter(|a| !a.is_directory())
-                .map(move |a| (a, Arc::clone(&dl)))
-        })
-        .collect();
-
-    verify_assets(client, all_assets, game_dir, emit).await
+    let installers = build_installers_from_data(client, &build, vo_lang).await?;
+    verify_installers(client, installers, game_id, vo_lang, game_dir, emit).await
 }
 
-async fn verify_assets(
+async fn verify_installers(
+    client: &Client,
+    mut installers: Vec<SophonInstaller>,
+    game_code: &str,
+    vo_lang: &str,
+    game_dir: &Path,
+    mut emit: impl FnMut(SophonProgress) + Send,
+) -> SophonResult<()> {
+    let vo_langs = vec![vo_lang.to_string()];
+    if game_code == "nap" {
+        let mut selected: Vec<_> = installers
+            .iter()
+            .map(|i| InstallerData {
+                chunk_download: Arc::new(i.chunk_download.clone()),
+                file_count: i.manifest.assets.len(),
+                label: i.label.clone(),
+                matching_field: i.matching_field.clone(),
+            })
+            .collect();
+        super::game_filters::filter_nap_installers(game_dir, &mut selected);
+        installers.retain(|i| {
+            selected
+                .iter()
+                .any(|s| s.matching_field == i.matching_field)
+        });
+    }
+    let mut all_assets = Vec::new();
+    let mut index_assets = Vec::new();
+    let mut has_binary_version = false;
+    for mut installer in installers {
+        let assets = &mut installer.manifest.assets;
+        match game_code {
+            "hk4e" => super::game_filters::filter_hk4e_asset_list(game_dir, assets, &vo_langs),
+            "hkrpg" => super::game_filters::filter_hkrpg_asset_list(game_dir, assets),
+            "nap" => super::game_filters::filter_nap_asset_list(game_dir, assets),
+            _ => {}
+        }
+        let download = Arc::new(installer.chunk_download);
+        for asset in installer.manifest.assets {
+            if asset.is_directory() {
+                continue;
+            }
+            has_binary_version |=
+                asset.asset_name == "StarRail_Data/StreamingAssets/BinaryVersion.bytes";
+            if game_code == "hk4e" {
+                // Package indexes need file metadata, not a second copy of all chunks.
+                index_assets.push(SophonManifestAssetProperty {
+                    asset_name: asset.asset_name.clone(),
+                    asset_type: asset.asset_type,
+                    asset_size: asset.asset_size,
+                    asset_hash_md5: asset.asset_hash_md5.clone(),
+                    asset_chunks: vec![],
+                });
+            }
+            let generated = match game_code {
+                "hk4e" => {
+                    asset.asset_name == "pkg_version"
+                        || (asset.asset_name.starts_with("Audio_")
+                            && asset.asset_name.ends_with("_pkg_version")
+                            && !asset.asset_name.contains('/'))
+                }
+                "hkrpg" => asset.asset_name == "StarRail_Data/app.info",
+                _ => false,
+            };
+            // beyond_pkg_version is NOT rebuilt by the local generator; repair
+            // it from the CDN rather than excluding it as if it were generated.
+            if !generated {
+                all_assets.push((asset, Arc::clone(&download)));
+            }
+        }
+    }
+    repair_assets(client, all_assets, game_dir, &mut emit).await?;
+    let gd = game_dir.to_path_buf();
+    let code = game_code.to_string();
+    tokio::task::spawn_blocking(move || -> SophonResult<()> {
+        match code.as_str() {
+            "hk4e" => {
+                super::game_filters::write_hk4e_audio_lang_record(&gd, &vo_langs)?;
+                let manifest = Arc::new(CompactManifest::from(index_assets));
+                super::game_filters::write_pkg_version_from_manifest(&gd, &manifest, &vo_langs)?;
+            }
+            "hkrpg" => {
+                super::game_filters::write_hkrpg_audio_lang_record(&gd, &vo_langs)?;
+                super::game_filters::write_hkrpg_app_info(&gd)?;
+                if has_binary_version {
+                    super::game_filters::write_hkrpg_binary_version_files(&gd)?;
+                }
+            }
+            "nap" => super::game_filters::write_nap_audio_lang_records(&gd, &vo_langs)?,
+            _ => {}
+        }
+        Ok(())
+    })
+    .await??;
+    emit(SophonProgress::Finished);
+    Ok(())
+}
+
+async fn repair_assets(
     client: &Client,
     mut all_assets: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)>,
     game_dir: &Path,
@@ -2888,7 +2952,6 @@ async fn verify_assets(
     let failed_count = failed_verifications.len() as u64;
 
     if failed_verifications.is_empty() {
-        emit(SophonProgress::Finished);
         return Ok(());
     }
 
@@ -3097,7 +3160,6 @@ async fn verify_assets(
     if let Err(err) = cache::save_verification_cache(game_dir, &verify_cache) {
         log::warn!("Failed to save verification cache after repair: {err}");
     }
-    emit(SophonProgress::Finished);
     Ok(())
 }
 
