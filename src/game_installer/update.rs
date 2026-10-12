@@ -13,11 +13,15 @@ use crate::api_scrape::SophonManifestMeta;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
     pub update_available: bool,
+    /// A remote preinstall or a usable local package is available.
     pub preinstall_available: bool,
+    /// A validated completed-package record exists (not merely a marker).
+    /// Legacy records may still need exact-target metadata recovery on apply.
     pub preinstall_downloaded: bool,
     pub current_tag: Option<String>,
     pub remote_tag: String,
     pub preinstall_tag: Option<String>,
+    /// Best-effort estimate: zero if unknown, or a conservative cached target total.
     pub update_compressed_size: u64,
     pub update_decompressed_size: u64,
     pub preinstall_compressed_size: u64,

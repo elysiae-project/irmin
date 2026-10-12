@@ -6,7 +6,11 @@
 //!   `cargo run --example preinstall -- <game_id> <vo_lang> <game_dir> --apply <tag>`
 //!
 //! `preinstall` downloads the patch package in the background; `apply_preinstall`
-//! writes it into the install on release. Ctrl-C cancels either.
+//! writes it into the install on release. Completed packages retain the exact
+//! target metadata, so release-day apply needs no live pre-download manifest.
+//! Payload chunks for new files or fallback repairs may still need the CDN.
+//! Legacy packages recover only their saved version; unavailable historical
+//! metadata returns an error without deleting the package. Ctrl-C cancels either.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -30,7 +34,9 @@ async fn main() {
     let result = match apply_tag {
         Some(tag) => {
             println!("applying preinstall {tag}...");
-            sophon.apply_preinstall(&tag, &handle, common::print_progress).await
+            sophon
+                .apply_preinstall(&tag, &handle, common::print_progress)
+                .await
         }
         None => {
             println!("checking for a preinstall...");
