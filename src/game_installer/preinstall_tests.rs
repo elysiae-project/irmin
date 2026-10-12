@@ -2374,6 +2374,268 @@ async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
 }
 
 #[tokio::test]
+async fn discovery_prefers_valid_live_package_and_keeps_its_sizes_when_queries_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_state(&[("game", "data.bin", b"target")], "http://localhost");
+    save_preinstall_state(dir.path(), &state).unwrap();
+    assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
+    for pre in [None, Some(test_branch("pre", "3.0"))] {
+        let queries = AtomicUsize::new(0);
+        let info = super::super::update::check_update_with_branches(
+            "nap",
+            "en",
+            dir.path(),
+            Some("1.0".into()),
+            test_branch("main", "2.0"),
+            pre,
+            |branch, from| {
+                queries.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(branch.tag, "2.0");
+                assert_eq!(from.as_deref(), Some("1.0"));
+                async { Err(SophonError::NoManifests) }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(info.update_available && info.preinstall_available && info.preinstall_downloaded);
+        assert_eq!(info.preinstall_tag.as_deref(), Some("2.0"));
+        assert_eq!(info.remote_tag, "2.0");
+        assert_eq!(
+            (
+                info.preinstall_compressed_size,
+                info.preinstall_decompressed_size
+            ),
+            (6, 6)
+        );
+        assert_eq!(
+            (info.update_compressed_size, info.update_decompressed_size),
+            (6, 6)
+        );
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn discovery_rejects_markers_arbitrary_json_corrupt_snapshots_and_wrong_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_state(&[("game", "data.bin", b"target")], "http://localhost");
+    let path = PreinstallState::state_file_path(dir.path(), "2.0");
+    fs::write(PreinstallState::marker_file_path(dir.path(), "2.0"), "2.0").unwrap();
+    for case in 0..5 {
+        match case {
+            0 => {}
+            1 => fs::write(&path, "{}").unwrap(),
+            2 => {
+                let mut corrupt = state.clone();
+                corrupt.target_snapshot.as_mut().unwrap().digest = "broken".into();
+                fs::write(&path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+            }
+            3 => {
+                let mut wrong_game = state.clone();
+                wrong_game.game_id = "hk4e".into();
+                wrong_game.target_snapshot.as_mut().unwrap().game_id = "hk4e".into();
+                reseal(&mut wrong_game);
+                save_preinstall_state(dir.path(), &wrong_game).unwrap();
+            }
+            _ => {
+                let mut wrong_source = state.clone();
+                wrong_source.installed_tag = "0.9".into();
+                wrong_source.target_snapshot.as_mut().unwrap().installed_tag = "0.9".into();
+                reseal(&mut wrong_source);
+                save_preinstall_state(dir.path(), &wrong_source).unwrap();
+            }
+        }
+        let info = super::super::update::check_update_with_branches(
+            "nap",
+            "en",
+            dir.path(),
+            Some("1.0".into()),
+            test_branch("main", "2.0"),
+            Some(test_branch("pre", "3.0")),
+            |branch, _| async move {
+                Ok(if branch.tag == "3.0" {
+                    (300, 900)
+                } else {
+                    (200, 600)
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!info.preinstall_downloaded, "case {case}");
+        assert_eq!(info.preinstall_tag.as_deref(), Some("3.0"));
+        assert_eq!(
+            (
+                info.preinstall_compressed_size,
+                info.preinstall_decompressed_size
+            ),
+            (300, 900)
+        );
+    }
+}
+
+#[tokio::test]
+async fn successful_apply_removes_only_its_package_state_not_shared_patch_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let (mut state, _) = patch_download_fixture("http://localhost");
+    state.downloaded_chunks.insert("patch".into());
+    // A legitimate patch-only asset need not appear in the normal manifest.
+    state.target_snapshot.as_mut().unwrap().manifests[0]
+        .manifest
+        .assets
+        .clear();
+    reseal(&mut state);
+    save_preinstall_state(dir.path(), &state).unwrap();
+    fs::write(PreinstallState::marker_file_path(dir.path(), "2.0"), "2.0").unwrap();
+    let mut future = state.clone();
+    future.tag = "3.0".into();
+    future.target_snapshot.as_mut().unwrap().tag = "3.0".into();
+    reseal(&mut future);
+    save_preinstall_state(dir.path(), &future).unwrap();
+    let future_path = PreinstallState::state_file_path(dir.path(), "3.0");
+    let future_before = fs::read(&future_path).unwrap();
+    fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
+    fs::write(patching_chunk_dir(dir.path()).join("patch"), b"target").unwrap();
+    fs::write(
+        patching_chunk_dir(dir.path()).join("another-incomplete-package"),
+        b"keep",
+    )
+    .unwrap();
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), b"target");
+    assert!(!PreinstallState::state_file_path(dir.path(), "2.0").exists());
+    assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
+    assert_eq!(fs::read(future_path).unwrap(), future_before);
+    assert_eq!(
+        fs::read(patching_chunk_dir(dir.path()).join("patch")).unwrap(),
+        b"target"
+    );
+    assert_eq!(
+        fs::read(patching_chunk_dir(dir.path()).join("another-incomplete-package")).unwrap(),
+        b"keep"
+    );
+}
+
+#[tokio::test]
+async fn planning_captures_each_selected_manifest_once_with_its_download_descriptor() {
+    use prost::Message;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let fields: &[(&str, &str, &[u8])] = &[
+        ("game", "data.bin", b"new-game"),
+        ("en-us", "voice.bin", b"new-voice"),
+        ("cutscenes", "movie.bin", b"new-movie"),
+    ];
+    let mut fixture = snapshot_state(fields, &server.uri());
+    serve_target_chunks(&server, &mut fixture, fields).await;
+    let snapshot = fixture.target_snapshot.as_mut().unwrap();
+    for entry in &mut snapshot.manifests {
+        entry.manifest.assets[0].asset_chunks[0].chunk_old_offset = 0;
+        Mock::given(path(format!("/manifests/{}", entry.manifest_id)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(entry.manifest.encode_to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let main = build_from_snapshot(snapshot, &server.uri());
+    let patch_dl = DownloadInfo {
+        url_prefix: server.uri(),
+        url_suffix: "patch-manifests".into(),
+        ..make_download_info()
+    };
+    Mock::given(path("/patch-manifests/empty-patch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(crate::proto_parse::SophonPatchProto::default().encode_to_vec()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let patch = SophonPatchBuildData {
+        build_id: "exact-build".into(),
+        patch_id: "patch-id".into(),
+        tag: "2.0".into(),
+        manifests: vec![SophonPatchManifestMeta {
+            category_id: String::new(),
+            category_name: String::new(),
+            matching_field: "game".into(),
+            manifest: crate::api_scrape::ManifestFileInfo {
+                id: "empty-patch".into(),
+                checksum: String::new(),
+                compressed_size: "0".into(),
+                uncompressed_size: "0".into(),
+            },
+            diff_download: patch_dl.clone(),
+            manifest_download: patch_dl,
+            stats: HashMap::new(),
+        }],
+    };
+    let mut wrong = main.clone();
+    wrong.tag = "3.0".into();
+    assert!(
+        build_preinstall_plan_from_builds(
+            &Client::new(),
+            "nap",
+            "en",
+            "1.0".into(),
+            patch.clone(),
+            wrong
+        )
+        .await
+        .is_err()
+    );
+    let plan =
+        build_preinstall_plan_from_builds(&Client::new(), "nap", "en", "1.0".into(), patch, main)
+            .await
+            .unwrap();
+    assert_eq!(plan.installed_tag, "1.0");
+    assert_eq!(plan.target_snapshot.manifests.len(), 3);
+    for entry in &plan.target_snapshot.manifests {
+        assert_eq!(entry.chunk_download.url_suffix, entry.matching_field);
+        assert_eq!(
+            entry.manifest.assets[0].asset_chunks[0].chunk_old_offset,
+            -1
+        );
+    }
+    preinstall_download(
+        &Client::new(),
+        plan,
+        dir.path(),
+        "nap",
+        "en",
+        DownloadHandle::new(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+    for &(_, path, data) in fields {
+        assert_eq!(fs::read(dir.path().join(path)).unwrap(), data);
+    }
+}
+
+#[tokio::test]
 async fn legacy_recovery_rejects_substituted_target_and_manifest_ids() {
     let state = snapshot_state(&[("game", "empty", b"")], "http://localhost");
     let build = build_from_snapshot(state.target_snapshot.as_ref().unwrap(), "http://localhost");
