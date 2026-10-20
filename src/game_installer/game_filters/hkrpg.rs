@@ -2,8 +2,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-
 use super::write_lang_file;
+use crate::game_installer::api::normalize_vo_locale;
 use crate::proto_parse::SophonManifestAssetProperty;
 
 const AUDIO_LANG_FILE: &str = "AudioLaucherRecord.txt";
@@ -85,11 +85,11 @@ pub fn write_audio_lang_record(game_dir: &Path, vo_langs: &[String]) -> std::io:
 }
 
 fn locale_code_to_audio_lang_name(locale: &str) -> Option<&'static str> {
-    match locale {
-        "zh-cn" | "zh-tw" | "cn" => Some("Chinese"),
-        "en-us" | "en" => Some("English(US)"),
-        "ja-jp" | "jp" => Some("Japanese"),
-        "ko-kr" | "kr" => Some("Korean"),
+    match normalize_vo_locale(locale)? {
+        "zh-cn" => Some("Chinese"),
+        "en-us" => Some("English(US)"),
+        "ja-jp" => Some("Japanese"),
+        "ko-kr" => Some("Korean"),
         _ => None,
     }
 }

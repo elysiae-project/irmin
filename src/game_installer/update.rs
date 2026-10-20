@@ -13,11 +13,15 @@ use crate::api_scrape::SophonManifestMeta;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
     pub update_available: bool,
+    /// A remote preinstall or a usable local package is available.
     pub preinstall_available: bool,
+    /// A validated completed-package record exists (not merely a marker).
+    /// Legacy records may still need exact-target metadata recovery on apply.
     pub preinstall_downloaded: bool,
     pub current_tag: Option<String>,
     pub remote_tag: String,
     pub preinstall_tag: Option<String>,
+    /// Best-effort estimate: zero if unknown, or a conservative cached target total.
     pub update_compressed_size: u64,
     pub update_decompressed_size: u64,
     pub preinstall_compressed_size: u64,
@@ -36,57 +40,99 @@ pub async fn check_update(
         });
     let (branch, pre_download_branch) = front_door?;
 
-    let main_branch = branch.main.as_ref().ok_or(SophonError::NoGameManifest)?;
-    let remote_tag = main_branch.tag.clone();
+    let main_branch = branch.main.ok_or(SophonError::NoGameManifest)?;
+    check_update_with_branches(
+        game_id,
+        vo_lang,
+        game_dir,
+        current_tag,
+        main_branch,
+        pre_download_branch,
+        |branch, from| async move {
+            if let Some(from) = from {
+                fetch_diff_sizes(client, &branch, &from, &branch.tag, vo_lang).await
+            } else {
+                fetch_build_sizes(client, &branch, vo_lang).await
+            }
+        },
+    )
+    .await
+}
 
-    let update_available = current_tag
-        .as_deref()
-        .map(|t| t != remote_tag)
-        .unwrap_or(false);
+// Branch discovery is separate from optional size queries, so local completed
+// packages remain usable when historical build/manifest endpoints disappear.
+pub(super) async fn check_update_with_branches<F, Fut>(
+    game_id: &str,
+    vo_lang: &str,
+    game_dir: &Path,
+    current_tag: Option<String>,
+    main_branch: PackageBranch,
+    pre_download_branch: Option<PackageBranch>,
+    mut query_sizes: F,
+) -> SophonResult<UpdateInfo>
+where
+    F: FnMut(PackageBranch, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = SophonResult<(u64, u64)>>,
+{
+    let remote_tag = main_branch.tag.clone();
+    let update_available = current_tag.as_deref().is_some_and(|tag| tag != remote_tag);
+    let cached_live = update_available
+        .then(|| {
+            super::preinstall::cached_preinstall(
+                game_dir,
+                &remote_tag,
+                game_id,
+                vo_lang,
+                current_tag.as_deref(),
+            )
+        })
+        .flatten();
+    let cached = cached_live.or_else(|| {
+        pre_download_branch.as_ref().and_then(|pre| {
+            super::preinstall::cached_preinstall(
+                game_dir,
+                &pre.tag,
+                game_id,
+                vo_lang,
+                current_tag.as_deref(),
+            )
+        })
+    });
 
     let (update_compressed_size, update_decompressed_size) = if update_available {
-        if let Some(ref installed) = current_tag {
-            fetch_diff_sizes(client, main_branch, installed, &remote_tag, vo_lang).await?
-        } else {
-            (0, 0)
+        match query_sizes(main_branch, current_tag.clone()).await {
+            Ok(sizes) => sizes,
+            Err(err) => {
+                log::warn!("Failed to estimate update sizes (availability is unchanged): {err}");
+                cached
+                    .as_ref()
+                    .filter(|state| state.tag == remote_tag)
+                    .map(|state| state.cached_sizes())
+                    .unwrap_or((0, 0))
+            }
         }
     } else {
         (0, 0)
     };
 
+    let preinstall_downloaded = cached.is_some();
     let (
         preinstall_available,
-        mut preinstall_tag,
+        preinstall_tag,
         preinstall_compressed_size,
         preinstall_decompressed_size,
-    ) = match pre_download_branch {
-        Some(ref pre) => {
-            let tag = pre.tag.clone();
-            match fetch_build_sizes(client, pre, vo_lang).await {
-                Ok((cs, ds)) => (true, Some(tag), cs, ds),
-                Err(err) => {
-                    log::warn!("Failed to fetch preinstall sizes: {err}");
-                    (true, Some(tag), 0, 0)
-                }
-            }
-        }
-        None => (false, None, 0, 0),
-    };
-
-    let preinstall_downloaded = if let Some(ref ptag) = preinstall_tag {
-        let marker = game_dir.join(format!(".sophon_preinstall_{ptag}"));
-        let state_file = game_dir.join(format!(".sophon_preinstall_{ptag}.json"));
-        marker.exists() || state_file.exists()
-    } else if update_available {
-        let marker = game_dir.join(format!(".sophon_preinstall_{remote_tag}"));
-        let state_file = game_dir.join(format!(".sophon_preinstall_{remote_tag}.json"));
-        let downloaded = marker.exists() || state_file.exists();
-        if downloaded {
-            preinstall_tag = Some(remote_tag.clone());
-        }
-        downloaded
+    ) = if let Some(state) = cached {
+        let (cs, ds) = state.cached_sizes();
+        (true, Some(state.tag), cs, ds)
+    } else if let Some(pre) = pre_download_branch {
+        let tag = pre.tag.clone();
+        let (cs, ds) = query_sizes(pre, None).await.unwrap_or_else(|err| {
+            log::warn!("Failed to fetch preinstall sizes: {err}");
+            (0, 0)
+        });
+        (true, Some(tag), cs, ds)
     } else {
-        false
+        (false, None, 0, 0)
     };
 
     Ok(UpdateInfo {
@@ -108,7 +154,12 @@ pub async fn fetch_build_sizes(
     branch: &PackageBranch,
     vo_lang: &str,
 ) -> SophonResult<(u64, u64)> {
-    let build = fetch_build(client, branch, None).await?;
+    let build = fetch_build(client, branch, Some(&branch.tag)).await?;
+    if build.tag != branch.tag {
+        return Err(SophonError::PreinstallStateInvalid(
+            "Size metadata returned a different target tag".into(),
+        ));
+    }
 
     // Match the same filter as build_installers_from_data:
     // game + VO language + non-VO manifests (cutscenes, etc.)
@@ -147,6 +198,11 @@ pub async fn fetch_diff_sizes(
         fetch_build(client, branch, Some(to_tag)),
     )?;
 
+    if old_build.tag != from_tag || new_build.tag != to_tag {
+        return Err(SophonError::PreinstallStateInvalid(
+            "Update size metadata returned a different version".into(),
+        ));
+    }
     let mut cs = 0u64;
     let mut ds = 0u64;
     let mut seen_chunks: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();

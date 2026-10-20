@@ -107,6 +107,10 @@ impl DownloadHandle {
         total_bytes: u64,
     ) -> SophonResult<()> {
         loop {
+            // Capture broadcast notifications before reading state or invoking
+            // the callback: either can race with resume/cancel. notify_waiters
+            // also wakes an already-created future that has not been polled.
+            let notified = self.pause_notify.notified();
             match self.get_state() {
                 ControlState::Running => return Ok(()),
                 ControlState::Cancelled => return Err(SophonError::Cancelled),
@@ -115,7 +119,7 @@ impl DownloadHandle {
                         downloaded_bytes,
                         total_bytes,
                     });
-                    self.pause_notify.notified().await;
+                    notified.await;
                 }
             }
         }
@@ -190,6 +194,85 @@ mod tests {
         let state = result.await.unwrap();
         assert!(state.is_err());
         assert!(matches!(state.unwrap_err(), super::SophonError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn handle_resume_from_paused_callback() {
+        let handle = DownloadHandle::new();
+        handle.pause();
+        let updater = |_| handle.resume();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.wait_if_paused(&updater, 0, 100),
+        )
+        .await
+        .expect("resume from the callback must not lose its notification");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_from_paused_callback() {
+        let handle = DownloadHandle::new();
+        handle.pause();
+        let updater = |_| handle.cancel();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.wait_if_paused(&updater, 0, 100),
+        )
+        .await
+        .expect("cancellation from the callback must not lose its notification");
+        assert!(matches!(result, Err(SophonError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn handle_resume_then_repause_rechecks_state() {
+        let handle = DownloadHandle::new();
+        handle.pause();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let updater = |_| {
+            handle.resume();
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                handle.pause();
+            }
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.wait_if_paused(&updater, 0, 100),
+        )
+        .await
+        .expect("a second pause must be checked after waking")
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn handle_broadcast_wakes_all_waiters_repeatedly() {
+        let handle = DownloadHandle::new();
+        let updater = |_| {};
+        for _ in 0..20 {
+            handle.pause();
+            let mut waiters: Vec<_> = (0..16)
+                .map(|_| Box::pin(handle.wait_if_paused(&updater, 0, 100)))
+                .collect();
+            for waiter in &mut waiters {
+                assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+            }
+            handle.resume();
+            let results = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                futures_util::future::join_all(waiters),
+            )
+            .await
+            .expect("resume must broadcast to every paused worker");
+            assert!(results.iter().all(Result::is_ok));
+        }
+        handle.cancel();
+        handle.resume();
+        handle.pause();
+        assert!(matches!(
+            handle.wait_if_paused(&updater, 0, 100).await,
+            Err(SophonError::Cancelled)
+        ));
     }
 
     #[test]

@@ -71,6 +71,20 @@ Supported voice pack locales:
 
 `SophonProgress` is a serde-serializable enum. Each variant reports the relevant counters; `Finished` signals a clean end. Errors come back as `SophonError` from the pipeline.
 
+### Manual integrity repair
+
+`verify_integrity` hashes installed files rather than trusting persisted size/mtime cache hits, regardless of the builder's download verification mode. It repairs missing or damaged files, respects the selected voice language and the game's removed-resource filters, and regenerates launcher-owned metadata. Repair errors and worker failures return `Err`; `Finished` is emitted only after repair and metadata generation succeed. Plugins and SDKs are outside this operation's scope.
+
+### Applying preinstalls after release
+
+Completed preinstalls now save the exact target manifests and each manifest's chunk-download information in their package state. Applying these packages does not need the pre-download branch, build metadata, or manifest endpoints to remain available, and cannot silently switch to a newer pre-download target.
+
+This is **metadata independence, not fully offline installation**. New files and patch-repair fallbacks can still need payload chunks from the CDN. An interrupted, incomplete preinstall still needs upstream metadata to rebuild its download plan after restart.
+
+Older package states remain readable. Irmin tries to recover their exact saved target and manifest IDs before changing game files; if that metadata is gone, apply returns an actionable error and preserves the downloaded package. Legacy packages retain their recorded voice scope: omitted voice packs generate a warning and need a subsequent normal update/repair. Legacy deletion lists lack scope information, so obsolete files are conservatively retained rather than risking deletion of an omitted voice pack; they may require separate cleanup.
+
+Successful apply removes that package's metadata and marker. Shared patch/chunk payloads are retained because other completed or interrupted packages may still need them. Failed or cancelled applies retain metadata for retry.
+
 ## How the pipeline works
 
 A download starts by fetching a manifest from the game's delivery API. The manifest lists every file, its size, and the chunks that compose it. Irmin checks what is already on disk, decides which chunks it still needs, and pulls them in parallel. In `Full` mode, chunks arrive zstd-compressed and irmin writes them to temp files. The assembler stitches them into final files, runs integrity checks, and installs any plugins or SDKs the manifest requests. In `Deferred`/`None` modes, irmin decompresses chunks inline into their final positions (the "eager" path), skipping intermediate IO.

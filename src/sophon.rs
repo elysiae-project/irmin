@@ -7,13 +7,13 @@ use std::sync::{Arc, OnceLock};
 
 use rustc_hash::FxHashMap;
 
+use crate::SophonProgress;
 use crate::client::DownloadClient;
 use crate::game_installer::{
     self, CompletedFiles, DownloadHandle, InstallCallbacks, InstallOptions, ResumeContext,
     SophonError, StateSaver, UpdateInfo, VerifyMode,
 };
 use crate::types::{DownloadState, DownloadType, ResumeInfo};
-use crate::SophonProgress;
 
 /// Closure accepted by every progress-bearing method. Implementations must be
 /// `'static` so the library can share the callback across worker tasks.
@@ -168,14 +168,15 @@ impl Sophon {
 
         progress(SophonProgress::FetchingManifest);
 
-        let (installers, deleted_files, new_tag, manifest_hash) = game_installer::build_update_installers(
-            &self.client,
-            &self.game_id,
-            &self.vo_lang,
-            &current_tag,
-            &self.game_dir,
-        )
-        .await?;
+        let (installers, deleted_files, new_tag, manifest_hash) =
+            game_installer::build_update_installers(
+                &self.client,
+                &self.game_id,
+                &self.vo_lang,
+                &current_tag,
+                &self.game_dir,
+            )
+            .await?;
 
         let (resume, options) = self.resolve_resume(handle, DownloadType::Update, &manifest_hash);
         let callbacks = self.build_callbacks(
@@ -207,7 +208,8 @@ impl Sophon {
     }
 
     /// Pre-download an upcoming version's patch package into `game_dir`,
-    /// persisting chunk progress for resume. Returns
+    /// persisting chunk progress for resume. Completed packages retain their
+    /// exact target metadata for release-day application. Returns
     /// [`SophonError::NoPreinstallAvailable`] when no preinstall exists.
     pub async fn preinstall(
         &self,
@@ -217,9 +219,13 @@ impl Sophon {
         let progress = Arc::new(on_progress);
         progress(SophonProgress::FetchingManifest);
 
-        let plan =
-            game_installer::build_preinstall_plan(&self.client, &self.game_id, &self.vo_lang, &self.game_dir)
-                .await?;
+        let plan = game_installer::build_preinstall_plan(
+            &self.client,
+            &self.game_id,
+            &self.vo_lang,
+            &self.game_dir,
+        )
+        .await?;
 
         let state_file = self.state_file();
         let prev_chunks: HashMap<String, u64> = self
@@ -249,7 +255,10 @@ impl Sophon {
     }
 
     /// Apply a previously downloaded preinstall package identified by
-    /// `preinstall_tag` and verify the result.
+    /// `preinstall_tag` and verify the result. New packages use saved target
+    /// metadata even after upstream pre-download metadata disappears. Payload
+    /// chunks may still require the CDN. Legacy packages require exact-target
+    /// metadata recovery; failure preserves their cached state and payloads.
     pub async fn apply_preinstall(
         &self,
         preinstall_tag: &str,
@@ -257,19 +266,37 @@ impl Sophon {
         on_progress: impl ProgressFn,
     ) -> Result<(), SophonError> {
         let progress = Arc::new(on_progress);
-        game_installer::apply_preinstall(&self.client, &self.game_dir, preinstall_tag, progress, handle)
-            .await
+        game_installer::apply_preinstall(
+            &self.client,
+            &self.game_dir,
+            preinstall_tag,
+            progress,
+            handle,
+        )
+        .await
     }
 
     /// Query update and preinstall availability and sizes without mutating disk.
     pub async fn check_update(&self) -> Result<UpdateInfo, SophonError> {
-        game_installer::check_update(&self.client, &self.game_id, &self.vo_lang, &self.game_dir).await
+        game_installer::check_update(&self.client, &self.game_id, &self.vo_lang, &self.game_dir)
+            .await
     }
 
-    /// Verify installed files and re-download any whose hash mismatches.
+    /// Hash installed files and re-download missing or damaged files.
+    ///
+    /// This explicit repair bypasses persisted verification-cache hits, honors
+    /// the selected voice language and game resource exclusions, and regenerates
+    /// launcher-owned metadata. `Ok(())` and `Finished` are emitted only after
+    /// successful repair and regeneration. Plugins/SDKs are outside this scope.
     pub async fn verify_integrity(&self, on_progress: impl ProgressFn) -> Result<(), SophonError> {
-        game_installer::verify_integrity(&self.client, &self.game_id, &self.vo_lang, &self.game_dir, on_progress)
-            .await
+        game_installer::verify_integrity(
+            &self.client,
+            &self.game_id,
+            &self.vo_lang,
+            &self.game_dir,
+            on_progress,
+        )
+        .await
     }
 
     /// `true` iff a parseable resume state for this game exists in `state_dir`.
@@ -279,8 +306,10 @@ impl Sophon {
 
     /// Resume state summary, if a parseable state exists.
     pub fn resume_info(&self) -> Option<ResumeInfo> {
-        load_download_state(&self.state_dir, &self.game_id)
-            .map(|s| ResumeInfo { game_id: s.game_id, download_type: s.download_type })
+        load_download_state(&self.state_dir, &self.game_id).map(|s| ResumeInfo {
+            game_id: s.game_id,
+            download_type: s.download_type,
+        })
     }
 
     /// Installed game tag, if an installation is present in `game_dir`.
@@ -429,7 +458,10 @@ fn atomic_write(target: &Path, data: &[u8]) {
 
 /// Per-game resume-state file path under `state_dir`.
 pub fn state_file_path(state_dir: &Path, game_id: &str) -> PathBuf {
-    state_dir.join(format!("{}{}{}", STATE_FILE_PREFIX, game_id, STATE_FILE_SUFFIX))
+    state_dir.join(format!(
+        "{}{}{}",
+        STATE_FILE_PREFIX, game_id, STATE_FILE_SUFFIX
+    ))
 }
 
 /// Load the persisted resume state for `game_id` from `state_dir`. Returns
@@ -495,7 +527,10 @@ mod tests {
 
         let mut chunks = HashMap::new();
         chunks.insert("c0".to_string(), 10);
-        write_state(&s, &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "h", chunks));
+        write_state(
+            &s,
+            &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "h", chunks),
+        );
 
         let loaded = s.load_state().expect("state loads");
         assert_eq!(loaded.game_id, "gameA");
@@ -515,13 +550,19 @@ mod tests {
         let s = make_sophon("gameA", &game_dir, &state_dir);
         let mut chunks = HashMap::new();
         chunks.insert("c0".to_string(), 10);
-        write_state(&s, &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "h", chunks));
+        write_state(
+            &s,
+            &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "h", chunks),
+        );
 
         let (resume, options) = s.resolve_resume(&DownloadHandle::new(), DownloadType::Fresh, "h");
         assert!(options.is_resume);
         assert_eq!(resume.prev_manifest_hash, "h");
         assert_eq!(resume.prev_downloaded_chunks.get("c0"), Some(&10));
-        assert!(game_dir.join("chunks").exists(), "chunks dir untouched on reuse");
+        assert!(
+            game_dir.join("chunks").exists(),
+            "chunks dir untouched on reuse"
+        );
     }
 
     #[test]
@@ -535,9 +576,19 @@ mod tests {
         std::fs::write(chunks_dir.join("old.zstd"), b"x").unwrap();
 
         let s = make_sophon("gameA", &game_dir, &state_dir);
-        write_state(&s, &sample_state("gameA", "en-US", &game_dir.to_string_lossy(), "old", HashMap::new()));
+        write_state(
+            &s,
+            &sample_state(
+                "gameA",
+                "en-US",
+                &game_dir.to_string_lossy(),
+                "old",
+                HashMap::new(),
+            ),
+        );
 
-        let (resume, options) = s.resolve_resume(&DownloadHandle::new(), DownloadType::Fresh, "new");
+        let (resume, options) =
+            s.resolve_resume(&DownloadHandle::new(), DownloadType::Fresh, "new");
         assert!(!options.is_resume);
         assert!(resume.prev_manifest_hash.is_empty());
         assert!(resume.prev_downloaded_chunks.is_empty());
@@ -551,7 +602,16 @@ mod tests {
         let state_dir = tmp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let s = make_sophon("gameA", &game_dir, &state_dir);
-        write_state(&s, &sample_state("gameA", "zh-CN", &game_dir.to_string_lossy(), "h", HashMap::new()));
+        write_state(
+            &s,
+            &sample_state(
+                "gameA",
+                "zh-CN",
+                &game_dir.to_string_lossy(),
+                "h",
+                HashMap::new(),
+            ),
+        );
 
         let (resume, options) = s.resolve_resume(&DownloadHandle::new(), DownloadType::Fresh, "h");
         assert!(!options.is_resume);

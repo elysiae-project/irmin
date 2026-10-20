@@ -2,6 +2,7 @@ mod hk4e;
 mod hkrpg;
 mod nap;
 
+pub(crate) use hk4e::is_generated_pkg_version;
 pub use hk4e::{
     filter_hk4e_asset_list, find_hk4e_persistent_dir,
     write_audio_lang_record as write_hk4e_audio_lang_record, write_pkg_version_from_manifest,
@@ -17,7 +18,10 @@ pub use nap::{filter_nap_asset_list, filter_nap_installers, write_nap_audio_lang
 /// locally (filtered or rewritten), so a byte-level CDN patch for it can never
 /// apply and must be skipped during preinstall apply.
 pub fn is_sophon_synthesized_asset(game_code: &str, target_file_path: &str) -> bool {
-    let name = target_file_path.rsplit('/').next().unwrap_or(target_file_path);
+    let name = target_file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(target_file_path);
     match game_code {
         "hk4e" => {
             name == "pkg_version"
@@ -122,7 +126,10 @@ mod tests {
     #[test]
     fn test_is_sophon_synthesized_asset_other_games_false() {
         assert!(!is_sophon_synthesized_asset("nap", "pkg_version"));
-        assert!(!is_sophon_synthesized_asset("bh3", "ZenlessZoneZero_Data/app.info"));
+        assert!(!is_sophon_synthesized_asset(
+            "bh3",
+            "ZenlessZoneZero_Data/app.info"
+        ));
         assert!(!is_sophon_synthesized_asset("np", "GenshinImpact.exe"));
     }
 
@@ -131,6 +138,52 @@ mod tests {
         assert!(!is_sophon_synthesized_asset("hk4e", "GenshinImpact.exe"));
         assert!(!is_sophon_synthesized_asset("hk4e", "pkg_version.txt"));
         assert!(!is_sophon_synthesized_asset("hk4e", ""));
+    }
+
+    #[test]
+    fn audio_metadata_normalizes_only_supported_locale_aliases() {
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["en-US", "en-us", "en", "EN"], "English(US)\n", "En\n"),
+            (
+                &["zh-CN", "zh-cn", "zh-TW", "zh-tw", "cn", "CN"],
+                "Chinese\n",
+                "Cn\n",
+            ),
+            (&["ja-JP", "ja-jp", "jp", "JP"], "Japanese\n", "Jp\n"),
+            (&["ko-KR", "ko-kr", "kr", "KR"], "Korean\n", "Kr\n"),
+            (
+                &[
+                    "fr-fr", "en-GB", "zh-HK", "zh", "tw", "ja", "ko", "en_US", " en-us ", "",
+                ],
+                "",
+                "",
+            ),
+        ];
+        for &(aliases, full_name, abbreviation) in cases {
+            for alias in aliases {
+                let dir = tempfile::tempdir().unwrap();
+                let vo_langs = [alias.to_string()];
+                write_hk4e_audio_lang_record(dir.path(), &vo_langs).unwrap();
+                write_hkrpg_audio_lang_record(dir.path(), &vo_langs).unwrap();
+                write_nap_audio_lang_records(dir.path(), &vo_langs).unwrap();
+
+                for (path, expected) in [
+                    ("GenshinImpact_Data/Persistent/audio_lang_14", full_name),
+                    ("StarRail_Data/Persistent/AudioLaucherRecord.txt", full_name),
+                    (
+                        "ZenlessZoneZero_Data/Persistent/audio_lang_launcher",
+                        full_name,
+                    ),
+                    ("ZenlessZoneZero_Data/Persistent/audio_lang", abbreviation),
+                ] {
+                    assert_eq!(
+                        fs::read_to_string(dir.path().join(path)).unwrap(),
+                        expected,
+                        "path={path}, alias={alias}",
+                    );
+                }
+            }
+        }
     }
 
     // write_lang_file
