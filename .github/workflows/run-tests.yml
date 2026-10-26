@@ -17,14 +17,15 @@ jobs:
                     - runner: ubuntu-24.04-arm
                       arch: aarch64
         runs-on: ${{ matrix.runner }}
-        container:
-            image: archlinux:latest
         steps:
             - name: Clone repository
               uses: actions/checkout@v6
 
             - name: Install dependencies
-              run: pacman -Syu base-devel rustup --noconfirm
+              run: |
+                sudo apt update
+                sudo apt install build-essential
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
             
             - name: Run Tests
               run: |
