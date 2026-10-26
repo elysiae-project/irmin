@@ -13,6 +13,7 @@ exclude = [
     "README.md",
     "SECURITY.md",
 ]
+license = "BSD-3-Clause"
 
 [lib]
 name = "irmin_rs"
