@@ -15,8 +15,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use irmin::game_installer::SophonError;
-use irmin::{DownloadHandle, Sophon, VerifyMode};
+use irmin_rs::game_installer::SophonError;
+use irmin_rs::{DownloadHandle, Sophon, VerifyMode};
 
 #[tokio::main]
 async fn main() {

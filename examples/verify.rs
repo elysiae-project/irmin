@@ -15,7 +15,7 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use irmin::{Sophon, SophonProgress};
+use irmin_rs::{Sophon, SophonProgress};
 
 #[tokio::main]
 async fn main() {

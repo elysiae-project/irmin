@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use irmin::{DownloadHandle, SophonProgress};
+use irmin_rs::{DownloadHandle, SophonProgress};
 
 /// The three positional shared args every operation takes.
 pub struct CommonArgs {

@@ -6,8 +6,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use irmin::game_installer::UpdateInfo;
-use irmin::Sophon;
+use irmin_rs::game_installer::UpdateInfo;
+use irmin_rs::Sophon;
 
 #[tokio::main]
 async fn main() {
