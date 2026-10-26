@@ -399,6 +399,7 @@ async fn install_single_plugin(
     Ok(())
 }
 
+/// Download, validate, and install the selected plugin archives into the game directory.
 pub async fn install_plugins(
     client: &Client,
     game_dir: &Path,
@@ -501,6 +502,7 @@ async fn install_single_sdk(
     Ok(())
 }
 
+/// Download, validate, and install channel SDK archives into the game directory.
 pub async fn install_channel_sdks(
     client: &Client,
     game_dir: &Path,

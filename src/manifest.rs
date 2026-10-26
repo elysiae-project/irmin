@@ -10,6 +10,10 @@ use crate::proto_parse::SophonManifestProto;
 /// API response variations. Assets are sorted by name; the undocumented
 /// `chunk_compressed_hash_xxh` field is excluded. Returns SHA-256 truncated
 /// to 8 hex chars.
+/// Compute a stable content identity for the manifest's asset records.
+///
+/// The result is used to determine whether persisted chunk state belongs to the
+/// same manifest; it is not a cryptographic signature or authenticity check.
 pub fn compute_content_manifest_hash(manifest: &SophonManifestProto) -> String {
     let mut assets: Vec<_> = manifest.assets.iter().collect();
     assets.sort_by_key(|a| &a.asset_name);

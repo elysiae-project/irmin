@@ -17,6 +17,7 @@ const GAME_DATA_DIR: &str =
     "\x47\x65\x6e\x73\x68\x69\x6e\x49\x6d\x70\x61\x63\x74\x5f\x44\x61\x74\x61";
 const GAME_DATA_DIR_CN: &str = "\x59\x75\x61\x6e\x53\x68\x65\x6e\x5f\x44\x61\x74\x61";
 
+/// Locate the persistent-data directory associated with an HK4E installation.
 pub fn find_hk4e_persistent_dir(game_dir: &Path) -> std::path::PathBuf {
     if let Ok(entries) = fs::read_dir(game_dir) {
         for entry in entries.flatten() {
@@ -31,6 +32,7 @@ pub fn find_hk4e_persistent_dir(game_dir: &Path) -> std::path::PathBuf {
     game_dir.join(format!("{GAME_DATA_DIR}/Persistent"))
 }
 
+/// Remove manifest entries that should not be installed for the current HK4E layout.
 pub fn filter_hk4e_asset_list(
     game_dir: &Path,
     assets: &mut Vec<SophonManifestAssetProperty>,
@@ -89,6 +91,7 @@ pub fn filter_hk4e_asset_list(
     }
 }
 
+/// Write the HK4E audio-language selection record.
 pub fn write_audio_lang_record(game_dir: &Path, vo_langs: &[String]) -> std::io::Result<()> {
     let persistent_dir = find_hk4e_persistent_dir(game_dir);
     fs::create_dir_all(&persistent_dir)?;
@@ -132,6 +135,7 @@ struct PkgVersionEntry {
     file_size: u64,
 }
 
+/// Regenerate package-version metadata from the selected manifest assets.
 pub fn write_pkg_version_from_manifest(
     game_dir: &Path,
     assets: &Arc<CompactManifest>,

@@ -39,6 +39,8 @@ pub struct AdaptiveAssembly {
 const EWMA_ALPHA: f64 = 0.3;
 
 impl AdaptiveAssembly {
+    /// Create a controller with assembly capped while downloads remain active.
+    /// Adaptive mode can scale up to twice the available CPU count.
     pub fn new() -> Self {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -54,6 +56,8 @@ impl AdaptiveAssembly {
         }
     }
 
+    /// Create a controller using `assembled_files` as the throughput counter
+    /// required for adaptive scaling after downloads finish.
     pub fn with_tracker(assembled_files: Arc<AtomicU64>) -> Self {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -69,6 +73,8 @@ impl AdaptiveAssembly {
         }
     }
 
+    /// Current worker target; while downloading this is always the fixed
+    /// assembly concurrency, then the adaptive target with that floor.
     pub fn current_target(&self) -> usize {
         if self.download_active.load(Ordering::Relaxed) {
             ASSEMBLY_CONCURRENCY
@@ -77,6 +83,7 @@ impl AdaptiveAssembly {
         }
     }
 
+    /// Switch between download-constrained and adaptive assembly scheduling.
     pub fn set_download_active(&self, active: bool) {
         self.download_active.store(active, Ordering::Relaxed);
     }

@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 
 /// Compact sorted index over a `StringArena` for `&str -> usize` lookup
 /// via binary search. Avoids per-entry HashMap overhead.
+/// Compact index that maps chunk names to their original arena index via binary search.
 pub struct ChunkNameLookup {
     arena: super::compact_manifest::StringArena,
     sorted_indices: Vec<u32>,
 }
 
 impl ChunkNameLookup {
+    /// Build a sorted lookup index while retaining the arena's original ordering.
     pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
         let n = arena.len();
         let mut sorted_indices: Vec<u32> = (0..n as u32).collect();
@@ -27,10 +29,12 @@ impl ChunkNameLookup {
         }
     }
 
+    /// Return the arena string at its original index; panics when out of range.
     pub fn get(&self, idx: usize) -> &str {
         self.arena.get(idx as u32)
     }
 
+    /// Find a name and return its original arena index, or `None` if absent.
     pub fn lookup(&self, name: &str) -> Option<usize> {
         let arena = &self.arena;
         let result = self
@@ -71,8 +75,10 @@ use crate::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
 use crate::proto_parse::SophonManifestAssetChunk;
 
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
+/// Thread-safe callback receiving the current downloaded-chunk size map for persistence.
 pub type StateSaver = Arc<dyn Fn(&HashMap<String, u64>) + Send + Sync>;
 
+/// Previously persisted data used to reuse valid chunks and completed files.
 pub struct ResumeContext {
     pub prev_manifest_hash: String,
     pub prev_downloaded_chunks: FxHashMap<String, u64>,
@@ -151,6 +157,7 @@ struct DownloadItem {
 
 type FileEntry = (u32, u32, u32);
 
+/// One manifest category together with its chunk download endpoint and identity.
 pub struct SophonInstaller {
     pub manifest: SophonManifestProto,
     pub chunk_download: DownloadInfo,
@@ -160,6 +167,8 @@ pub struct SophonInstaller {
 }
 
 impl SophonInstaller {
+    /// Fetch and decode the manifest referenced by `meta`; normalizes chunk
+    /// offsets for a full download and retains its hash and matching field.
     pub async fn from_manifest_meta(
         client: &Client,
         meta: &SophonManifestMeta,
@@ -182,6 +191,8 @@ impl SophonInstaller {
     }
 }
 
+/// Fetch the current main build and its locale-matching installer manifests.
+/// Returns the installers, selected build tag, and combined manifest hash.
 pub async fn build_installers(
     client: &Client,
     game_id: &str,
@@ -202,6 +213,8 @@ pub async fn build_installers(
     Ok((installers, tag, manifest_hash))
 }
 
+/// Fetch installer manifests for a specific historical build tag.
+/// Returns the installers, requested tag, and combined manifest hash.
 pub async fn build_installers_for_tag(
     client: &Client,
     game_id: &str,
@@ -222,6 +235,8 @@ pub async fn build_installers_for_tag(
     Ok((installers, tag.to_string(), manifest_hash))
 }
 
+/// Build an update plan from an installed tag to the current build, including
+/// deleted paths and the new tag/hash. Existing chunk offsets may be reused.
 pub async fn build_update_installers(
     client: &Client,
     game_id: &str,
@@ -339,6 +354,7 @@ fn compute_diff_files(
 /// `(u32, u32) -> offset` table from an old manifest. Extracted so the
 /// interning logic is unit-testable without a network round-trip.
 #[allow(clippy::type_complexity)]
+/// Intern old chunk metadata and offset mappings for reuse during update planning.
 pub fn intern_old_chunk_offsets<'a>(
     manifest: &'a SophonManifestProto,
 ) -> (
@@ -379,6 +395,7 @@ pub fn intern_old_chunk_offsets<'a>(
 /// Stamp each chunk's `chunk_old_offset` with the matching old-file offset
 /// using the interned reverse maps. Chunks with no old match get `-1`.
 #[allow(clippy::type_complexity)]
+/// Assign reusable source-file offsets to matching chunks in the update installers.
 pub fn assign_chunk_offsets(
     diff_files: &mut [SophonManifestAssetProperty],
     offsets: &FxHashMap<(u32, u32), u64>,
@@ -1974,6 +1991,7 @@ async fn finalize_install(
     Ok(())
 }
 
+/// Runtime switches and control handle consumed by [`install`].
 pub struct InstallOptions {
     pub is_preinstall: bool,
     pub is_resume: bool,
@@ -1981,6 +1999,7 @@ pub struct InstallOptions {
     pub verify_mode: super::VerifyMode,
 }
 
+/// Progress and persistence callbacks used throughout [`install`].
 pub struct InstallCallbacks {
     pub updater: ProgressUpdater,
     pub state_saver: StateSaver,
@@ -2002,6 +2021,9 @@ fn chunk_still_valid_for_resume(chunk_name: &str, chunk_size: u64, chunks_dir: &
     }
 }
 
+/// Download required chunks, assemble files, apply removals, and write the
+/// installed tag. Errors stop the operation and are returned without claiming
+/// successful completion; cancellation is reported as [`SophonError::Cancelled`].
 #[allow(clippy::too_many_arguments)]
 pub async fn install(
     installers: Vec<SophonInstaller>,
@@ -2702,6 +2724,7 @@ pub async fn install(
     result
 }
 
+/// Verify installed manifest files and repair missing or damaged files.
 pub async fn verify_integrity(
     client: &Client,
     game_id: &str,

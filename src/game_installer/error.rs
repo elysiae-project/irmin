@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Errors returned by API fetching, chunk transfer, patching, assembly, and verification.
+///
+/// Variants preserve structured values where callers may need to distinguish
+/// retryable failures or report expected and actual file properties.
 #[derive(Debug, Error)]
 pub enum SophonError {
     #[error("HTTP request failed: {0}")]
@@ -130,6 +134,9 @@ pub enum SophonError {
 }
 
 impl SophonError {
+    /// Whether retrying the failed operation may succeed without changing inputs.
+    /// Network/I/O, checksum, size, resume, download, and decompression failures
+    /// are retryable; cancellation and deterministic validation/API failures are not.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(_)
@@ -167,6 +174,7 @@ impl SophonError {
     }
 }
 
+/// Result type used by installer APIs.
 pub type SophonResult<T> = Result<T, SophonError>;
 
 impl From<tokio::time::error::Elapsed> for SophonError {

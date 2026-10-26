@@ -17,6 +17,10 @@ impl Default for DownloadClient {
 }
 
 impl DownloadClient {
+    /// Build the tuned HTTP/1.1 client used for concurrent chunk transfers.
+    ///
+    /// Panics if reqwest cannot construct the configured client (for example,
+    /// due to an invalid TLS backend configuration).
     pub fn new() -> Self {
         Self(
             reqwest::Client::builder()

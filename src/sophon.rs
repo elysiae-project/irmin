@@ -85,6 +85,8 @@ impl SophonBuilder {
         self
     }
 
+    /// Consume the builder and create a downloader. Defaults the state directory
+    /// to the game directory and constructs a tuned client unless one was set.
     pub fn build(self) -> Sophon {
         Sophon {
             client: self.client.unwrap_or_else(|| DownloadClient::new().0),
@@ -103,14 +105,17 @@ impl Sophon {
         SophonBuilder::new(game_id, game_dir)
     }
 
+    /// Game identifier used for branch and build requests.
     pub fn game_id(&self) -> &str {
         &self.game_id
     }
 
+    /// Installation directory read and modified by download operations.
     pub fn game_dir(&self) -> &Path {
         &self.game_dir
     }
 
+    /// Voice-over locale used when selecting language-specific manifests.
     pub fn vo_lang(&self) -> &str {
         &self.vo_lang
     }

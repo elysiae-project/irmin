@@ -18,6 +18,7 @@ pub fn filter_nap_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestAss
     let _ = (game_dir, assets);
 }
 
+/// Apply NAP installer-specific filtering using the installation state.
 pub fn filter_nap_installers(game_dir: &Path, installer_data: &mut Vec<InstallerData>) {
     let kdel_fields = match read_kdel_resource_matching_fields(game_dir) {
         Some(fields) if !fields.is_empty() => fields,
@@ -64,6 +65,7 @@ fn read_kdel_resource_matching_fields(game_dir: &Path) -> Option<Vec<String>> {
     Some(fields)
 }
 
+/// Write the NAP audio-language records for the selected voice locales.
 pub fn write_nap_audio_lang_records(game_dir: &Path, vo_langs: &[String]) -> std::io::Result<()> {
     let persistent_dir = game_dir.join(format!("{GAME_DATA_DIR}/Persistent"));
     fs::create_dir_all(&persistent_dir)?;

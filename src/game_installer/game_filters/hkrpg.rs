@@ -10,6 +10,7 @@ const AUDIO_LANG_FILE: &str = "AudioLaucherRecord.txt";
 const GAME_DATA_DIR: &str = "\x53\x74\x61\x72\x52\x61\x69\x6c\x5f\x44\x61\x74\x61";
 const APP_VENDOR: &str = "\x43\x6f\x67\x6e\x6f\x73\x70\x68\x65\x72\x65";
 
+/// Remove manifest entries excluded for the current HKRPG installation.
 pub fn filter_hkrpg_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestAssetProperty>) {
     let blacklist_path =
         game_dir.join(format!("{GAME_DATA_DIR}/Persistent/DownloadBlacklist.json"));
@@ -73,6 +74,7 @@ pub fn filter_hkrpg_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestA
     }
 }
 
+/// Write the HKRPG audio-language selection record.
 pub fn write_audio_lang_record(game_dir: &Path, vo_langs: &[String]) -> std::io::Result<()> {
     let persistent_dir = game_dir.join(format!("{GAME_DATA_DIR}/Persistent"));
     fs::create_dir_all(&persistent_dir)?;
@@ -124,6 +126,7 @@ fn add_both_persistent_or_streaming_assets(path: &str, blacklist: &mut Vec<Strin
     }
 }
 
+/// Regenerate the launcher-owned HKRPG application metadata file.
 pub fn write_app_info(game_dir: &Path) -> std::io::Result<()> {
     let app_info_path = game_dir.join(format!("{GAME_DATA_DIR}/app.info"));
     if let Some(parent) = app_info_path.parent() {
@@ -135,6 +138,7 @@ pub fn write_app_info(game_dir: &Path) -> std::io::Result<()> {
     )
 }
 
+/// Regenerate HKRPG binary-version metadata files.
 pub fn write_binary_version_files(game_dir: &Path) -> std::io::Result<()> {
     let bv_path = game_dir.join(format!(
         "{GAME_DATA_DIR}/StreamingAssets/BinaryVersion.bytes"

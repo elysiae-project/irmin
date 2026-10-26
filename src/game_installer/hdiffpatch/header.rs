@@ -43,6 +43,7 @@ pub(crate) struct RleRefClip {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Describes a byte range copied from the old file into the new file.
 pub struct CoverHeader {
     pub old_pos: i64,
     pub new_pos: i64,
@@ -51,6 +52,7 @@ pub struct CoverHeader {
 }
 
 impl CoverHeader {
+    /// Construct a cover range and its link to the next cover record.
     pub fn new(old_pos: i64, new_pos: i64, cover_length: i64, next_cover_index: i64) -> Self {
         Self {
             old_pos,
@@ -63,7 +65,11 @@ impl CoverHeader {
 
 pub(crate) const K_SIGN_TAG_BIT: u8 = 1;
 pub(crate) const K_BYTE_RLE_TYPE: u8 = 2;
+/// Preferred maximum patch working-buffer length in bytes.
 pub const MAX_MEM_BUFFER_LEN: i64 = 1 << 20;
+/// Hard upper bound used for patch working-buffer allocation.
 pub const MAX_MEM_BUFFER_LIMIT: usize = 2 << 20;
+/// Maximum reusable byte-array capacity used by the patch implementation.
 pub const MAX_ARRAY_POOL_LEN: usize = 1 << 20;
+/// Offset of the second reusable array region within the pooled allocation.
 pub const MAX_ARRAY_POOL_SECOND_OFFSET: usize = MAX_ARRAY_POOL_LEN / 2;

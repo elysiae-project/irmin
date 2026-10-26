@@ -13,6 +13,7 @@ const STATE_PAUSED: u8 = 1;
 const STATE_CANCELLED: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Snapshot of a download's cooperative pause and cancellation state.
 pub enum ControlState {
     Running,
     Paused,
@@ -20,6 +21,8 @@ pub enum ControlState {
 }
 
 #[derive(Clone)]
+/// Cloneable control handle shared with an in-progress operation.
+/// Pausing is cooperative; cancellation is permanent for this handle.
 pub struct DownloadHandle {
     state: Arc<AtomicU8>,
     cancel_token: CancellationToken,
@@ -27,6 +30,7 @@ pub struct DownloadHandle {
 }
 
 impl DownloadHandle {
+    /// Create an active, unpaused control handle.
     pub fn new() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(STATE_RUNNING)),
@@ -35,6 +39,7 @@ impl DownloadHandle {
         }
     }
 
+    /// Request a pause; workers stop at their next pause-aware checkpoint.
     pub fn pause(&self) {
         // compare_exchange avoids racing with cancel; cancellation is terminal.
         while let Err(current) = self.state.compare_exchange(
@@ -50,6 +55,7 @@ impl DownloadHandle {
         }
     }
 
+    /// Clear the pause request and wake workers waiting in `wait_if_paused`.
     pub fn resume(&self) {
         // Cancellation is terminal.
         if self.state.load(Ordering::Acquire) == STATE_CANCELLED {
@@ -70,24 +76,29 @@ impl DownloadHandle {
         }
     }
 
+    /// Permanently request cancellation and wake cancellation-aware workers.
     pub fn cancel(&self) {
         self.state.store(STATE_CANCELLED, Ordering::Release);
         self.cancel_token.cancel();
         self.pause_notify.notify_waiters();
     }
 
+    /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_CANCELLED
     }
 
+    /// Whether a pause request is currently active.
     pub fn is_paused(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_PAUSED
     }
 
+    /// Future that resolves when this handle is cancelled.
     pub fn cancelled_future(&self) -> tokio_util::sync::WaitForCancellationFuture<'_> {
         self.cancel_token.cancelled()
     }
 
+    /// Read the current control state.
     pub fn get_state(&self) -> ControlState {
         match self.state.load(Ordering::Acquire) {
             STATE_RUNNING => ControlState::Running,
@@ -100,6 +111,8 @@ impl DownloadHandle {
         }
     }
 
+    /// Wait until resumed, or return early if cancellation is requested.
+    /// Wait while paused, returning `Err(())` if cancellation occurs first.
     pub async fn wait_if_paused(
         &self,
         updater: &(impl Fn(SophonProgress) + Send + Sync + ?Sized),

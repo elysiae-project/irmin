@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use super::header::{DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo};
 use super::parser::BinaryExtensions;
 
+/// Applies an HDiff patch from a source and diff file into a destination file.
 pub struct HDiff {
     pub source_path: String,
     pub diff_path: String,
@@ -13,11 +14,13 @@ pub struct HDiff {
 }
 
 impl HDiff {
+    /// Test/benchmark constructor with a zero diff offset.
     #[cfg(any(test, feature = "benchmark"))]
     pub fn new(source_path: String, diff_path: String, dest_path: String) -> Self {
         Self::with_offset(source_path, diff_path, dest_path, 0)
     }
 
+    /// Create a patch operation with explicit source, diff, and destination offsets.
     pub fn with_offset(
         source_path: String,
         diff_path: String,
@@ -32,6 +35,8 @@ impl HDiff {
         }
     }
 
+    /// Apply the patch, optionally reporting completed output bytes; returns
+    /// `true` only when the patch completes successfully.
     pub fn apply(&mut self, on_progress: Option<Box<dyn Fn(u64)>>) -> bool {
         match self.apply_inner(on_progress.as_ref().map(|cb| cb.as_ref())) {
             Ok(()) => true,

@@ -29,12 +29,14 @@ pub use patch_core::enumerate_cover_headers_checked;
 
 use std::sync::Mutex;
 
+/// Mutex-protected pool of reusable byte vectors for patch operations.
 pub struct BufferPool {
     buffers: Mutex<Vec<Vec<u8>>>,
     max_idle: usize,
 }
 
 impl BufferPool {
+    /// Create a pool retaining at most `max_idle` returned buffers.
     pub const fn new(max_idle: usize) -> Self {
         Self {
             buffers: Mutex::new(Vec::new()),
@@ -42,6 +44,8 @@ impl BufferPool {
         }
     }
 
+    /// Remove the smallest pooled buffer with sufficient capacity, or allocate
+    /// a new vector with at least `min_capacity`; returned contents are retained.
     pub fn take(&self, min_capacity: usize) -> Vec<u8> {
         let mut pool = self.buffers.lock().unwrap();
         let mut best_idx = None;
@@ -60,6 +64,7 @@ impl BufferPool {
         Vec::with_capacity(min_capacity)
     }
 
+    /// Return a buffer to the pool unless the configured idle limit is reached.
     pub fn return_buf(&self, buf: Vec<u8>) {
         let mut pool = self.buffers.lock().unwrap();
         if pool.len() < self.max_idle {
@@ -68,6 +73,7 @@ impl BufferPool {
     }
 
     #[cfg(test)]
+    /// Test-only return path that reduces excess capacity before pooling.
     pub fn return_buf_shrunken(&self, mut buf: Vec<u8>, max_cap: usize) {
         let mut pool = self.buffers.lock().unwrap();
         if pool.len() < self.max_idle {

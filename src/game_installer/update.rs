@@ -11,6 +11,7 @@ use crate::api_scrape::PackageBranch;
 use crate::api_scrape::SophonManifestMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Availability and byte-size summary for update and preinstall operations.
 pub struct UpdateInfo {
     pub update_available: bool,
     /// A remote preinstall or a usable local package is available.
@@ -28,6 +29,7 @@ pub struct UpdateInfo {
     pub preinstall_decompressed_size: u64,
 }
 
+/// Query remote build metadata and compare it with the installed version.
 pub async fn check_update(
     client: &Client,
     game_id: &str,
@@ -149,6 +151,7 @@ where
     })
 }
 
+/// Fetch build statistics and return compressed/uncompressed sizes for matching manifests.
 pub async fn fetch_build_sizes(
     client: &Client,
     branch: &PackageBranch,
@@ -186,6 +189,7 @@ pub async fn fetch_build_sizes(
     Ok((cs, ds))
 }
 
+/// Fetch patch metadata and sum the selected diff payload sizes.
 pub async fn fetch_diff_sizes(
     client: &Client,
     branch: &PackageBranch,

@@ -72,6 +72,7 @@ impl DiffRefGuard {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Strategy used to produce or remove a target file during preinstall application.
 pub enum PatchMethod {
     CopyOver,
     Patch,
@@ -82,6 +83,7 @@ pub enum PatchMethod {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Target-file metadata and the patch/download action selected for it.
 pub struct PatchAssetInfo {
     pub target_file_path: String,
     pub target_file_size: u64,
@@ -100,6 +102,7 @@ pub struct PatchAssetInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Identity and checksum metadata for a shared patch payload chunk.
 pub struct PatchChunkInfo {
     pub patch_name: String,
     pub patch_size: u64,
@@ -109,6 +112,7 @@ pub struct PatchChunkInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Persisted preinstall package state, including payload references and target metadata.
 pub struct PreinstallState {
     pub tag: String,
     pub game_id: String,
@@ -127,6 +131,7 @@ pub struct PreinstallState {
 /// Immutable metadata for a completed package. Payload chunks may still need the CDN.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Sealed snapshot of exact target manifests retained for later package application.
 pub struct TargetSnapshot {
     version: u32,
     game_id: String,
@@ -142,6 +147,7 @@ pub struct TargetSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// One manifest and its chunk endpoint retained in a target snapshot.
 pub struct TargetManifest {
     matching_field: String,
     manifest_id: String,
@@ -379,12 +385,14 @@ impl TargetSnapshot {
 }
 
 impl PreinstallState {
+    /// Return the persisted state file path for a validated preinstall tag.
     pub fn state_file_path(game_dir: &Path, tag: &str) -> PathBuf {
         game_dir.join(format!(
             ".sophon_preinstall_{tag}{PREINSTALL_STATE_FILE_EXT}"
         ))
     }
 
+    /// Return the completion marker path for a preinstall tag.
     pub fn marker_file_path(game_dir: &Path, tag: &str) -> PathBuf {
         game_dir.join(format!(".sophon_preinstall_{tag}"))
     }
@@ -485,6 +493,7 @@ pub(super) fn cached_preinstall(
     Some(state)
 }
 
+/// Persist preinstall metadata for later resume or application.
 pub fn save_preinstall_state(game_dir: &Path, state: &PreinstallState) -> SophonResult<()> {
     validate_tag(&state.tag)?;
     if let Some(snapshot) = &state.target_snapshot {
@@ -508,6 +517,7 @@ pub fn save_preinstall_state(game_dir: &Path, state: &PreinstallState) -> Sophon
     Ok(())
 }
 
+/// Load and validate persisted preinstall metadata for `tag`.
 pub fn load_preinstall_state(game_dir: &Path, tag: &str) -> SophonResult<PreinstallState> {
     validate_tag(tag)?;
     let path = PreinstallState::state_file_path(game_dir, tag);
@@ -528,11 +538,13 @@ pub fn load_preinstall_state(game_dir: &Path, tag: &str) -> SophonResult<Preinst
     Ok(state)
 }
 
+/// Remove persisted state and marker files associated with `tag`.
 pub fn delete_preinstall_state(game_dir: &Path, tag: &str) {
     let _ = fs::remove_file(PreinstallState::state_file_path(game_dir, tag));
     let _ = fs::remove_file(PreinstallState::marker_file_path(game_dir, tag));
 }
 
+/// Download and patch work selected for the upcoming build.
 pub struct PreinstallPlan {
     pub patch_assets: Vec<PatchAssetInfo>,
     pub deleted_files: Vec<String>,
@@ -577,6 +589,7 @@ fn validate_patch_asset_fields(asset: &SophonPatchAssetProperty) -> bool {
     true
 }
 
+/// Resolve available patch manifests into a plan for the upcoming release.
 pub async fn build_preinstall_plan(
     client: &Client,
     game_id: &str,
@@ -998,6 +1011,7 @@ async fn process_preinstall_chunk(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// Download and persist the payload chunks required by a preinstall plan.
 pub async fn preinstall_download(
     download_client: &Client,
     plan: PreinstallPlan,
@@ -1786,6 +1800,7 @@ pub(super) fn verify_file_hash(path: &Path, expected_hash: &str) -> bool {
     }
 }
 
+/// Apply a previously downloaded preinstall package and verify resulting files.
 pub async fn apply_preinstall(
     client: &Client,
     game_dir: &Path,

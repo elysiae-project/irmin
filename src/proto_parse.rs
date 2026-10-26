@@ -2,14 +2,14 @@
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-// Top-level manifest
+/// Decoded full-install manifest containing the assets for a build.
 #[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct SophonManifestProto {
     #[prost(message, repeated, tag = "1")]
     pub assets: Vec<SophonManifestAssetProperty>,
 }
 
-// Asset properties
+/// Manifest record describing one file or directory in the game tree.
 #[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct SophonManifestAssetProperty {
     /// Asset path relative to the game directory.
@@ -34,14 +34,15 @@ pub struct SophonManifestAssetProperty {
 }
 
 impl SophonManifestAssetProperty {
-    /// Check if this asset is a directory.
+    /// Returns true when the wire type is nonzero or the asset has no file hash.
+    /// This accommodates directory records whose type/hash fields vary.
     #[inline]
     pub fn is_directory(&self) -> bool {
         self.asset_type != 0 || self.asset_hash_md5.is_empty()
     }
 }
 
-// Chunk properties
+/// CDN object and file-range metadata for one asset chunk.
 #[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct SophonManifestAssetChunk {
     /// CDN object name for the download URL.
@@ -88,11 +89,16 @@ pub(crate) fn normalize_full_download_manifest(manifest: &mut SophonManifestProt
     }
 }
 
+/// Decode a protobuf full manifest from any byte container.
+///
+/// Returns a prost decode error for malformed or truncated wire data; this does
+/// not validate asset paths, hashes, or semantic field combinations.
 #[inline]
 pub fn decode_manifest(buf: impl AsRef<[u8]>) -> Result<SophonManifestProto, prost::DecodeError> {
     SophonManifestProto::decode(buf.as_ref())
 }
 
+/// Decoded preinstall patch manifest, including patches and removals.
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonPatchProto {
     #[prost(message, repeated, tag = "1")]
@@ -102,6 +108,7 @@ pub struct SophonPatchProto {
     pub unused_assets: Vec<SophonUnusedAssetProperty>,
 }
 
+/// Patch plan for one target asset and its candidate version-specific data.
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonPatchAssetProperty {
     #[prost(string, tag = "1")]
@@ -117,6 +124,7 @@ pub struct SophonPatchAssetProperty {
     pub asset_infos: Vec<SophonPatchAssetInfo>,
 }
 
+/// Version-tagged patch choice for a target asset; `chunk` may be absent.
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonPatchAssetInfo {
     #[prost(string, tag = "1")]
@@ -126,6 +134,7 @@ pub struct SophonPatchAssetInfo {
     pub chunk: Option<SophonPatchAssetChunk>,
 }
 
+/// Patch payload range and the source-file identity required to apply it.
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonPatchAssetChunk {
     #[prost(string, tag = "1")]
@@ -159,6 +168,7 @@ pub struct SophonPatchAssetChunk {
     pub original_file_md5: String,
 }
 
+/// Files no longer used by a given game version.
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonUnusedAssetProperty {
     #[prost(string, tag = "1")]
@@ -168,12 +178,14 @@ pub struct SophonUnusedAssetProperty {
     pub asset_infos: Vec<SophonUnusedAssetInfo>,
 }
 
+/// One group of unused files associated with a version entry.
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonUnusedAssetInfo {
     #[prost(message, repeated, tag = "1")]
     pub assets: Vec<SophonUnusedAssetFile>,
 }
 
+/// Path, expected size, and MD5 of a file to remove or validate as unused.
 #[derive(Clone, PartialEq, Message)]
 pub struct SophonUnusedAssetFile {
     #[prost(string, tag = "1")]
@@ -186,6 +198,10 @@ pub struct SophonUnusedAssetFile {
     pub file_md5: String,
 }
 
+/// Decode a protobuf patch manifest.
+///
+/// This validates wire-format decoding only; range, path, and checksum
+/// validation occurs when the preinstall plan is built or applied.
 #[inline]
 pub fn decode_patch_manifest(
     buf: impl AsRef<[u8]>,

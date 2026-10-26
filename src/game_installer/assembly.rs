@@ -23,6 +23,7 @@ use super::{FILE_WRITE_BUFFER_SIZE, PROGRESS_UPDATE_INTERVAL_MS};
 use crate::SophonProgress;
 use crate::game_installer::compact_manifest::CompactManifest;
 
+/// Return the on-disk compressed-chunk filename by appending `.zstd`.
 #[inline]
 pub fn chunk_filename(chunk_name: &str) -> String {
     let mut s = String::with_capacity(chunk_name.len() + 5);
@@ -31,6 +32,8 @@ pub fn chunk_filename(chunk_name: &str) -> String {
     s
 }
 
+/// Decrement the shared usage count and remove the cached chunk when its last
+/// consumer releases it. Invalid or unknown names are ignored.
 #[inline]
 pub fn decrement_chunk_refcount(
     chunk_name: &str,
@@ -53,6 +56,9 @@ pub fn decrement_chunk_refcount(
     }
 }
 
+/// Recursively remove files with a `.tmp` extension below `dir`.
+/// Missing or non-directory roots are treated as already clean; traversal I/O
+/// errors are returned, while individual removal failures are ignored.
 pub fn cleanup_tmp_files(dir: &Path) -> std::io::Result<()> {
     if !dir.is_dir() {
         return Ok(());
@@ -107,6 +113,11 @@ pub fn validate_chunk_name(chunk_name: &str) -> bool {
     true
 }
 
+/// Reject empty, absolute, drive-prefixed, NUL-containing, or parent-traversal
+/// asset paths before joining them to the installation directory.
+///
+/// Returns `InvalidAssetName` for empty/NUL names and `PathTraversal` for
+/// paths that could escape the game directory.
 pub fn validate_asset_name(name: &str) -> SophonResult<()> {
     if name.is_empty() {
         return Err(SophonError::InvalidAssetName(
@@ -156,6 +167,11 @@ impl Drop for DecrementGuard<'_> {
     }
 }
 
+/// Assemble one manifest file from its cached compressed chunks.
+///
+/// Existing valid targets may be retained according to verification policy;
+/// temporary output is used before replacement. Invalid asset names, I/O,
+/// decompression, and integrity failures are returned as [`SophonError`].
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_file(
     all_files: &CompactManifest,
@@ -807,6 +823,7 @@ fn write_from_old_file(
     }
 }
 
+/// Owned configuration passed to a blocking assembly worker.
 pub struct AssemblyTaskParams {
     pub file_idx: usize,
     pub tmp_dir_idx: usize,
@@ -827,6 +844,7 @@ pub struct AssemblyTaskParams {
     pub verify_mode: super::VerifyMode,
 }
 
+/// Run an assembly worker over queued file indices until the channel closes.
 pub fn run_assembly_task(
     params: AssemblyTaskParams,
     updater: impl Fn(SophonProgress) + Send + Sync + 'static,
@@ -1033,6 +1051,7 @@ pub fn run_assembly_task(
     Ok(())
 }
 
+/// Spawn a blocking assembly worker and return its Tokio join handle.
 pub async fn spawn_assembly_task(
     params: AssemblyTaskParams,
     updater: impl Fn(SophonProgress) + Send + Sync + 'static,

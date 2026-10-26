@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::game_installer::SophonError;
 
-/// Progress events emitted during download operations.
+/// Progress events emitted during download, update, repair, and preinstall operations.
+///
+/// Serde encodes each event as an object with a camel-case `type` discriminator;
+/// payload field names are also camel case. Byte and file counters are snapshots,
+/// not guaranteed to increase monotonically across distinct phases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SophonProgress {
@@ -84,6 +88,9 @@ pub enum SophonProgress {
 }
 
 /// Structured error payload for the Tauri IPC boundary.
+///
+/// The tagged representation preserves common actionable error details; errors
+/// without a dedicated variant are converted to `Generic` display text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum CommandError {

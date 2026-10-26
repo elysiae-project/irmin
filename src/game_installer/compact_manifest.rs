@@ -34,6 +34,8 @@ pub struct StringArena {
 }
 
 impl StringArena {
+    /// Allocate an arena sized for approximately `spans` strings and
+    /// `total_bytes` UTF-8 bytes; capacities may grow if estimates are exceeded.
     pub fn with_capacity(spans: usize, total_bytes: usize) -> Self {
         Self {
             data: String::with_capacity(total_bytes),
@@ -42,6 +44,8 @@ impl StringArena {
         }
     }
 
+    /// Append `s` and return its zero-based index. Duplicate values are stored
+    /// separately; indices are valid only while this arena's ordering is stable.
     pub fn intern(&mut self, s: &str) -> u32 {
         let idx = self.offsets.len() as u32;
         self.offsets.push(self.data.len() as u32);
@@ -51,6 +55,8 @@ impl StringArena {
 
     /// Intern a string, returning an existing index if an identical string
     /// was already interned. Uses a hash key to avoid per-entry String allocs.
+    /// Intern `s`, reusing an identical existing value when present. Hash
+    /// collisions are checked against the stored string before reuse.
     pub fn intern_dedup(&mut self, s: &str) -> u32 {
         let mut h = rustc_hash::FxHasher::default();
         s.hash(&mut h);
@@ -67,6 +73,9 @@ impl StringArena {
     }
 
     #[inline]
+    /// Resolve an index returned by an interning operation.
+    ///
+    /// Panics when `idx` is outside the arena; returned text borrows the arena.
     pub fn get(&self, idx: u32) -> &str {
         let start = self.offsets[idx as usize] as usize;
         let end = self
@@ -78,16 +87,19 @@ impl StringArena {
     }
 
     #[inline]
+    /// Number of strings interned, including duplicates.
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
 
     #[inline]
+    /// UTF-8 byte length of all concatenated strings, excluding offsets.
     pub fn byte_len(&self) -> usize {
         self.data.len()
     }
 
     /// Drop the deduplication map to free memory after all interning is done.
+    /// Release the temporary hash map used by `intern_dedup`; arena contents remain.
     pub fn clear_dedup(&mut self) {
         self.dedup.clear();
         self.dedup.shrink_to_fit();
@@ -107,6 +119,7 @@ impl From<&[&str]> for StringArena {
 
 /// Zero-copy view into a single chunk row in `CompactManifest`.
 #[derive(Clone, Copy)]
+/// Borrowed chunk metadata row returned by [`CompactManifest`] accessors.
 pub struct ChunkRef<'a> {
     pub chunk_name: &'a str,
     pub chunk_decompressed_hash_md5: &'a str,
@@ -120,6 +133,11 @@ pub struct ChunkRef<'a> {
 ///
 /// Chunks are stored in a single flat array indexed globally. Each file
 /// owns a contiguous slice `[file_chunk_start[i]..file_chunk_start[i+1])`.
+/// Compact columnar representation of a decoded manifest.
+///
+/// File and chunk indices are zero-based; accessor indices are expected to be
+/// in range and generally panic when out of bounds. Chunk rows are contiguous
+/// per file, allowing each file's chunk range to be represented compactly.
 pub struct CompactManifest {
     arena: StringArena,
     file_name_idx: Vec<u32>,
@@ -136,41 +154,49 @@ pub struct CompactManifest {
 }
 
 impl CompactManifest {
+    /// Number of asset records.
     pub fn num_files(&self) -> usize {
         self.file_name_idx.len()
     }
 
+    /// Number of chunk records across all assets.
     pub fn num_chunks(&self) -> usize {
         self.chunk_name_idx.len()
     }
 
     #[inline]
+    /// Asset path for `file_idx`.
     pub fn file_name(&self, file_idx: usize) -> &str {
         self.arena.get(self.file_name_idx[file_idx])
     }
 
     #[inline]
+    /// Expected assembled-file MD5 string for `file_idx`.
     pub fn file_hash_md5(&self, file_idx: usize) -> &str {
         self.arena.get(self.file_hash_idx[file_idx])
     }
 
     #[cfg(test)]
     #[inline]
+    /// Raw asset type code for `file_idx` (available in test builds).
     pub fn file_type(&self, file_idx: usize) -> u32 {
         self.file_type[file_idx] as u32
     }
 
     #[inline]
+    /// Expected assembled byte length for `file_idx`.
     pub fn file_size(&self, file_idx: usize) -> u64 {
         self.file_size[file_idx]
     }
 
     #[inline]
+    /// Whether the asset is classified as a directory.
     pub fn is_directory(&self, file_idx: usize) -> bool {
         self.file_type[file_idx] != 0 || self.file_hash_md5(file_idx).is_empty()
     }
 
     #[inline]
+    /// Global half-open chunk-index range belonging to `file_idx`.
     pub fn file_chunk_range(&self, file_idx: usize) -> std::ops::Range<u32> {
         let start = self.file_chunk_start[file_idx];
         let end = self
@@ -184,6 +210,7 @@ impl CompactManifest {
     /// Find the file index that owns a given global chunk index via binary
     /// search.
     #[inline]
+    /// Owning file index for a global chunk index; caller must pass a valid index.
     pub fn file_idx_for_chunk(&self, chunk_idx: usize) -> usize {
         match self.file_chunk_start.binary_search(&(chunk_idx as u32)) {
             Ok(i) => i,
@@ -192,6 +219,7 @@ impl CompactManifest {
     }
 
     #[inline]
+    /// Borrowed metadata for a global chunk row.
     pub fn chunk(&self, chunk_idx: usize) -> ChunkRef<'_> {
         ChunkRef {
             chunk_name: self.arena.get(self.chunk_name_idx[chunk_idx]),
@@ -205,12 +233,14 @@ impl CompactManifest {
 
     /// Access a chunk by its `(file_idx, chunk_idx_in_file)` pair.
     #[inline]
+    /// Borrowed metadata for a file-local chunk index; indices are not bounds-checked.
     pub fn file_chunk(&self, file_idx: usize, chunk_idx_in_file: usize) -> ChunkRef<'_> {
         let range = self.file_chunk_range(file_idx);
         self.chunk(range.start as usize + chunk_idx_in_file)
     }
 
     #[inline]
+    /// String-arena index of a chunk's CDN object name.
     pub fn chunk_name_arena_idx(&self, chunk_idx: usize) -> u32 {
         self.chunk_name_idx[chunk_idx]
     }
@@ -218,6 +248,7 @@ impl CompactManifest {
     /// Compute a chunk's offset within its file by summing decompressed sizes
     /// of all preceding chunks in the same file. O(chunks_before) per call.
     #[inline]
+    /// Byte offset within the owning file, summing preceding decompressed chunk sizes.
     pub fn chunk_file_offset(&self, chunk_idx: usize) -> u64 {
         let file_idx = self.file_idx_for_chunk(chunk_idx);
         let range = self.file_chunk_range(file_idx);
@@ -228,6 +259,7 @@ impl CompactManifest {
 
     /// Compute the byte offset of a single chunk within its file. O(chunk_idx).
     #[inline]
+    /// Byte offset of the file-local chunk, summing preceding decompressed sizes.
     pub fn file_chunk_offset(&self, file_idx: usize, chunk_idx: usize) -> u64 {
         let range = self.file_chunk_range(file_idx);
         (range.start as usize..range.start as usize + chunk_idx)
@@ -236,6 +268,7 @@ impl CompactManifest {
     }
 
     /// Precompute file offsets for all chunks in a file. O(chunks_in_file).
+    /// Offsets of all chunks in the file, in file order.
     pub fn file_chunk_offsets(&self, file_idx: usize) -> Vec<u64> {
         let range = self.file_chunk_range(file_idx);
         let mut offsets = Vec::with_capacity((range.end - range.start) as usize);
@@ -248,11 +281,13 @@ impl CompactManifest {
     }
 
     /// Arena byte size for memory logging.
+    /// Approximate arena storage bytes, including its u32 offsets.
     pub fn arena_bytes(&self) -> usize {
         self.arena.byte_len() + self.arena.len() * std::mem::size_of::<u32>()
     }
 
     /// Columnar byte size for memory logging.
+    /// Approximate memory occupied by column allocations, excluding allocator overhead.
     pub fn column_bytes(&self) -> usize {
         let n_files = self.file_name_idx.len();
         let n_chunks = self.chunk_name_idx.len();

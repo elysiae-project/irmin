@@ -1,6 +1,8 @@
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Serialize};
 
+/// Top-level response from the game-branch discovery endpoint.
+/// `retcode` and `message` carry the service status; `data` contains branches.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct FrontDoorResponse {
@@ -9,11 +11,13 @@ pub struct FrontDoorResponse {
     pub data: FrontDoorData,
 }
 
+/// Branch listings returned by the front-door endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FrontDoorData {
     pub game_branches: Vec<GameBranch>,
 }
 
+/// Main and optional pre-download packages for one game.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct GameBranch {
@@ -22,6 +26,7 @@ pub struct GameBranch {
     pub pre_download: Option<PackageBranch>,
 }
 
+/// Service identifiers used to identify a game and its business variant.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct GameId {
@@ -29,6 +34,7 @@ pub struct GameId {
     pub biz: String,
 }
 
+/// Package selection and credentials for a game branch.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PackageBranch {
     pub package_id: String,
@@ -37,6 +43,7 @@ pub struct PackageBranch {
     pub tag: String,
 }
 
+/// Response envelope for a Sophon build lookup; `data` may be absent when no build is available.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SophonBuildResponse {
@@ -45,6 +52,7 @@ pub struct SophonBuildResponse {
     pub data: Option<SophonBuildData>,
 }
 
+/// Build identifier, release tag, and manifests selected for that build.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SophonBuildData {
@@ -53,6 +61,7 @@ pub struct SophonBuildData {
     pub manifests: Vec<SophonManifestMeta>,
 }
 
+/// Metadata required to fetch and consume one category manifest.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SophonManifestMeta {
@@ -67,6 +76,7 @@ pub struct SophonManifestMeta {
     pub deduplicated_stats: Option<Stats>,
 }
 
+/// CDN manifest identity and its compressed and expanded byte counts, encoded as strings by the API.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManifestFileInfo {
@@ -76,9 +86,10 @@ pub struct ManifestFileInfo {
     pub uncompressed_size: String,
 }
 
-/// Describes where to download chunks or the manifest file.
+/// Describes encryption, compression, and URL construction for downloaded objects.
 ///
-/// URL formula: `{url_prefix}{url_suffix}/{item_name}`
+/// The generated URL is `{url_prefix}/{url_suffix}/{item_name}`, omitting the
+/// suffix segment when it is empty; surrounding slashes are normalized.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DownloadInfo {
     pub encryption: i32,
@@ -88,7 +99,10 @@ pub struct DownloadInfo {
     pub url_suffix: String,
 }
 
-/// Compression format for downloaded content.
+/// Compression format code used by the Sophon API.
+///
+/// Serde accepts numeric codes `0..=4`; the legacy booleans `false` and `true`
+/// map to `None` and `Zstd`. Serialization always emits the integer code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Compression {
@@ -190,6 +204,8 @@ impl Serialize for Compression {
 }
 
 impl DownloadInfo {
+    /// Build the CDN URL for `item_name`, trimming boundary slashes from the
+    /// configured prefix and suffix. The item name itself is appended verbatim.
     pub fn url_for(&self, item_name: &str) -> String {
         let prefix = self.url_prefix.trim_end_matches('/');
         let suffix = self.url_suffix.trim_matches('/');
@@ -200,6 +216,8 @@ impl DownloadInfo {
         }
     }
 
+    /// Write the same URL as [`Self::url_for`] into `buf`, clearing its previous
+    /// contents first so the allocation can be reused.
     pub fn url_for_into(&self, item_name: &str, buf: &mut String) {
         buf.clear();
         let prefix = self.url_prefix.trim_end_matches('/');
@@ -213,11 +231,14 @@ impl DownloadInfo {
         buf.push_str(item_name);
     }
 
+    /// Whether the caller's chunk-processing path should decompress this
+    /// object. Currently only `Zstd` is treated as compressed here.
     pub fn is_compressed(&self) -> bool {
         matches!(self.compression, Compression::Zstd)
     }
 }
 
+/// Aggregate sizes and counts from the build API; numeric values are string-encoded.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Stats {
@@ -227,6 +248,7 @@ pub struct Stats {
     pub chunk_count: String,
 }
 
+/// Response envelope for a patch-build lookup.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SophonPatchBuildResponse {
@@ -235,6 +257,7 @@ pub struct SophonPatchBuildResponse {
     pub data: Option<SophonPatchBuildData>,
 }
 
+/// Patch build identity and per-category patch manifests.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +268,7 @@ pub struct SophonPatchBuildData {
     pub manifests: Vec<SophonPatchManifestMeta>,
 }
 
+/// Metadata to retrieve a category's patch manifest and associated diff objects.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SophonPatchManifestMeta {

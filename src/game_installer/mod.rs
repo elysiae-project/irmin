@@ -1,13 +1,19 @@
 //! Sophon chunk-based game installer.
 mod adaptive_assembly;
+/// Throughput-based controller for scaling concurrent chunk requests.
 pub mod adaptive_download;
 mod api;
+/// Chunk validation, file assembly, and temporary-file cleanup.
 pub mod assembly;
 mod assembly_opt;
+/// Persistent and in-memory file verification cache.
 pub mod cache;
+/// Disk-backed completion bitmap used to resume eager decompression.
 pub mod chunk_bitmap;
+/// Memory-compact columnar manifest representation.
 pub mod compact_manifest;
 mod download;
+/// Streaming decompression directly into output file ranges.
 pub mod eager_decompress;
 mod error;
 mod game_filters;
@@ -16,7 +22,9 @@ mod handle;
 pub mod hdiffpatch;
 #[cfg(not(feature = "benchmark"))]
 mod hdiffpatch;
+/// Manifest planning and download/assembly orchestration.
 pub mod installer;
+/// Output-file preallocation and shared file-handle management.
 pub mod output_allocator;
 mod plugin_api;
 mod plugin_install;
@@ -24,6 +32,7 @@ mod preinstall;
 mod update;
 
 mod profiling;
+/// Platform file-copy and preallocation helpers.
 pub mod sysio;
 
 #[cfg(test)]
@@ -31,15 +40,20 @@ mod eager_integration_tests;
 #[cfg(test)]
 mod integration_tests;
 
-/// Max retries for failed chunk downloads.
+/// Maximum attempts for a failed chunk download.
 pub const MAX_RETRIES: u32 = 5;
+/// Maximum retries after a downloaded chunk fails integrity validation.
 pub const MAX_HASH_RETRIES: u32 = 5;
 
-/// Max concurrent chunk downloads (hard ceiling for adaptive scaling).
+/// Hard ceiling for concurrent chunk download workers.
 pub const DOWNLOAD_CONCURRENCY: usize = adaptive_download::MAX_CONCURRENCY;
 
 use std::time::Duration;
 
+/// Exponential retry delay with up to one second of jitter.
+///
+/// The exponential component doubles per attempt, caps at 30 seconds, and the
+/// attempt is capped before shifting to avoid overflow.
 pub fn retry_delay(attempt: u32) -> Duration {
     let exp = 1000u64.saturating_mul(1u64 << attempt.min(5));
     // Jitter prevents thundering-herd when multiple chunks fail at once.
@@ -51,6 +65,7 @@ pub fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(exp.min(30_000) + jitter)
 }
 
+/// Sleep for `delay`, returning `Err(())` if the handle is cancelled first.
 pub async fn cancelable_sleep(
     handle: &crate::game_installer::handle::DownloadHandle,
     delay: Duration,
@@ -67,7 +82,7 @@ pub async fn cancelable_sleep(
         } => Err(()),
     }
 }
-/// Max concurrent assembly tasks.
+/// Fixed assembly worker count while chunk downloads are active.
 pub const ASSEMBLY_CONCURRENCY: usize = 4;
 /// Installed version marker filename.
 pub const VERSION_FILE_NAME: &str = ".sophon_version";
@@ -149,11 +164,13 @@ pub fn compute_eta_speed(
     }
 }
 
+/// Service endpoint used to resolve a game id to its current branches.
 pub const FRONT_DOOR_URL: &str = concat!(
     "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x68\x79\x70\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
     "\x2f\x68\x79\x70\x2f\x68\x79\x70\x2d\x63\x6f\x6e\x6e\x65\x63\x74",
     "/api/getGameBranches?launcher_id=VYTpXlbWo8"
 );
+/// Base endpoint used to fetch build metadata.
 pub const SOPHON_BUILD_URL_BASE: &str = concat!(
     "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
     "/downloader/sophon_chunk/api/getBuild"
@@ -167,14 +184,14 @@ fn version_file_path(game_dir: &Path) -> PathBuf {
     game_dir.join(VERSION_FILE_NAME)
 }
 
-/// Read the installed version tag, if present.
+/// Read and trim the installed tag marker; returns `None` if it cannot be read.
 pub fn read_installed_tag(game_dir: &Path) -> Option<String> {
     fs::read_to_string(version_file_path(game_dir))
         .ok()
         .map(|s| s.trim().to_owned())
 }
 
-/// Write the installed version tag.
+/// Replace the installed tag marker with `tag`, returning filesystem errors.
 pub fn write_installed_tag(game_dir: &Path, tag: &str) -> io::Result<()> {
     fs::write(version_file_path(game_dir), tag)
 }

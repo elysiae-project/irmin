@@ -13,12 +13,14 @@ use dashmap::DashMap;
 use super::error::{SophonError, SophonResult};
 use super::sysio;
 
+/// Manages preallocated output files and shared handles by manifest file index.
 pub struct OutputAllocator {
     handles: DashMap<usize, Arc<File>>,
     game_dir: PathBuf,
 }
 
 impl OutputAllocator {
+    /// Create an allocator rooted at the installation directory.
     pub fn new(game_dir: &Path) -> Self {
         Self {
             handles: DashMap::new(),

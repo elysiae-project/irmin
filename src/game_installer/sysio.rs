@@ -10,6 +10,7 @@ use super::error::{SophonError, SophonResult};
 /// `copy_file_range(2)`: copies up to `len` bytes from `src_fd` at
 /// `src_off` to `dst_fd` at `dst_off`. Returns the number of bytes copied.
 /// Loops if the kernel copies fewer than requested per call.
+/// Copy a byte range between file descriptors using the platform copy-range facility.
 pub fn copy_file_range(
     src_fd: RawFd,
     src_off: u64,
@@ -51,6 +52,7 @@ pub fn copy_file_range(
 /// once copied so the source pages do not stay resident.
 /// Copy a region from `src` to `dst` using `copy_file_range`. Evicts source
 /// pages after the copy. Callers handle destination eviction.
+/// Copy file contents from a source path into an existing destination handle.
 pub fn copy_file_from(
     src: &File,
     src_off: u64,
@@ -75,6 +77,7 @@ pub fn copy_file_from(
 /// Copy a region of `src_path` into `dst_file` at `dst_off` using
 /// `copy_file_range`. Applies `POSIX_FADV_DONTNEED` on the source region
 /// once copied so the source pages do not stay resident.
+/// Copy a specified source-file region into a destination file at an offset.
 pub fn copy_file_region_to(
     src_path: &Path,
     src_off: u64,
@@ -89,6 +92,7 @@ pub fn copy_file_region_to(
 /// Pre-allocate disk blocks for `file` up to `len` bytes using
 /// `fallocate(2)` with `FALLOC_FL_KEEP_SIZE`. Allocates extents without
 /// zeroing or changing file size. Silently ignores unsupported filesystems.
+/// Reserve space for `len` bytes in `file`, returning the operating-system error.
 pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
     let ret = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len as libc::off_t) };

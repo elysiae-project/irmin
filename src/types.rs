@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-/// Type of download operation, persisted for correct resumption dispatch.
+/// Kind of operation represented by persisted resume state.
+///
+/// The serialized discriminator is camel case (`fresh`, `update`, or
+/// `preinstall`) and determines which resume path is eligible to consume it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadType {
@@ -21,7 +24,10 @@ pub enum DownloadType {
 /// freshly loaded manifest. Future saves always write `Indices`.
 #[derive(Debug, Clone)]
 pub enum CompletedFiles {
+    /// Current compact representation: indices into the freshly loaded manifest.
     Indices(Vec<usize>),
+    /// Older representation containing asset paths, migrated during install.
+    /// Serializing this variant deliberately writes an empty index array.
     Legacy(Vec<String>),
 }
 
@@ -86,13 +92,22 @@ impl<'de> Deserialize<'de> for CompletedFiles {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadState {
+    /// Service game identifier; checked before a state can be resumed.
     pub game_id: String,
+    /// Voice language used to select manifests.
     pub vo_lang: String,
+    /// Install directory recorded when this state was written.
     pub output_path: String,
+    /// Operation kind required to dispatch resumption correctly.
     pub download_type: DownloadType,
+    /// Build tag associated with the operation, when known.
     pub current_tag: Option<String>,
+    /// Combined manifest identity used to reject stale chunk state.
     pub manifest_hash: String,
+    /// Downloaded chunk object names and their recorded sizes.
     pub downloaded_chunks: HashMap<String, u64>,
+    /// Completed asset indices, or legacy paths awaiting migration; defaults
+    /// to empty when loading state files written before this field existed.
     #[serde(default)]
     pub completed_files: CompletedFiles,
 }
@@ -101,11 +116,16 @@ pub struct DownloadState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeInfo {
+    /// Game whose saved state is available.
     pub game_id: String,
+    /// Operation type that would be resumed.
     pub download_type: DownloadType,
 }
 
-/// Save download state after every N completed chunks.
+/// Chunk completions between periodic resume-state saves.
+///
+/// A successful operation removes its state file; this interval controls the
+/// maximum amount of chunk progress that may need to be repeated after a crash.
 pub const CHUNK_STATE_SAVE_INTERVAL: u64 = 500;
 
 #[cfg(test)]

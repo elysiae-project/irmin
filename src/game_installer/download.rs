@@ -114,6 +114,8 @@ fn get_available_space(path: &Path) -> Option<u64> {
     Some(space)
 }
 
+/// Ensure the filesystem containing `dest` has at least `needed` available
+/// bytes. Returns `NoSpaceAvailable` with the measured free space when short.
 pub fn check_available_space(dest: &Path, needed: u64) -> Result<(), SophonError> {
     let Some(parent) = dest.parent() else {
         return Ok(());

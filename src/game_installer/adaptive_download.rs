@@ -9,8 +9,10 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 /// Initial number of download workers.
+/// Starting number of concurrent chunk download workers.
 pub const INITIAL_CONCURRENCY: usize = 24;
 /// Maximum download workers (hard ceiling).
+/// Hard upper bound on concurrent chunk download workers.
 pub const MAX_CONCURRENCY: usize = 48;
 /// Interval between throughput checks.
 const MEASURE_INTERVAL_MS: u64 = 1000;
@@ -32,6 +34,7 @@ pub struct AdaptiveDownload {
 }
 
 impl AdaptiveDownload {
+    /// Start at [`INITIAL_CONCURRENCY`] with no throughput baseline.
     pub fn new() -> Self {
         Self {
             target: AtomicUsize::new(INITIAL_CONCURRENCY),
@@ -42,12 +45,15 @@ impl AdaptiveDownload {
     }
 
     /// Current number of workers that should be alive.
+    /// Current worker count target, initially [`INITIAL_CONCURRENCY`].
     pub fn current_target(&self) -> usize {
         self.target.load(Ordering::Relaxed)
     }
 
     /// Called periodically with the total downloaded bytes. Returns the new
     /// target if it changed (signals the caller to spawn more workers).
+    /// Record cumulative downloaded bytes. At most once per measurement window,
+    /// scales up when smoothed throughput rises; returns a changed target.
     pub fn measure(&self, total_bytes: u64) -> Option<usize> {
         let now = now_nanos();
         let prev_time = self.last_time.load(Ordering::Relaxed);

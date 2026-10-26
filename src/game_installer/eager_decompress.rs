@@ -15,12 +15,14 @@ use super::assembly_opt::{
 use super::error::{SophonError, SophonResult};
 
 /// Buffer size for reading from the zstd decoder and writing to the output file.
+/// Buffer size used by eager streaming decompression.
 pub const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Performs eager decompression: decompresses compressed data and writes
 /// decompressed output directly to `out_file` at `chunk_offset`.
 ///
 /// Returns the number of decompressed bytes written on success.
+/// Decompress a chunk directly into output storage without retaining a `.zstd` intermediate.
 pub fn eager_decompress_chunk(
     compressed_data: &[u8],
     out_file: &File,
@@ -128,6 +130,7 @@ pub fn eager_decompress_chunk(
 /// Streaming variant: decompresses from a sync `Read` source directly to the
 /// output file. Avoids buffering the entire compressed chunk in memory.
 /// Used in non-Full verify modes where no compressed hash is needed.
+/// Stream a compressed chunk into a file range, avoiding a full decompressed heap buffer.
 pub fn stream_decompress_to_file(
     reader: impl io::Read,
     out_file: &File,

@@ -459,6 +459,7 @@ pub(crate) fn tbytes_set_rle_vector_software(
     Ok(())
 }
 
+/// Iterator over validated cover headers borrowed from the encoded patch data.
 pub struct CoverHeaderIterator<'a> {
     reader: CoverReader<'a>,
     remaining: i64,
@@ -722,6 +723,7 @@ pub(crate) fn enumerate_cover_headers(
 }
 
 #[allow(clippy::needless_lifetimes)]
+/// Parse cover headers while validating ranges and returning structured errors.
 pub fn enumerate_cover_headers_checked<'a>(
     cover_reader: &'a mut dyn Read,
     cover_size: i64,

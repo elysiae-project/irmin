@@ -11,6 +11,10 @@ use std::sync::Mutex;
 
 const MAGIC: u32 = 0x49524D42; // "IRMB"
 
+/// Thread-safe, disk-backed completion bits for chunk indices.
+///
+/// `sync` persists the current bits, but callers must persist output bytes
+/// before syncing a corresponding completion bit to avoid false resume claims.
 pub struct ChunkBitmap {
     bits: Vec<AtomicU64>,
     path: PathBuf,
@@ -134,6 +138,7 @@ impl ChunkBitmap {
         Ok(())
     }
 
+    /// Number of chunk indices represented by this bitmap.
     pub fn total_chunks(&self) -> usize {
         self.total_chunks
     }

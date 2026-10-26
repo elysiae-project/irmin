@@ -19,6 +19,8 @@ use super::VERIFICATION_CACHE_FILE;
 use super::assembly_opt::md5_hex_eq;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Cached proof that a file matched a manifest size and MD5 at a particular
+/// whole-second modification time. A changed size or timestamp forces hashing.
 pub struct VerificationEntry {
     pub size: u64,
     pub md5: String,
@@ -30,6 +32,8 @@ struct VerificationCacheSerializable {
     files: HashMap<String, VerificationEntry>,
 }
 
+/// Load the per-install verification cache, treating missing or malformed
+/// cache files as empty and trimming oversized caches to the configured limit.
 pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationEntry> {
     let cache_path = game_dir.join(VERIFICATION_CACHE_FILE);
 
@@ -94,6 +98,7 @@ pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationE
     cache
 }
 
+/// Atomically replace the on-disk verification cache via a synced temporary file.
 pub fn save_verification_cache(
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
@@ -119,6 +124,7 @@ pub fn save_verification_cache(
     Ok(())
 }
 
+/// Verify a file using a path relative to `game_dir` as its cache key.
 pub fn check_file_md5_cached(
     path: &Path,
     expected_size: u64,
@@ -131,6 +137,7 @@ pub fn check_file_md5_cached(
     check_file_md5_with_cache_key(path, expected_size, expected_md5, &cache_key, cache)
 }
 
+/// As [`check_file_md5_cached`], also returning the observed size when the file exists.
 pub fn check_file_md5_cached_with_size(
     path: &Path,
     expected_size: u64,
@@ -143,6 +150,7 @@ pub fn check_file_md5_cached_with_size(
     check_file_md5_with_cache_key_and_size(path, expected_size, expected_md5, &cache_key, cache)
 }
 
+/// Verify a file using an explicit cache key; returns false for missing or mismatched files.
 pub fn check_file_md5_with_cache_key(
     path: &Path,
     expected_size: u64,
@@ -154,6 +162,7 @@ pub fn check_file_md5_with_cache_key(
         .map(|(ok, _)| ok)
 }
 
+/// As [`check_file_md5_with_cache_key`], returning `Some(actual_size)` when present.
 pub fn check_file_md5_with_cache_key_and_size(
     path: &Path,
     expected_size: u64,
@@ -213,6 +222,8 @@ pub fn check_file_md5_with_cache_key_and_size(
     Ok((matches, Some(actual_size)))
 }
 
+/// Compute the raw 16-byte MD5 digest of a file using buffered sequential reads.
+/// Returns an I/O error if opening or reading the file fails.
 pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();

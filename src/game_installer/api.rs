@@ -15,6 +15,7 @@ use super::{FRONT_DOOR_URL, SOPHON_BUILD_URL_BASE};
 use crate::api_scrape::DownloadInfo;
 use crate::compute_content_manifest_hash;
 
+/// Decoded manifest paired with the checksum returned by the API.
 pub struct ManifestWithHash {
     pub manifest: SophonManifestProto,
     pub hash: String,
@@ -66,6 +67,7 @@ async fn fetch_json_with_retry<T: serde::de::DeserializeOwned>(
     ))
 }
 
+/// Fetch a game's main and pre-download branch metadata.
 pub async fn fetch_front_door(
     client: &Client,
     game_id: &str,
@@ -83,6 +85,7 @@ pub async fn fetch_front_door(
     Ok((branch, pre))
 }
 
+/// Download and decode a manifest object, returning its computed identity.
 pub async fn fetch_manifest(
     client: &Client,
     dl: &DownloadInfo,
@@ -116,6 +119,7 @@ pub async fn fetch_manifest(
     Ok(ManifestWithHash { manifest, hash })
 }
 
+/// Fetch the current build or a specific tag from a package branch.
 pub async fn fetch_build(
     client: &Client,
     branch: &PackageBranch,
@@ -149,11 +153,13 @@ pub async fn fetch_build(
     Ok(data)
 }
 
+/// Base endpoint for patch-build metadata requests.
 pub const SOPHON_PATCH_BUILD_URL_BASE: &str = concat!(
     "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
     "/downloader/sophon_chunk/api/getPatchBuild"
 );
 
+/// Fetch metadata describing the available patch build.
 pub async fn fetch_patch_build(
     client: &Client,
     branch: &PackageBranch,
@@ -211,12 +217,14 @@ pub async fn fetch_patch_build(
     unreachable!()
 }
 
+/// Decoded patch manifest together with the build metadata needed to resolve its entries.
 pub struct PatchManifestWithMeta {
     pub patch_manifest: SophonPatchProto,
     pub diff_download: DownloadInfo,
     pub matching_field: String,
 }
 
+/// Download and decode a patch manifest and retain its metadata.
 pub async fn fetch_patch_manifest(
     client: &Client,
     meta: &SophonPatchManifestMeta,
@@ -269,6 +277,7 @@ pub(crate) fn normalize_vo_locale(locale: &str) -> Option<&'static str> {
 }
 
 #[inline]
+/// Check whether a manifest selector matches the requested voice locale.
 pub fn vo_lang_matches(matching_field: &str, vo_lang: &str) -> bool {
     let Some(locale) = normalize_vo_locale(vo_lang) else {
         return false;
@@ -278,6 +287,7 @@ pub fn vo_lang_matches(matching_field: &str, vo_lang: &str) -> bool {
 }
 
 #[inline]
+/// Whether a selector names a locale supported by the installer.
 pub fn is_known_vo_locale(matching_field: &str) -> bool {
     let f = matching_field.as_bytes();
     f.windows(5).any(|w| w.eq_ignore_ascii_case(b"en-us"))
@@ -288,6 +298,7 @@ pub fn is_known_vo_locale(matching_field: &str) -> bool {
 }
 
 #[inline]
+/// Parse the service size representation into bytes; malformed input returns an error.
 pub fn parse_size(s: &str) -> SophonResult<u64> {
     s.parse()
         .map_err(|_| SophonError::InvalidSizeString(s.to_string()))

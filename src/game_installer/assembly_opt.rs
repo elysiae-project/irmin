@@ -38,6 +38,7 @@ pub(crate) struct Md5 {
 }
 
 impl Md5 {
+    /// Initialize a reusable MD5 context, returning an error if backend setup fails.
     pub fn new() -> SophonResult<Self> {
         Ok(Self {
             inner: fast_md5::Md5::new(),

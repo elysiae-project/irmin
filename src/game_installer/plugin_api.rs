@@ -22,6 +22,8 @@ const GAME_IDS: &[(&str, &str)] = &[
     ("\x6e\x61\x70", "\x55\x35\x68\x62\x64\x73\x54\x39\x57\x37"),
 ];
 
+/// Map a supported short game code to the service game identifier.
+/// Returns `None` for unknown codes.
 pub fn game_id_for_code(code: &str) -> Option<&'static str> {
     GAME_IDS.iter().find(|(c, _)| c == &code).map(|(_, id)| *id)
 }
@@ -42,6 +44,7 @@ struct PluginApiData {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// A release record for a plugin package.
 pub struct PluginRelease {
     #[allow(dead_code)]
     pub game: GameRef,
@@ -49,6 +52,7 @@ pub struct PluginRelease {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Service reference to a game and its business identity.
 pub struct GameRef {
     #[allow(dead_code)]
     pub id: String,
@@ -57,6 +61,7 @@ pub struct GameRef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Plugin package metadata and the release selected for installation.
 pub struct PluginPackageInfo {
     pub plugin_id: String,
     #[allow(dead_code)]
@@ -81,6 +86,7 @@ struct SdkApiData {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Channel SDK package information returned by the service.
 pub struct ChannelSdkData {
     #[allow(dead_code)]
     pub game: GameRef,
@@ -91,6 +97,7 @@ pub struct ChannelSdkData {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Download URL and validation metadata for a package.
 pub struct PackageData {
     pub url: String,
     pub md5: String,
@@ -109,6 +116,7 @@ pub struct PackageData {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Expected package file metadata used to validate extracted content.
 pub struct ValidationEntry {
     pub path: String,
     #[allow(dead_code)]
@@ -147,6 +155,7 @@ where
     serde_json::from_str(&raw).map_err(serde::de::Error::custom)
 }
 
+/// Fetch plugin package metadata for a service game identifier.
 pub async fn fetch_plugins(client: &Client, game_id: &str) -> SophonResult<Vec<PluginPackageInfo>> {
     let url = format!(
         "{base}?launcher_id={launcher_id}&game_ids[]={game_id}&language=en",
@@ -195,6 +204,7 @@ pub async fn fetch_plugins(client: &Client, game_id: &str) -> SophonResult<Vec<P
     Ok(plugins)
 }
 
+/// Fetch channel SDK package metadata using the provided HTTP client.
 pub async fn fetch_channel_sdks(
     client: &Client,
     game_id: &str,

@@ -87,6 +87,7 @@ pub(crate) trait BinaryExtensions: Read {
 
 impl<T: Read> BinaryExtensions for T {}
 
+/// Decode a little-endian base-128 integer from a byte slice.
 pub fn read_long_7bit_from_slice(
     buf: &[u8],
     offset: &mut usize,
