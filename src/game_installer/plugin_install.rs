@@ -190,23 +190,25 @@ fn extract_zip(zip_path: &Path, game_dir: &Path) -> SophonResult<()> {
             .by_index(i)
             .map_err(|err| SophonError::Decompression(err.to_string()))?;
 
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(err) => {
+                log::warn!("Rejecting entry #{i} with undecodable name: {err}");
+                continue;
+            }
+        };
+
         // Reject symlink entries. Treating a symlink target as file contents
         // is a data-integrity bug.
         if entry.is_symlink() {
-            log::warn!(
-                "Rejecting symlink entry '{name}' in plugin archive",
-                name = entry.name()
-            );
+            log::warn!("Rejecting symlink entry '{name}' in plugin archive");
             continue;
         }
 
         // Reject NTFS alternate data streams and other colon-bearing names.
         // Legitimate plugin/SDK paths never contain ':'.
-        if entry.name().contains(':') {
-            log::warn!(
-                "Rejecting entry with alternate-data-stream name '{name}'",
-                name = entry.name()
-            );
+        if name.contains(':') {
+            log::warn!("Rejecting entry with alternate-data-stream name '{name}'");
             continue;
         }
 
@@ -214,7 +216,6 @@ fn extract_zip(zip_path: &Path, game_dir: &Path) -> SophonResult<()> {
         if declared > ZIP_MAX_ENTRY_BYTES {
             return Err(SophonError::Decompression(format!(
                 "entry '{name}' declares {declared} bytes, exceeds per-entry limit of {ZIP_MAX_ENTRY_BYTES}",
-                name = entry.name()
             )));
         }
         // Ratio check on the declared compressed size; skip if the entry did
@@ -223,7 +224,6 @@ fn extract_zip(zip_path: &Path, game_dir: &Path) -> SophonResult<()> {
         if cc > 0 && declared > cc.saturating_mul(ZIP_MAX_RATIO) {
             return Err(SophonError::Decompression(format!(
                 "entry '{name}' ratio {ratio} exceeds {ZIP_MAX_RATIO}",
-                name = entry.name(),
                 ratio = declared / cc,
             )));
         }
