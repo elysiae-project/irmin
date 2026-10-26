@@ -4,6 +4,7 @@ description = "A Sophon download management library, for use on Linux with 'Anim
 authors = ["The Elysiae Project"]
 edition = "2024"
 rust-version = "1.92.0"
+version = "1.0.0"
 
 [lib]
 name = "irmin"
