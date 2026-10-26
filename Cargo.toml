@@ -1,5 +1,5 @@
 [package]
-name = "irmin"
+name = "irmin_rs"
 description = "A Sophon download management library, for use on Linux with 'Anime Games'"
 authors = ["The Elysiae Project"]
 edition = "2024"
@@ -13,9 +13,10 @@ exclude = [
     "README.md",
     "SECURITY.md",
 ]
+license = "BSD-3-Clause"
 
 [lib]
-name = "irmin"
+name = "irmin_rs"
 crate-type = ["lib"]
 
 [dependencies]
