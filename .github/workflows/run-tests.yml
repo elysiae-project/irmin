@@ -1,0 +1,32 @@
+name: Run Irmin Tests
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_dispatch:
+
+jobs:
+    test:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - runner: ubuntu-24.04
+                      arch: x86_64
+                    - runner: ubuntu-24.04-arm
+                      arch: aarch64
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - name: Clone repository
+              uses: actions/checkout@v6
+
+            - name: Install dependencies
+              run: |
+                sudo apt update
+                sudo apt install build-essential -y
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            
+            - name: Run Tests
+              run: |
+                cargo test

@@ -1,45 +1,61 @@
 [package]
 name = "irmin"
-version = "1.0.0"
-description = "Sophon game downloader"
+description = "A Sophon download management library, for use on Linux with 'Anime Games'"
 authors = ["The Elysiae Project"]
 edition = "2024"
 rust-version = "1.92.0"
+version = "1.0.0"
+exclude = [
+    ".vscode/*",
+    "examples/*",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "README.md",
+    "SECURITY.md",
+]
 
 [lib]
 name = "irmin"
 crate-type = ["lib"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util", "signal"] }
-tokio-util = { version = "0.7", features = ["io", "io-util"] }
-futures-util = "0.3"
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
-reqwest = { version = "0.13", features = ["stream", "json"] }
-zstd = { version = "0.13", features = ["experimental"] }
-fast-md5 = "1.0"
-prost = "0.14"
-dashmap = { version = "6", features = ["serde"] }
-hex = "0.4"
-thiserror = "2"
-sha2 = "0.11"
-libc = "0.2"
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
-rustc-hash = "2"
-lz4 = "1"
-flate2 = "1"
-zip = { version = "8", default-features = false, features = ["deflate"] }
-log = "0.4"
+tokio = { version = "1.54.1", features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "io-util",
+    "signal",
+] }
+tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
+futures-util = "0.3.34"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.154"
+reqwest = { version = "0.13.5", features = ["stream", "json"] }
+zstd = { version = "0.14.3", features = ["experimental"] }
+fast-md5 = "1.0.0"
+prost = "0.14.4"
+dashmap = { version = "6.2.1", features = ["serde"] }
+hex = "0.4.3"
+thiserror = "2.0.21"
+sha2 = "0.11.1"
+libc = "0.2.191"
+xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
+rustc-hash = "2.1.3"
+lz4 = "1.28.1"
+flate2 = "1.1.10"
+zip = { version = "9.1.2", default-features = false, features = ["deflate"] }
+log = "0.4.34"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.7", optional = true }
-tikv-jemalloc-ctl = { version = "0.7", optional = true }
+tikv-jemallocator = { version = "0.7.0", optional = true }
+tikv-jemalloc-ctl = { version = "0.7.0", optional = true }
 
 [dev-dependencies]
-wiremock = "0.6"
-criterion = "0.8"
-tempfile = "3"
+wiremock = "0.6.5"
+criterion = "0.8.2"
+tempfile = "3.27.0"
 
 [features]
 sophon-profiling = [
