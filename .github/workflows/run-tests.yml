@@ -3,7 +3,17 @@ name: Run Irmin Tests
 on:
     push:
         branches: [main]
+        paths: 
+          - '**.rs'
+          - 'Cargo.lock'
+          - 'Cargo.toml'
+          - '.github/workflows/run-tests.yml'
     pull_request:
+        paths:
+          - '**.rs'
+          - 'Cargo.lock'
+          - 'Cargo.toml'
+          - '.github/workflows/run-tests.yml'
     workflow_dispatch:
 
 jobs:
