@@ -12,13 +12,19 @@ A Rust library that downloads Chinese anime games. Manifest-based chunk download
 
 ## Requirements
 
-- [Rust](https://rustup.rs) 1.92 or newer
+- Rust >= 1.92. We recommend the use of [rustup](https://rustup.rs) instead of installing rust directly
 
 Irmin targets Linux.
 
-## Use it from Rust
+## Use Irmin
 
-Add the crate and build a `Sophon`:
+First, add the crates:
+
+```toml
+irmin = { version = "1.0.0", package = "irmin_rs" }
+```
+
+next, create the Sophon download handler:
 
 ```rust
 use irmin::{Sophon, DownloadHandle, SophonProgress, VerifyMode};
