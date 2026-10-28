@@ -1,0 +1,26 @@
+name: Publish Irmin Release
+
+on:
+    release:
+        types: [published]
+
+jobs:
+    publish:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Clone repo
+              uses: actions/checkout@v6
+            
+            - name: Install dependencies
+              run: |
+                sudo apt update
+                sudo apt install build-essential -y
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            
+            - name: Install toolchain & Log in
+              run: |
+                rustup toolchain install
+                cargo login ${{ secrets.CARGO_LOGIN }}
+
+            - name: Publish
+              run: cargo publish
