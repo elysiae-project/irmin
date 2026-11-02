@@ -589,6 +589,28 @@ fn validate_patch_asset_fields(asset: &SophonPatchAssetProperty) -> bool {
     true
 }
 
+fn select_preinstall_build(
+    target_tag: &str,
+    exact_build: SophonResult<SophonBuildData>,
+    current_build: SophonResult<SophonBuildData>,
+) -> SophonResult<SophonBuildData> {
+    match exact_build {
+        Ok(build) if build.tag == target_tag => Ok(build),
+        Ok(build) => Err(invalid_state(format!(
+            "Requested preinstall target {target_tag}, but exact-tag lookup returned {}",
+            build.tag
+        ))),
+        Err(exact_tag_error) => match current_build {
+            Ok(build) if build.tag == target_tag => Ok(build),
+            Ok(build) => Err(invalid_state(format!(
+                "Preinstall target {target_tag} is unavailable by exact tag, and current branch build is {}",
+                build.tag
+            ))),
+            Err(_) => Err(exact_tag_error),
+        },
+    }
+}
+
 /// Resolve available patch manifests into a plan for the upcoming release.
 pub async fn build_preinstall_plan(
     client: &Client,
@@ -604,7 +626,13 @@ pub async fn build_preinstall_plan(
     let patch_build = fetch_patch_build(client, &pre_branch).await?;
     let tag = patch_build.tag.clone();
 
-    let main_build = fetch_build(client, &pre_branch, Some(&tag)).await?;
+    let main_build = match fetch_build(client, &pre_branch, Some(&tag)).await {
+        Ok(build) => select_preinstall_build(&tag, Ok(build), Err(SophonError::NoManifests))?,
+        Err(exact_tag_error) => {
+            let current_build = fetch_build(client, &pre_branch, None).await;
+            select_preinstall_build(&tag, Err(exact_tag_error), current_build)?
+        }
+    };
     if tag != pre_branch.tag {
         return Err(invalid_state(
             "Preinstall branch and patch target tags disagree",

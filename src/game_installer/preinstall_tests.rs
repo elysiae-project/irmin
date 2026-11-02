@@ -1,6 +1,42 @@
 use super::*;
 use fast_md5;
 
+#[tokio::test]
+async fn preinstall_falls_back_to_current_build_only_for_matching_target_tag() {
+    use crate::api_scrape::SophonBuildData;
+
+    let target = "7.2.0";
+    let exact_tag_build = Err(SophonError::ApiError(-202, "not found".into()));
+    let current_build = Ok(SophonBuildData {
+        build_id: "current-target".into(),
+        tag: target.into(),
+        manifests: vec![],
+    });
+    let selected = select_preinstall_build(target, exact_tag_build, current_build).unwrap();
+    assert_eq!(selected.tag, target);
+
+    let exact_tag_build = Err(SophonError::ApiError(-202, "not found".into()));
+    let current_build = Ok(SophonBuildData {
+        build_id: "newer-build".into(),
+        tag: "7.3.0".into(),
+        manifests: vec![],
+    });
+    assert!(select_preinstall_build(target, exact_tag_build, current_build).is_err());
+
+    let exact_build = Ok(SophonBuildData {
+        build_id: "exact-target".into(),
+        tag: target.into(),
+        manifests: vec![],
+    });
+    let current_build = Err(SophonError::NoManifests);
+    assert_eq!(
+        select_preinstall_build(target, exact_build, current_build)
+            .unwrap()
+            .build_id,
+        "exact-target"
+    );
+}
+
 #[test]
 fn patch_method_serialization() {
     let method = PatchMethod::CopyOver;
