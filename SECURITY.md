@@ -7,7 +7,7 @@ The Elysiae project aims to have the best security possible for all of its appli
 The Elysiae project is not accepting security reports for:
 
 - Outdated versions of Irmin
-- Distributions of Irmin that aren't based on the source code of this repository
+- Forks of Irmin and projects that use forks of Irmin
 - Packages that Irmin depends on, except for if the package becomes outdated and starts to be affected by security vulnerabilites
 
 ## Reporting a security vulnerability
