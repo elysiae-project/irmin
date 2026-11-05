@@ -64,14 +64,81 @@ struct Config {
     budget_mib: Option<u64>,
     json: bool,
     keep_workdir: bool,
+    source_backend: SourceBackend,
 }
 
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SourceBackend {
+    #[default]
+    Mmap,
+    File,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
 struct MemorySnapshot {
     vm_rss_kib: u64,
     vm_hwm_kib: u64,
     rss_anon_kib: Option<u64>,
     rss_file_kib: Option<u64>,
+    rss_shmem_kib: Option<u64>,
+}
+
+struct MemorySampler {
+    stop: Arc<AtomicBool>,
+    peak: Arc<std::sync::Mutex<MemorySnapshot>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CpuUsage {
+    user_micros: u64,
+    system_micros: u64,
+}
+
+impl MemorySampler {
+    fn start() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(std::sync::Mutex::new(MemorySnapshot::default()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_peak = Arc::clone(&peak);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                if let Ok(snapshot) = read_memory_snapshot()
+                    && let Ok(mut current_peak) = thread_peak.lock()
+                {
+                    update_memory_peak(&mut current_peak, snapshot);
+                }
+                thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if let Ok(snapshot) = read_memory_snapshot()
+                && let Ok(mut current_peak) = thread_peak.lock()
+            {
+                update_memory_peak(&mut current_peak, snapshot);
+            }
+        });
+        Self {
+            stop,
+            peak,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(&mut self) -> MemorySnapshot {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.peak
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn update_memory_peak(peak: &mut MemorySnapshot, current: MemorySnapshot) {
+    if current.vm_rss_kib > peak.vm_rss_kib {
+        *peak = current;
+    }
 }
 
 enum ScenarioContext {
@@ -248,6 +315,13 @@ fn run_cli() -> Result<(), String> {
             .arg(config.size_mib.to_string())
             .arg(config.chunks.to_string())
             .arg(server_url)
+            .env_remove("IRMIN_HDIFF_FORCE_FILE_SOURCE")
+            .env(
+                "IRMIN_HDIFF_FORCE_FILE_SOURCE",
+                (config.source_backend == SourceBackend::File)
+                    .then_some("1")
+                    .unwrap_or("0"),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .output()
@@ -284,6 +358,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut budget_mib = None;
     let mut json = false;
     let mut keep_workdir = false;
+    let mut source_backend = SourceBackend::Mmap;
     let mut index = 0;
 
     while index < args.len() {
@@ -311,6 +386,18 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             }
             "--json" => json = true,
             "--keep-workdir" => keep_workdir = true,
+            "--source-backend" => {
+                index += 1;
+                source_backend = match value_at(args, index, option)? {
+                    "mmap" => SourceBackend::Mmap,
+                    "file" => SourceBackend::File,
+                    value => {
+                        return Err(format!(
+                            "unknown source backend '{value}'; expected mmap or file"
+                        ));
+                    }
+                };
+            }
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
@@ -335,6 +422,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         budget_mib,
         json,
         keep_workdir,
+        source_backend,
     })
 }
 
@@ -355,7 +443,7 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
@@ -367,14 +455,19 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let size_mib = parse_positive(&args[2], "--size-mib")?;
     let chunks = parse_positive(&args[3], "--chunks")?;
     let context = prepare_child_context(scenario, &fixture_dir, size_mib, chunks, &args[4])?;
+    let mut sampler = MemorySampler::start();
+    thread::sleep(std::time::Duration::from_millis(5));
     let baseline = read_memory_snapshot()?;
     let hwm_reset = reset_hwm().is_ok();
     let operation_baseline = read_memory_snapshot()?;
+    let cpu_before = read_cpu_usage()?;
     let started = Instant::now();
     let verification = run_operation(context)?;
     let elapsed_ms = started.elapsed().as_millis();
-    let peak = read_memory_snapshot()?;
-    let peak_rss_kib = peak.vm_hwm_kib.max(peak.vm_rss_kib);
+    let operation_end = read_memory_snapshot()?;
+    let cpu_after = read_cpu_usage()?;
+    let sampled_peak = sampler.finish();
+    let peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
     verify_output(verification)?;
     println!(
         "{}",
@@ -383,6 +476,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
             "size_mib": size_mib,
             "chunks": chunks,
             "elapsed_ms": elapsed_ms,
+            "user_cpu_ms": cpu_after.user_micros.saturating_sub(cpu_before.user_micros) / 1000,
+            "system_cpu_ms": cpu_after.system_micros.saturating_sub(cpu_before.system_micros) / 1000,
             "baseline_rss_kib": if hwm_reset { operation_baseline.vm_rss_kib } else { baseline.vm_rss_kib },
             "peak_rss_kib": peak_rss_kib,
             "peak_delta_kib": peak_rss_kib.saturating_sub(if hwm_reset {
@@ -390,8 +485,16 @@ fn run_child(args: &[String]) -> Result<(), String> {
             } else {
                 baseline.vm_rss_kib
             }),
-            "end_rss_anon_kib": peak.rss_anon_kib,
-            "end_rss_file_kib": peak.rss_file_kib,
+            "operation_end_rss_anon_kib": operation_end.rss_anon_kib,
+            "operation_end_rss_file_kib": operation_end.rss_file_kib,
+            "operation_end_rss_shmem_kib": operation_end.rss_shmem_kib,
+            "sampled_max_vm_rss_kib": sampled_peak.vm_rss_kib,
+            "sampled_max_rss_anon_kib": sampled_peak.rss_anon_kib,
+            "sampled_max_rss_file_kib": sampled_peak.rss_file_kib,
+            "sampled_max_rss_shmem_kib": sampled_peak.rss_shmem_kib,
+            "sampling_interval_ms": 2,
+            "cpu_scope": "operation_thread",
+            "sampled_peak_is_coherent_snapshot": true,
             "hwm_reset": hwm_reset,
             "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
         })
@@ -410,6 +513,31 @@ fn reset_hwm() -> std::io::Result<()> {
             std::io::ErrorKind::Unsupported,
             "Linux required",
         ))
+    }
+}
+
+fn read_cpu_usage() -> Result<CpuUsage, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let result = unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let usage = unsafe { usage.assume_init() };
+        let timeval_micros = |time: libc::timeval| {
+            (time.tv_sec as u64)
+                .saturating_mul(1_000_000)
+                .saturating_add(time.tv_usec as u64)
+        };
+        Ok(CpuUsage {
+            user_micros: timeval_micros(usage.ru_utime),
+            system_micros: timeval_micros(usage.ru_stime),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("CPU usage sampling requires Linux".to_owned())
     }
 }
 
@@ -433,6 +561,7 @@ fn parse_memory_status(status: &str) -> MemorySnapshot {
             ("VmHWM", Some(value)) => snapshot.vm_hwm_kib = value,
             ("RssAnon", Some(value)) => snapshot.rss_anon_kib = Some(value),
             ("RssFile", Some(value)) => snapshot.rss_file_kib = Some(value),
+            ("RssShmem", Some(value)) => snapshot.rss_shmem_kib = Some(value),
             _ => {}
         }
     }
@@ -854,12 +983,43 @@ mod tests {
 
     #[test]
     fn parses_memory_status_fields() {
-        let status = "VmRSS:\t1024 kB\nVmHWM:\t2048 kB\nRssAnon:\t512 kB\nRssFile:\t256 kB\n";
+        let status = "VmRSS:\t1024 kB\nVmHWM:\t2048 kB\nRssAnon:\t512 kB\nRssFile:\t256 kB\nRssShmem:\t128 kB\n";
         let snapshot = parse_memory_status(status);
         assert_eq!(snapshot.vm_rss_kib, 1024);
         assert_eq!(snapshot.vm_hwm_kib, 2048);
         assert_eq!(snapshot.rss_anon_kib, Some(512));
         assert_eq!(snapshot.rss_file_kib, Some(256));
+        assert_eq!(snapshot.rss_shmem_kib, Some(128));
+    }
+
+    #[test]
+    fn memory_peak_tracks_components_independently() {
+        let mut peak = MemorySnapshot::default();
+        update_memory_peak(
+            &mut peak,
+            MemorySnapshot {
+                vm_rss_kib: 900,
+                vm_hwm_kib: 1000,
+                rss_anon_kib: Some(700),
+                rss_file_kib: Some(300),
+                rss_shmem_kib: Some(100),
+            },
+        );
+        update_memory_peak(
+            &mut peak,
+            MemorySnapshot {
+                vm_rss_kib: 800,
+                vm_hwm_kib: 1100,
+                rss_anon_kib: Some(400),
+                rss_file_kib: Some(600),
+                rss_shmem_kib: Some(800),
+            },
+        );
+        assert_eq!(peak.vm_rss_kib, 900);
+        assert_eq!(peak.vm_hwm_kib, 1000);
+        assert_eq!(peak.rss_anon_kib, Some(700));
+        assert_eq!(peak.rss_file_kib, Some(300));
+        assert_eq!(peak.rss_shmem_kib, Some(100));
     }
 
     #[test]

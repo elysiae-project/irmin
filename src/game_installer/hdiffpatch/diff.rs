@@ -181,7 +181,12 @@ impl HDiff {
             }
             // mmap avoids per-cover seek/read calls while kernel readahead stays adaptive.
             // Falls back to File if mmap fails; page residency stays demand-driven.
-            if old_len > 0 {
+            #[cfg(feature = "benchmark")]
+            let force_file_source =
+                std::env::var("IRMIN_HDIFF_FORCE_FILE_SOURCE").is_ok_and(|value| value == "1");
+            #[cfg(not(feature = "benchmark"))]
+            let force_file_source = false;
+            if old_len > 0 && !force_file_source {
                 let map_len = usize::try_from(old_len).map_err(|_| {
                     std::io::Error::other("source file is too large to map on this platform")
                 })?;

@@ -18,14 +18,14 @@ use std::sync::atomic::AtomicU32;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fast_md5;
 
-use irmin::game_installer::{
+use irmin_rs::game_installer::{
     assembly::{assemble_file, chunk_filename},
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
     installer::ChunkNameLookup,
     sysio, VerifyMode,
 };
-use irmin::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
+use irmin_rs::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 
 /// Fill a file with `mib` MiB of byte `fill`.
 fn fill_file(path: &std::path::Path, mib: usize, fill: u8) {
@@ -404,7 +404,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
         b.iter(|| {
             cache.clear();
             evict_page_cache(&path);
-            let _ = irmin::game_installer::cache::check_file_md5_cached(
+            let _ = irmin_rs::game_installer::cache::check_file_md5_cached(
                 &path, bytes, &md5, &game_dir, &cache,
             )
             .unwrap();
@@ -414,7 +414,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
     // Populate cache for hit benchmark
     {
         cache.clear();
-        let result = irmin::game_installer::cache::check_file_md5_cached(
+        let result = irmin_rs::game_installer::cache::check_file_md5_cached(
             &path, bytes, &md5, &game_dir, &cache,
         )
         .unwrap();
@@ -424,7 +424,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
     group.bench_function("hit", |b| {
         let game_dir = game_dir.clone();
         b.iter(|| {
-            let result = irmin::game_installer::cache::check_file_md5_cached(
+            let result = irmin_rs::game_installer::cache::check_file_md5_cached(
                 &path, bytes, &md5, &game_dir, &cache,
             )
             .unwrap();
@@ -603,7 +603,7 @@ fn bench_chunk_lookup(c: &mut Criterion) {
 // Varint decode benchmark
 // ---------------------------------------------------------------------------
 
-use irmin::game_installer::hdiffpatch::read_long_7bit_from_slice;
+use irmin_rs::game_installer::hdiffpatch::read_long_7bit_from_slice;
 
 /// Encode a non-negative i64 as a 7-bit varint (tag_bit=0 format).
 fn encode_7bit_varint(v: i64) -> Vec<u8> {
@@ -672,9 +672,9 @@ fn bench_varint_decode(c: &mut Criterion) {
 // Cover stream decode benchmark
 // ---------------------------------------------------------------------------
 
-use irmin::game_installer::hdiffpatch::enumerate_cover_headers_checked;
+use irmin_rs::game_installer::hdiffpatch::enumerate_cover_headers_checked;
 
-use irmin::proto_parse::SophonManifestProto;
+use irmin_rs::proto_parse::SophonManifestProto;
 use prost::Message;
 /// Encode a tagged varint (tag_bit=1) into a p_sign byte + continuation bytes.
 /// Returns (p_sign_byte, continuation_bytes). `sign` is 0 (positive) or 1 (negative).
@@ -810,8 +810,8 @@ fn bench_protobuf_decode(c: &mut Criterion) {
 // Buffer pool benchmark
 // ---------------------------------------------------------------------------
 
-use irmin::game_installer::hdiffpatch::HDiffPublic as HDiff;
-use irmin::game_installer::hdiffpatch::{BufferPool, BENCH_MAX_ARRAY_POOL_LEN};
+use irmin_rs::game_installer::hdiffpatch::HDiffPublic as HDiff;
+use irmin_rs::game_installer::hdiffpatch::{BufferPool, BENCH_MAX_ARRAY_POOL_LEN};
 
 const POOL_OPS: u64 = 1000;
 
@@ -1483,7 +1483,7 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .open(&out_path)
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
-            irmin::game_installer::eager_decompress::eager_decompress_chunk(
+            irmin_rs::game_installer::eager_decompress::eager_decompress_chunk(
                 &compressed,
                 &out_file,
                 0,
