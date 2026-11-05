@@ -31,6 +31,7 @@ use irmin_rs::types::CompletedFiles;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scenario {
     Hdiff,
+    PreinstallApply,
     Assembly,
     SophonInstall,
 }
@@ -39,10 +40,11 @@ impl Scenario {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "hdiff" => Ok(Self::Hdiff),
+            "preinstall-apply" => Ok(Self::PreinstallApply),
             "assembly" => Ok(Self::Assembly),
             "sophon-install" => Ok(Self::SophonInstall),
             _ => Err(format!(
-                "unknown scenario '{value}'; expected hdiff, assembly, or sophon-install"
+                "unknown scenario '{value}'; expected hdiff, preinstall-apply, assembly, or sophon-install"
             )),
         }
     }
@@ -50,6 +52,7 @@ impl Scenario {
     fn name(self) -> &'static str {
         match self {
             Self::Hdiff => "hdiff",
+            Self::PreinstallApply => "preinstall-apply",
             Self::Assembly => "assembly",
             Self::SophonInstall => "sophon-install",
         }
@@ -176,6 +179,7 @@ fn update_memory_peak(peak: &mut MemorySnapshot, current: MemorySnapshot) {
 
 enum ScenarioContext {
     Hdiff { dir: PathBuf },
+    PreinstallApply(Box<PreinstallApplyContext>),
     Assembly { context: Box<AssemblyContext> },
     SophonInstall(Box<InstallContext>),
 }
@@ -199,8 +203,21 @@ struct InstallContext {
     runtime: tokio::runtime::Runtime,
 }
 
+struct PreinstallApplyContext {
+    game_dir: PathBuf,
+    expected_path: PathBuf,
+    expected_size: usize,
+    runtime: tokio::runtime::Runtime,
+    client: reqwest::Client,
+}
+
 enum Verification {
     Hdiff(PathBuf),
+    FileCompare {
+        expected: PathBuf,
+        actual: PathBuf,
+        size: usize,
+    },
     Assembly {
         expected: PathBuf,
         actual: PathBuf,
@@ -461,10 +478,14 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
 
     let scenario = scenario.ok_or_else(|| usage().to_owned())?;
     if scenario != Scenario::Hdiff && source_backend != SourceBackend::Mmap {
-        return Err("--source-backend is only supported for the hdiff scenario".to_owned());
+        return Err(
+            "--source-backend overrides are only supported for the hdiff scenario".to_owned(),
+        );
     }
-    if scenario != Scenario::Hdiff && cover_pattern != CoverPattern::Sequential {
-        return Err("--cover-pattern is only supported for the hdiff scenario".to_owned());
+    if !matches!(scenario, Scenario::Hdiff | Scenario::PreinstallApply)
+        && cover_pattern != CoverPattern::Sequential
+    {
+        return Err("--cover-pattern is only supported for HDiff scenarios".to_owned());
     }
     if source_backend != SourceBackend::Windowed && window_size_provided {
         return Err("--window-mib/--window-kib require --source-backend windowed".to_owned());
@@ -566,13 +587,20 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::json!({
             "scenario": scenario.name(),
+            "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
+            "representative": false,
+            "asset_count": (scenario == Scenario::PreinstallApply).then_some(1),
             "cover_pattern": cover_pattern.name(),
             "source_backend": source_backend,
             "window_cache_hits": window_stats.hits.load(Ordering::Relaxed),
             "window_cache_misses": window_stats.misses.load(Ordering::Relaxed),
             "window_cache_bytes_read": window_stats.bytes_read.load(Ordering::Relaxed),
             "size_mib": size_mib,
-            "chunks": chunks,
+            "chunks": if matches!(scenario, Scenario::Assembly | Scenario::SophonInstall) {
+                Some(chunks)
+            } else {
+                None
+            },
             "elapsed_ms": elapsed_ms,
             "user_cpu_ms": cpu_after.user_micros.saturating_sub(cpu_before.user_micros) / 1000,
             "system_cpu_ms": cpu_after.system_micros.saturating_sub(cpu_before.system_micros) / 1000,
@@ -591,7 +619,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
             "sampled_max_rss_file_kib": sampled_peak.rss_file_kib,
             "sampled_max_rss_shmem_kib": sampled_peak.rss_shmem_kib,
             "sampling_interval_ms": 2,
-            "cpu_scope": "operation_thread",
+            "cpu_scope": "process_including_sampler",
             "sampled_peak_is_coherent_snapshot": true,
             "hwm_reset": hwm_reset,
             "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
@@ -618,7 +646,7 @@ fn read_cpu_usage() -> Result<CpuUsage, String> {
     #[cfg(target_os = "linux")]
     {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-        let result = unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
         if result != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
@@ -674,7 +702,9 @@ fn prepare_fixture(
     cover_pattern: CoverPattern,
 ) -> Result<(), String> {
     match scenario {
-        Scenario::Hdiff => prepare_hdiff_fixture(dir, size_mib, cover_pattern),
+        Scenario::Hdiff | Scenario::PreinstallApply => {
+            prepare_hdiff_fixture(dir, size_mib, cover_pattern)
+        }
         Scenario::Assembly => prepare_assembly_fixture(dir, size_mib, chunks),
         Scenario::SophonInstall => prepare_install_fixture(dir, size_mib, chunks),
     }
@@ -756,6 +786,30 @@ fn prepare_child_context(
         Scenario::Hdiff => Ok(ScenarioContext::Hdiff {
             dir: dir.to_path_buf(),
         }),
+        Scenario::PreinstallApply => {
+            let game_dir = dir.join("synthetic-game");
+            let (_, expected_size) = irmin_rs::game_installer::prepare_benchmark_preinstall_state(
+                &game_dir,
+                &dir.join("old.bin"),
+                &dir.join("new.bin"),
+                &dir.join("patch.hdiff"),
+                "benchmark/asset.bin",
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(ScenarioContext::PreinstallApply(Box::new(
+                PreinstallApplyContext {
+                    game_dir,
+                    expected_path: dir.join("new.bin"),
+                    expected_size: usize::try_from(expected_size)
+                        .map_err(|_| "benchmark output too large".to_owned())?,
+                    runtime: tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?,
+                    client: reqwest::Client::new(),
+                },
+            )))
+        }
         Scenario::Assembly => prepare_assembly_context(dir, size_mib, chunks),
         Scenario::SophonInstall => prepare_install_context(dir, size_mib, chunks, server_url),
     }
@@ -920,6 +974,29 @@ fn run_operation(
             apply_hdiff_fixture_with_backend(&dir, hdiff_source_backend)?;
             Ok(Verification::Hdiff(dir))
         }
+        ScenarioContext::PreinstallApply(context) => {
+            let PreinstallApplyContext {
+                game_dir,
+                expected_path,
+                expected_size,
+                runtime,
+                client,
+            } = *context;
+            runtime
+                .block_on(irmin_rs::game_installer::apply_preinstall(
+                    &client,
+                    &game_dir,
+                    "synthetic-target",
+                    Arc::new(|_| {}),
+                    &DownloadHandle::new(),
+                ))
+                .map_err(|error| format!("preinstall apply failed: {error}"))?;
+            Ok(Verification::FileCompare {
+                expected: expected_path,
+                actual: game_dir.join("benchmark/asset.bin"),
+                size: expected_size,
+            })
+        }
         ScenarioContext::Assembly { context } => {
             let AssemblyContext {
                 manifest,
@@ -996,6 +1073,11 @@ fn run_operation(
 fn verify_output(verification: Verification) -> Result<(), String> {
     match verification {
         Verification::Hdiff(dir) => compare_hdiff_fixture(&dir),
+        Verification::FileCompare {
+            expected,
+            actual,
+            size,
+        } => compare_files_streaming(&expected, &actual, size),
         Verification::Assembly {
             expected,
             actual,
@@ -1141,6 +1223,15 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--cover-pattern".into(),
+                "reverse".into(),
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1215,6 +1306,73 @@ mod tests {
         let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn synthetic_preinstall_fixture_runs_public_apply_path() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
+        let context =
+            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, "").unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn synthetic_preinstall_rejects_changed_installed_tag_before_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
+        let game_dir = dir.path().join("synthetic-game");
+        irmin_rs::game_installer::prepare_benchmark_preinstall_state(
+            &game_dir,
+            &dir.path().join("old.bin"),
+            &dir.path().join("new.bin"),
+            &dir.path().join("patch.hdiff"),
+            "benchmark/asset.bin",
+        )
+        .unwrap();
+        irmin_rs::game_installer::write_installed_tag(&game_dir, "wrong-source-tag").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(irmin_rs::game_installer::apply_preinstall(
+            &reqwest::Client::new(),
+            &game_dir,
+            "synthetic-target",
+            Arc::new(|_| {}),
+            &DownloadHandle::new(),
+        ));
+        assert!(result.is_err());
+        assert!(
+            compare_files_streaming(
+                &dir.path().join("old.bin"),
+                &game_dir.join("benchmark/asset.bin"),
+                1024 * 1024,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn synthetic_preinstall_rejects_unsafe_fixture_path_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let game_dir = dir.path().join("not-created");
+        let source = dir.path().join("source.bin");
+        let target = dir.path().join("target.bin");
+        let patch = dir.path().join("patch.hdiff");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&target, b"target").unwrap();
+        fs::write(&patch, b"patch").unwrap();
+        let result = irmin_rs::game_installer::prepare_benchmark_preinstall_state(
+            &game_dir,
+            &source,
+            &target,
+            &patch,
+            "../escape.bin",
+        );
+        assert!(result.is_err());
+        assert!(!game_dir.exists());
     }
 
     #[test]

@@ -199,6 +199,7 @@ pub fn write_installed_tag(game_dir: &Path, tag: &str) -> io::Result<()> {
 pub use crate::types::CompletedFiles;
 pub use assembly::validate_asset_name;
 pub use error::SophonError;
+pub use handle::ControlState;
 pub use handle::DownloadHandle;
 pub use installer::{
     InstallCallbacks, InstallOptions, ResumeContext, StateSaver, assign_chunk_offsets,
@@ -206,9 +207,10 @@ pub use installer::{
     intern_old_chunk_offsets, verify_integrity,
 };
 pub use plugin_install::{install_channel_sdks, install_plugins};
+#[cfg(feature = "benchmark")]
+pub use preinstall::prepare_synthetic_apply_state as prepare_benchmark_preinstall_state;
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
 pub use update::{UpdateInfo, check_update};
-pub use handle::ControlState;
 
 /// Advance jemalloc epoch and trigger a background decay pass. Call after
 /// major sophon phase transitions (download → assembly, etc.) to reduce

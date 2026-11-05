@@ -517,6 +517,131 @@ pub fn save_preinstall_state(game_dir: &Path, state: &PreinstallState) -> Sophon
     Ok(())
 }
 
+#[cfg(feature = "benchmark")]
+pub fn prepare_synthetic_apply_state(
+    game_dir: &Path,
+    original_path: &Path,
+    target_path: &Path,
+    patch_path: &Path,
+    target_relative_path: &str,
+) -> SophonResult<(String, u64)> {
+    super::assembly::validate_asset_name(target_relative_path)?;
+    let patch_name = "synthetic.hdiff";
+    let patch_size = fs::metadata(patch_path)?.len();
+    let patch_hash = hash_file_md5(patch_path)?;
+    let original_size = fs::metadata(original_path)?.len();
+    let original_hash = hash_file_md5(original_path)?;
+    let target_size = fs::metadata(target_path)?.len();
+    let target_hash = hash_file_md5(target_path)?;
+    let game_id = "synthetic";
+    let installed_tag = "synthetic-source";
+    let tag = "synthetic-target";
+    let matching_field = "game";
+    let manifest_id = "synthetic-manifest";
+    let chunk_download = DownloadInfo {
+        encryption: 0,
+        password: String::new(),
+        compression: crate::api_scrape::Compression::None,
+        // Port zero has no listener, so an unexpected DownloadOver fallback fails locally.
+        url_prefix: "http://127.0.0.1:0/unused".to_owned(),
+        url_suffix: String::new(),
+    };
+    let patch_asset = PatchAssetInfo {
+        target_file_path: target_relative_path.to_owned(),
+        target_file_size: target_size,
+        target_file_hash: target_hash.clone(),
+        patch_method: PatchMethod::Patch,
+        patch_name: patch_name.to_owned(),
+        patch_hash: patch_hash.clone(),
+        patch_offset: 0,
+        patch_size,
+        patch_chunk_length: patch_size,
+        original_file_path: Some(target_relative_path.to_owned()),
+        original_file_hash: Some(original_hash),
+        original_file_size: Some(original_size),
+        matching_field: matching_field.to_owned(),
+    };
+    let target_chunk = SophonManifestAssetChunk {
+        chunk_name: "synthetic-target-data".to_owned(),
+        chunk_decompressed_hash_md5: target_hash.clone(),
+        chunk_on_file_offset: 0,
+        chunk_size: target_size.max(1),
+        chunk_size_decompressed: target_size,
+        chunk_compressed_hash_xxh: 0,
+        chunk_compressed_hash_md5: target_hash.clone(),
+        chunk_old_offset: -1,
+    };
+    let mut state = PreinstallState {
+        tag: tag.to_owned(),
+        game_id: game_id.to_owned(),
+        vo_lang: "en-us".to_owned(),
+        installed_tag: installed_tag.to_owned(),
+        patch_assets: vec![patch_asset],
+        deleted_files: Vec::new(),
+        downloaded_chunks: [patch_name.to_owned()].into_iter().collect(),
+        diff_downloads: Default::default(),
+        main_chunk_download: chunk_download.clone(),
+        main_manifest_ids: vec![(matching_field.to_owned(), manifest_id.to_owned())],
+        target_snapshot: None,
+    };
+    let mut snapshot = TargetSnapshot {
+        version: 1,
+        game_id: game_id.to_owned(),
+        vo_lang: state.vo_lang.clone(),
+        installed_tag: installed_tag.to_owned(),
+        tag: tag.to_owned(),
+        build_id: "synthetic-build".to_owned(),
+        legacy_coverage: false,
+        manifests: vec![TargetManifest {
+            matching_field: matching_field.to_owned(),
+            manifest_id: manifest_id.to_owned(),
+            chunk_download,
+            manifest: SophonManifestProto {
+                assets: vec![SophonManifestAssetProperty {
+                    asset_name: target_relative_path.to_owned(),
+                    asset_chunks: vec![target_chunk],
+                    asset_type: 0,
+                    asset_size: target_size,
+                    asset_hash_md5: target_hash.clone(),
+                }],
+            },
+        }],
+        digest: String::new(),
+    };
+    snapshot.seal(&state.patch_assets, &state.deleted_files)?;
+    state.target_snapshot = Some(snapshot);
+
+    fs::create_dir_all(game_dir)?;
+    let install_path = game_dir.join(target_relative_path);
+    if let Some(parent) = install_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(original_path, &install_path)?;
+    let chunk_dir = patching_chunk_dir(game_dir);
+    fs::create_dir_all(&chunk_dir)?;
+    fs::copy(patch_path, chunk_dir.join(patch_name))?;
+    super::write_installed_tag(game_dir, installed_tag)?;
+    save_preinstall_state(game_dir, &state)?;
+    Ok((target_relative_path.to_owned(), target_size))
+}
+
+#[cfg(feature = "benchmark")]
+fn hash_file_md5(path: &Path) -> SophonResult<String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = fast_md5::Md5::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Load and validate persisted preinstall metadata for `tag`.
 pub fn load_preinstall_state(game_dir: &Path, tag: &str) -> SophonResult<PreinstallState> {
     validate_tag(tag)?;
