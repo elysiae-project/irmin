@@ -1,92 +1,13 @@
 use super::HDiff;
 use std::fs;
 
-const OLD_TEXT: &[u8] =
-    b"Hello World! This is the original file content for testing HDiff patching.";
-const NEW_TEXT: &[u8] =
-    b"Hello Universe! This is the modified file content for testing HDiff patching.";
-const DIFF_V13_TEXT: &[u8] = b"HDIFF13&zstd\x00MJ\x01\x03\x00\x04\x00\x08\x00\x0e\x00\x0b\x0e?\x1b\xc7 (\xfe\xfd\xfb\x02\xfd\xfb\x04\xf8Hello Universe";
-
 const NEW_FROM_EMPTY: &[u8] = b"This is brand new content created from nothing!";
 const DIFF_EMPTY_TO_NEW: &[u8] = b"HDIFF13&zstd\x00/\x00\x00\x00\x00\x02\x00\x00\x00/\x00 .This is brand new content created from nothing!";
 
-const SAME: &[u8] = b"Identical content on both sides";
-const DIFF_IDENTITY: &[u8] =
-    b"HDIFF13&zstd\x00\x1f\x1f\x01\x03\x00\x01\x00\x00\x00\x00\x00\x00\x00\x1f\x1e";
-
-fn write_and_apply(old: &[u8], diff: &[u8], expected: &[u8]) -> bool {
-    let dir = tempfile::tempdir().unwrap();
-    let old_path = dir.path().join("old.bin");
-    let diff_path = dir.path().join("diff.hdiff");
-    let out_path = dir.path().join("out.bin");
-
-    fs::write(&old_path, old).unwrap();
-    fs::write(&diff_path, diff).unwrap();
-
-    let op = old_path.to_string_lossy().to_string();
-    let dp = diff_path.to_string_lossy().to_string();
-    let tp = out_path.to_string_lossy().to_string();
-
-    let mut hdiff = HDiff::new(op, dp, tp);
-    if !hdiff.apply(None) {
-        return false;
-    }
-
-    let result = fs::read(&out_path).unwrap();
-    result == expected
-}
-
-/// Test with synthetic hdiff data - may fail due to invalid synthetic
-/// fixture
 #[test]
-#[ignore = "synthetic hdiff fixture produces invalid patch data"]
-fn hdiff_v13_zstd_text_patch() {
-    assert!(
-        write_and_apply(OLD_TEXT, DIFF_V13_TEXT, NEW_TEXT),
-        "v13 zstd text patch output mismatch"
-    );
-}
-/// Test with synthetic hdiff data - may fail due to invalid synthetic
-/// fixture
-#[test]
-#[ignore = "synthetic hdiff fixture produces invalid patch data"]
 fn hdiff_v13_zstd_empty_original() {
-    assert!(
-        write_and_apply(b"", DIFF_EMPTY_TO_NEW, NEW_FROM_EMPTY),
-        "empty original patch output mismatch"
-    );
-}
-
-#[test]
-fn hdiff_v13_zstd_large_binary() {
-    let fixture_dir = "/tmp/hdiff_test";
-    let old_path = format!("{fixture_dir}/old_large.bin");
-    let diff_path = format!("{fixture_dir}/large_zstd.hdiff");
-    let out_path = format!("{fixture_dir}/output_large_test.bin");
-
-    if !std::path::Path::new(&old_path).exists() {
-        eprintln!("skipping: large binary test fixtures not present at {fixture_dir}");
-        return;
-    }
-
-    let mut hdiff = HDiff::new(old_path, diff_path, out_path.clone());
-    assert!(hdiff.apply(None), "large binary patch apply failed");
-
-    let result = fs::read(&out_path).unwrap();
-    let expected = fs::read(format!("{fixture_dir}/new_large.bin")).unwrap();
-    assert_eq!(result, expected, "large binary patch output mismatch");
-    let _ = fs::remove_file(&out_path);
-}
-
-/// Test with synthetic hdiff data - may fail due to invalid synthetic
-/// fixture
-#[test]
-#[ignore = "synthetic hdiff fixture produces invalid patch data"]
-fn hdiff_v13_zstd_identity_patch() {
-    assert!(
-        write_and_apply(SAME, DIFF_IDENTITY, SAME),
-        "identity patch output mismatch"
-    );
+    let result = hdiff_e2e_apply(b"", DIFF_EMPTY_TO_NEW);
+    assert_eq!(result, NEW_FROM_EMPTY);
 }
 
 #[test]
@@ -96,8 +17,8 @@ fn hdiff_wrong_old_size_fails() {
     let diff_path = dir.path().join("diff.hdiff");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&old_path, SAME).unwrap();
-    fs::write(&diff_path, DIFF_V13_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
+    fs::write(&diff_path, b"HDIFF13&zstd\0\x80").unwrap();
 
     let op = old_path.to_string_lossy().to_string();
     let dp = diff_path.to_string_lossy().to_string();
@@ -117,7 +38,7 @@ fn hdiff_invalid_diff_file_fails() {
     let diff_path = dir.path().join("diff.hdiff");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&old_path, OLD_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
     fs::write(&diff_path, b"NOT_A_HDIFF_FILE_CONTENTS").unwrap();
 
     let op = old_path.to_string_lossy().to_string();
@@ -129,11 +50,26 @@ fn hdiff_invalid_diff_file_fails() {
 }
 
 #[test]
-fn hdiff_detect_hdiff_magic_bytes() {
-    assert!(
-        DIFF_V13_TEXT.starts_with(b"HDIFF"),
-        "diff data should start with HDIFF magic bytes"
+fn hdiff_truncated_header_fails_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+
+    fs::write(&old_path, b"").unwrap();
+    fs::write(&diff_path, b"HDIFF13&zstd\0\x80").unwrap();
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
     );
+
+    assert!(!hdiff.apply(None));
+}
+
+#[test]
+fn hdiff_detect_hdiff_magic_bytes() {
+    assert!(DIFF_EMPTY_TO_NEW.starts_with(b"HDIFF"));
 }
 
 #[test]
@@ -142,7 +78,7 @@ fn hdiff_nonexistent_source_file_fails() {
     let diff_path = dir.path().join("diff.hdiff");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&diff_path, DIFF_V13_TEXT).unwrap();
+    fs::write(&diff_path, b"HDIFF13&zstd\0\x80").unwrap();
 
     let op = dir
         .path()
@@ -181,11 +117,9 @@ fn hdiff_newfile_no_source_file() {
     // old_data_size == 0 means the source is optional; the patcher should
     // not fail due to a missing source file.
     let result = hdiff.apply(None);
-    // Expect success or failure for reasons other than a missing source.
-    if result {
-        let output = fs::read(&out_path).unwrap();
-        assert_eq!(output, NEW_FROM_EMPTY, "newfile hdiff output mismatch");
-    }
+    assert!(result, "valid newfile patch should apply without a source");
+    let output = fs::read(&out_path).unwrap();
+    assert_eq!(output, NEW_FROM_EMPTY, "newfile hdiff output mismatch");
 }
 
 #[test]
@@ -194,7 +128,7 @@ fn hdiff_nonexistent_diff_file_fails() {
     let old_path = dir.path().join("old.bin");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&old_path, OLD_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
 
     let op = old_path.to_string_lossy().to_string();
     let dp = dir
@@ -214,8 +148,8 @@ fn hdiff_same_source_and_dest_fails() {
     let old_path = dir.path().join("file.bin");
     let diff_path = dir.path().join("diff.hdiff");
 
-    fs::write(&old_path, OLD_TEXT).unwrap();
-    fs::write(&diff_path, DIFF_V13_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
 
     // Same source and dest path should fail.
     let path_str = old_path.to_string_lossy().to_string();
@@ -459,14 +393,6 @@ fn compression_mode_all_supported_parse() {
             expected
         );
     }
-}
-
-/// compress_cover_buf_size == 1 triggers padding (whereas > 1 would not).
-#[test]
-fn cover_padding_with_small_compressed_size() {
-    // Padding logic is exercised by the v20_zstd and v13_zstd end-to-end tests
-    // which use compressed covers. A dedicated regression would require crafting
-    // a patch with exactly compress_cover_buf_size == 1.
 }
 
 /// Verify the padding logic for all compression modes
@@ -728,13 +654,25 @@ fn cover_header_new_with_zero_values() {
 
 /// Empty input returns no headers.
 #[test]
-fn enumerate_cover_headers_rejects_negative_cover_length() {
+fn enumerate_cover_headers_empty_input_with_zero_covers_is_valid() {
     use std::io::Cursor;
 
-    // Empty input succeeds.
     let mut c = Cursor::new(Vec::new());
     let result = super::patch_core::enumerate_cover_headers(&mut c, 0, 0);
     assert!(result.is_ok());
+}
+
+#[test]
+fn enumerate_cover_headers_decodes_minimal_header() {
+    use std::io::Cursor;
+
+    let encoded_header = [0x00, 0x00, 0x02];
+    let mut cursor = Cursor::new(encoded_header);
+    let headers = super::patch_core::enumerate_cover_headers(&mut cursor, 3, 1).unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].old_pos, 0);
+    assert_eq!(headers[0].new_pos, 0);
+    assert_eq!(headers[0].cover_length, 2);
 }
 
 /// enumerate_cover_headers rejects negative old_pos from underflow.
@@ -1469,6 +1407,23 @@ fn hdiff_e2e_v13_zstd_rle_run_exceeds_buffer_applies_correctly() {
         new,
         "oversized RLE run output mismatch"
     );
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_identity_patch_applies_correctly() {
+    let original = test_prng_data(31, 16 * 1024);
+    let patch = build_v13_zstd_patch(&original, &original);
+    assert_eq!(hdiff_e2e_apply(&original, &patch), original);
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_handles_new_data_tail() {
+    let old = test_prng_data(32, 8192);
+    let mut new = old.clone();
+    new[4096..].fill(0x5a);
+    new.extend_from_slice(b"partial tail");
+    let patch = build_v13_zstd_patch(&old, &new);
+    assert_eq!(hdiff_e2e_apply(&old, &patch), new);
 }
 
 /// Shared apply helper for e2e tests.
