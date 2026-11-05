@@ -796,7 +796,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_only_mmap_accepts_explicit_advice() {
+    fn read_only_mmap_maps_file_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.bin");
         std::fs::write(&path, b"mapped source").unwrap();
