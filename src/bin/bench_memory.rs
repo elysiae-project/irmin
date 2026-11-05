@@ -11,13 +11,14 @@ use std::time::Instant;
 use fast_md5::Md5;
 use irmin_rs::api_scrape::{Compression, DownloadInfo};
 use irmin_rs::bench_support::{
-    apply_hdiff_fixture, compare_hdiff_fixture, deterministic_data,
+    apply_hdiff_fixture_with_backend, compare_hdiff_fixture, deterministic_data,
     prepare_hdiff_fixture as prepare_shared_hdiff_fixture,
 };
 use irmin_rs::game_installer::VerifyMode;
 use irmin_rs::game_installer::assembly::{assemble_file, chunk_filename};
 use irmin_rs::game_installer::cache::{VerificationCache, VerificationEntry};
 use irmin_rs::game_installer::compact_manifest::{CompactManifest, StringArena};
+use irmin_rs::game_installer::hdiffpatch::{HDiffSourceBackend, WindowStats};
 use irmin_rs::game_installer::installer::{
     ChunkNameLookup, InstallCallbacks, InstallOptions, ResumeContext, SophonInstaller, install,
 };
@@ -65,6 +66,7 @@ struct Config {
     json: bool,
     keep_workdir: bool,
     source_backend: SourceBackend,
+    window_size_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,6 +74,7 @@ enum SourceBackend {
     #[default]
     Mmap,
     File,
+    Windowed,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -315,13 +318,11 @@ fn run_cli() -> Result<(), String> {
             .arg(config.size_mib.to_string())
             .arg(config.chunks.to_string())
             .arg(server_url)
-            .env_remove("IRMIN_HDIFF_FORCE_FILE_SOURCE")
-            .env(
-                "IRMIN_HDIFF_FORCE_FILE_SOURCE",
-                (config.source_backend == SourceBackend::File)
-                    .then_some("1")
-                    .unwrap_or("0"),
-            )
+            .arg(match config.source_backend {
+                SourceBackend::Mmap => "mmap".to_owned(),
+                SourceBackend::File => "file".to_owned(),
+                SourceBackend::Windowed => format!("windowed:{}", config.window_size_bytes),
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .output()
@@ -359,6 +360,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut json = false;
     let mut keep_workdir = false;
     let mut source_backend = SourceBackend::Mmap;
+    let mut window_size_bytes = 256 * 1024;
+    let mut window_size_provided = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -391,12 +394,27 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 source_backend = match value_at(args, index, option)? {
                     "mmap" => SourceBackend::Mmap,
                     "file" => SourceBackend::File,
+                    "windowed" => SourceBackend::Windowed,
                     value => {
                         return Err(format!(
-                            "unknown source backend '{value}'; expected mmap or file"
+                            "unknown source backend '{value}'; expected mmap, file, or windowed"
                         ));
                     }
                 };
+            }
+            "--window-mib" => {
+                index += 1;
+                window_size_provided = true;
+                window_size_bytes = parse_positive(value_at(args, index, option)?, option)?
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| "window size is too large".to_owned())?;
+            }
+            "--window-kib" => {
+                index += 1;
+                window_size_provided = true;
+                window_size_bytes = parse_positive(value_at(args, index, option)?, option)?
+                    .checked_mul(1024)
+                    .ok_or_else(|| "window size is too large".to_owned())?;
             }
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
@@ -405,6 +423,16 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     }
 
     let scenario = scenario.ok_or_else(|| usage().to_owned())?;
+    if scenario != Scenario::Hdiff && source_backend != SourceBackend::Mmap {
+        return Err("--source-backend is only supported for the hdiff scenario".to_owned());
+    }
+    if source_backend != SourceBackend::Windowed && window_size_provided {
+        return Err("--window-mib/--window-kib require --source-backend windowed".to_owned());
+    }
+    #[cfg(not(unix))]
+    if source_backend == SourceBackend::Windowed {
+        return Err("the windowed source backend requires Unix".to_owned());
+    }
     if size_mib.checked_mul(1024 * 1024).is_none() {
         return Err("--size-mib is too large".to_owned());
     }
@@ -413,6 +441,9 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     }
     if scenario == Scenario::SophonInstall && (size_mib * 1024 * 1024) % chunks != 0 {
         return Err("sophon-install size-mib must divide evenly into chunks".to_owned());
+    }
+    if source_backend == SourceBackend::Windowed && window_size_bytes > 64 * 1024 * 1024 {
+        return Err("window size must not exceed 64 MiB".to_owned());
     }
     Ok(Config {
         scenario,
@@ -423,6 +454,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         json,
         keep_workdir,
         source_backend,
+        window_size_bytes,
     })
 }
 
@@ -443,17 +475,39 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 5 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL".to_owned());
+    if args.len() != 6 {
+        return Err(
+            "child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL SOURCE_BACKEND"
+                .to_owned(),
+        );
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
     let size_mib = parse_positive(&args[2], "--size-mib")?;
     let chunks = parse_positive(&args[3], "--chunks")?;
+    let source_backend = args[5].as_str();
+    let window_stats = Arc::new(WindowStats::default());
+    let hdiff_source_backend = match source_backend {
+        "mmap" => HDiffSourceBackend::Mmap,
+        "file" => HDiffSourceBackend::File,
+        value if value.starts_with("windowed:") => {
+            let window_size = value["windowed:".len()..]
+                .parse::<usize>()
+                .map_err(|_| "invalid child window size".to_owned())?;
+            if window_size == 0 || window_size > 64 * 1024 * 1024 {
+                return Err("child window size must be between 1 byte and 64 MiB".to_owned());
+            }
+            HDiffSourceBackend::Windowed {
+                window_size,
+                stats: Arc::clone(&window_stats),
+            }
+        }
+        _ => return Err("invalid child source backend".to_owned()),
+    };
     let context = prepare_child_context(scenario, &fixture_dir, size_mib, chunks, &args[4])?;
     let mut sampler = MemorySampler::start();
     thread::sleep(std::time::Duration::from_millis(5));
@@ -462,7 +516,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let operation_baseline = read_memory_snapshot()?;
     let cpu_before = read_cpu_usage()?;
     let started = Instant::now();
-    let verification = run_operation(context)?;
+    let verification = run_operation(context, hdiff_source_backend)?;
     let elapsed_ms = started.elapsed().as_millis();
     let operation_end = read_memory_snapshot()?;
     let cpu_after = read_cpu_usage()?;
@@ -473,6 +527,10 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::json!({
             "scenario": scenario.name(),
+            "source_backend": source_backend,
+            "window_cache_hits": window_stats.hits.load(Ordering::Relaxed),
+            "window_cache_misses": window_stats.misses.load(Ordering::Relaxed),
+            "window_cache_bytes_read": window_stats.bytes_read.load(Ordering::Relaxed),
             "size_mib": size_mib,
             "chunks": chunks,
             "elapsed_ms": elapsed_ms,
@@ -779,10 +837,13 @@ fn prepare_install_context(
     })))
 }
 
-fn run_operation(context: ScenarioContext) -> Result<Verification, String> {
+fn run_operation(
+    context: ScenarioContext,
+    hdiff_source_backend: HDiffSourceBackend,
+) -> Result<Verification, String> {
     match context {
         ScenarioContext::Hdiff { dir } => {
-            apply_hdiff_fixture(&dir)?;
+            apply_hdiff_fixture_with_backend(&dir, hdiff_source_backend)?;
             Ok(Verification::Hdiff(dir))
         }
         ScenarioContext::Assembly { context } => {
@@ -962,6 +1023,15 @@ mod tests {
         assert!(
             parse_args(&[
                 "--scenario".into(),
+                "assembly".into(),
+                "--source-backend".into(),
+                "file".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
                 "sophon-install".into(),
                 "--size-mib".into(),
                 "1".into(),
@@ -976,6 +1046,15 @@ mod tests {
                 "hdiff".into(),
                 "--size-mib".into(),
                 usize::MAX.to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--window-kib".into(),
+                "256".into(),
             ])
             .is_err()
         );
@@ -1051,7 +1130,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1).unwrap();
         let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
-        let verification = run_operation(context).unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
 
@@ -1060,7 +1139,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_assembly_fixture(dir.path(), 1, 2).unwrap();
         let context = prepare_child_context(Scenario::Assembly, dir.path(), 1, 2, "").unwrap();
-        let verification = run_operation(context).unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
 
@@ -1072,7 +1151,7 @@ mod tests {
         let context =
             prepare_child_context(Scenario::SophonInstall, dir.path(), 1, 2, &server.base_url)
                 .unwrap();
-        let verification = run_operation(context).unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
 }

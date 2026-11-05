@@ -1,4 +1,4 @@
-use crate::game_installer::hdiffpatch::HDiffPublic as HDiff;
+use crate::game_installer::hdiffpatch::{HDiffPublic as HDiff, HDiffSourceBackend};
 use std::fs;
 use std::path::Path;
 
@@ -157,12 +157,19 @@ pub fn compare_hdiff_fixture(dir: &Path) -> Result<(), String> {
 }
 
 pub fn apply_hdiff_fixture(dir: &Path) -> Result<(), String> {
+    apply_hdiff_fixture_with_backend(dir, HDiffSourceBackend::Mmap)
+}
+
+pub fn apply_hdiff_fixture_with_backend(
+    dir: &Path,
+    source_backend: HDiffSourceBackend,
+) -> Result<(), String> {
     let mut patch = HDiff::new(
         dir.join("old.bin").to_string_lossy().into_owned(),
         dir.join("patch.hdiff").to_string_lossy().into_owned(),
         dir.join("out.bin").to_string_lossy().into_owned(),
     );
-    if !patch.apply(None) {
+    if !patch.apply_with_source_backend(None, source_backend) {
         return Err("HDiff apply failed".to_owned());
     }
     Ok(())
@@ -203,6 +210,28 @@ mod tests {
         fs::write(dir.path().join("new.bin"), &new).unwrap();
         fs::write(dir.path().join("patch.hdiff"), patch).unwrap();
         verify_hdiff_fixture(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hdiff_backends_produce_identical_output() {
+        use crate::game_installer::hdiffpatch::HDiffSourceBackend;
+
+        for backend in [
+            HDiffSourceBackend::Mmap,
+            HDiffSourceBackend::File,
+            HDiffSourceBackend::Windowed {
+                window_size: 4096,
+                stats: std::sync::Arc::new(
+                    crate::game_installer::hdiffpatch::WindowStats::default(),
+                ),
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            prepare_hdiff_fixture(dir.path(), 1).unwrap();
+            apply_hdiff_fixture_with_backend(dir.path(), backend).unwrap();
+            compare_hdiff_fixture(dir.path()).unwrap();
+        }
     }
 }
 

@@ -13,13 +13,17 @@ pub(crate) use diff::HDiff;
 pub(crate) use diff::SeekableRead;
 #[allow(unused_imports)]
 pub(crate) use header::{
-    CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, RleRefClip, K_BYTE_RLE_TYPE,
-    K_SIGN_TAG_BIT, MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN,
-    MAX_MEM_BUFFER_LIMIT,
+    CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, K_BYTE_RLE_TYPE, K_SIGN_TAG_BIT,
+    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT,
+    RleRefClip,
 };
 
 #[cfg(feature = "benchmark")]
 pub use diff::HDiff as HDiffPublic;
+#[cfg(feature = "benchmark")]
+pub use diff::SourceBackend as HDiffSourceBackend;
+#[cfg(feature = "benchmark")]
+pub use diff::WindowStats;
 #[cfg(feature = "benchmark")]
 pub use header::MAX_ARRAY_POOL_LEN as BENCH_MAX_ARRAY_POOL_LEN;
 #[cfg(feature = "benchmark")]

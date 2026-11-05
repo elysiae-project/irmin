@@ -1,5 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+#[cfg(all(feature = "benchmark", unix))]
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use super::header::{DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo};
@@ -11,6 +13,32 @@ pub struct HDiff {
     pub diff_path: String,
     pub dest_path: String,
     pub diff_offset: u64,
+}
+
+#[cfg(feature = "benchmark")]
+#[derive(Clone, Debug)]
+pub enum SourceBackend {
+    Mmap,
+    File,
+    Windowed {
+        window_size: usize,
+        stats: std::sync::Arc<WindowStats>,
+    },
+}
+
+#[cfg(feature = "benchmark")]
+#[derive(Debug, Default)]
+pub struct WindowStats {
+    pub hits: std::sync::atomic::AtomicU64,
+    pub misses: std::sync::atomic::AtomicU64,
+    pub bytes_read: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(not(feature = "benchmark"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SourceBackend {
+    #[default]
+    Mmap,
 }
 
 impl HDiff {
@@ -38,7 +66,31 @@ impl HDiff {
     /// Apply the patch, optionally reporting completed output bytes; returns
     /// `true` only when the patch completes successfully.
     pub fn apply(&mut self, on_progress: Option<Box<dyn Fn(u64)>>) -> bool {
-        match self.apply_inner(on_progress.as_ref().map(|cb| cb.as_ref())) {
+        self.apply_with_source_backend(on_progress, SourceBackend::Mmap)
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn apply_with_source_backend(
+        &mut self,
+        on_progress: Option<Box<dyn Fn(u64)>>,
+        source_backend: SourceBackend,
+    ) -> bool {
+        match self.apply_inner(on_progress.as_ref().map(|cb| cb.as_ref()), source_backend) {
+            Ok(()) => true,
+            Err(err) => {
+                log::error!("[HDiff::apply] Error: {err}");
+                false
+            }
+        }
+    }
+
+    #[cfg(not(feature = "benchmark"))]
+    fn apply_with_source_backend(
+        &mut self,
+        on_progress: Option<Box<dyn Fn(u64)>>,
+        source_backend: SourceBackend,
+    ) -> bool {
+        match self.apply_inner(on_progress.as_ref().map(|cb| cb.as_ref()), source_backend) {
             Ok(()) => true,
             Err(err) => {
                 log::error!("[HDiff::apply] Error: {err}");
@@ -50,6 +102,7 @@ impl HDiff {
     fn apply_inner(
         &self,
         on_progress: Option<&dyn Fn(u64)>,
+        source_backend: SourceBackend,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Reject in-place patching: canonicalize detects same file on disk
         // when both exist; string comparison catches same-path-string when
@@ -136,6 +189,8 @@ impl HDiff {
         // Newfile patch: old_data_size == 0 means source is optional.
         let mut source_mmap = None;
         let mut old_file_fallback: Option<File> = None;
+        #[cfg(all(feature = "benchmark", unix))]
+        let mut windowed_source = None;
         let mut source_cursor: Option<Cursor<&[u8]>> = None;
 
         let source_file = match File::open(&self.source_path) {
@@ -181,12 +236,8 @@ impl HDiff {
             }
             // mmap avoids per-cover seek/read calls while kernel readahead stays adaptive.
             // Falls back to File if mmap fails; page residency stays demand-driven.
-            #[cfg(feature = "benchmark")]
-            let force_file_source =
-                std::env::var("IRMIN_HDIFF_FORCE_FILE_SOURCE").is_ok_and(|value| value == "1");
-            #[cfg(not(feature = "benchmark"))]
-            let force_file_source = false;
-            if old_len > 0 && !force_file_source {
+            let use_mmap = matches!(source_backend, SourceBackend::Mmap);
+            if old_len > 0 && use_mmap {
                 let map_len = usize::try_from(old_len).map_err(|_| {
                     std::io::Error::other("source file is too large to map on this platform")
                 })?;
@@ -203,7 +254,16 @@ impl HDiff {
                     }
                 }
             } else {
-                old_file_fallback = Some(f);
+                #[cfg(all(feature = "benchmark", unix))]
+                if let SourceBackend::Windowed { window_size, stats } = source_backend {
+                    windowed_source = Some(WindowedSource::new(f, window_size, 4, stats)?);
+                } else {
+                    old_file_fallback = Some(f);
+                }
+                #[cfg(not(all(feature = "benchmark", unix)))]
+                {
+                    old_file_fallback = Some(f);
+                }
             }
         } else {
             old_file_fallback = Some(File::open("/dev/null")?);
@@ -251,9 +311,19 @@ impl HDiff {
                 super::super::FILE_WRITE_BUFFER_SIZE,
                 out_file.try_clone()?,
             ));
-            let old_source: &mut dyn SeekableRead = match source_cursor.as_mut() {
-                Some(c) => c,
-                None => old_file_fallback.as_mut().unwrap(),
+            let old_source: &mut dyn SeekableRead = if let Some(cursor) = source_cursor.as_mut() {
+                cursor
+            } else {
+                #[cfg(all(feature = "benchmark", unix))]
+                if let Some(windowed) = windowed_source.as_mut() {
+                    windowed
+                } else {
+                    old_file_fallback.as_mut().unwrap()
+                }
+                #[cfg(not(all(feature = "benchmark", unix)))]
+                {
+                    old_file_fallback.as_mut().unwrap()
+                }
             };
 
             if header_info.is_single_compressed_diff {
@@ -535,5 +605,316 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+#[cfg(all(test, feature = "benchmark"))]
+mod windowed_source_tests {
+    use super::{WindowStats, WindowedSource};
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    #[test]
+    fn matches_cursor_across_windows_and_backtracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        let data = (0..97).map(|value| value as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &data).unwrap();
+        let mut source = WindowedSource::new(
+            std::fs::File::open(&path).unwrap(),
+            7,
+            3,
+            std::sync::Arc::new(WindowStats::default()),
+        )
+        .unwrap();
+        let mut oracle = Cursor::new(data);
+
+        for seek in [
+            SeekFrom::Start(65),
+            SeekFrom::Start(3),
+            SeekFrom::Current(18),
+            SeekFrom::End(-11),
+            SeekFrom::Start(0),
+        ] {
+            assert_eq!(source.seek(seek).unwrap(), oracle.seek(seek).unwrap());
+            let mut actual = [0; 19];
+            let mut expected = [0; 19];
+            assert_eq!(
+                source.read(&mut actual).unwrap(),
+                oracle.read(&mut expected).unwrap()
+            );
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn randomized_reads_and_evictions_match_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        let data = (0usize..4093)
+            .map(|index| (index.wrapping_mul(37) % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &data).unwrap();
+        let mut source = WindowedSource::new(
+            std::fs::File::open(&path).unwrap(),
+            31,
+            3,
+            std::sync::Arc::new(WindowStats::default()),
+        )
+        .unwrap();
+        let mut oracle = Cursor::new(data);
+        let mut state = 0x1234_5678u32;
+        for _ in 0..500 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let position = (state as usize % 4300) as u64;
+            assert_eq!(
+                source.seek(SeekFrom::Start(position)).unwrap(),
+                oracle.seek(SeekFrom::Start(position)).unwrap()
+            );
+            let length = ((state >> 16) as usize % 97) + 1;
+            let mut actual = vec![0; length];
+            let mut expected = vec![0; length];
+            let actual_len = source.read(&mut actual).unwrap();
+            let expected_len = oracle.read(&mut expected).unwrap();
+            assert_eq!(actual_len, expected_len);
+            assert_eq!(&actual[..actual_len], &expected[..expected_len]);
+        }
+    }
+
+    #[test]
+    fn seek_past_end_reads_eof_and_negative_seek_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut source = WindowedSource::new(
+            std::fs::File::open(&path).unwrap(),
+            2,
+            1,
+            std::sync::Arc::new(WindowStats::default()),
+        )
+        .unwrap();
+        assert_eq!(source.seek(SeekFrom::Start(7)).unwrap(), 7);
+        assert_eq!(source.read(&mut [0; 1]).unwrap(), 0);
+        assert!(source.seek(SeekFrom::Current(-8)).is_err());
+    }
+
+    #[test]
+    fn detects_source_truncation_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut source =
+            WindowedSource::new(file, 4, 2, std::sync::Arc::new(WindowStats::default())).unwrap();
+        std::fs::write(&path, b"a").unwrap();
+        assert_eq!(
+            source.read_exact(&mut [0; 4]).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn detects_truncation_mid_window_with_read_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut source =
+            WindowedSource::new(file, 8, 1, std::sync::Arc::new(WindowStats::default())).unwrap();
+        std::fs::write(&path, b"abcd").unwrap();
+        assert_eq!(
+            source.read_exact(&mut [0; 8]).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn rejects_zero_window_or_slot_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let stats = std::sync::Arc::new(WindowStats::default());
+        assert!(WindowedSource::new(file.try_clone().unwrap(), 0, 1, stats.clone()).is_err());
+        assert!(WindowedSource::new(file, 1, 0, stats).is_err());
+    }
+
+    #[test]
+    fn empty_source_is_immediately_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, []).unwrap();
+        let mut source = WindowedSource::new(
+            std::fs::File::open(&path).unwrap(),
+            4,
+            1,
+            std::sync::Arc::new(WindowStats::default()),
+        )
+        .unwrap();
+        assert_eq!(source.read(&mut [0; 1]).unwrap(), 0);
+    }
+}
+
 pub(crate) trait SeekableRead: Read + Seek {}
 impl<T: Read + Seek> SeekableRead for T {}
+
+#[cfg(feature = "benchmark")]
+struct WindowSlot {
+    base: Option<u64>,
+    valid: usize,
+    stamp: u64,
+    data: Vec<u8>,
+}
+
+#[cfg(feature = "benchmark")]
+/// Bounded positional-read cache for benchmark comparisons.
+/// The source file must remain unchanged while the patch is applied.
+struct WindowedSource {
+    file: File,
+    len: u64,
+    position: u64,
+    window_size: usize,
+    max_slots: usize,
+    clock: u64,
+    slots: Vec<WindowSlot>,
+    stats: std::sync::Arc<WindowStats>,
+}
+
+#[cfg(feature = "benchmark")]
+impl WindowedSource {
+    fn new(
+        file: File,
+        window_size: usize,
+        slot_count: usize,
+        stats: std::sync::Arc<WindowStats>,
+    ) -> std::io::Result<Self> {
+        if window_size == 0 || slot_count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "window size and slot count must be positive",
+            ));
+        }
+        let len = file.metadata()?.len();
+        Ok(Self {
+            file,
+            len,
+            position: 0,
+            window_size,
+            max_slots: slot_count,
+            clock: 0,
+            slots: Vec::with_capacity(slot_count),
+            stats,
+        })
+    }
+
+    fn slot_for_position(&mut self) -> std::io::Result<usize> {
+        let base = self.position / self.window_size as u64 * self.window_size as u64;
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(index) = self.slots.iter().position(|slot| slot.base == Some(base)) {
+            self.stats
+                .hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.slots[index].stamp = self.clock;
+            return Ok(index);
+        }
+        self.stats
+            .misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let index = if self.slots.len() < self.max_slots {
+            self.slots.push(WindowSlot {
+                base: None,
+                valid: 0,
+                stamp: self.clock,
+                data: vec![0; self.window_size],
+            });
+            self.slots.len() - 1
+        } else {
+            self.slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, slot)| slot.stamp)
+                .map(|(index, _)| index)
+                .expect("positive slot count")
+        };
+        let slot = &mut self.slots[index];
+        slot.base = None;
+        slot.valid = 0;
+        let mut filled = 0;
+        while filled < self.window_size {
+            let count = loop {
+                match self
+                    .file
+                    .read_at(&mut slot.data[filled..], base + filled as u64)
+                {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            filled += count;
+        }
+        if base < self.len && filled == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "source file ended before its recorded length",
+            ));
+        }
+        slot.base = Some(base);
+        slot.valid = filled;
+        slot.stamp = self.clock;
+        self.stats
+            .bytes_read
+            .fetch_add(filled as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(index)
+    }
+}
+
+#[cfg(feature = "benchmark")]
+impl Read for WindowedSource {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || self.position >= self.len {
+            return Ok(0);
+        }
+        let mut copied = 0;
+        while copied < output.len() && self.position < self.len {
+            let index = self.slot_for_position()?;
+            let offset = (self.position - self.slots[index].base.unwrap()) as usize;
+            let count = (output.len() - copied)
+                .min(self.slots[index].valid.saturating_sub(offset))
+                .min(usize::try_from(self.len - self.position).unwrap_or(usize::MAX));
+            if count == 0 {
+                return if copied == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "source file ended before its recorded length",
+                    ))
+                } else {
+                    Ok(copied)
+                };
+            }
+            output[copied..copied + count]
+                .copy_from_slice(&self.slots[index].data[offset..offset + count]);
+            self.position += count as u64;
+            copied += count;
+        }
+        Ok(copied)
+    }
+}
+
+#[cfg(feature = "benchmark")]
+impl Seek for WindowedSource {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let position = match from {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+        };
+        if position < 0 || position > i128::from(u64::MAX) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            ));
+        }
+        self.position = position as u64;
+        Ok(self.position)
+    }
+}
