@@ -12,7 +12,7 @@ use fast_md5::Md5;
 use irmin_rs::api_scrape::{Compression, DownloadInfo};
 use irmin_rs::bench_support::{
     apply_hdiff_fixture_with_backend, compare_hdiff_fixture, deterministic_data,
-    prepare_hdiff_fixture as prepare_shared_hdiff_fixture,
+    make_v13_zstd_reordered_patch, prepare_hdiff_fixture as prepare_shared_hdiff_fixture,
 };
 use irmin_rs::game_installer::VerifyMode;
 use irmin_rs::game_installer::assembly::{assemble_file, chunk_filename};
@@ -67,6 +67,36 @@ struct Config {
     keep_workdir: bool,
     source_backend: SourceBackend,
     window_size_bytes: usize,
+    cover_pattern: CoverPattern,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CoverPattern {
+    #[default]
+    Sequential,
+    Reverse,
+    Thrash,
+}
+
+impl CoverPattern {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "sequential" => Ok(Self::Sequential),
+            "reverse" => Ok(Self::Reverse),
+            "thrash" => Ok(Self::Thrash),
+            _ => Err(format!(
+                "unknown cover pattern '{value}'; expected sequential, reverse, or thrash"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::Reverse => "reverse",
+            Self::Thrash => "thrash",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -301,6 +331,7 @@ fn run_cli() -> Result<(), String> {
             &fixture_dir,
             config.size_mib,
             config.chunks,
+            config.cover_pattern,
         )?;
         let mut local_server = if config.scenario == Scenario::SophonInstall {
             Some(LocalChunkServer::start(fixture_dir.clone())?)
@@ -318,6 +349,7 @@ fn run_cli() -> Result<(), String> {
             .arg(config.size_mib.to_string())
             .arg(config.chunks.to_string())
             .arg(server_url)
+            .arg(config.cover_pattern.name())
             .arg(match config.source_backend {
                 SourceBackend::Mmap => "mmap".to_owned(),
                 SourceBackend::File => "file".to_owned(),
@@ -362,6 +394,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut source_backend = SourceBackend::Mmap;
     let mut window_size_bytes = 256 * 1024;
     let mut window_size_provided = false;
+    let mut cover_pattern = CoverPattern::Sequential;
     let mut index = 0;
 
     while index < args.len() {
@@ -416,6 +449,10 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                     .checked_mul(1024)
                     .ok_or_else(|| "window size is too large".to_owned())?;
             }
+            "--cover-pattern" => {
+                index += 1;
+                cover_pattern = CoverPattern::parse(value_at(args, index, option)?)?;
+            }
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
@@ -425,6 +462,9 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let scenario = scenario.ok_or_else(|| usage().to_owned())?;
     if scenario != Scenario::Hdiff && source_backend != SourceBackend::Mmap {
         return Err("--source-backend is only supported for the hdiff scenario".to_owned());
+    }
+    if scenario != Scenario::Hdiff && cover_pattern != CoverPattern::Sequential {
+        return Err("--cover-pattern is only supported for the hdiff scenario".to_owned());
     }
     if source_backend != SourceBackend::Windowed && window_size_provided {
         return Err("--window-mib/--window-kib require --source-backend windowed".to_owned());
@@ -455,6 +495,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         keep_workdir,
         source_backend,
         window_size_bytes,
+        cover_pattern,
     })
 }
 
@@ -475,21 +516,19 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 6 {
-        return Err(
-            "child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL SOURCE_BACKEND"
-                .to_owned(),
-        );
+    if args.len() != 7 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL COVER_PATTERN SOURCE_BACKEND".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
     let size_mib = parse_positive(&args[2], "--size-mib")?;
     let chunks = parse_positive(&args[3], "--chunks")?;
-    let source_backend = args[5].as_str();
+    let cover_pattern = CoverPattern::parse(&args[5])?;
+    let source_backend = args[6].as_str();
     let window_stats = Arc::new(WindowStats::default());
     let hdiff_source_backend = match source_backend {
         "mmap" => HDiffSourceBackend::Mmap,
@@ -527,6 +566,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::json!({
             "scenario": scenario.name(),
+            "cover_pattern": cover_pattern.name(),
             "source_backend": source_backend,
             "window_cache_hits": window_stats.hits.load(Ordering::Relaxed),
             "window_cache_misses": window_stats.misses.load(Ordering::Relaxed),
@@ -631,16 +671,50 @@ fn prepare_fixture(
     dir: &Path,
     size_mib: usize,
     chunks: usize,
+    cover_pattern: CoverPattern,
 ) -> Result<(), String> {
     match scenario {
-        Scenario::Hdiff => prepare_hdiff_fixture(dir, size_mib),
+        Scenario::Hdiff => prepare_hdiff_fixture(dir, size_mib, cover_pattern),
         Scenario::Assembly => prepare_assembly_fixture(dir, size_mib, chunks),
         Scenario::SophonInstall => prepare_install_fixture(dir, size_mib, chunks),
     }
 }
 
-fn prepare_hdiff_fixture(dir: &Path, size_mib: usize) -> Result<(), String> {
-    prepare_shared_hdiff_fixture(dir, size_mib)
+fn prepare_hdiff_fixture(
+    dir: &Path,
+    size_mib: usize,
+    cover_pattern: CoverPattern,
+) -> Result<(), String> {
+    if cover_pattern == CoverPattern::Sequential {
+        return prepare_shared_hdiff_fixture(dir, size_mib);
+    }
+    const BLOCK_SIZE: usize = 64 * 1024;
+    let block_count = size_mib * 1024 * 1024 / BLOCK_SIZE;
+    let old = deterministic_data(0xDEAD, block_count * BLOCK_SIZE);
+    let permutation = match cover_pattern {
+        CoverPattern::Reverse => (0..block_count).rev().collect::<Vec<_>>(),
+        CoverPattern::Thrash => {
+            let step = (5..block_count)
+                .step_by(2)
+                .find(|step| gcd(*step, block_count) == 1)
+                .unwrap_or(1);
+            (0..block_count)
+                .map(|index| (index * step) % block_count)
+                .collect::<Vec<_>>()
+        }
+        CoverPattern::Sequential => unreachable!(),
+    };
+    let (patch, new) = make_v13_zstd_reordered_patch(&old, &permutation);
+    fs::write(dir.join("old.bin"), &old).map_err(|error| error.to_string())?;
+    fs::write(dir.join("new.bin"), &new).map_err(|error| error.to_string())?;
+    fs::write(dir.join("patch.hdiff"), patch).map_err(|error| error.to_string())
+}
+
+fn gcd(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn prepare_assembly_fixture(dir: &Path, size_mib: usize, chunks: usize) -> Result<(), String> {
@@ -1058,6 +1132,15 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "assembly".into(),
+                "--cover-pattern".into(),
+                "reverse".into(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1128,10 +1211,29 @@ mod tests {
     #[test]
     fn generated_hdiff_fixture_applies_to_expected_output() {
         let dir = tempfile::tempdir().unwrap();
-        prepare_hdiff_fixture(dir.path(), 1).unwrap();
+        prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
         let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn reordered_hdiff_patterns_apply_with_each_source_backend() {
+        for pattern in [CoverPattern::Reverse, CoverPattern::Thrash] {
+            let dir = tempfile::tempdir().unwrap();
+            prepare_hdiff_fixture(dir.path(), 1, pattern).unwrap();
+            for backend in [
+                HDiffSourceBackend::Mmap,
+                HDiffSourceBackend::File,
+                HDiffSourceBackend::Windowed {
+                    window_size: 256 * 1024,
+                    stats: Arc::new(WindowStats::default()),
+                },
+            ] {
+                apply_hdiff_fixture_with_backend(dir.path(), backend).unwrap();
+                compare_hdiff_fixture(dir.path()).unwrap();
+            }
+        }
     }
 
     #[test]

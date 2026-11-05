@@ -50,10 +50,49 @@ pub fn make_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
         ));
     }
 
+    make_v13_zstd_patch_from_covers(old, new, &covers)
+}
+
+pub fn make_v13_zstd_reordered_patch(old: &[u8], permutation: &[usize]) -> (Vec<u8>, Vec<u8>) {
+    const BLOCK_SIZE: usize = 64 * 1024;
+    assert_eq!(old.len() % BLOCK_SIZE, 0);
+    assert!(
+        permutation
+            .iter()
+            .all(|&index| index < old.len() / BLOCK_SIZE)
+    );
+    let new = permutation
+        .iter()
+        .flat_map(|&index| {
+            let start = index * BLOCK_SIZE;
+            old[start..start + BLOCK_SIZE].iter().copied()
+        })
+        .collect::<Vec<_>>();
+    let covers = permutation
+        .iter()
+        .enumerate()
+        .map(|(new_index, &old_index)| (old_index * BLOCK_SIZE, new_index * BLOCK_SIZE, BLOCK_SIZE))
+        .collect::<Vec<_>>();
+    (make_v13_zstd_patch_from_covers(old, &new, &covers), new)
+}
+
+fn make_v13_zstd_patch_from_covers(
+    old: &[u8],
+    new: &[u8],
+    covers: &[(usize, usize, usize)],
+) -> Vec<u8> {
+    let mut checked_new_end = 0usize;
+    for &(old_pos, new_pos, len) in covers {
+        assert!(old_pos.checked_add(len).is_some_and(|end| end <= old.len()));
+        assert!(new_pos >= checked_new_end);
+        assert!(new_pos.checked_add(len).is_some_and(|end| end <= new.len()));
+        checked_new_end = new_pos + len;
+    }
+
     let mut cover_data = Vec::new();
     let mut previous_old_end = 0usize;
     let mut previous_new_end = 0usize;
-    for &(old_pos, new_pos, len) in &covers {
+    for &(old_pos, new_pos, len) in covers {
         let delta = old_pos.abs_diff(previous_old_end);
         let sign = usize::from(old_pos < previous_old_end) as u8;
         cover_data.extend_from_slice(&encode_tagged_1bit(sign, delta as u64));
@@ -65,7 +104,7 @@ pub fn make_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
 
     let mut rle_data = Vec::new();
     let mut previous_new_end = 0usize;
-    for &(_, new_pos, len) in &covers {
+    for &(_, new_pos, len) in covers {
         let gap = new_pos - previous_new_end;
         if gap > 0 {
             rle_data.extend_from_slice(&encode_tagged_2bit(0, (gap - 1) as u64));
@@ -80,7 +119,7 @@ pub fn make_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
 
     let mut new_data = Vec::new();
     let mut previous_new_end = 0usize;
-    for &(_, new_pos, len) in &covers {
+    for &(_, new_pos, len) in covers {
         if new_pos > previous_new_end {
             new_data.extend_from_slice(&new[previous_new_end..new_pos]);
         }
@@ -229,6 +268,36 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             prepare_hdiff_fixture(dir.path(), 1).unwrap();
+            apply_hdiff_fixture_with_backend(dir.path(), backend).unwrap();
+            compare_hdiff_fixture(dir.path()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reordered_old_covers_apply_identically_with_backward_reads() {
+        use crate::game_installer::hdiffpatch::HDiffSourceBackend;
+
+        const BLOCKS: usize = 64;
+        const BLOCK_SIZE: usize = 64 * 1024;
+        let old = deterministic_data(0xA11CE, BLOCKS * BLOCK_SIZE);
+        let permutation = (0..BLOCKS).rev().collect::<Vec<_>>();
+        let (patch, expected) = make_v13_zstd_reordered_patch(&old, &permutation);
+
+        for backend in [
+            HDiffSourceBackend::Mmap,
+            HDiffSourceBackend::File,
+            HDiffSourceBackend::Windowed {
+                window_size: 256 * 1024,
+                stats: std::sync::Arc::new(
+                    crate::game_installer::hdiffpatch::WindowStats::default(),
+                ),
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("old.bin"), &old).unwrap();
+            fs::write(dir.path().join("new.bin"), &expected).unwrap();
+            fs::write(dir.path().join("patch.hdiff"), &patch).unwrap();
             apply_hdiff_fixture_with_backend(dir.path(), backend).unwrap();
             compare_hdiff_fixture(dir.path()).unwrap();
         }
