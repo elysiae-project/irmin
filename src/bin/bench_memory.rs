@@ -1,817 +1,918 @@
-//! Peak RSS sampler for the Sophon installer hot paths.
-//!
-//! Resident-set size is a one-shot peak metric, not an iterative timing, so it
-//! does not fit the criterion statistical model. This binary polls
-//! `/proc/self/statm` from a background thread while each operation runs and
-//! reports peak-vs-baseline RSS.
-//!
-//! Run:  cargo run --release --features benchmark --bin bench_memory -- [op]
-//! where [op] is a substring of one of the operations below; runs all if none.
-
-use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use fast_md5;
-
-use irmin::game_installer::{
-    assembly::{assemble_file, chunk_filename},
-    cache::{VerificationCache, VerificationEntry},
-    compact_manifest::{CompactManifest, StringArena},
-    installer::{intern_old_chunk_offsets, ChunkNameLookup},
-    sysio, VerifyMode,
+use fast_md5::Md5;
+use irmin_rs::api_scrape::{Compression, DownloadInfo};
+use irmin_rs::bench_support::{
+    apply_hdiff_fixture, compare_hdiff_fixture, deterministic_data,
+    prepare_hdiff_fixture as prepare_shared_hdiff_fixture,
 };
-use irmin::proto_parse::{
+use irmin_rs::game_installer::VerifyMode;
+use irmin_rs::game_installer::assembly::{assemble_file, chunk_filename};
+use irmin_rs::game_installer::cache::{VerificationCache, VerificationEntry};
+use irmin_rs::game_installer::compact_manifest::{CompactManifest, StringArena};
+use irmin_rs::game_installer::installer::{
+    ChunkNameLookup, InstallCallbacks, InstallOptions, ResumeContext, SophonInstaller, install,
+};
+use irmin_rs::game_installer::{DownloadHandle, SophonError};
+use irmin_rs::proto_parse::{
     SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
 };
+use irmin_rs::types::CompletedFiles;
 
-/// RSS poll interval. 2 ms catches short allocation spikes without measurable
-/// load.
-const SAMPLE_MS: u64 = 2;
-
-/// Duration the diff ops hold their peak allocation so the sampler observes it
-/// before the values drop; without it the allocation completes and frees
-/// within a single poll window.
-const PEAK_HOLD: Duration = Duration::from_millis(40);
-
-/// Resident set size in KiB, read from `/proc/self/statm`.
-fn rss_kib() -> u64 {
-    let mut buf = String::new();
-    fs::File::open("/proc/self/statm")
-        .and_then(|mut f| f.read_to_string(&mut buf))
-        .expect("/proc/self/statm: linux-only sampler");
-    let resident_pages: u64 = buf.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
-    resident_pages * page / 1024
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scenario {
+    Hdiff,
+    Assembly,
+    SophonInstall,
 }
 
-/// Background RSS poller. Tracks the peak resident-set size observed while it
-/// runs; stopping it returns the peak.
-struct RssSampler {
-    peak: Arc<AtomicU64>,
+impl Scenario {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "hdiff" => Ok(Self::Hdiff),
+            "assembly" => Ok(Self::Assembly),
+            "sophon-install" => Ok(Self::SophonInstall),
+            _ => Err(format!(
+                "unknown scenario '{value}'; expected hdiff, assembly, or sophon-install"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hdiff => "hdiff",
+            Self::Assembly => "assembly",
+            Self::SophonInstall => "sophon-install",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Config {
+    scenario: Scenario,
+    size_mib: usize,
+    chunks: usize,
+    repeat: usize,
+    budget_mib: Option<u64>,
+    json: bool,
+    keep_workdir: bool,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct MemorySnapshot {
+    vm_rss_kib: u64,
+    vm_hwm_kib: u64,
+    rss_anon_kib: Option<u64>,
+    rss_file_kib: Option<u64>,
+}
+
+enum ScenarioContext {
+    Hdiff { dir: PathBuf },
+    Assembly { context: Box<AssemblyContext> },
+    SophonInstall(Box<InstallContext>),
+}
+
+struct AssemblyContext {
+    manifest: CompactManifest,
+    game_dir: PathBuf,
+    chunks_dir: PathBuf,
+    tmp_dir: PathBuf,
+    expected_path: PathBuf,
+    lookup: ChunkNameLookup,
+    refcounts: Vec<AtomicU32>,
+    cache: VerificationCache<String, VerificationEntry>,
+}
+
+struct InstallContext {
+    installer: SophonInstaller,
+    game_dir: PathBuf,
+    expected_path: PathBuf,
+    size_mib: usize,
+    runtime: tokio::runtime::Runtime,
+}
+
+enum Verification {
+    Hdiff(PathBuf),
+    Assembly {
+        expected: PathBuf,
+        actual: PathBuf,
+        size: usize,
+    },
+    SophonInstall {
+        expected: PathBuf,
+        actual: PathBuf,
+        size: usize,
+    },
+}
+
+struct LocalChunkServer {
+    base_url: String,
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<()>>,
 }
 
-impl RssSampler {
-    fn start() -> Self {
-        let peak = Arc::new(AtomicU64::new(rss_kib()));
+impl LocalChunkServer {
+    fn start(root: PathBuf) -> Result<Self, String> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
-        let (p, s) = (Arc::clone(&peak), Arc::clone(&stop));
-        let handle = thread::spawn(move || loop {
-            let r = rss_kib();
-            let cur = p.load(Ordering::Relaxed);
-            if r > cur {
-                p.store(r, Ordering::Relaxed);
-            }
-            if s.load(Ordering::Relaxed) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(SAMPLE_MS));
-        });
-        RssSampler {
-            peak,
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    fn finish(mut self) -> u64 {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-        // Sample once more in case the operation finished between polls.
-        let last = rss_kib();
-        let tracked = self.peak.load(Ordering::Relaxed);
-        tracked.max(last)
-    }
-}
-
-/// Run `op` under the sampler; print peak RSS and delta vs a quiet baseline.
-fn measure<F: FnOnce()>(label: &str, op: F) {
-    let baseline = rss_kib();
-    let sampler = RssSampler::start();
-    let t = Instant::now();
-    op();
-    let dur = t.elapsed();
-    let peak = sampler.finish();
-    let delta = peak as i64 - baseline as i64;
-    println!(
-        "{label:<32} {dur:>6.0} ms   RSS {baseline:>6} -> {peak:>6} KiB   (peak delta {delta:+} KiB)",
-        dur = dur.as_secs_f64() * 1000.0,
-    );
-}
-
-/// Run `setup`, record baseline RSS, then run `op` under the sampler. The
-/// delta reflects only `op`'s allocations, not the fixture data from `setup`.
-fn measure_with_setup<T, S, O>(label: &str, setup: S, op: O)
-where
-    S: FnOnce() -> T,
-    O: FnOnce(T),
-{
-    let context = setup();
-    unsafe {
-        libc::malloc_trim(0);
-    }
-    let baseline = rss_kib();
-    let sampler = RssSampler::start();
-    let t = Instant::now();
-    op(context);
-    let dur = t.elapsed();
-    let peak = sampler.finish();
-    let delta = peak as i64 - baseline as i64;
-    println!(
-        "{label:<32} {dur:>6.0} ms   RSS {baseline:>6} -> {peak:>6} KiB   (peak delta {delta:+} KiB)",
-        dur = dur.as_secs_f64() * 1000.0,
-    );
-}
-
-fn fill_file(path: &Path, mib: usize, fill: u8) {
-    let block = vec![fill; 1024 * 1024];
-    let mut f = fs::File::create(path).expect("create");
-    for _ in 0..mib {
-        f.write_all(&block).expect("write");
-    }
-    f.sync_all().expect("sync");
-}
-
-fn evict_page_cache(path: &Path) {
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-    unsafe {
-        let fd = libc::open(c.as_ptr(), libc::O_RDONLY);
-        if fd >= 0 {
-            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-            libc::close(fd);
-        }
-    }
-}
-
-/// Read `mib` MiB with per-region `POSIX_FADV_DONTNEED` so the kernel frees
-/// the pages once hashed. Proves the page-cache eviction lowers resident RSS.
-fn op_read_md5_with_fadvise(path: &Path, mib: usize, advise: bool) {
-    let f = fs::File::open(path).expect("open");
-    let fd = f.as_raw_fd();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut h = fast_md5::Md5::new();
-    let mut off = 0u64;
-    let total = (mib * 1024 * 1024) as u64;
-    while off < total {
-        let n = f.read_at(&mut buf, off).expect("read");
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        if advise {
-            unsafe {
-                libc::posix_fadvise(
-                    fd,
-                    off as libc::off_t,
-                    n as libc::off_t,
-                    libc::POSIX_FADV_DONTNEED,
-                );
-            }
-        }
-        off += n as u64;
-    }
-    let _ = hex::encode(h.finalize());
-}
-
-/// Create chunk files on disk and build the manifest without retaining the raw
-/// assembled bytes in memory. Drops all intermediate data and trims the
-/// allocator so RSS reflects only what assembly itself allocates.
-fn setup_assembly_fixture(
-    chunks_dir: &Path,
-    chunk_size: u64,
-    num_chunks: usize,
-    with_chunk_hashes: bool,
-) -> CompactManifest {
-    let chunks: Vec<SophonManifestAssetChunk> = (0..num_chunks)
-        .map(|i| {
-            let name = format!("ck{i:02}");
-            let data = vec![(i as u8).wrapping_mul(7).wrapping_add(0x40); chunk_size as usize];
-            let comp = zstd::encode_all(&data[..], 3).unwrap();
-            fs::write(chunks_dir.join(chunk_filename(&name)), &comp).unwrap();
-            let offset = (i as u64) * chunk_size;
-            let chunk_hash = if with_chunk_hashes {
-                hex::encode(fast_md5::digest(&data))
-            } else {
-                String::new()
-            };
-            drop(data);
-            drop(comp);
-            SophonManifestAssetChunk {
-                chunk_name: name,
-                chunk_decompressed_hash_md5: chunk_hash,
-                chunk_on_file_offset: offset,
-                chunk_size: 0,
-                chunk_size_decompressed: chunk_size,
-                chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: String::new(),
-                chunk_old_offset: -1,
-            }
-        })
-        .collect();
-    let file = SophonManifestAssetProperty {
-        asset_name: "assembled.bin".to_string(),
-        asset_chunks: chunks,
-        asset_type: 0,
-        asset_size: chunk_size * num_chunks as u64,
-        asset_hash_md5: String::new(),
-    };
-    let manifest = CompactManifest::from(vec![file]);
-    // Return freed memory to the OS so it doesn't inflate the assembly
-    // RSS measurement.
-    unsafe {
-        libc::malloc_trim(0);
-    }
-    manifest
-}
-
-fn temp_dir() -> PathBuf {
-    std::path::PathBuf::from("/var/tmp").join(format!("bench_memory_{}", std::process::id()))
-}
-
-fn op_assembly_e2e(dir: &Path) {
-    let game_dir = dir.join("game");
-    let chunks_dir = dir.join("chunks");
-    let tmp_dir = dir.join("tmp");
-    fs::create_dir_all(&game_dir).unwrap();
-    fs::create_dir_all(&chunks_dir).unwrap();
-    fs::create_dir_all(&tmp_dir).unwrap();
-    let manifest = setup_assembly_fixture(&chunks_dir, 8 * 1024 * 1024, 8, false);
-    let name_refs: Vec<&str> = (0..8)
-        .map(|i| Box::leak(format!("ck{i:02}").into_boxed_str()) as &str)
-        .collect();
-    let lookup = ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice()));
-    let refcounts: Vec<std::sync::atomic::AtomicU32> = (0..8)
-        .map(|_| std::sync::atomic::AtomicU32::new(1000))
-        .collect();
-    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
-    assemble_file(
-        &manifest,
-        0,
-        &game_dir,
-        &chunks_dir,
-        &tmp_dir,
-        &lookup,
-        &refcounts,
-        &cache,
-        true,
-        VerifyMode::Full,
-    )
-    .expect("assemble");
-}
-
-fn op_assembly_e2e_parallel(dir: &Path) {
-    let game_dir = dir.join("game_p");
-    let chunks_dir = dir.join("chunks_p");
-    let tmp_dir = dir.join("tmp_p");
-    fs::create_dir_all(&game_dir).unwrap();
-    fs::create_dir_all(&chunks_dir).unwrap();
-    fs::create_dir_all(&tmp_dir).unwrap();
-    let manifest = setup_assembly_fixture(&chunks_dir, 8 * 1024 * 1024, 8, true);
-    let name_refs: Vec<&str> = (0..8)
-        .map(|i| Box::leak(format!("ck{i:02}").into_boxed_str()) as &str)
-        .collect();
-    let lookup = ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice()));
-    let refcounts: Vec<std::sync::atomic::AtomicU32> = (0..8)
-        .map(|_| std::sync::atomic::AtomicU32::new(1000))
-        .collect();
-    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
-    assemble_file(
-        &manifest,
-        0,
-        &game_dir,
-        &chunks_dir,
-        &tmp_dir,
-        &lookup,
-        &refcounts,
-        &cache,
-        true,
-        VerifyMode::Full,
-    )
-    .expect("assemble");
-}
-
-fn op_assembly_e2e_small(dir: &Path) {
-    let game_dir = dir.join("game_s");
-    let chunks_dir = dir.join("chunks_s");
-    let tmp_dir = dir.join("tmp_s");
-    fs::create_dir_all(&game_dir).unwrap();
-    fs::create_dir_all(&chunks_dir).unwrap();
-    fs::create_dir_all(&tmp_dir).unwrap();
-    let manifest = setup_assembly_fixture(&chunks_dir, 256 * 1024, 32, false);
-    let name_refs: Vec<&str> = (0..32)
-        .map(|i| Box::leak(format!("ck{i:02}").into_boxed_str()) as &str)
-        .collect();
-    let lookup = ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice()));
-    let refcounts: Vec<std::sync::atomic::AtomicU32> = (0..32)
-        .map(|_| std::sync::atomic::AtomicU32::new(1000))
-        .collect();
-    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
-    assemble_file(
-        &manifest,
-        0,
-        &game_dir,
-        &chunks_dir,
-        &tmp_dir,
-        &lookup,
-        &refcounts,
-        &cache,
-        true,
-        VerifyMode::Full,
-    )
-    .expect("assemble");
-}
-
-fn op_copy_file_range(dir: &Path) {
-    let src = dir.join("src.bin");
-    fill_file(&src, 64, 0xAB);
-    let dst = dir.join("dst.bin");
-    let d = fs::File::create(&dst).unwrap();
-    d.set_len(64 * 1024 * 1024).unwrap();
-    sysio::copy_file_region_to(&src, 0, &d, 0, 64 * 1024 * 1024).unwrap();
-    d.sync_all().unwrap();
-}
-
-fn op_read_write_md5(dir: &Path) {
-    let src = dir.join("src.bin");
-    fill_file(&src, 64, 0xAB);
-    let dst = dir.join("dst.bin");
-    let mut s = fs::File::open(&src).unwrap();
-    let mut d = fs::File::create(&dst).unwrap();
-    d.set_len(64 * 1024 * 1024).unwrap();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut h = fast_md5::Md5::new();
-    loop {
-        let n = s.read(&mut buf).unwrap();
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        d.write_all(&buf[..n]).unwrap();
-    }
-    d.sync_all().unwrap();
-    let _ = hex::encode(h.finalize());
-}
-
-fn op_zstd_decompress(dir: &Path) {
-    let raw = vec![0x42u8; 8 * 1024 * 1024];
-    let comp = zstd::encode_all(&raw[..], 3).unwrap();
-    let comp_path = dir.join("chunk.zst");
-    fs::write(&comp_path, &comp).unwrap();
-    let out = dir.join("out.bin");
-    let o = fs::File::create(&out).unwrap();
-    o.set_len(raw.len() as u64).unwrap();
-    let cf = fs::File::open(&comp_path).unwrap();
-    let br = std::io::BufReader::with_capacity(256 * 1024, cf);
-    let mut dec = zstd::Decoder::new(br).unwrap();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut woff = 0u64;
-    loop {
-        let n = dec.read(&mut buf).unwrap();
-        if n == 0 {
-            break;
-        }
-        o.write_all_at(&buf[..n], woff).unwrap();
-        woff += n as u64;
-    }
-    o.sync_all().unwrap();
-}
-
-/// Build a synthetic manifest with `num_files` non-directory assets, each
-/// carrying `chunks_per_file` chunks. Chunk hashes cycle through a pool of
-/// `num_files` unique strings so interning deduplicates them. Asset names
-/// are unique per file. The caller is responsible for trimming the allocator
-/// after construction if measuring RSS of a subsequent operation.
-fn build_synthetic_manifest(num_files: usize, chunks_per_file: usize) -> SophonManifestProto {
-    let hash_pool: Vec<String> = (0..num_files).map(|i| format!("{i:032x}")).collect();
-    let assets: Vec<SophonManifestAssetProperty> = (0..num_files)
-        .map(|f| {
-            let chunks: Vec<SophonManifestAssetChunk> = (0..chunks_per_file)
-                .map(|c| {
-                    let h = &hash_pool[(f + c) % num_files];
-                    SophonManifestAssetChunk {
-                        chunk_name: format!("f{f}c{c}"),
-                        chunk_decompressed_hash_md5: h.clone(),
-                        chunk_on_file_offset: (c * 1024 * 1024) as u64,
-                        chunk_size: 0,
-                        chunk_size_decompressed: 0,
-                        chunk_compressed_hash_xxh: 0,
-                        chunk_compressed_hash_md5: String::new(),
-                        chunk_old_offset: -1,
+        let server_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve_chunk_request(stream, &root),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(5));
                     }
-                })
-                .collect();
-            let size = chunks.iter().map(|c| c.chunk_size_decompressed).sum();
-            let mut hash = format!("{f:032x}");
-            hash.push_str("00");
-            SophonManifestAssetProperty {
-                asset_name: format!("asset_{f}.pak"),
-                asset_chunks: chunks,
-                asset_type: 0,
-                asset_size: size,
-                asset_hash_md5: hash,
+                    Err(_) => break,
+                }
             }
+        });
+        Ok(Self {
+            base_url: format!("http://{address}"),
+            stop,
+            thread: Some(thread),
         })
-        .collect();
-    SophonManifestProto { assets }
-}
-
-/// Replicate the pre-interning approach: `HashMap<(String, String), u64>`
-/// keyed by cloned asset names and chunk hashes.
-fn build_string_key_offsets(manifest: &SophonManifestProto) -> HashMap<(String, String), u64> {
-    manifest
-        .assets
-        .iter()
-        .filter(|f| !f.is_directory())
-        .flat_map(|f| {
-            let name = f.asset_name.clone();
-            f.asset_chunks.iter().map(move |c| {
-                (
-                    (name.clone(), c.chunk_decompressed_hash_md5.clone()),
-                    c.chunk_on_file_offset,
-                )
-            })
-        })
-        .collect()
-}
-
-fn op_diff_interned_keys(manifest: SophonManifestProto) {
-    let (offsets, name_to_id, hash_to_id) = intern_old_chunk_offsets(&manifest);
-    std::hint::black_box(&offsets);
-    std::hint::black_box(&name_to_id);
-    std::hint::black_box(&hash_to_id);
-    std::hint::black_box(&manifest);
-    thread::sleep(PEAK_HOLD);
-}
-
-fn op_diff_string_keys(manifest: SophonManifestProto) {
-    let offsets = build_string_key_offsets(&manifest);
-    std::hint::black_box(&offsets);
-    std::hint::black_box(&manifest);
-    thread::sleep(PEAK_HOLD);
-}
-
-/// Diagnostic: allocate a known size so the RSS delta proves the sampler works.
-fn op_alloc_50mb() {
-    let v: Vec<u8> = vec![0xFF; 50 * 1024 * 1024];
-    let probe = v.iter().copied().fold(0u64, |a, b| a ^ b as u64);
-    std::hint::black_box(probe);
-    thread::sleep(PEAK_HOLD);
-    drop(v);
-}
-
-/// mmap a 128 MiB file and MD5 it in one pass. Compares against the pread path.
-fn op_mmap_md5_128m(dir: &Path) {
-    let big = dir.join("mmap_md5.bin");
-    fill_file(&big, 128, 0xCD);
-    evict_page_cache(&big);
-    let f = fs::File::open(&big).expect("open");
-    let len = f.metadata().unwrap().len() as usize;
-    let mmap = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE,
-            f.as_raw_fd(),
-            0,
-        )
-    };
-    if mmap == libc::MAP_FAILED {
-        panic!("mmap failed");
     }
-    let mut h = fast_md5::Md5::new();
-    h.update(unsafe { std::slice::from_raw_parts(mmap as *const u8, len) });
-    let _ = hex::encode(h.finalize());
-    unsafe {
-        libc::munmap(mmap, len);
-    }
-}
 
-/// Streaming MD5 of 128 MiB via file_md5_digest (BufReader + fadvise).
-fn op_stream_md5_128m(dir: &Path) {
-    let big = dir.join("stream_md5.bin");
-    fill_file(&big, 128, 0xCD);
-    evict_page_cache(&big);
-    let _ = irmin::game_installer::cache::file_md5_digest(&big);
-}
-
-/// XXH64 of 128 MiB via pread. Compares throughput and RSS against MD5.
-fn op_xxh64_128m(dir: &Path) {
-    let big = dir.join("xxh64.bin");
-    fill_file(&big, 128, 0xCD);
-    evict_page_cache(&big);
-    let f = fs::File::open(&big).expect("open");
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut h = xxhash_rust::xxh64::Xxh64::new(0);
-    let mut off = 0u64;
-    let total: u64 = 128 * 1024 * 1024;
-    while off < total {
-        let n = f.read_at(&mut buf, off).expect("read");
-        if n == 0 {
-            break;
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
-        h.update(&buf[..n]);
-        off += n as u64;
     }
-    let _ = h.digest();
 }
 
-/// One-shot zstd decompression of an 8 MiB frame into a heap buffer. Measures
-/// the peak RSS of the single-pass path vs streaming.
-fn op_zstd_oneshot_8m(dir: &Path) {
-    let raw = vec![0x42u8; 8 * 1024 * 1024];
-    let comp = zstd::encode_all(&raw[..], 3).unwrap();
-    let comp_path = dir.join("oneshot.zst");
-    fs::write(&comp_path, &comp).unwrap();
-    drop(raw);
-    drop(comp);
-    unsafe {
-        libc::malloc_trim(0);
+impl Drop for LocalChunkServer {
+    fn drop(&mut self) {
+        self.stop();
     }
-    let cf = fs::File::open(&comp_path).expect("open");
-    let comp_size = cf.metadata().unwrap().len() as usize;
-    let comp_mmap = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            comp_size,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE,
-            cf.as_raw_fd(),
-            0,
-        )
+}
+
+fn serve_chunk_request(mut stream: TcpStream, root: &Path) {
+    let mut request = [0u8; 8192];
+    let read = match stream.read(&mut request) {
+        Ok(read) => read,
+        Err(_) => return,
     };
-    if comp_mmap == libc::MAP_FAILED {
-        panic!("mmap failed");
-    }
-    let comp_slice = unsafe { std::slice::from_raw_parts(comp_mmap as *const u8, comp_size) };
-
-    let out_path = dir.join("oneshot_out.bin");
-    let of = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&out_path)
-        .unwrap();
-    of.set_len(8 * 1024 * 1024).unwrap();
-    let out_mmap = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            8 * 1024 * 1024,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            of.as_raw_fd(),
-            0,
-        )
-    };
-    if out_mmap == libc::MAP_FAILED {
-        panic!("out mmap failed");
-    }
-    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_mmap as *mut u8, 8 * 1024 * 1024) };
-
-    let mut ctx = zstd::zstd_safe::DCtx::create();
-    let written = ctx.decompress(out_slice, comp_slice).expect("decompress");
-    std::hint::black_box(written);
-
-    unsafe {
-        libc::munmap(comp_mmap, comp_size);
-        libc::munmap(out_mmap, 8 * 1024 * 1024);
-    }
-}
-
-/// Build a CompactManifest from a large synthetic manifest. Measures the arena
-/// and column vec allocations.
-fn op_compact_manifest_build_with_assets(assets: Vec<SophonManifestAssetProperty>) {
-    let compact = CompactManifest::from(assets);
-    std::hint::black_box(compact.num_files());
-    std::hint::black_box(compact.num_chunks());
-    thread::sleep(PEAK_HOLD);
-}
-
-/// Fill a verification cache to the cap. Measures the DashMap's resident
-/// memory.
-fn op_verify_cache_fill(num_entries: usize) {
-    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
-    for i in 0..num_entries {
-        let key = format!("asset_{i}.pak");
-        cache.insert(
-            key,
-            VerificationEntry {
-                size: 1024,
-                md5: format!("{i:032x}"),
-                mtime_secs: 0,
-            },
+    let request = String::from_utf8_lossy(&request[..read]);
+    let Some(requested) = request
+        .lines()
+        .next()
+        .filter(|line| line.ends_with(" HTTP/1.1") || line.ends_with(" HTTP/1.0"))
+        .and_then(|line| line.split_whitespace().nth(1))
+    else {
+        let _ = stream.write_all(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
+        return;
+    };
+    let Some(name) = requested.strip_prefix("/chunks/") else {
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    };
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
     }
-    std::hint::black_box(cache.len());
-    thread::sleep(PEAK_HOLD);
-}
-
-/// Build a ChunkNameLookup from a large arena. Measures the sort + index vec.
-fn op_chunk_name_lookup(num_chunks: usize) {
-    let names: Vec<String> = (0..num_chunks).map(|i| format!("chunk_{i:08}")).collect();
-    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let arena = StringArena::from(name_refs.as_slice());
-    let lookup = ChunkNameLookup::from_arena(arena);
-    std::hint::black_box(lookup.get(0));
-    thread::sleep(PEAK_HOLD);
-}
-
-/// Build the download_items_index HashMap used during download state setup.
-/// Mirrors the per-chunk `&str -> usize` map that locates duplicate chunks.
-fn op_download_items_index(num_chunks: usize) {
-    let names: Vec<String> = (0..num_chunks).map(|i| format!("chunk_{i:08}")).collect();
-    let mut map: HashMap<&str, u32> = HashMap::with_capacity(num_chunks);
-    for (i, n) in names.iter().enumerate() {
-        map.insert(n.as_str(), i as u32);
-    }
-    std::hint::black_box(map.len());
-    thread::sleep(PEAK_HOLD);
-}
-
-/// Measure streaming-decoder RSS for a zstd frame at a given WindowLogMax cap.
-/// Reports whether the cap actually pre-allocates the full window or only
-/// allocates what the frame declares.
-fn op_zstd_decoder_rss(frame_bytes: usize, window_log_max: u32) {
-    let data: Vec<u8> = (0..frame_bytes).map(|i| (i % 251) as u8).collect();
-    let comp = zstd::encode_all(&data[..], 3).unwrap();
-    let mut dec = zstd::stream::read::Decoder::new(comp.as_slice()).unwrap();
-    dec.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log_max))
-        .unwrap();
-    let mut out = Vec::with_capacity(data.len());
-    std::io::copy(&mut dec, &mut out).unwrap();
-    std::hint::black_box(out.len());
-    thread::sleep(PEAK_HOLD);
-    drop(out);
-    drop(dec);
-    drop(comp);
-    drop(data);
+    let path = root.join(name);
+    let Ok(body) = fs::read(path) else {
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(&body);
 }
 
 fn main() {
-    let filter = std::env::args().nth(1);
-    let dir = temp_dir();
-    fs::create_dir_all(&dir).expect("tmp");
-    let run = |name: &str, op: &dyn Fn()| {
-        if filter.as_deref().is_none_or(|f| name.contains(f)) {
-            measure(name, op);
+    if let Err(error) = run_cli() {
+        eprintln!("bench_memory: {error}");
+        std::process::exit(2);
+    }
+}
+
+fn run_cli() -> Result<(), String> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "--child") {
+        return run_child(&args[1..]);
+    }
+
+    let config = parse_args(&args)?;
+    let workdir = tempfile::Builder::new()
+        .prefix("irmin-memory-bench-")
+        .tempdir()
+        .map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut results = Vec::with_capacity(config.repeat);
+
+    for iteration in 0..config.repeat {
+        let fixture_dir = workdir.path().join(format!("run-{iteration}"));
+        fs::create_dir_all(&fixture_dir).map_err(|error| error.to_string())?;
+        prepare_fixture(
+            config.scenario,
+            &fixture_dir,
+            config.size_mib,
+            config.chunks,
+        )?;
+        let mut local_server = if config.scenario == Scenario::SophonInstall {
+            Some(LocalChunkServer::start(fixture_dir.clone())?)
+        } else {
+            None
+        };
+        let server_url = local_server
+            .as_ref()
+            .map(|server| server.base_url.clone())
+            .unwrap_or_default();
+
+        let output = Command::new(&executable)
+            .args(["--child", config.scenario.name()])
+            .arg(&fixture_dir)
+            .arg(config.size_mib.to_string())
+            .arg(config.chunks.to_string())
+            .arg(server_url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} child failed: {}",
+                config.scenario.name(),
+                output.status
+            ));
         }
-    };
-
-    let dir = dir.clone();
-    run("baseline", &|| {
-        thread::sleep(Duration::from_millis(50));
-    });
-
-    let d = dir.clone();
-    run("read_md5_128m_no_advise", &|| {
-        let big = d.join("big.bin");
-        fill_file(&big, 128, 0xCD);
-        evict_page_cache(&big);
-        op_read_md5_with_fadvise(&big, 128, false);
-    });
-
-    let d = dir.clone();
-    run("read_md5_128m_fadvise", &|| {
-        let big = d.join("big.bin");
-        evict_page_cache(&big);
-        op_read_md5_with_fadvise(&big, 128, true);
-    });
-
-    let d = dir.clone();
-    run("copy_file_range_64m", &|| op_copy_file_range(&d));
-
-    let d = dir.clone();
-    run("read_write_md5_64m", &|| op_read_write_md5(&d));
-
-    let d = dir.clone();
-    run("zstd_decompress_8m", &|| op_zstd_decompress(&d));
-
-    let d = dir.clone();
-    run("assembly_e2e_8x8m", &|| op_assembly_e2e(&d));
-
-    let d = dir.clone();
-    run("assembly_e2e_parallel_8x8m", &|| {
-        op_assembly_e2e_parallel(&d)
-    });
-
-    let d = dir.clone();
-    run("assembly_e2e_32x256k", &|| op_assembly_e2e_small(&d));
-
-    let d = dir.clone();
-    run("mmap_md5_128m", &|| op_mmap_md5_128m(&d));
-
-    let d = dir.clone();
-    run("stream_md5_128m", &|| op_stream_md5_128m(&d));
-
-    let d = dir.clone();
-    run("xxh64_128m", &|| op_xxh64_128m(&d));
-
-    let d = dir.clone();
-    run("zstd_oneshot_8m", &|| op_zstd_oneshot_8m(&d));
-
-    if filter
-        .as_deref()
-        .is_none_or(|f| "compact_manifest_build_5000x50".contains(f))
-    {
-        measure_with_setup(
-            "compact_manifest_build_5000x50",
-            || build_synthetic_manifest(5000, 50).assets,
-            op_compact_manifest_build_with_assets,
-        );
+        let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+        let result: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|error| format!("invalid child JSON: {error}; output={stdout:?}"))?;
+        results.push(result);
+        if let Some(mut server) = local_server.take() {
+            server.stop();
+        }
     }
 
-    if filter
-        .as_deref()
-        .is_none_or(|f| "verify_cache_fill_5000".contains(f))
-    {
-        run("verify_cache_fill_5000", &|| op_verify_cache_fill(5000));
+    report_results(&config, &results)?;
+    if config.keep_workdir {
+        eprintln!("fixtures retained at {}", workdir.path().display());
+        std::mem::forget(workdir);
+    }
+    Ok(())
+}
+
+fn parse_args(args: &[String]) -> Result<Config, String> {
+    let mut scenario = None;
+    let mut size_mib = 64;
+    let mut chunks = 8;
+    let mut repeat = 3;
+    let mut budget_mib = None;
+    let mut json = false;
+    let mut keep_workdir = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--scenario" => {
+                index += 1;
+                scenario = Some(Scenario::parse(value_at(args, index, option)?)?);
+            }
+            "--size-mib" => {
+                index += 1;
+                size_mib = parse_positive(value_at(args, index, option)?, option)?;
+            }
+            "--chunks" => {
+                index += 1;
+                chunks = parse_positive(value_at(args, index, option)?, option)?;
+            }
+            "--repeat" => {
+                index += 1;
+                repeat = parse_positive(value_at(args, index, option)?, option)?;
+            }
+            "--budget-mib" => {
+                index += 1;
+                budget_mib = Some(parse_positive(value_at(args, index, option)?, option)? as u64);
+            }
+            "--json" => json = true,
+            "--keep-workdir" => keep_workdir = true,
+            "--help" | "-h" => return Err(usage().to_owned()),
+            other => return Err(format!("unknown argument '{other}'\n{}", usage())),
+        }
+        index += 1;
     }
 
-    if filter
-        .as_deref()
-        .is_none_or(|f| "chunk_name_lookup_10000".contains(f))
-    {
-        run("chunk_name_lookup_10000", &|| op_chunk_name_lookup(10000));
+    let scenario = scenario.ok_or_else(|| usage().to_owned())?;
+    if size_mib.checked_mul(1024 * 1024).is_none() {
+        return Err("--size-mib is too large".to_owned());
     }
-
-    if filter
-        .as_deref()
-        .is_none_or(|f| "download_items_index_10000".contains(f))
-    {
-        run("download_items_index_10000", &|| {
-            op_download_items_index(10000)
-        });
+    if scenario == Scenario::Assembly && (size_mib * 1024 * 1024) % chunks != 0 {
+        return Err("assembly size-mib must divide evenly into chunks".to_owned());
     }
-
-    // Diagnostic runs only with an explicit filter so a 50 MiB allocation does
-    // not inflate the baseline of subsequent ops on a full run.
-    if filter
-        .as_deref()
-        .is_some_and(|f| "alloc_50mb_diag".contains(f))
-    {
-        run("alloc_50mb_diag", &|| op_alloc_50mb());
+    if scenario == Scenario::SophonInstall && (size_mib * 1024 * 1024) % chunks != 0 {
+        return Err("sophon-install size-mib must divide evenly into chunks".to_owned());
     }
+    Ok(Config {
+        scenario,
+        size_mib,
+        chunks,
+        repeat,
+        budget_mib,
+        json,
+        keep_workdir,
+    })
+}
 
-    if filter
-        .as_deref()
-        .is_some_and(|f| "zstd_decoder_rss".contains(f))
-    {
-        for &(frame_bytes, wl) in &[
-            (256 * 1024usize, 26u32),
-            (256 * 1024, 19),
-            (1024 * 1024, 26),
-            (1024 * 1024, 23),
-            (1024 * 1024, 21),
-            (8 * 1024 * 1024, 26),
-            (8 * 1024 * 1024, 24),
-            (8 * 1024 * 1024, 23),
-            (32 * 1024 * 1024, 26),
-            (32 * 1024 * 1024, 23),
-        ] {
-            let size_label = if frame_bytes >= 1024 * 1024 {
-                format!("{}MiB", frame_bytes / (1024 * 1024))
+fn value_at<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing value for {option}"))
+}
+
+fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{option} expects a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{option} expects a positive integer"));
+    }
+    Ok(parsed)
+}
+
+fn usage() -> &'static str {
+    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--budget-mib N] [--json] [--keep-workdir]"
+}
+
+fn run_child(args: &[String]) -> Result<(), String> {
+    if args.len() != 5 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL".to_owned());
+    }
+    let scenario = Scenario::parse(&args[0])?;
+    let fixture_dir = PathBuf::from(&args[1]);
+    let size_mib = parse_positive(&args[2], "--size-mib")?;
+    let chunks = parse_positive(&args[3], "--chunks")?;
+    let context = prepare_child_context(scenario, &fixture_dir, size_mib, chunks, &args[4])?;
+    let baseline = read_memory_snapshot()?;
+    let hwm_reset = reset_hwm().is_ok();
+    let operation_baseline = read_memory_snapshot()?;
+    let started = Instant::now();
+    let verification = run_operation(context)?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let peak = read_memory_snapshot()?;
+    let peak_rss_kib = peak.vm_hwm_kib.max(peak.vm_rss_kib);
+    verify_output(verification)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "scenario": scenario.name(),
+            "size_mib": size_mib,
+            "chunks": chunks,
+            "elapsed_ms": elapsed_ms,
+            "baseline_rss_kib": if hwm_reset { operation_baseline.vm_rss_kib } else { baseline.vm_rss_kib },
+            "peak_rss_kib": peak_rss_kib,
+            "peak_delta_kib": peak_rss_kib.saturating_sub(if hwm_reset {
+                operation_baseline.vm_rss_kib
             } else {
-                format!("{}KiB", frame_bytes / 1024)
-            };
-            let label = format!("zstd_decoder_rss_{size_label}_wl{wl}");
-            run(&label, &|| op_zstd_decoder_rss(frame_bytes, wl));
+                baseline.vm_rss_kib
+            }),
+            "end_rss_anon_kib": peak.rss_anon_kib,
+            "end_rss_file_kib": peak.rss_file_kib,
+            "hwm_reset": hwm_reset,
+            "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
+        })
+    );
+    Ok(())
+}
+
+fn reset_hwm() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::write("/proc/self/clear_refs", b"5")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Linux required",
+        ))
+    }
+}
+
+fn read_memory_snapshot() -> Result<MemorySnapshot, String> {
+    let status = fs::read_to_string("/proc/self/status").map_err(|error| error.to_string())?;
+    Ok(parse_memory_status(&status))
+}
+
+fn parse_memory_status(status: &str) -> MemorySnapshot {
+    let mut snapshot = MemorySnapshot::default();
+    for line in status.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let value = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok());
+        match (key, value) {
+            ("VmRSS", Some(value)) => snapshot.vm_rss_kib = value,
+            ("VmHWM", Some(value)) => snapshot.vm_hwm_kib = value,
+            ("RssAnon", Some(value)) => snapshot.rss_anon_kib = Some(value),
+            ("RssFile", Some(value)) => snapshot.rss_file_kib = Some(value),
+            _ => {}
         }
     }
+    snapshot
+}
 
-    if filter
-        .as_deref()
-        .is_none_or(|f| "diff_interned_keys_2000x100".contains(f))
+fn prepare_fixture(
+    scenario: Scenario,
+    dir: &Path,
+    size_mib: usize,
+    chunks: usize,
+) -> Result<(), String> {
+    match scenario {
+        Scenario::Hdiff => prepare_hdiff_fixture(dir, size_mib),
+        Scenario::Assembly => prepare_assembly_fixture(dir, size_mib, chunks),
+        Scenario::SophonInstall => prepare_install_fixture(dir, size_mib, chunks),
+    }
+}
+
+fn prepare_hdiff_fixture(dir: &Path, size_mib: usize) -> Result<(), String> {
+    prepare_shared_hdiff_fixture(dir, size_mib)
+}
+
+fn prepare_assembly_fixture(dir: &Path, size_mib: usize, chunks: usize) -> Result<(), String> {
+    let chunk_size = size_mib * 1024 * 1024 / chunks;
+    let chunk_dir = dir.join("chunks");
+    fs::create_dir_all(&chunk_dir).map_err(|error| error.to_string())?;
+    for index in 0..chunks {
+        let data = deterministic_data(0x9e37_79b9_7f4a_7c15 + index as u64, chunk_size);
+        let compressed = zstd::encode_all(data.as_slice(), 3).map_err(|error| error.to_string())?;
+        fs::write(
+            chunk_dir.join(chunk_filename(&format!("chunk-{index:04}"))),
+            compressed,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn prepare_install_fixture(dir: &Path, size_mib: usize, chunks: usize) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let chunk_size = size_mib * 1024 * 1024 / chunks;
+    for index in 0..chunks {
+        let raw = deterministic_data(0xBEEF + index as u64, chunk_size);
+        let compressed = zstd::encode_all(raw.as_slice(), 3).map_err(|error| error.to_string())?;
+        fs::write(dir.join(format!("chunk-{index:04}")), compressed)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn prepare_child_context(
+    scenario: Scenario,
+    dir: &Path,
+    size_mib: usize,
+    chunks: usize,
+    server_url: &str,
+) -> Result<ScenarioContext, String> {
+    match scenario {
+        Scenario::Hdiff => Ok(ScenarioContext::Hdiff {
+            dir: dir.to_path_buf(),
+        }),
+        Scenario::Assembly => prepare_assembly_context(dir, size_mib, chunks),
+        Scenario::SophonInstall => prepare_install_context(dir, size_mib, chunks, server_url),
+    }
+}
+
+fn prepare_assembly_context(
+    dir: &Path,
+    size_mib: usize,
+    chunks: usize,
+) -> Result<ScenarioContext, String> {
+    let chunk_size = size_mib * 1024 * 1024 / chunks;
+    let chunks_dir = dir.join("chunks");
+    for index in 0..chunks {
+        let chunk_path = chunks_dir.join(chunk_filename(&format!("chunk-{index:04}")));
+        if !chunk_path.is_file() {
+            return Err(format!("missing benchmark chunk {}", chunk_path.display()));
+        }
+    }
+    let game_dir = dir.join("game");
+    let tmp_dir = dir.join("tmp");
+    fs::create_dir_all(&game_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
+    let mut expected_hasher = Md5::new();
+    for index in 0..chunks {
+        expected_hasher.update(&deterministic_data(
+            0x9e37_79b9_7f4a_7c15 + index as u64,
+            chunk_size,
+        ));
+    }
+    let expected_hash = hex::encode(expected_hasher.finalize());
+    let expected_path = dir.join("expected.bin");
+    let mut expected_file = File::create(&expected_path).map_err(|error| error.to_string())?;
+    for index in 0..chunks {
+        expected_file
+            .write_all(&deterministic_data(
+                0x9e37_79b9_7f4a_7c15 + index as u64,
+                chunk_size,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    let chunk_rows = (0..chunks)
+        .map(|index| {
+            let raw = deterministic_data(0x9e37_79b9_7f4a_7c15 + index as u64, chunk_size);
+            let compressed_path = chunks_dir.join(chunk_filename(&format!("chunk-{index:04}")));
+            let compressed = fs::read(&compressed_path).expect("generated chunk exists");
+            SophonManifestAssetChunk {
+                chunk_name: format!("chunk-{index:04}"),
+                chunk_decompressed_hash_md5: hex::encode(fast_md5::digest(&raw)),
+                chunk_on_file_offset: (index * chunk_size) as u64,
+                chunk_size: compressed.len() as u64,
+                chunk_size_decompressed: chunk_size as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: hex::encode(fast_md5::digest(&compressed)),
+                chunk_old_offset: -1,
+            }
+        })
+        .collect::<Vec<_>>();
+    let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
+        asset_name: "assembled.bin".to_owned(),
+        asset_chunks: chunk_rows,
+        asset_type: 0,
+        asset_size: (size_mib * 1024 * 1024) as u64,
+        asset_hash_md5: expected_hash,
+    }]);
+    let names = (0..chunks)
+        .map(|index| Box::leak(format!("chunk-{index:04}").into_boxed_str()) as &str)
+        .collect::<Vec<_>>();
+    let lookup = ChunkNameLookup::from_arena(StringArena::from(names.as_slice()));
+    let refcounts = (0..chunks).map(|_| AtomicU32::new(1)).collect::<Vec<_>>();
+    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
+    Ok(ScenarioContext::Assembly {
+        context: Box::new(AssemblyContext {
+            manifest,
+            game_dir,
+            chunks_dir,
+            tmp_dir,
+            expected_path,
+            lookup,
+            refcounts,
+            cache,
+        }),
+    })
+}
+
+fn prepare_install_context(
+    dir: &Path,
+    size_mib: usize,
+    chunks: usize,
+    server_url: &str,
+) -> Result<ScenarioContext, String> {
+    if server_url.is_empty() {
+        return Err("sophon-install requires a local fixture server".to_owned());
+    }
+    let chunk_size = size_mib * 1024 * 1024 / chunks;
+    let mut file_hasher = Md5::new();
+    let chunk_rows = (0..chunks)
+        .map(|index| {
+            let raw = deterministic_data(0xBEEF + index as u64, chunk_size);
+            file_hasher.update(&raw);
+            let compressed_path = dir.join(format!("chunk-{index:04}"));
+            let compressed = fs::read(&compressed_path).map_err(|error| error.to_string())?;
+            Ok(SophonManifestAssetChunk {
+                chunk_name: format!("chunk-{index:04}"),
+                chunk_decompressed_hash_md5: hex::encode(fast_md5::digest(&raw)),
+                chunk_on_file_offset: (index * chunk_size) as u64,
+                chunk_size: compressed.len() as u64,
+                chunk_size_decompressed: chunk_size as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: hex::encode(fast_md5::digest(&compressed)),
+                chunk_old_offset: -1,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let expected_path = dir.join("expected-install.bin");
+    let mut expected_file = File::create(&expected_path).map_err(|error| error.to_string())?;
+    for index in 0..chunks {
+        expected_file
+            .write_all(&deterministic_data(0xBEEF + index as u64, chunk_size))
+            .map_err(|error| error.to_string())?;
+    }
+    let file_md5 = hex::encode(file_hasher.finalize());
+    let manifest = SophonManifestProto {
+        assets: vec![SophonManifestAssetProperty {
+            asset_name: "installed.bin".to_owned(),
+            asset_chunks: chunk_rows,
+            asset_type: 0,
+            asset_size: (size_mib * 1024 * 1024) as u64,
+            asset_hash_md5: file_md5,
+        }],
+    };
+    let installer = SophonInstaller {
+        manifest,
+        chunk_download: DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: server_url.to_owned(),
+            url_suffix: "chunks".to_owned(),
+        },
+        label: "memory-bench".to_owned(),
+        matching_field: "bench".to_owned(),
+        manifest_hash: "memory-bench-manifest".to_owned(),
+    };
+    Ok(ScenarioContext::SophonInstall(Box::new(InstallContext {
+        installer,
+        game_dir: dir.join("install-game"),
+        expected_path,
+        size_mib,
+        runtime: tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?,
+    })))
+}
+
+fn run_operation(context: ScenarioContext) -> Result<Verification, String> {
+    match context {
+        ScenarioContext::Hdiff { dir } => {
+            apply_hdiff_fixture(&dir)?;
+            Ok(Verification::Hdiff(dir))
+        }
+        ScenarioContext::Assembly { context } => {
+            let AssemblyContext {
+                manifest,
+                game_dir,
+                chunks_dir,
+                tmp_dir,
+                expected_path,
+                lookup,
+                refcounts,
+                cache,
+            } = *context;
+            assemble_file(
+                &manifest,
+                0,
+                &game_dir,
+                &chunks_dir,
+                &tmp_dir,
+                &lookup,
+                &refcounts,
+                &cache,
+                true,
+                VerifyMode::Full,
+            )
+            .map_err(|error| format!("assembly failed: {error}"))?;
+            Ok(Verification::Assembly {
+                expected: expected_path,
+                actual: game_dir.join("assembled.bin"),
+                size: manifest.file_size(0) as usize,
+            })
+        }
+        ScenarioContext::SophonInstall(context) => {
+            let InstallContext {
+                installer,
+                game_dir,
+                expected_path,
+                size_mib,
+                runtime,
+            } = *context;
+            runtime
+                .block_on(install(
+                    vec![installer],
+                    &game_dir,
+                    Vec::new(),
+                    "bench-tag",
+                    ResumeContext {
+                        prev_manifest_hash: String::new(),
+                        prev_downloaded_chunks: Default::default(),
+                        resume_seed: CompletedFiles::default(),
+                    },
+                    InstallOptions {
+                        is_preinstall: false,
+                        is_resume: false,
+                        handle: DownloadHandle::new(),
+                        verify_mode: VerifyMode::Full,
+                    },
+                    InstallCallbacks {
+                        updater: Arc::new(|_| {}),
+                        state_saver: Arc::new(|_| {}),
+                        completion_state: Arc::new(OnceLock::new()),
+                    },
+                    "bench",
+                    &[],
+                ))
+                .map_err(|error: SophonError| format!("Sophon install failed: {error}"))?;
+            Ok(Verification::SophonInstall {
+                expected: expected_path,
+                actual: game_dir.join("installed.bin"),
+                size: size_mib * 1024 * 1024,
+            })
+        }
+    }
+}
+
+fn verify_output(verification: Verification) -> Result<(), String> {
+    match verification {
+        Verification::Hdiff(dir) => compare_hdiff_fixture(&dir),
+        Verification::Assembly {
+            expected,
+            actual,
+            size,
+        }
+        | Verification::SophonInstall {
+            expected,
+            actual,
+            size,
+        } => compare_files_streaming(&expected, &actual, size),
+    }
+}
+
+fn compare_files_streaming(
+    expected: &Path,
+    actual: &Path,
+    expected_len: usize,
+) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut expected_file = File::open(expected).map_err(|error| error.to_string())?;
+    let mut actual_file = File::open(actual).map_err(|error| error.to_string())?;
+    if expected_file.metadata().map_err(|e| e.to_string())?.len() != expected_len as u64
+        || actual_file.metadata().map_err(|e| e.to_string())?.len() != expected_len as u64
     {
-        measure_with_setup(
-            "diff_interned_keys_2000x100",
-            || build_synthetic_manifest(2000, 100),
-            op_diff_interned_keys,
+        return Err("benchmark output size mismatch".to_owned());
+    }
+    let mut left = [0u8; 64 * 1024];
+    let mut right = [0u8; 64 * 1024];
+    loop {
+        let left_len = expected_file.read(&mut left).map_err(|e| e.to_string())?;
+        let right_len = actual_file.read(&mut right).map_err(|e| e.to_string())?;
+        if left_len != right_len || left[..left_len] != right[..right_len] {
+            return Err("benchmark output validation failed".to_owned());
+        }
+        if left_len == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn report_results(config: &Config, results: &[serde_json::Value]) -> Result<(), String> {
+    let mut peaks = results
+        .iter()
+        .filter_map(|result| result["peak_rss_kib"].as_u64())
+        .collect::<Vec<_>>();
+    peaks.sort_unstable();
+    let median = peaks[peaks.len() / 2];
+    let maximum = *peaks.last().unwrap();
+    if config.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "scenario": config.scenario.name(),
+                "runs": results,
+                "median_peak_rss_kib": median,
+                "max_peak_rss_kib": maximum,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "{}: median peak {} KiB; max peak {} KiB",
+            config.scenario.name(),
+            median,
+            maximum
+        );
+        for result in results {
+            println!("{}", serde_json::to_string(result).unwrap());
+        }
+    }
+    if let Some(budget) = config.budget_mib
+        && maximum > budget.saturating_mul(1024)
+    {
+        return Err(format!("peak {maximum} KiB exceeds {budget} MiB budget"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_required_scenario_and_positive_values() {
+        assert!(parse_args(&[]).is_err());
+        assert!(parse_positive("0", "--repeat").is_err());
+        assert!(parse_positive("abc", "--repeat").is_err());
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "assembly".into(),
+                "--chunks".into(),
+                "0".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "sophon-install".into(),
+                "--size-mib".into(),
+                "1".into(),
+                "--chunks".into(),
+                "3".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--size-mib".into(),
+                usize::MAX.to_string(),
+            ])
+            .is_err()
         );
     }
 
-    if filter
-        .as_deref()
-        .is_none_or(|f| "diff_string_keys_2000x100".contains(f))
-    {
-        measure_with_setup(
-            "diff_string_keys_2000x100",
-            || build_synthetic_manifest(2000, 100),
-            op_diff_string_keys,
-        );
+    #[test]
+    fn parses_memory_status_fields() {
+        let status = "VmRSS:\t1024 kB\nVmHWM:\t2048 kB\nRssAnon:\t512 kB\nRssFile:\t256 kB\n";
+        let snapshot = parse_memory_status(status);
+        assert_eq!(snapshot.vm_rss_kib, 1024);
+        assert_eq!(snapshot.vm_hwm_kib, 2048);
+        assert_eq!(snapshot.rss_anon_kib, Some(512));
+        assert_eq!(snapshot.rss_file_kib, Some(256));
     }
 
-    let _ = fs::remove_dir_all(&dir);
+    #[test]
+    fn hwm_reset_fallback_uses_process_baseline() {
+        let baseline = MemorySnapshot {
+            vm_rss_kib: 500,
+            vm_hwm_kib: 900,
+            ..MemorySnapshot::default()
+        };
+        let peak = MemorySnapshot {
+            vm_rss_kib: 700,
+            vm_hwm_kib: 900,
+            ..MemorySnapshot::default()
+        };
+        let hwm_reset = false;
+        let peak_rss_kib = peak.vm_hwm_kib.max(peak.vm_rss_kib);
+        let baseline_rss_kib = if hwm_reset {
+            peak.vm_rss_kib
+        } else {
+            baseline.vm_rss_kib
+        };
+        assert_eq!(peak_rss_kib, 900);
+        assert_eq!(peak_rss_kib.saturating_sub(baseline_rss_kib), 400);
+        assert!(!hwm_reset);
+    }
+
+    #[test]
+    fn generated_hdiff_fixture_applies_to_expected_output() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 1).unwrap();
+        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
+        let verification = run_operation(context).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn generated_assembly_fixture_assembles_and_matches_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_assembly_fixture(dir.path(), 1, 2).unwrap();
+        let context = prepare_child_context(Scenario::Assembly, dir.path(), 1, 2, "").unwrap();
+        let verification = run_operation(context).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn sophon_install_downloads_and_assembles_local_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_install_fixture(dir.path(), 1, 2).unwrap();
+        let server = LocalChunkServer::start(dir.path().to_path_buf()).unwrap();
+        let context =
+            prepare_child_context(Scenario::SophonInstall, dir.path(), 1, 2, &server.base_url)
+                .unwrap();
+        let verification = run_operation(context).unwrap();
+        verify_output(verification).unwrap();
+    }
 }

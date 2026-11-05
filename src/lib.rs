@@ -18,6 +18,9 @@ pub mod sophon;
 /// Persisted download and resume-state models.
 pub mod types;
 
+#[cfg(feature = "benchmark")]
+pub mod bench_support;
+
 /// Tuned HTTP client used for chunk transfers.
 pub use client::DownloadClient;
 /// Current pause/cancellation state of a [`DownloadHandle`].
