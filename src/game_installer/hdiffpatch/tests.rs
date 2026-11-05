@@ -11,6 +11,25 @@ fn hdiff_v13_zstd_empty_original() {
 }
 
 #[test]
+fn hdiff_existing_empty_source_applies_newfile_patch() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("empty-old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, b"").unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(hdiff.apply(None));
+    assert_eq!(fs::read(out_path).unwrap(), NEW_FROM_EMPTY);
+}
+
+#[test]
 fn hdiff_wrong_old_size_fails() {
     let dir = tempfile::tempdir().unwrap();
     let old_path = dir.path().join("old.bin");
@@ -29,6 +48,30 @@ fn hdiff_wrong_old_size_fails() {
         !hdiff.apply(None),
         "should fail when old file size doesn't match"
     );
+}
+
+#[test]
+fn hdiff_rejects_truncated_patch_stream() {
+    let old = test_prng_data(35, 8192);
+    let new = old.clone();
+    let mut patch = build_v13_zstd_patch(&old, &new);
+    let data_start = b"HDIFF13&zstd\0".len() + 2;
+    patch.truncate(data_start + (patch.len() - data_start) / 2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(!hdiff.apply(None));
+    assert!(!out_path.exists(), "incomplete output should be removed");
 }
 
 #[test]
@@ -68,6 +111,52 @@ fn hdiff_truncated_header_fails_without_panicking() {
 }
 
 #[test]
+fn hdiff_varint_overflow_in_old_data_size_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, b"").unwrap();
+
+    let mut patch = b"HDIFF13&nocomp\0".to_vec();
+    patch.extend_from_slice(&[
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ]);
+    patch.extend_from_slice(&[0x00; 9]);
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(!hdiff.apply(None));
+}
+
+#[test]
+fn hdiff_varint_overflow_in_new_data_size_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, b"").unwrap();
+
+    let mut patch = b"HDIFF13&nocomp\0".to_vec();
+    patch.extend_from_slice(&[
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x00,
+    ]);
+    patch.extend_from_slice(&[0x00; 9]);
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(!hdiff.apply(None));
+}
+
+#[test]
 fn hdiff_detect_hdiff_magic_bytes() {
     assert!(DIFF_EMPTY_TO_NEW.starts_with(b"HDIFF"));
 }
@@ -93,6 +182,28 @@ fn hdiff_nonexistent_source_file_fails() {
         !hdiff.apply(None),
         "should fail for nonexistent source file"
     );
+}
+
+#[test]
+fn hdiff_missing_source_with_nonzero_old_size_fails_before_output_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_old_path = dir.path().join("missing.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(
+        &diff_path,
+        b"HDIFF13&nocomp\0\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+    )
+    .unwrap();
+
+    let mut hdiff = HDiff::new(
+        missing_old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert!(!out_path.exists());
 }
 /// Newfile hdiff patches work without a source file.
 #[test]
@@ -120,6 +231,29 @@ fn hdiff_newfile_no_source_file() {
     assert!(result, "valid newfile patch should apply without a source");
     let output = fs::read(&out_path).unwrap();
     assert_eq!(output, NEW_FROM_EMPTY, "newfile hdiff output mismatch");
+}
+
+#[cfg(unix)]
+#[test]
+fn hdiff_newfile_dangling_source_symlink_fails() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing_target = dir.path().join("missing-target.bin");
+    let source_link = dir.path().join("source-link.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    symlink(&missing_target, &source_link).unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
+
+    let mut hdiff = HDiff::new(
+        source_link.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert!(!out_path.exists());
 }
 
 #[test]
@@ -162,6 +296,122 @@ fn hdiff_same_source_and_dest_fails() {
         !hdiff.apply(None),
         "should fail when source and destination are the same file"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn hdiff_hardlinked_source_and_destination_fail_without_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let alias_path = dir.path().join("alias.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    fs::write(&old_path, b"source bytes remain intact").unwrap();
+    fs::hard_link(&old_path, &alias_path).unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        alias_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert_eq!(fs::read(&old_path).unwrap(), b"source bytes remain intact");
+    assert_eq!(
+        fs::read(&alias_path).unwrap(),
+        b"source bytes remain intact"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hdiff_symlink_destination_is_rejected_without_changing_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let target_path = dir.path().join("target.bin");
+    let symlink_path = dir.path().join("out.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    fs::write(&old_path, b"source bytes").unwrap();
+    fs::write(&target_path, b"target bytes remain").unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
+    symlink(&target_path, &symlink_path).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        symlink_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert_eq!(fs::read(&target_path).unwrap(), b"target bytes remain");
+    assert!(
+        fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn hdiff_failed_patch_preserves_existing_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, test_prng_data(91, 8192)).unwrap();
+    fs::write(&out_path, b"previous output stays").unwrap();
+    let mut patch = build_v13_zstd_patch(&test_prng_data(91, 8192), &test_prng_data(91, 8192));
+    patch.truncate(b"HDIFF13&zstd\0".len() + 4);
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert_eq!(fs::read(&out_path).unwrap(), b"previous output stays");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+}
+
+#[test]
+fn hdiff_success_replaces_destination_with_patch_output() {
+    let old = test_prng_data(92, 8192);
+    let new = old.clone();
+    let patch = build_v13_zstd_patch(&old, &new);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&diff_path, patch).unwrap();
+    fs::write(&out_path, b"previous output").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(hdiff.apply(None));
+    assert_eq!(fs::read(&out_path).unwrap(), new);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&out_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
 }
 
 /// enumerate_cover_headers rejects cover_count > 0 with cover_size == 0.
@@ -421,8 +671,9 @@ fn padding_applies_only_to_zlib_mode() {
 }
 
 use super::{
-    CompressionMode, CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, RleRefClip,
+    CompressionMode, CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo,
     MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT,
+    RleRefClip,
 };
 
 #[test]
@@ -1361,6 +1612,17 @@ fn build_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch
 }
 
+fn patch_has_v13_covers(patch: &[u8]) -> bool {
+    use super::parser::BinaryExtensions;
+
+    let mut input = std::io::Cursor::new(patch);
+    let header = input.read_string_to_null(512).unwrap();
+    assert!(header.starts_with("HDIFF13&"));
+    let mut info = HeaderInfo::default();
+    HDiff::read_non_single_file_header(&mut input, &mut info).unwrap();
+    info.chunk_info.cover_count > 0
+}
+
 #[test]
 fn hdiff_e2e_v20_nocomp_applies_correctly() {
     let old = test_prng_data(100, 8192);
@@ -1414,6 +1676,18 @@ fn hdiff_e2e_v13_zstd_identity_patch_applies_correctly() {
     let original = test_prng_data(31, 16 * 1024);
     let patch = build_v13_zstd_patch(&original, &original);
     assert_eq!(hdiff_e2e_apply(&original, &patch), original);
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_sparse_source_covers() {
+    let old = test_prng_data(34, 64 * 1024);
+    let mut new = old.clone();
+    for block in (0..old.len() / 256).step_by(6) {
+        new[block * 256] ^= 0xff;
+    }
+    let patch = build_v13_zstd_patch(&old, &new);
+    assert!(patch_has_v13_covers(&patch));
+    assert_eq!(hdiff_e2e_apply(&old, &patch), new);
 }
 
 #[test]

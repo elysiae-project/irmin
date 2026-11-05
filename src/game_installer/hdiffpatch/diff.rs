@@ -55,7 +55,11 @@ impl HDiff {
         // when both exist; string comparison catches same-path-string when
         // the destination does not yet exist.
         let source_canonical: Option<PathBuf> = std::fs::canonicalize(&self.source_path).ok();
-        let dest_canonical: Option<PathBuf> = std::fs::canonicalize(&self.dest_path).ok();
+        let dest_canonical: Option<PathBuf> = match std::fs::canonicalize(&self.dest_path) {
+            Ok(path) => Some(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
         if source_canonical.is_some()
             && dest_canonical.is_some()
             && source_canonical == dest_canonical
@@ -67,6 +71,15 @@ impl HDiff {
             .into());
         }
 
+        let destination_symlink_metadata = std::fs::symlink_metadata(&self.dest_path);
+        let destination_metadata = match destination_symlink_metadata {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("destination path must not be a symbolic link".into());
+            }
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
         let mut diff_file = File::open(&self.diff_path)?;
         if self.diff_offset > 0 {
             diff_file.seek(SeekFrom::Start(self.diff_offset))?;
@@ -125,114 +138,189 @@ impl HDiff {
         let mut old_file_fallback: Option<File> = None;
         let mut source_cursor: Option<Cursor<&[u8]>> = None;
 
-        if header_info.old_data_size == 0 && !std::path::Path::new(&self.source_path).exists() {
-            old_file_fallback = Some(File::open("/dev/null")?);
-        } else {
-            let f = File::open(&self.source_path)?;
-            let old_len = f.metadata()?.len() as i64;
-            if old_len != header_info.old_data_size {
+        let source_file = match File::open(&self.source_path) {
+            Ok(file) => Some(file),
+            Err(err)
+                if header_info.old_data_size == 0
+                    && err.kind() == std::io::ErrorKind::NotFound
+                    && matches!(
+                        std::fs::symlink_metadata(&self.source_path),
+                        Err(ref metadata_err)
+                            if metadata_err.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                None
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if let Some(f) = source_file {
+            let source_metadata = f.metadata()?;
+            if destination_metadata
+                .as_ref()
+                .is_some_and(|destination| same_file_identity(&source_metadata, destination))
+            {
                 return Err(format!(
-                    "input file size mismatch: expected {expected} bytes, got {old_len} bytes",
-                    expected = header_info.old_data_size
+                    "source and destination refer to the same file: {path}",
+                    path = self.source_path
                 )
                 .into());
             }
-            // mmap source for zero-syscall random access in cover operations.
-            // Falls back to File if mmap fails.
+            let old_len = source_metadata.len();
+            let expected_old_len = u64::try_from(header_info.old_data_size).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "patch header has negative old data size",
+                )
+            })?;
+            if old_len != expected_old_len {
+                return Err(format!(
+                    "input file size mismatch: expected {expected} bytes, got {old_len} bytes",
+                    expected = expected_old_len
+                )
+                .into());
+            }
+            // mmap avoids per-cover seek/read calls while kernel readahead stays adaptive.
+            // Falls back to File if mmap fails; page residency stays demand-driven.
             if old_len > 0 {
+                let map_len = usize::try_from(old_len).map_err(|_| {
+                    std::io::Error::other("source file is too large to map on this platform")
+                })?;
                 match unsafe {
-                    crate::game_installer::assembly_opt::mmap_read_only_unchecked(
-                        &f,
-                        old_len as usize,
-                    )
+                    crate::game_installer::assembly_opt::mmap_read_only_unchecked(&f, map_len)
                 } {
                     Ok(guard) => {
-                        unsafe {
-                            libc::madvise(guard.map_base, guard.map_len, libc::MADV_RANDOM);
-                            // Pre-fault source pages only when small enough to
-                            // avoid blocking the thread on multi-GB files.
-                            if guard.map_len <= 256 * 1024 * 1024 {
-                                libc::madvise(
-                                    guard.map_base,
-                                    guard.map_len,
-                                    libc::MADV_POPULATE_READ,
-                                );
-                            }
+                        let advice_result = unsafe {
+                            libc::madvise(guard.map_base, guard.map_len, libc::MADV_NORMAL)
+                        };
+                        if advice_result != 0 {
+                            log::debug!(
+                                "MADV_NORMAL advisory failed for source mapping: {}",
+                                std::io::Error::last_os_error()
+                            );
                         }
                         source_mmap = Some(guard);
                         source_cursor = Some(Cursor::new(source_mmap.as_ref().unwrap().as_slice()));
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        log::debug!("source mmap failed, using File fallback: {err}");
                         old_file_fallback = Some(f);
                     }
                 }
             } else {
                 old_file_fallback = Some(f);
             }
-        }
-
-        let old_source: &mut dyn SeekableRead = match source_cursor.as_mut() {
-            Some(c) => c,
-            None => old_file_fallback.as_mut().unwrap(),
-        };
-
-        let expected_size = header_info.new_data_size;
-        if expected_size < 0 {
-            return Err(std::io::Error::other("new_data_size is negative").into());
-        }
-
-        let out_file = File::create(&self.dest_path)?;
-        if expected_size > 0 {
-            out_file.set_len(expected_size as u64)?;
-            let _ = crate::game_installer::sysio::preallocate(&out_file, expected_size as u64);
-        }
-        let mut out_writer =
-            BufWriter::with_capacity(super::super::FILE_WRITE_BUFFER_SIZE, out_file);
-
-        if header_info.is_single_compressed_diff {
-            // Direct slice path avoids seek+read_exact vtable dispatch per cover chunk.
-            let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
-            if let Some(slice) = old_slice {
-                super::patch_sf::PatchSF::new(header_info).patch_with_slice(
-                    slice,
-                    &mut out_writer,
-                    &self.diff_path,
-                    on_progress,
-                )?;
-            } else {
-                super::patch_sf::PatchSF::new(header_info).patch(
-                    old_source,
-                    &mut out_writer,
-                    &self.diff_path,
-                    on_progress,
-                )?;
-            }
         } else {
-            let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
-            if let Some(slice) = old_slice {
-                super::patch_single::PatchSingle::new(header_info).patch_with_slice(
-                    slice,
-                    &mut out_writer,
-                    &self.diff_path,
-                    on_progress,
-                )?;
-            } else {
-                super::patch_single::PatchSingle::new(header_info).patch(
-                    old_source,
-                    &mut out_writer,
-                    &self.diff_path,
-                    on_progress,
-                )?;
-            }
+            old_file_fallback = Some(File::open("/dev/null")?);
         }
-        out_writer.flush()?;
 
-        let actual_size = std::fs::metadata(&self.dest_path)?.len() as i64;
-        if actual_size != expected_size {
-            return Err(format!(
-                "Patch output size mismatch: expected {expected_size} bytes, got {actual_size} bytes",
-            )
-            .into());
+        let expected_size = u64::try_from(header_info.new_data_size).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "new_data_size is negative")
+        })?;
+
+        let destination_path = PathBuf::from(&self.dest_path);
+        let parent = destination_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut temp_builder = tempfile::Builder::new();
+        temp_builder.prefix(".hdiffpatch-");
+        #[cfg(unix)]
+        temp_builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+        let mut temp_output = temp_builder.tempfile_in(parent)?;
+        if let Some(metadata) = destination_metadata.as_ref() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                temp_output
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(
+                        metadata.permissions().mode() & 0o777,
+                    ))?;
+            }
+            #[cfg(not(unix))]
+            temp_output
+                .as_file()
+                .set_permissions(metadata.permissions())?;
+        }
+        let patch_result: Result<(), Box<dyn std::error::Error>> = (|| {
+            let out_file = temp_output.as_file_mut();
+            if expected_size > 0 {
+                out_file.set_len(expected_size)?;
+                if let Err(err) = crate::game_installer::sysio::preallocate(out_file, expected_size)
+                {
+                    log::debug!("destination preallocation failed: {err}");
+                }
+            }
+            let mut out_writer = CountingWriter::new(BufWriter::with_capacity(
+                super::super::FILE_WRITE_BUFFER_SIZE,
+                out_file.try_clone()?,
+            ));
+            let old_source: &mut dyn SeekableRead = match source_cursor.as_mut() {
+                Some(c) => c,
+                None => old_file_fallback.as_mut().unwrap(),
+            };
+
+            if header_info.is_single_compressed_diff {
+                // Direct slice path avoids seek+read_exact vtable dispatch per cover chunk.
+                let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
+                if let Some(slice) = old_slice {
+                    super::patch_sf::PatchSF::new(header_info).patch_with_slice(
+                        slice,
+                        &mut out_writer,
+                        &self.diff_path,
+                        on_progress,
+                    )?;
+                } else {
+                    super::patch_sf::PatchSF::new(header_info).patch(
+                        old_source,
+                        &mut out_writer,
+                        &self.diff_path,
+                        on_progress,
+                    )?;
+                }
+            } else {
+                let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
+                if let Some(slice) = old_slice {
+                    super::patch_single::PatchSingle::new(header_info).patch_with_slice(
+                        slice,
+                        &mut out_writer,
+                        &self.diff_path,
+                        on_progress,
+                    )?;
+                } else {
+                    super::patch_single::PatchSingle::new(header_info).patch(
+                        old_source,
+                        &mut out_writer,
+                        &self.diff_path,
+                        on_progress,
+                    )?;
+                }
+            }
+            out_writer.flush()?;
+
+            let actual_size = out_writer.written();
+            if actual_size != expected_size {
+                return Err(std::io::Error::other(format!(
+                    "Patch output size mismatch: expected {expected_size} bytes, got {actual_size} bytes",
+                ))
+                .into());
+            }
+            Ok(())
+        })();
+        source_cursor.take();
+        source_mmap.take();
+        if patch_result.is_err() {
+            drop(temp_output);
+            return patch_result;
+        }
+        patch_result?;
+        temp_output.as_file().sync_all()?;
+        temp_output
+            .persist(&destination_path)
+            .map_err(|err| err.error)?;
+        #[cfg(unix)]
+        if let Err(err) = File::open(parent).and_then(|directory| directory.sync_all()) {
+            log::debug!("destination directory sync failed after atomic patch replacement: {err}");
         }
 
         Ok(())
@@ -364,6 +452,90 @@ impl HDiff {
                 "cover_end_pos overflow in diff chunk info".into()
             })?;
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    false
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::CountingWriter;
+    use std::io::{Cursor, Write};
+
+    #[test]
+    fn counting_writer_tracks_successfully_written_bytes() {
+        let mut writer = CountingWriter::new(Cursor::new(Vec::new()));
+        writer.write_all(b"patch output").unwrap();
+        assert_eq!(writer.written(), 12);
+        assert_eq!(writer.inner.into_inner(), b"patch output");
+    }
+
+    #[test]
+    fn counting_writer_tracks_partial_writes() {
+        struct PartialWriter {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+
+        impl Write for PartialWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let count = buf.len().min(self.limit);
+                self.bytes.extend_from_slice(&buf[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = CountingWriter::new(PartialWriter {
+            bytes: Vec::new(),
+            limit: 3,
+        });
+        writer.write_all(b"1234567").unwrap();
+        assert_eq!(writer.written(), 7);
+        assert_eq!(writer.inner.bytes, b"1234567");
+    }
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, written: 0 }
+    }
+
+    fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written = self
+            .written
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("patch output byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
