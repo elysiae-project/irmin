@@ -7,9 +7,9 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
+use super::FILE_WRITE_BUFFER_SIZE;
 use super::error::{SophonError, SophonResult};
 use super::sysio;
-use super::FILE_WRITE_BUFFER_SIZE;
 
 const ASSEMBLY_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -222,6 +222,11 @@ impl Drop for MmapGuard {
     }
 }
 
+/// Map the prefix of a file for read-only access with kernel-default paging behavior.
+///
+/// # Safety
+/// The caller must ensure `len` does not exceed the file size and no process modifies or truncates
+/// the file while the mapping is used. Truncation can cause `SIGBUS` when mapped pages are read.
 pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Result<MmapGuard> {
     if len == 0 {
         return Err(io::Error::other("empty file"));
@@ -238,12 +243,6 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
     };
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
-    }
-    unsafe {
-        libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
-        if len >= 2 * 1024 * 1024 {
-            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-        }
     }
     Ok(MmapGuard {
         ptr,
@@ -795,6 +794,17 @@ fn decompress_chunk_with_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_mmap_accepts_explicit_advice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, b"mapped source").unwrap();
+        let file = File::open(&path).unwrap();
+
+        let mapping = unsafe { mmap_read_only_unchecked(&file, 6) }.unwrap();
+        assert_eq!(mapping.as_slice(), b"mapped");
+    }
 
     fn write_at_new(path: &Path) -> File {
         std::fs::OpenOptions::new()

@@ -189,15 +189,6 @@ impl HDiff {
                     crate::game_installer::assembly_opt::mmap_read_only_unchecked(&f, map_len)
                 } {
                     Ok(guard) => {
-                        let advice_result = unsafe {
-                            libc::madvise(guard.map_base, guard.map_len, libc::MADV_NORMAL)
-                        };
-                        if advice_result != 0 {
-                            log::debug!(
-                                "MADV_NORMAL advisory failed for source mapping: {}",
-                                std::io::Error::last_os_error()
-                            );
-                        }
                         source_mmap = Some(guard);
                         source_cursor = Some(Cursor::new(source_mmap.as_ref().unwrap().as_slice()));
                     }
