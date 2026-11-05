@@ -1856,6 +1856,7 @@ where
     F: FnOnce(PreinstallState) -> Fut,
     Fut: std::future::Future<Output = SophonResult<TargetSnapshot>>,
 {
+    let _buffer_pool_trim = HdiffPoolTrimGuard;
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
     }
@@ -2177,6 +2178,14 @@ where
     }
 
     Ok(())
+}
+
+struct HdiffPoolTrimGuard;
+
+impl Drop for HdiffPoolTrimGuard {
+    fn drop(&mut self) {
+        super::hdiffpatch::trim_idle_buffers();
+    }
 }
 
 fn regenerate_hk4e_pkg_version(

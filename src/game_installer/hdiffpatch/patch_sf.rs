@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::io::{Read, SeekFrom, Write};
 
 use super::compression::get_clip_stream;
-use super::parser::{read_long_7bit_from_slice, BinaryExtensions};
+use super::parser::{BinaryExtensions, read_long_7bit_from_slice};
 use super::{BufferPool, HeaderInfo, SeekableRead};
 
 const MAX_STEP_SIZE: usize = 16 * 1024 * 1024;
@@ -12,6 +12,11 @@ const IO_BUF_SIZE: usize = 256 * 1024;
 
 static WORK_BUF_POOL: BufferPool = BufferPool::new(1);
 static STEP_BUF_POOL: BufferPool = BufferPool::new(1);
+
+pub(super) fn trim_idle_buffers() {
+    WORK_BUF_POOL.clear();
+    STEP_BUF_POOL.clear();
+}
 
 pub(crate) struct PatchSF {
     header_info: HeaderInfo,

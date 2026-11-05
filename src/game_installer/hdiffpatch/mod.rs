@@ -31,6 +31,11 @@ pub use parser::read_long_7bit_from_slice;
 #[cfg(feature = "benchmark")]
 pub use patch_core::enumerate_cover_headers_checked;
 
+pub(crate) fn trim_idle_buffers() {
+    patch_core::trim_idle_buffers();
+    patch_sf::trim_idle_buffers();
+}
+
 use std::sync::Mutex;
 
 /// Mutex-protected pool of reusable byte vectors for patch operations.
@@ -74,6 +79,14 @@ impl BufferPool {
         if pool.len() < self.max_idle {
             pool.push(buf);
         }
+    }
+
+    /// Drop all currently idle buffers from this pool.
+    pub fn clear(&self) {
+        self.buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     #[cfg(test)]
@@ -137,5 +150,13 @@ mod buffer_pool_tests {
         pool.return_buf_shrunken(small, 256 * 1024);
         let buf = pool.take(1);
         assert!(buf.capacity() >= 100 && buf.capacity() <= 256 * 1024);
+    }
+
+    #[test]
+    fn clear_drops_idle_buffers() {
+        let pool = BufferPool::new(2);
+        pool.return_buf(Vec::with_capacity(1024));
+        pool.clear();
+        assert!(pool.take(1).capacity() < 1024);
     }
 }

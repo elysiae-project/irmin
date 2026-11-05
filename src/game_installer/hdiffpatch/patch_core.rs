@@ -9,6 +9,11 @@ use crate::game_installer::hdiffpatch::parser::{read_long_7bit_from_slice, Binar
 static SHARED_BUFFER_POOL: BufferPool = BufferPool::new(1);
 static CACHE_BUFFER_POOL: BufferPool = BufferPool::new(1);
 
+pub(super) fn trim_idle_buffers() {
+    SHARED_BUFFER_POOL.clear();
+    CACHE_BUFFER_POOL.clear();
+}
+
 pub(crate) fn write_cover_stream_to_output(
     clips: &mut [Box<dyn Read>],
     input_stream: &mut dyn SeekableRead,
