@@ -1257,6 +1257,59 @@ fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch
 }
 
+/// Generate an HDIFF13 patch whose covers exercise additive or literal RLE runs.
+fn gen_hdiff_v13_rle_patch(old: &[u8], run_kind: u8) -> (Vec<u8>, Vec<u8>) {
+    let run_len = old.len();
+    let new = old
+        .iter()
+        .enumerate()
+        .map(|(index, &byte)| {
+            if run_kind == 2 {
+                byte.wrapping_add(0x37)
+            } else {
+                byte.wrapping_add((index as u8).wrapping_mul(13).wrapping_add(1))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let cover_buf = [
+        encode_tagged_1bit(0, 0),
+        encode_7bit_varint(0),
+        encode_7bit_varint(run_len as i64),
+    ]
+    .concat();
+    let rle_ctrl_buf = encode_tagged_2bit(run_kind, run_len as i64 - 1);
+    let rle_code_buf = if run_kind == 2 {
+        vec![0x37]
+    } else {
+        old.iter()
+            .zip(&new)
+            .map(|(&old_byte, &new_byte)| new_byte.wrapping_sub(old_byte))
+            .collect()
+    };
+    let mut patch = Vec::new();
+    patch.extend_from_slice(b"HDIFF13&nocomp\0");
+    for value in [
+        new.len() as i64,
+        old.len() as i64,
+        1,
+        cover_buf.len() as i64,
+        0,
+        rle_ctrl_buf.len() as i64,
+        0,
+        rle_code_buf.len() as i64,
+        0,
+        0,
+        0,
+    ] {
+        patch.extend_from_slice(&encode_7bit_varint(value));
+    }
+    patch.extend_from_slice(&cover_buf);
+    patch.extend_from_slice(&rle_ctrl_buf);
+    patch.extend_from_slice(&rle_code_buf);
+    (patch, new)
+}
+
 /// Generate a valid HDIFF13&zstd patch (each stream section individually zstd-compressed).
 fn gen_hdiff_v13_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     // Reuse the same cover/rle logic as nocomp variant
@@ -1378,6 +1431,8 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
     let patch_v20_zstd = gen_hdiff_v20_patch_zstd(&old, &new);
     let patch_v13 = gen_hdiff_v13_patch(&old, &new);
     let patch_v13_zstd = gen_hdiff_v13_patch_zstd(&old, &new);
+    let (patch_v13_rle_add, new_rle_add) = gen_hdiff_v13_rle_patch(&old, 2);
+    let (patch_v13_rle_copy, new_rle_copy) = gen_hdiff_v13_rle_patch(&old, 3);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let old_path = dir.path().join("old.bin");
@@ -1385,12 +1440,16 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
     let patch_v20z_path = dir.path().join("patch_v20_zstd.hdiff");
     let patch_v13_path = dir.path().join("patch_v13.hdiff");
     let patch_v13z_path = dir.path().join("patch_v13_zstd.hdiff");
+    let patch_v13_add_path = dir.path().join("patch_v13_rle_add.hdiff");
+    let patch_v13_copy_path = dir.path().join("patch_v13_rle_copy.hdiff");
     let out_path = dir.path().join("out.bin");
     fs::write(&old_path, &old).unwrap();
     fs::write(&patch_v20_path, &patch_v20).unwrap();
     fs::write(&patch_v20z_path, &patch_v20_zstd).unwrap();
     fs::write(&patch_v13_path, &patch_v13).unwrap();
     fs::write(&patch_v13z_path, &patch_v13_zstd).unwrap();
+    fs::write(&patch_v13_add_path, &patch_v13_rle_add).unwrap();
+    fs::write(&patch_v13_copy_path, &patch_v13_rle_copy).unwrap();
 
     // Verify all variants produce correct output
     for (name, path) in [
@@ -1408,6 +1467,22 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
         let result = fs::read(&out_path).unwrap();
         assert_eq!(result, new, "{name} patch output mismatch");
     }
+    for (name, path, expected) in [
+        ("v13_rle_add", &patch_v13_add_path, &new_rle_add),
+        ("v13_rle_copy", &patch_v13_copy_path, &new_rle_copy),
+    ] {
+        let mut hdiff = HDiff::new(
+            old_path.to_string_lossy().to_string(),
+            path.to_string_lossy().to_string(),
+            out_path.to_string_lossy().to_string(),
+        );
+        assert!(hdiff.apply(None), "{name} patch verification failed");
+        assert_eq!(
+            fs::read(&out_path).unwrap(),
+            *expected,
+            "{name} output mismatch"
+        );
+    }
 
     let mut group = c.benchmark_group("hdiffpatch_e2e");
     group.throughput(Throughput::Bytes(new.len() as u64));
@@ -1417,6 +1492,21 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
         ("v20_zstd", &patch_v20z_path),
         ("v13_nocomp", &patch_v13_path),
         ("v13_zstd", &patch_v13z_path),
+    ] {
+        group.bench_function(BenchmarkId::new(label, HDIFF_MIB), |b| {
+            b.iter(|| {
+                let mut hdiff = HDiff::new(
+                    old_path.to_string_lossy().to_string(),
+                    path.to_string_lossy().to_string(),
+                    out_path.to_string_lossy().to_string(),
+                );
+                assert!(hdiff.apply(None));
+            });
+        });
+    }
+    for (label, path) in [
+        ("v13_rle_add", &patch_v13_add_path),
+        ("v13_rle_copy", &patch_v13_copy_path),
     ] {
         group.bench_function(BenchmarkId::new(label, HDIFF_MIB), |b| {
             b.iter(|| {
