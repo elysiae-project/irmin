@@ -76,6 +76,7 @@ struct Config {
     fixture_backing: FixtureBacking,
     sweep_sizes_mib: Option<Vec<usize>>,
     memory_max_mib: Option<u64>,
+    interleave_sizes: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,6 +202,21 @@ struct CgroupMemoryEvents {
     oom: u64,
     oom_kill: u64,
     oom_group_kill: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct CgroupPressure {
+    some_total_us: u64,
+    full_total_us: u64,
+}
+
+impl CgroupPressure {
+    fn delta(before: &Self, after: &Self) -> Self {
+        Self {
+            some_total_us: after.some_total_us.saturating_sub(before.some_total_us),
+            full_total_us: after.full_total_us.saturating_sub(before.full_total_us),
+        }
+    }
 }
 
 impl CgroupMemoryEvents {
@@ -514,6 +530,26 @@ fn main() {
     }
 }
 
+fn size_run_order(sizes: &[usize], repeats: usize, interleave: bool) -> Vec<(usize, usize)> {
+    if interleave {
+        (0..repeats)
+            .flat_map(|repeat| {
+                let mut order = sizes.to_vec();
+                let size_count = order.len();
+                if size_count > 0 {
+                    order.rotate_left(repeat % size_count);
+                }
+                order.into_iter().map(move |size| (size, repeat))
+            })
+            .collect()
+    } else {
+        sizes
+            .iter()
+            .flat_map(|&size| (0..repeats).map(move |repeat| (size, repeat)))
+            .collect()
+    }
+}
+
 fn run_cli() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "--child") {
@@ -527,22 +563,24 @@ fn run_cli() -> Result<(), String> {
         .sweep_sizes_mib
         .clone()
         .unwrap_or_else(|| vec![config.size_mib]);
-    let mut sweep_results = Vec::with_capacity(sizes.len());
-    for (size_index, size_mib) in sizes.into_iter().enumerate() {
-        let mut results = Vec::with_capacity(config.repeat);
-        for iteration in 0..config.repeat {
-            let run_index = size_index * config.repeat + iteration;
-            results.push(run_child_once(
-                &config,
-                &executable,
-                workdir.path(),
-                filesystem_info,
-                size_mib,
-                run_index,
-            )?);
-        }
-        sweep_results.push((size_mib, results));
+    let mut by_size = sizes
+        .iter()
+        .map(|size| (*size, Vec::with_capacity(config.repeat)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut run_index = 0;
+    for (size_mib, _repeat) in size_run_order(&sizes, config.repeat, config.interleave_sizes) {
+        let result = run_child_once(
+            &config,
+            &executable,
+            workdir.path(),
+            filesystem_info,
+            size_mib,
+            run_index,
+        )?;
+        by_size.get_mut(&size_mib).unwrap().push(result);
+        run_index += 1;
     }
+    let sweep_results = by_size.into_iter().collect::<Vec<_>>();
     if config.sweep_sizes_mib.is_some() {
         report_size_sweep(&config, &sweep_results)?;
     } else {
@@ -840,6 +878,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut fixture_backing = FixtureBacking::Tempfile;
     let mut sweep_sizes_mib = None;
     let mut memory_max_mib = None;
+    let mut interleave_sizes = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -911,6 +950,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 memory_max_mib =
                     Some(parse_positive(value_at(args, index, option)?, option)? as u64);
             }
+            "--interleave-sizes" => interleave_sizes = true,
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
@@ -982,6 +1022,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         {
             return Err("memory-limited sweep requires the system allocator".to_owned());
         }
+    } else if interleave_sizes {
+        return Err("--interleave-sizes requires --sweep-sizes-mib".to_owned());
     } else if memory_max_mib.is_some() {
         return Err("--memory-max-mib requires --sweep-sizes-mib".to_owned());
     }
@@ -1002,6 +1044,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         fixture_backing,
         sweep_sizes_mib,
         memory_max_mib,
+        interleave_sizes,
     })
 }
 
@@ -1079,7 +1122,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
             ));
         }
         let events = read_cgroup_memory_events(&path)?;
-        Some((actual, path, events))
+        let pressure = read_cgroup_memory_pressure(&path)?;
+        Some((actual, path, events, pressure))
     } else {
         None
     };
@@ -1109,8 +1153,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
         _ => return Err("invalid child source backend".to_owned()),
     };
     let context = prepare_child_context(scenario, &fixture_dir, size_mib, chunks, &args[4])?;
-    let cgroup_events_after_setup = if let Some((_, path, _)) = &cgroup_memory_before_setup {
-        Some(read_cgroup_memory_events(path)?)
+    let cgroup_after_setup = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
+        Some((
+            read_cgroup_memory_events(path)?,
+            read_cgroup_memory_pressure(path)?,
+        ))
     } else {
         None
     };
@@ -1130,23 +1177,38 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let elapsed_ms = started.elapsed().as_millis();
     let operation_end = read_memory_snapshot()?;
     let cpu_after = read_cpu_usage()?;
-    let cgroup_events_after_operation = if let Some((_, path, _)) = &cgroup_memory_before_setup {
-        Some(read_cgroup_memory_events(path)?)
+    let cgroup_after_operation = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
+        Some((
+            read_cgroup_memory_events(path)?,
+            read_cgroup_memory_pressure(path)?,
+        ))
     } else {
         None
     };
     let cgroup_setup_events = cgroup_memory_before_setup
         .as_ref()
-        .zip(cgroup_events_after_setup.as_ref())
-        .map(|((_, _, before), after)| CgroupMemoryEvents::delta(before, after));
-    let cgroup_operation_events = cgroup_events_after_setup
+        .zip(cgroup_after_setup.as_ref())
+        .map(|((_, _, before, _), (after, _))| CgroupMemoryEvents::delta(before, after));
+    let cgroup_operation_events = cgroup_after_setup
         .as_ref()
-        .zip(cgroup_events_after_operation.as_ref())
-        .map(|(before, after)| CgroupMemoryEvents::delta(before, after));
+        .zip(cgroup_after_operation.as_ref())
+        .map(|((before, _), (after, _))| CgroupMemoryEvents::delta(before, after));
     let cgroup_total_events = cgroup_memory_before_setup
         .as_ref()
-        .zip(cgroup_events_after_operation.as_ref())
-        .map(|((_, _, before), after)| CgroupMemoryEvents::delta(before, after));
+        .zip(cgroup_after_operation.as_ref())
+        .map(|((_, _, before, _), (after, _))| CgroupMemoryEvents::delta(before, after));
+    let cgroup_setup_pressure = cgroup_memory_before_setup
+        .as_ref()
+        .zip(cgroup_after_setup.as_ref())
+        .map(|((_, _, _, before), (_, after))| CgroupPressure::delta(before, after));
+    let cgroup_operation_pressure = cgroup_after_setup
+        .as_ref()
+        .zip(cgroup_after_operation.as_ref())
+        .map(|((_, before), (_, after))| CgroupPressure::delta(before, after));
+    let cgroup_total_pressure = cgroup_memory_before_setup
+        .as_ref()
+        .zip(cgroup_after_operation.as_ref())
+        .map(|((_, _, _, before), (_, after))| CgroupPressure::delta(before, after));
     let sampled_peak = sampler.finish();
     #[cfg(all(
         unix,
@@ -1231,7 +1293,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         serde_json::to_value(
             cgroup_memory_before_setup
                 .as_ref()
-                .map(|(limit, _, _)| *limit),
+                .map(|(limit, _, _, _)| *limit),
         )
         .unwrap_or_default(),
     );
@@ -1246,6 +1308,18 @@ fn run_child(args: &[String]) -> Result<(), String> {
     result.insert(
         "cgroup_memory_events_total".to_owned(),
         serde_json::to_value(cgroup_total_events).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_pressure_setup".to_owned(),
+        serde_json::to_value(cgroup_setup_pressure).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_pressure_operation".to_owned(),
+        serde_json::to_value(cgroup_operation_pressure).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_pressure_total".to_owned(),
+        serde_json::to_value(cgroup_total_pressure).unwrap_or_default(),
     );
     result.insert(
         "allocator".to_owned(),
@@ -1378,6 +1452,41 @@ fn read_cgroup_memory_events(path: &Path) -> Result<CgroupMemoryEvents, String> 
         }
     }
     Ok(events)
+}
+
+fn read_cgroup_memory_pressure(path: &Path) -> Result<CgroupPressure, String> {
+    let contents = fs::read_to_string(path.join("memory.pressure"))
+        .map_err(|error| format!("failed reading cgroup memory.pressure: {error}"))?;
+    let mut some_total_us = None;
+    let mut full_total_us = None;
+    for line in contents.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(kind) = parts.next() else {
+            continue;
+        };
+        let mut total = None;
+        for field in parts {
+            if let Some(value) = field.strip_prefix("total=") {
+                total = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid cgroup memory.pressure total: {line:?}"))?,
+                );
+            }
+        }
+        let total = total.ok_or_else(|| format!("missing total in memory.pressure: {line:?}"))?;
+        match kind {
+            "some" => some_total_us = Some(total),
+            "full" => full_total_us = Some(total),
+            _ => {}
+        }
+    }
+    Ok(CgroupPressure {
+        some_total_us: some_total_us
+            .ok_or_else(|| "missing some line in memory.pressure".to_owned())?,
+        full_total_us: full_total_us
+            .ok_or_else(|| "missing full line in memory.pressure".to_owned())?,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1981,6 +2090,16 @@ fn report_size_sweep(
                     "cgroup_memory_events_operation",
                     "high",
                 ),
+                "median_operation_psi_some_us": median_nested_u64(
+                    runs,
+                    "cgroup_memory_pressure_operation",
+                    "some_total_us",
+                ),
+                "median_operation_psi_full_us": median_nested_u64(
+                    runs,
+                    "cgroup_memory_pressure_operation",
+                    "full_total_us",
+                ),
                 "runs": runs,
             })
         })
@@ -1993,6 +2112,12 @@ fn report_size_sweep(
         "fixture_backing": config.fixture_backing.name(),
         "fixture_cache_state": "warm",
         "allocator": "system",
+        "interleave_sizes": config.interleave_sizes,
+        "run_order": if config.interleave_sizes {
+            "deterministic_rotation"
+        } else {
+            "grouped_by_size"
+        },
         "fit_kind": "ordinary_least_squares",
         "points": points,
         "fits": {
@@ -2005,7 +2130,8 @@ fn report_size_sweep(
         "notes": [
             "Warm-cache disk-backed synthetic measurements; not representative preinstall validation.",
             "RSS components come from a coherent sampled peak snapshot; fits are descriptive linear approximations.",
-            "Major/minor faults are process-wide; cgroup memory.events are split into setup, operation, and total deltas when memory-limited.",
+            "Major/minor faults are process-wide; cgroup memory.events and PSI memory totals are split into setup, operation, and total deltas when memory-limited.",
+            "Interleaving rotates sizes by repeat; balanced rotation requires repeat_count to be a multiple of size_count.",
         ],
     });
     if config.json {
@@ -2041,7 +2167,7 @@ fn median_nested_u64(runs: &[serde_json::Value], object: &str, field: &str) -> O
 }
 
 fn linear_fit(samples: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
-    if samples.len() < 2 {
+    if samples.len() < 3 {
         return None;
     }
     let count = samples.len() as f64;
@@ -2251,6 +2377,19 @@ mod tests {
     }
 
     #[test]
+    fn size_run_order_matches_grouped_and_interleaved_labels() {
+        let sizes = [16, 32, 64];
+        assert_eq!(
+            size_run_order(&sizes, 2, false),
+            [(16, 0), (16, 1), (32, 0), (32, 1), (64, 0), (64, 1)]
+        );
+        assert_eq!(
+            size_run_order(&sizes, 2, true),
+            [(16, 0), (32, 0), (64, 0), (32, 1), (64, 1), (16, 1)]
+        );
+    }
+
+    #[test]
     fn sweep_requires_disk_backing_and_system_allocator() {
         let base = [
             "--scenario",
@@ -2293,6 +2432,7 @@ mod tests {
         assert!((r_squared - 1.0).abs() < f64::EPSILON);
         assert!(linear_fit(&[(16.0, 1.0)]).is_none());
         assert!(linear_fit(&[(16.0, 1.0), (16.0, 2.0)]).is_none());
+        assert!(linear_fit(&[(16.0, 1.0), (32.0, 2.0)]).is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -2370,6 +2510,28 @@ mod tests {
         assert_eq!(events.oom, 2);
         assert_eq!(events.oom_kill, 1);
         assert_eq!(events.oom_group_kill, 0);
+    }
+
+    #[test]
+    fn parses_cgroup_memory_pressure_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("memory.pressure"),
+            "some avg10=0.25 avg60=0.10 avg300=0.01 total=12345\nfull avg10=0.05 avg60=0.01 avg300=0.00 total=6789\n",
+        )
+        .unwrap();
+        let pressure = read_cgroup_memory_pressure(dir.path()).unwrap();
+        assert_eq!(pressure.some_total_us, 12345);
+        assert_eq!(pressure.full_total_us, 6789);
+        let after = CgroupPressure {
+            some_total_us: 13000,
+            full_total_us: 7000,
+        };
+        let delta = CgroupPressure::delta(&pressure, &after);
+        assert_eq!(delta.some_total_us, 655);
+        assert_eq!(delta.full_total_us, 211);
+        fs::write(dir.path().join("memory.pressure"), "some avg10=0 total=5\n").unwrap();
+        assert!(read_cgroup_memory_pressure(dir.path()).is_err());
     }
 
     #[test]
