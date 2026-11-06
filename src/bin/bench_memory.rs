@@ -286,6 +286,7 @@ struct Config {
     size_mib: usize,
     chunks: usize,
     asset_count: usize,
+    preinstall_mode: PreinstallMode,
     repeat: usize,
     budget_mib: Option<u64>,
     json: bool,
@@ -347,6 +348,32 @@ enum FixtureBacking {
     #[default]
     Tempfile,
     Disk,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PreinstallMode {
+    #[default]
+    Patch,
+    CopyOver,
+}
+
+impl PreinstallMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "patch" => Ok(Self::Patch),
+            "copyover" => Ok(Self::CopyOver),
+            _ => Err(format!(
+                "unknown preinstall mode '{value}'; expected patch or copyover"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::CopyOver => "copyover",
+        }
+    }
 }
 
 impl FixtureBacking {
@@ -841,6 +868,7 @@ fn run_child_once(
             size_mib,
             config.chunks,
             config.cover_pattern,
+            config.preinstall_mode,
         )?;
     }
     let mut local_server = if !prepare_in_child && config.scenario == Scenario::SophonInstall {
@@ -905,6 +933,7 @@ fn child_command_args(
         size_mib.to_string(),
         config.chunks.to_string(),
         config.asset_count.to_string(),
+        config.preinstall_mode.name().to_owned(),
         server_url.to_owned(),
         config.cover_pattern.name().to_owned(),
         config.fixture_backing.name().to_owned(),
@@ -1099,6 +1128,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut size_mib = 64;
     let mut chunks = 8;
     let mut asset_count = 1;
+    let mut preinstall_mode = PreinstallMode::Patch;
     let mut repeat = 3;
     let mut budget_mib = None;
     let mut json = false;
@@ -1131,6 +1161,10 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--asset-count" => {
                 index += 1;
                 asset_count = parse_positive(value_at(args, index, option)?, option)?;
+            }
+            "--preinstall-mode" => {
+                index += 1;
+                preinstall_mode = PreinstallMode::parse(value_at(args, index, option)?)?;
             }
             "--repeat" => {
                 index += 1;
@@ -1204,6 +1238,12 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     }
     if asset_count != 1 && scenario != Scenario::PreinstallApply {
         return Err("--asset-count overrides are only supported for preinstall-apply".to_owned());
+    }
+    if preinstall_mode != PreinstallMode::Patch && scenario != Scenario::PreinstallApply {
+        return Err("--preinstall-mode is only supported for preinstall-apply".to_owned());
+    }
+    if preinstall_mode == PreinstallMode::CopyOver && cover_pattern != CoverPattern::Sequential {
+        return Err("copyover mode requires the sequential cover pattern".to_owned());
     }
     if !matches!(scenario, Scenario::Hdiff | Scenario::PreinstallApply)
         && cover_pattern != CoverPattern::Sequential
@@ -1296,6 +1336,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         size_mib,
         chunks,
         asset_count,
+        preinstall_mode,
         repeat,
         budget_mib,
         json,
@@ -1340,33 +1381,34 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 11 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE".to_owned());
+    if args.len() != 12 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT PREINSTALL_MODE SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
     let size_mib = parse_positive(&args[2], "--size-mib")?;
     let chunks = parse_positive(&args[3], "--chunks")?;
     let asset_count = parse_positive(&args[4], "--asset-count")?;
+    let preinstall_mode = PreinstallMode::parse(&args[5])?;
     if asset_count > 8 || (asset_count != 1 && scenario != Scenario::PreinstallApply) {
         return Err("child asset count is unsupported for this scenario".to_owned());
     }
-    let cover_pattern = CoverPattern::parse(&args[6])?;
-    let fixture_backing = FixtureBacking::parse(&args[7])?;
-    let reported_fs_magic = if args[8].is_empty() {
+    let cover_pattern = CoverPattern::parse(&args[7])?;
+    let fixture_backing = FixtureBacking::parse(&args[8])?;
+    let reported_fs_magic = if args[9].is_empty() {
         None
     } else {
         Some(
-            u64::from_str_radix(&args[8], 16)
+            u64::from_str_radix(&args[9], 16)
                 .map_err(|_| "invalid fixture filesystem magic".to_owned())?,
         )
     };
-    let source_backend = args[9].as_str();
-    let prepare_in_child = match args[10].as_str() {
+    let source_backend = args[10].as_str();
+    let prepare_in_child = match args[11].as_str() {
         "prepare" => true,
         "prepared" => false,
         _ => return Err("invalid child fixture preparation mode".to_owned()),
@@ -1404,7 +1446,14 @@ fn run_child(args: &[String]) -> Result<(), String> {
         return Err("fixture filesystem changed between setup and child run".to_owned());
     }
     if prepare_in_child {
-        prepare_fixture(scenario, &fixture_dir, size_mib, chunks, cover_pattern)?;
+        prepare_fixture(
+            scenario,
+            &fixture_dir,
+            size_mib,
+            chunks,
+            cover_pattern,
+            preinstall_mode,
+        )?;
     }
     let window_stats = Arc::new(WindowStats::default());
     let hdiff_source_backend = match source_backend {
@@ -1430,7 +1479,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
         size_mib,
         chunks,
         asset_count,
-        &args[5],
+        preinstall_mode,
+        &args[6],
     )?;
     let cgroup_after_setup = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
         Some((
@@ -1536,6 +1586,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
             "step_sizes_include_cover_and_rle_sections": true,
             "step_layout_is_synthetic_stress": true,
         }))
+    } else if scenario == Scenario::PreinstallApply && preinstall_mode == PreinstallMode::CopyOver {
+        Some(serde_json::json!({
+            "output_bytes": size_mib * 1024 * 1024,
+            "raw_copyover_payload_bytes": size_mib * 1024 * 1024,
+        }))
     } else {
         None
     };
@@ -1544,6 +1599,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
         "representative": false,
         "asset_count": (scenario == Scenario::PreinstallApply).then_some(asset_count),
+        "preinstall_mode": (scenario == Scenario::PreinstallApply)
+            .then_some(preinstall_mode.name()),
         "cover_pattern": cover_pattern.name(),
         "fixture_shape": fixture_shape,
         "fixture_backing": fixture_backing.name(),
@@ -1946,10 +2003,16 @@ fn prepare_fixture(
     size_mib: usize,
     chunks: usize,
     cover_pattern: CoverPattern,
+    preinstall_mode: PreinstallMode,
 ) -> Result<(), String> {
     match scenario {
         Scenario::Hdiff | Scenario::PreinstallApply => {
-            prepare_hdiff_fixture(dir, size_mib, cover_pattern)
+            if scenario == Scenario::PreinstallApply && preinstall_mode == PreinstallMode::CopyOver
+            {
+                prepare_copyover_fixture(dir, size_mib)
+            } else {
+                prepare_hdiff_fixture(dir, size_mib, cover_pattern)
+            }
         }
         Scenario::Assembly => prepare_assembly_fixture(dir, size_mib, chunks),
         Scenario::SophonInstall => prepare_install_fixture(dir, size_mib, chunks),
@@ -1996,6 +2059,20 @@ fn prepare_hdiff_fixture(
     fs::write(dir.join("patch.hdiff"), patch).map_err(|error| error.to_string())
 }
 
+fn prepare_copyover_fixture(dir: &Path, size_mib: usize) -> Result<(), String> {
+    let size = size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "CopyOver fixture size is too large".to_owned())?;
+    let old = deterministic_data(0xC0_0A, size);
+    let mut new = deterministic_data(0xC0_0B, size);
+    if new.starts_with(b"HDIFF") {
+        new[0] ^= 0xff;
+    }
+    fs::write(dir.join("old.bin"), old).map_err(|error| error.to_string())?;
+    fs::write(dir.join("new.bin"), &new).map_err(|error| error.to_string())?;
+    fs::write(dir.join("patch.hdiff"), new).map_err(|error| error.to_string())
+}
+
 fn gcd(mut left: usize, mut right: usize) -> usize {
     while right != 0 {
         (left, right) = (right, left % right);
@@ -2037,6 +2114,7 @@ fn prepare_child_context(
     size_mib: usize,
     chunks: usize,
     asset_count: usize,
+    preinstall_mode: PreinstallMode,
     server_url: &str,
 ) -> Result<ScenarioContext, String> {
     if asset_count == 0 || asset_count > 8 {
@@ -2055,7 +2133,15 @@ fn prepare_child_context(
                 } else {
                     dir.join(format!("synthetic-game-{index:02}"))
                 };
-                let (_, size) = irmin_rs::game_installer::prepare_benchmark_preinstall_state(
+                let state_builder = match preinstall_mode {
+                    PreinstallMode::Patch => {
+                        irmin_rs::game_installer::prepare_benchmark_preinstall_state
+                    }
+                    PreinstallMode::CopyOver => {
+                        irmin_rs::game_installer::prepare_benchmark_copyover_state
+                    }
+                };
+                let (_, size) = state_builder(
                     &game_dir,
                     &dir.join("old.bin"),
                     &dir.join("new.bin"),
@@ -2613,6 +2699,7 @@ mod tests {
     #[test]
     fn parses_required_scenario_and_positive_values() {
         assert!(usage().contains("--asset-count N"));
+        assert!(usage().contains("--preinstall-mode patch|copyover"));
         assert!(parse_args(&[]).is_err());
         assert!(parse_positive("0", "--repeat").is_err());
         assert!(parse_positive("abc", "--repeat").is_err());
@@ -2701,6 +2788,44 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(sequence.asset_count, 3);
+        let copyover = parse_args(&[
+            "--scenario".into(),
+            "preinstall-apply".into(),
+            "--preinstall-mode".into(),
+            "copyover".into(),
+        ])
+        .unwrap();
+        assert_eq!(copyover.preinstall_mode, PreinstallMode::CopyOver);
+        let copyover_sequence = parse_args(&[
+            "--scenario".into(),
+            "preinstall-apply".into(),
+            "--preinstall-mode".into(),
+            "copyover".into(),
+            "--asset-count".into(),
+            "3".into(),
+        ])
+        .unwrap();
+        assert_eq!(copyover_sequence.asset_count, 3);
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--preinstall-mode".into(),
+                "copyover".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--preinstall-mode".into(),
+                "copyover".into(),
+                "--cover-pattern".into(),
+                "reverse".into(),
+            ])
+            .is_err()
+        );
         assert!(
             parse_args(&[
                 "--scenario".into(),
@@ -3197,7 +3322,16 @@ mod tests {
     fn generated_hdiff_fixture_applies_to_expected_output() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
-        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, 1, "").unwrap();
+        let context = prepare_child_context(
+            Scenario::Hdiff,
+            dir.path(),
+            1,
+            1,
+            1,
+            PreinstallMode::Patch,
+            "",
+        )
+        .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3206,7 +3340,16 @@ mod tests {
     fn hdiff20_step_fixture_runs_through_direct_apply_verification() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
-        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 4, 1, 1, "").unwrap();
+        let context = prepare_child_context(
+            Scenario::Hdiff,
+            dir.path(),
+            4,
+            1,
+            1,
+            PreinstallMode::Patch,
+            "",
+        )
+        .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3215,8 +3358,16 @@ mod tests {
     fn hdiff20_step_fixture_runs_through_preinstall_apply_verification() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
-        let context =
-            prepare_child_context(Scenario::PreinstallApply, dir.path(), 4, 1, 1, "").unwrap();
+        let context = prepare_child_context(
+            Scenario::PreinstallApply,
+            dir.path(),
+            4,
+            1,
+            1,
+            PreinstallMode::Patch,
+            "",
+        )
+        .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3226,8 +3377,16 @@ mod tests {
     fn sequential_preinstall_assets_report_retained_heap_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
-        let context =
-            prepare_child_context(Scenario::PreinstallApply, dir.path(), 4, 1, 2, "").unwrap();
+        let context = prepare_child_context(
+            Scenario::PreinstallApply,
+            dir.path(),
+            4,
+            1,
+            2,
+            PreinstallMode::Patch,
+            "",
+        )
+        .unwrap();
         let window = allocation_stats::AllocationWindow::start().unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         let snapshot = window.finish().unwrap();
@@ -3246,12 +3405,46 @@ mod tests {
         verify_output(verification).unwrap();
     }
 
+    #[cfg(feature = "bench-alloc-stats")]
+    #[test]
+    fn copyover_mode_runs_through_preinstall_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_copyover_fixture(dir.path(), 4).unwrap();
+        let old = fs::read(dir.path().join("old.bin")).unwrap();
+        let new = fs::read(dir.path().join("new.bin")).unwrap();
+        let patch = fs::read(dir.path().join("patch.hdiff")).unwrap();
+        assert_ne!(old, new);
+        assert_eq!(patch, new);
+        assert!(!patch.starts_with(b"HDIFF"));
+        let context = prepare_child_context(
+            Scenario::PreinstallApply,
+            dir.path(),
+            4,
+            1,
+            1,
+            PreinstallMode::CopyOver,
+            "",
+        )
+        .unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        verify_output(verification).unwrap();
+    }
+
     #[test]
     fn uncovered_prefix_fixture_applies_with_each_direct_source_backend() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::UncoveredPrefix).unwrap();
         for backend in [HDiffSourceBackend::Mmap, HDiffSourceBackend::File] {
-            let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, 1, "").unwrap();
+            let context = prepare_child_context(
+                Scenario::Hdiff,
+                dir.path(),
+                1,
+                1,
+                1,
+                PreinstallMode::Patch,
+                "",
+            )
+            .unwrap();
             let verification = run_operation(context, backend).unwrap();
             verify_output(verification).unwrap();
         }
@@ -3261,8 +3454,16 @@ mod tests {
     fn uncovered_prefix_fixture_runs_through_preinstall_apply() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::UncoveredPrefix).unwrap();
-        let context =
-            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, 1, "").unwrap();
+        let context = prepare_child_context(
+            Scenario::PreinstallApply,
+            dir.path(),
+            1,
+            1,
+            1,
+            PreinstallMode::Patch,
+            "",
+        )
+        .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3271,8 +3472,16 @@ mod tests {
     fn synthetic_preinstall_fixture_runs_public_apply_path() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
-        let context =
-            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, 1, "").unwrap();
+        let context = prepare_child_context(
+            Scenario::PreinstallApply,
+            dir.path(),
+            1,
+            1,
+            1,
+            PreinstallMode::Patch,
+            "",
+        )
+        .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3357,7 +3566,16 @@ mod tests {
     fn generated_assembly_fixture_assembles_and_matches_expected() {
         let dir = tempfile::tempdir().unwrap();
         prepare_assembly_fixture(dir.path(), 1, 2).unwrap();
-        let context = prepare_child_context(Scenario::Assembly, dir.path(), 1, 2, 1, "").unwrap();
+        let context = prepare_child_context(
+            Scenario::Assembly,
+            dir.path(),
+            1,
+            2,
+            1,
+            PreinstallMode::Patch,
+            "",
+        )
+        .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3373,6 +3591,7 @@ mod tests {
             1,
             2,
             1,
+            PreinstallMode::Patch,
             &server.base_url,
         )
         .unwrap();

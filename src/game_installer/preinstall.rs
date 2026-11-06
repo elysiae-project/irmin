@@ -525,6 +525,43 @@ pub fn prepare_synthetic_apply_state(
     patch_path: &Path,
     target_relative_path: &str,
 ) -> SophonResult<(String, u64)> {
+    prepare_synthetic_apply_state_with_method(
+        game_dir,
+        original_path,
+        target_path,
+        patch_path,
+        target_relative_path,
+        PatchMethod::Patch,
+    )
+}
+
+#[cfg(feature = "benchmark")]
+pub fn prepare_synthetic_copyover_state(
+    game_dir: &Path,
+    original_path: &Path,
+    target_path: &Path,
+    patch_path: &Path,
+    target_relative_path: &str,
+) -> SophonResult<(String, u64)> {
+    prepare_synthetic_apply_state_with_method(
+        game_dir,
+        original_path,
+        target_path,
+        patch_path,
+        target_relative_path,
+        PatchMethod::CopyOver,
+    )
+}
+
+#[cfg(feature = "benchmark")]
+fn prepare_synthetic_apply_state_with_method(
+    game_dir: &Path,
+    original_path: &Path,
+    target_path: &Path,
+    patch_path: &Path,
+    target_relative_path: &str,
+    patch_method: PatchMethod,
+) -> SophonResult<(String, u64)> {
     super::assembly::validate_asset_name(target_relative_path)?;
     let patch_name = "synthetic.hdiff";
     let patch_size = fs::metadata(patch_path)?.len();
@@ -550,7 +587,7 @@ pub fn prepare_synthetic_apply_state(
         target_file_path: target_relative_path.to_owned(),
         target_file_size: target_size,
         target_file_hash: target_hash.clone(),
-        patch_method: PatchMethod::Patch,
+        patch_method,
         patch_name: patch_name.to_owned(),
         patch_hash: patch_hash.clone(),
         patch_offset: 0,

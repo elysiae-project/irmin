@@ -209,6 +209,8 @@ pub use installer::{
 pub use plugin_install::{install_channel_sdks, install_plugins};
 #[cfg(feature = "benchmark")]
 pub use preinstall::prepare_synthetic_apply_state as prepare_benchmark_preinstall_state;
+#[cfg(feature = "benchmark")]
+pub use preinstall::prepare_synthetic_copyover_state as prepare_benchmark_copyover_state;
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
 pub use update::{UpdateInfo, check_update};
 
