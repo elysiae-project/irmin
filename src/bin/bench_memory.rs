@@ -14,7 +14,10 @@ use fast_md5::Md5;
 use irmin_rs::api_scrape::{Compression, DownloadInfo};
 use irmin_rs::bench_support::{
     apply_hdiff_fixture_with_backend, compare_hdiff_fixture, deterministic_data,
-    make_v13_zstd_reordered_patch, prepare_hdiff_fixture as prepare_shared_hdiff_fixture,
+    make_v13_zstd_reordered_patch,
+    prepare_hdiff_fixture as prepare_shared_hdiff_fixture,
+    prepare_hdiff_uncovered_prefix_fixture as prepare_shared_uncovered_prefix_fixture,
+    uncovered_prefix_fixture_sizes,
 };
 use irmin_rs::game_installer::VerifyMode;
 use irmin_rs::game_installer::assembly::{assemble_file, chunk_filename};
@@ -85,6 +88,7 @@ enum CoverPattern {
     Sequential,
     Reverse,
     Thrash,
+    UncoveredPrefix,
 }
 
 impl CoverPattern {
@@ -93,8 +97,9 @@ impl CoverPattern {
             "sequential" => Ok(Self::Sequential),
             "reverse" => Ok(Self::Reverse),
             "thrash" => Ok(Self::Thrash),
+            "uncovered-prefix" => Ok(Self::UncoveredPrefix),
             _ => Err(format!(
-                "unknown cover pattern '{value}'; expected sequential, reverse, or thrash"
+                "unknown cover pattern '{value}'; expected sequential, reverse, thrash, or uncovered-prefix"
             )),
         }
     }
@@ -104,6 +109,7 @@ impl CoverPattern {
             Self::Sequential => "sequential",
             Self::Reverse => "reverse",
             Self::Thrash => "thrash",
+            Self::UncoveredPrefix => "uncovered-prefix",
         }
     }
 }
@@ -567,8 +573,14 @@ fn run_cli() -> Result<(), String> {
         .iter()
         .map(|size| (*size, Vec::with_capacity(config.repeat)))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut run_index = 0;
-    for (size_mib, _repeat) in size_run_order(&sizes, config.repeat, config.interleave_sizes) {
+    for (run_index, (size_mib, _repeat)) in size_run_order(
+        &sizes,
+        config.repeat,
+        config.interleave_sizes,
+    )
+    .into_iter()
+    .enumerate()
+    {
         let result = run_child_once(
             &config,
             &executable,
@@ -578,7 +590,6 @@ fn run_cli() -> Result<(), String> {
             run_index,
         )?;
         by_size.get_mut(&size_mib).unwrap().push(result);
-        run_index += 1;
     }
     let sweep_results = by_size.into_iter().collect::<Vec<_>>();
     if config.sweep_sizes_mib.is_some() {
@@ -978,6 +989,9 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     if size_mib.checked_mul(1024 * 1024).is_none() {
         return Err("--size-mib is too large".to_owned());
     }
+    if cover_pattern == CoverPattern::UncoveredPrefix {
+        uncovered_prefix_fixture_sizes(size_mib)?;
+    }
     if scenario == Scenario::Assembly && (size_mib * 1024 * 1024) % chunks != 0 {
         return Err("assembly size-mib must divide evenly into chunks".to_owned());
     }
@@ -1010,6 +1024,11 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             .any(|size| size.checked_mul(1024 * 1024).is_none())
         {
             return Err("a sweep size is too large".to_owned());
+        }
+        if cover_pattern == CoverPattern::UncoveredPrefix {
+            for &size in sizes {
+                uncovered_prefix_fixture_sizes(size)?;
+            }
         }
         if memory_max_mib.is_some() && !cfg!(target_os = "linux") {
             return Err("--memory-max-mib requires Linux".to_owned());
@@ -1078,7 +1097,7 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
@@ -1105,6 +1124,9 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "prepared" => false,
         _ => return Err("invalid child fixture preparation mode".to_owned()),
     };
+    if cover_pattern == CoverPattern::UncoveredPrefix {
+        uncovered_prefix_fixture_sizes(size_mib)?;
+    }
     let expected_memory_max = std::env::var("IRMIN_BENCH_MEMORY_MAX_BYTES")
         .ok()
         .filter(|value| !value.is_empty())
@@ -1228,12 +1250,23 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let kernel_hwm_peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
     let peak_rss_kib = kernel_hwm_peak_rss_kib.max(sampled_peak.vm_rss_kib);
     verify_output(verification)?;
+    let fixture_shape = if cover_pattern == CoverPattern::UncoveredPrefix {
+        let (prefix_size, suffix_size) = uncovered_prefix_fixture_sizes(size_mib)?;
+        Some(serde_json::json!({
+            "uncovered_prefix_bytes": prefix_size,
+            "covered_suffix_bytes": suffix_size,
+            "output_bytes": prefix_size + suffix_size,
+        }))
+    } else {
+        None
+    };
     let mut result = serde_json::json!({
         "scenario": scenario.name(),
         "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
         "representative": false,
         "asset_count": (scenario == Scenario::PreinstallApply).then_some(1),
         "cover_pattern": cover_pattern.name(),
+        "fixture_shape": fixture_shape,
         "fixture_backing": fixture_backing.name(),
         "fixture_fs_magic": format!("0x{:x}", filesystem_info.magic),
         "fixture_fs_type": filesystem_info.name,
@@ -1402,7 +1435,7 @@ fn read_cgroup_memory_limit() -> Result<(u64, PathBuf), String> {
         }
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")
             .map_err(|error| format!("failed reading cgroup mountinfo: {error}"))?;
-        let (mount_root, mount_point) = find_cgroup2_mount(&mountinfo, &membership_path)?;
+        let (mount_root, mount_point) = find_cgroup2_mount(&mountinfo, membership_path)?;
         let relative_to_mount = membership_path
             .strip_prefix(&mount_root)
             .map_err(|_| "cgroup membership is outside the mounted cgroup2 root".to_owned())?;
@@ -1620,6 +1653,10 @@ fn prepare_hdiff_fixture(
     size_mib: usize,
     cover_pattern: CoverPattern,
 ) -> Result<(), String> {
+    if cover_pattern == CoverPattern::UncoveredPrefix {
+        prepare_shared_uncovered_prefix_fixture(dir, size_mib)?;
+        return Ok(());
+    }
     if cover_pattern == CoverPattern::Sequential {
         return prepare_shared_hdiff_fixture(dir, size_mib);
     }
@@ -1638,6 +1675,7 @@ fn prepare_hdiff_fixture(
                 .collect::<Vec<_>>()
         }
         CoverPattern::Sequential => unreachable!(),
+        CoverPattern::UncoveredPrefix => unreachable!(),
     };
     let (patch, new) = make_v13_zstd_reordered_patch(&old, &permutation);
     fs::write(dir.join("old.bin"), &old).map_err(|error| error.to_string())?;
@@ -2267,6 +2305,18 @@ mod tests {
             ])
             .is_err()
         );
+        let uncovered_sweep = parse_args(&[
+            "--scenario".into(),
+            "preinstall-apply".into(),
+            "--cover-pattern".into(),
+            "uncovered-prefix".into(),
+            "--fixture-backing".into(),
+            "disk".into(),
+            "--sweep-sizes-mib".into(),
+            "16,32,64".into(),
+        ])
+        .unwrap();
+        assert_eq!(uncovered_sweep.cover_pattern, CoverPattern::UncoveredPrefix);
         assert!(
             parse_args(&[
                 "--scenario".into(),
@@ -2277,6 +2327,59 @@ mod tests {
                 "disk".into(),
             ])
             .is_ok()
+        );
+        assert_eq!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--cover-pattern".into(),
+                "uncovered-prefix".into(),
+            ])
+            .unwrap()
+            .cover_pattern,
+            CoverPattern::UncoveredPrefix
+        );
+        assert_eq!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--cover-pattern".into(),
+                "uncovered-prefix".into(),
+            ])
+            .unwrap()
+            .cover_pattern,
+            CoverPattern::UncoveredPrefix
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "assembly".into(),
+                "--cover-pattern".into(),
+                "uncovered-prefix".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--size-mib".into(),
+                "1".into(),
+                "--cover-pattern".into(),
+                "uncovered-prefix".into(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--size-mib".into(),
+                "0".into(),
+                "--cover-pattern".into(),
+                "uncovered-prefix".into(),
+            ])
+            .is_err()
         );
         assert!(
             parse_args(&[
@@ -2693,6 +2796,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
         let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn uncovered_prefix_fixture_applies_with_each_direct_source_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 1, CoverPattern::UncoveredPrefix).unwrap();
+        for backend in [HDiffSourceBackend::Mmap, HDiffSourceBackend::File] {
+            let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
+            let verification = run_operation(context, backend).unwrap();
+            verify_output(verification).unwrap();
+        }
+    }
+
+    #[test]
+    fn uncovered_prefix_fixture_runs_through_preinstall_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 1, CoverPattern::UncoveredPrefix).unwrap();
+        let context = prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, "")
+            .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }

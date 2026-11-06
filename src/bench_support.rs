@@ -179,6 +179,43 @@ pub fn prepare_hdiff_fixture(dir: &Path, size_mib: usize) -> Result<(), String> 
         .map_err(|error| error.to_string())
 }
 
+pub fn uncovered_prefix_fixture_sizes(size_mib: usize) -> Result<(usize, usize), String> {
+    const BLOCK_SIZE: usize = 64 * 1024;
+    let output_size = size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "HDiff fixture size is too large".to_owned())?;
+    let aligned_size = output_size / BLOCK_SIZE * BLOCK_SIZE;
+    // The fixture needs at least one uncovered block and one copied block.
+    if aligned_size < BLOCK_SIZE * 2 {
+        return Err("uncovered-prefix fixture requires at least two 64 KiB blocks".to_owned());
+    }
+    // Keep a copied suffix while leaving most output in the uncovered-data path.
+    let suffix_size = (aligned_size / 16).max(BLOCK_SIZE);
+    let suffix_size = suffix_size / BLOCK_SIZE * BLOCK_SIZE;
+    let prefix_size = aligned_size - suffix_size;
+    Ok((prefix_size, suffix_size))
+}
+
+pub fn prepare_hdiff_uncovered_prefix_fixture(
+    dir: &Path,
+    size_mib: usize,
+) -> Result<(usize, usize), String> {
+    let (prefix_size, suffix_size) = uncovered_prefix_fixture_sizes(size_mib)?;
+    let old = deterministic_data(0xBAD5, suffix_size);
+    let prefix = deterministic_data(0xBAD6, prefix_size);
+    let output_size = prefix_size + suffix_size;
+    let mut new = Vec::with_capacity(output_size);
+    new.extend_from_slice(&prefix);
+    new.extend_from_slice(&old);
+    let covers = [(0, prefix_size, suffix_size)];
+    let patch = make_v13_zstd_patch_from_covers(&old, &new, &covers);
+
+    fs::write(dir.join("old.bin"), &old).map_err(|error| error.to_string())?;
+    fs::write(dir.join("new.bin"), &new).map_err(|error| error.to_string())?;
+    fs::write(dir.join("patch.hdiff"), patch).map_err(|error| error.to_string())?;
+    Ok((prefix_size, suffix_size))
+}
+
 pub fn verify_hdiff_fixture(dir: &Path) -> Result<(), String> {
     apply_hdiff_fixture(dir)?;
     compare_hdiff_fixture(dir)
@@ -223,6 +260,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1).unwrap();
         verify_hdiff_fixture(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn uncovered_prefix_fixture_applies_and_reports_component_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (prefix_size, suffix_size) =
+            prepare_hdiff_uncovered_prefix_fixture(dir.path(), 1).unwrap();
+        assert_eq!(prefix_size + suffix_size, 1024 * 1024);
+        assert_eq!(suffix_size, 64 * 1024);
+
+        let old = fs::read(dir.path().join("old.bin")).unwrap();
+        let new = fs::read(dir.path().join("new.bin")).unwrap();
+        assert_eq!(old.len(), suffix_size);
+        assert_eq!(new.len(), prefix_size + suffix_size);
+        assert_eq!(&new[prefix_size..], old);
+
+        verify_hdiff_fixture(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn uncovered_prefix_sizes_are_aligned_and_bounded() {
+        const BLOCK_SIZE: usize = 64 * 1024;
+        assert!(uncovered_prefix_fixture_sizes(0).is_err());
+        assert_eq!(
+            uncovered_prefix_fixture_sizes(1).unwrap(),
+            (15 * BLOCK_SIZE, BLOCK_SIZE)
+        );
+        for size_mib in [2, 3, 16, 64] {
+            let (prefix, suffix) = uncovered_prefix_fixture_sizes(size_mib).unwrap();
+            assert!(prefix >= BLOCK_SIZE);
+            assert!(suffix >= BLOCK_SIZE);
+            assert_eq!(prefix % BLOCK_SIZE, 0);
+            assert_eq!(suffix % BLOCK_SIZE, 0);
+            assert_eq!(prefix + suffix, size_mib * 1024 * 1024);
+        }
+        assert!(uncovered_prefix_fixture_sizes(usize::MAX).is_err());
     }
 
     #[test]

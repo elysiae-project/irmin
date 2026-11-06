@@ -1507,63 +1507,17 @@ fn gen_hdiff_v13_rle_patch(old: &[u8], run_kind: u8) -> (Vec<u8>, Vec<u8>) {
     (patch, new)
 }
 
-fn gen_hdiff_v13_zstd_uncovered_prefix_patch(old: &[u8], prefix: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    assert!(!old.is_empty());
-    assert!(!prefix.is_empty());
-    let cover_len = old.len();
-    let new_size = i64::try_from(prefix.len() + cover_len).unwrap();
-    let old_size = i64::try_from(old.len()).unwrap();
-    let prefix_size = i64::try_from(prefix.len()).unwrap();
-    let cover_size = i64::try_from(cover_len).unwrap();
-    let mut new = Vec::with_capacity(prefix.len() + cover_len);
-    new.extend_from_slice(prefix);
-    new.extend_from_slice(old);
-
-    let cover_buf = [
-        encode_tagged_1bit(0, 0),
-        encode_7bit_varint(prefix_size),
-        encode_7bit_varint(cover_size),
-    ]
-    .concat();
-    let mut rle_ctrl_buf = Vec::new();
-    rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, prefix_size - 1));
-    rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, cover_size - 1));
-    let cover_compressed = zstd::encode_all(cover_buf.as_slice(), 3).unwrap();
-    let rle_ctrl_compressed = zstd::encode_all(rle_ctrl_buf.as_slice(), 3).unwrap();
-    let new_data_compressed = zstd::encode_all(prefix, 3).unwrap();
-
-    let mut patch = b"HDIFF13&zstd\0".to_vec();
-    for value in [
-        new_size,
-        old_size,
-        1,
-        cover_buf.len() as i64,
-        cover_compressed.len() as i64,
-        rle_ctrl_buf.len() as i64,
-        rle_ctrl_compressed.len() as i64,
-        0,
-        0,
-        prefix_size,
-        new_data_compressed.len() as i64,
-    ] {
-        patch.extend_from_slice(&encode_7bit_varint(value));
-    }
-    patch.extend_from_slice(&cover_compressed);
-    patch.extend_from_slice(&rle_ctrl_compressed);
-    patch.extend_from_slice(&new_data_compressed);
-    (patch, new)
-}
-
 fn bench_v13_large_uncovered_prefix(c: &mut Criterion) {
-    let old = gen_prng_data(0xBAD5, 1024 * 1024);
-    let prefix = gen_prng_data(0xBAD6, 64 * 1024 * 1024);
-    let (patch, expected) = gen_hdiff_v13_zstd_uncovered_prefix_patch(&old, &prefix);
     let dir = tempfile::tempdir().unwrap();
+    let (prefix_size, suffix_size) =
+        irmin_rs::bench_support::prepare_hdiff_uncovered_prefix_fixture(dir.path(), 64).unwrap();
     let old_path = dir.path().join("old.bin");
-    let patch_path = dir.path().join("uncovered-prefix.hdiff");
+    let patch_path = dir.path().join("patch.hdiff");
     let out_path = dir.path().join("out.bin");
-    fs::write(&old_path, &old).unwrap();
-    fs::write(&patch_path, &patch).unwrap();
+    let expected_path = dir.path().join("new.bin");
+    let expected_size = fs::metadata(&expected_path).unwrap().len();
+    assert_eq!(expected_size, (prefix_size + suffix_size) as u64);
+    let expected_hash = hash_file_xxh64(&expected_path);
 
     let mut patcher = HDiff::new(
         old_path.to_string_lossy().into_owned(),
@@ -1571,12 +1525,18 @@ fn bench_v13_large_uncovered_prefix(c: &mut Criterion) {
         out_path.to_string_lossy().into_owned(),
     );
     assert!(patcher.apply(None), "large leading-gap patch failed");
-    assert_eq!(hash_file_xxh64(&out_path), xxhash_rust::xxh64::xxh64(&expected, 0));
+    assert_eq!(fs::metadata(&out_path).unwrap().len(), expected_size);
+    assert_eq!(hash_file_xxh64(&out_path), expected_hash);
 
     let mut group = c.benchmark_group("hdiffpatch_v13_uncovered_prefix");
     group.sample_size(10);
-    group.throughput(Throughput::Bytes(expected.len() as u64));
-    group.bench_function("random_prefix_64m_cover_1m", |bencher| {
+    group.throughput(Throughput::Bytes(expected_size));
+    let fixture_label = format!(
+        "random_prefix_{}m_cover_{}m",
+        prefix_size / (1024 * 1024),
+        suffix_size / (1024 * 1024)
+    );
+    group.bench_function(fixture_label, |bencher| {
         bencher.iter(|| {
             let mut patcher = HDiff::new(
                 old_path.to_string_lossy().into_owned(),
