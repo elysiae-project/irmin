@@ -47,7 +47,47 @@ impl PatchSingle {
         Ok(())
     }
 
-    fn open_clips(&self, patch_path: &str) -> std::io::Result<[Box<dyn Read>; 4]> {
+    #[cfg(test)]
+    pub(crate) fn patch_with_chunk_size(
+        &self,
+        input_stream: &mut dyn SeekableRead,
+        output_stream: &mut dyn Write,
+        patch_path: &str,
+        chunk_size: usize,
+        on_progress: Option<&dyn Fn(u64)>,
+    ) -> std::io::Result<()> {
+        let mut clips = self.open_clips(patch_path)?;
+        super::patch_core::write_cover_stream_to_output_with_chunk_size(
+            &mut clips,
+            input_stream,
+            output_stream,
+            &self.header_info,
+            chunk_size,
+            on_progress,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn patch_with_slice_and_chunk_size(
+        &self,
+        old_data: &[u8],
+        output_stream: &mut dyn Write,
+        patch_path: &str,
+        chunk_size: usize,
+        on_progress: Option<&dyn Fn(u64)>,
+    ) -> std::io::Result<()> {
+        let mut clips = self.open_clips(patch_path)?;
+        super::patch_core::write_cover_stream_to_output_with_slice_and_chunk_size(
+            &mut clips,
+            old_data,
+            output_stream,
+            &self.header_info,
+            chunk_size,
+            on_progress,
+        )
+    }
+
+    pub(super) fn open_clips(&self, patch_path: &str) -> std::io::Result<[Box<dyn Read>; 4]> {
         let padding: u64 = match self.header_info.comp_mode {
             CompressionMode::Zlib => 1,
             _ => 0,

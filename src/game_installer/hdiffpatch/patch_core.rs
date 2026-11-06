@@ -1,13 +1,15 @@
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, SeekFrom, Write};
 
 use super::{
-    BufferPool, CoverHeader, HeaderInfo, RleRefClip, SeekableRead, K_BYTE_RLE_TYPE, K_SIGN_TAG_BIT,
-    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT,
+    BufferPool, CoverHeader, HeaderInfo, K_BYTE_RLE_TYPE, K_SIGN_TAG_BIT, MAX_ARRAY_POOL_LEN,
+    MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, RleRefClip, SeekableRead,
 };
-use crate::game_installer::hdiffpatch::parser::{read_long_7bit_from_slice, BinaryExtensions};
+use crate::game_installer::hdiffpatch::parser::{BinaryExtensions, read_long_7bit_from_slice};
 
 static SHARED_BUFFER_POOL: BufferPool = BufferPool::new(1);
 static CACHE_BUFFER_POOL: BufferPool = BufferPool::new(1);
+const REGION_CHUNK_SIZE: usize = 4 << 20;
+const PROGRESS_INTERVAL: u64 = REGION_CHUNK_SIZE as u64;
 
 pub(super) fn trim_idle_buffers() {
     SHARED_BUFFER_POOL.clear();
@@ -31,6 +33,26 @@ pub(crate) fn write_cover_stream_to_output(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn write_cover_stream_to_output_with_chunk_size(
+    clips: &mut [Box<dyn Read>],
+    input_stream: &mut dyn SeekableRead,
+    output_stream: &mut dyn Write,
+    header_info: &HeaderInfo,
+    chunk_size: usize,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> std::io::Result<()> {
+    write_cover_stream_inner_with_chunk_size(
+        clips,
+        input_stream,
+        None,
+        output_stream,
+        header_info,
+        on_progress,
+        chunk_size,
+    )
+}
+
 /// Variant with direct old-data slice access, bypassing seek+read_exact.
 pub(crate) fn write_cover_stream_to_output_with_slice(
     clips: &mut [Box<dyn Read>],
@@ -51,6 +73,27 @@ pub(crate) fn write_cover_stream_to_output_with_slice(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn write_cover_stream_to_output_with_slice_and_chunk_size(
+    clips: &mut [Box<dyn Read>],
+    old_data: &[u8],
+    output_stream: &mut dyn Write,
+    header_info: &HeaderInfo,
+    chunk_size: usize,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> std::io::Result<()> {
+    let mut dummy = Cursor::new(&[][..]);
+    write_cover_stream_inner_with_chunk_size(
+        clips,
+        &mut dummy,
+        Some(old_data),
+        output_stream,
+        header_info,
+        on_progress,
+        chunk_size,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_cover_stream_inner(
     clips: &mut [Box<dyn Read>],
@@ -60,15 +103,49 @@ fn write_cover_stream_inner(
     header_info: &HeaderInfo,
     on_progress: Option<&dyn Fn(u64)>,
 ) -> std::io::Result<()> {
+    write_cover_stream_inner_with_chunk_size(
+        clips,
+        input_stream,
+        old_data,
+        output_stream,
+        header_info,
+        on_progress,
+        REGION_CHUNK_SIZE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cover_stream_inner_with_chunk_size(
+    clips: &mut [Box<dyn Read>],
+    input_stream: &mut dyn SeekableRead,
+    old_data: Option<&[u8]>,
+    output_stream: &mut dyn Write,
+    header_info: &HeaderInfo,
+    on_progress: Option<&dyn Fn(u64)>,
+    chunk_size: usize,
+) -> std::io::Result<()> {
+    if chunk_size == 0 {
+        return Err(std::io::Error::other("region chunk size is zero"));
+    }
+    if chunk_size > REGION_CHUNK_SIZE {
+        return Err(std::io::Error::other(
+            "region chunk size exceeds the production cache limit",
+        ));
+    }
+    if header_info.chunk_info.cover_count < 0 {
+        return Err(std::io::Error::other("cover_count is negative"));
+    }
     let mut shared_buffer = SHARED_BUFFER_POOL.take(MAX_ARRAY_POOL_LEN);
     if shared_buffer.capacity() < MAX_ARRAY_POOL_LEN {
         shared_buffer = Vec::with_capacity(MAX_ARRAY_POOL_LEN);
     }
     shared_buffer.resize(MAX_ARRAY_POOL_LEN, 0);
-    let mut cache = Cursor::new(CACHE_BUFFER_POOL.take(MAX_MEM_BUFFER_LEN as usize));
+    let cache_vec = prepare_region_cache(CACHE_BUFFER_POOL.take(chunk_size), chunk_size);
+    let mut cache = Cursor::new(cache_vec);
 
     let mut new_pos_back = 0i64;
     let mut total_written: u64 = 0;
+    let mut last_reported = 0u64;
     let mut rle_struct = RleRefClip::default();
     let (cover_slice, rest_slice) = clips.split_first_mut().unwrap();
     let cover_reader = &mut **cover_slice;
@@ -85,11 +162,30 @@ fn write_cover_stream_inner(
         header_info.chunk_info.cover_count,
     )?;
 
-    for cover_result in headers {
+    let mut headers = headers;
+    for cover_result in headers.by_ref() {
         let cover = cover_result?;
+        if cover.new_pos < 0 {
+            return Err(std::io::Error::other("cover new position is negative"));
+        }
         if cover.new_pos < new_pos_back {
             return Err(std::io::Error::other(
                 "backward or overlapping covers in patch",
+            ));
+        }
+        if cover.cover_length < 0 {
+            return Err(std::io::Error::other("cover length is negative"));
+        }
+        if cover.old_pos < 0 {
+            return Err(std::io::Error::other("cover old position is negative"));
+        }
+        let old_cover_end = cover
+            .old_pos
+            .checked_add(cover.cover_length)
+            .ok_or_else(|| std::io::Error::other("old cover length overflow"))?;
+        if old_cover_end > header_info.old_data_size {
+            return Err(std::io::Error::other(
+                "cover extends past expected source size",
             ));
         }
         let cover_end = cover
@@ -103,45 +199,59 @@ fn write_cover_stream_inner(
         }
         if new_pos_back < cover.new_pos {
             let copy_length = cover.new_pos - new_pos_back;
-            tbytes_copy_stream_from_old_clip(
+            write_reader_region(
                 &mut cache,
                 new_data_reader,
                 copy_length,
+                chunk_size,
+                output_stream,
+                &mut total_written,
+                &mut last_reported,
+                on_progress,
                 &mut shared_buffer,
-            )?;
-            tbytes_determine_rle_type(
                 &mut rle_struct,
-                &mut cache,
-                copy_length,
-                &mut shared_buffer,
                 rle_ctrl_reader,
                 rle_code_reader,
             )?;
         }
 
-        tbytes_copy_old_clip_patch(
-            &mut cache,
-            input_stream,
-            old_data,
-            &mut rle_struct,
-            cover.old_pos,
-            cover.cover_length,
-            &mut shared_buffer,
-            rle_ctrl_reader,
-            rle_code_reader,
-        )?;
+        if let Some(slice) = old_data {
+            write_slice_region(
+                &mut cache,
+                slice,
+                cover.old_pos,
+                cover.cover_length,
+                chunk_size,
+                output_stream,
+                &mut total_written,
+                &mut last_reported,
+                on_progress,
+                &mut shared_buffer,
+                &mut rle_struct,
+                rle_ctrl_reader,
+                rle_code_reader,
+            )?;
+        } else {
+            input_stream.seek(SeekFrom::Start(cover.old_pos as u64))?;
+            write_reader_region(
+                &mut cache,
+                input_stream,
+                cover.cover_length,
+                chunk_size,
+                output_stream,
+                &mut total_written,
+                &mut last_reported,
+                on_progress,
+                &mut shared_buffer,
+                &mut rle_struct,
+                rle_ctrl_reader,
+                rle_code_reader,
+            )?;
+        }
         new_pos_back = cover
             .new_pos
             .checked_add(cover.cover_length)
             .ok_or_else(|| std::io::Error::other("new_pos overflow in cover iteration"))?;
-        if cache.get_ref().len() > MAX_MEM_BUFFER_LIMIT || cover.next_cover_index == 0 {
-            let cache_len = cache.get_ref().len() as u64;
-            write_cache_to_output(&mut cache, output_stream)?;
-            total_written += cache_len;
-            if let Some(ref cb) = on_progress {
-                cb(total_written);
-            }
-        }
     }
 
     if new_pos_back < header_info.new_data_size {
@@ -151,26 +261,40 @@ fn write_cover_stream_inner(
                 "tail copy length is negative; diff is malformed",
             ));
         }
-        tbytes_copy_stream_from_old_clip(
+        write_reader_region(
             &mut cache,
             new_data_reader,
             copy_length,
+            chunk_size,
+            output_stream,
+            &mut total_written,
+            &mut last_reported,
+            on_progress,
             &mut shared_buffer,
-        )?;
-        tbytes_determine_rle_type(
             &mut rle_struct,
-            &mut cache,
-            copy_length,
-            &mut shared_buffer,
             rle_ctrl_reader,
             rle_code_reader,
         )?;
-        let cache_len = cache.get_ref().len() as u64;
-        write_cache_to_output(&mut cache, output_stream)?;
-        total_written += cache_len;
-        if let Some(ref cb) = on_progress {
-            cb(total_written);
-        }
+    }
+    let buffered_total = total_written
+        .checked_add(cache.get_ref().len() as u64)
+        .ok_or_else(|| std::io::Error::other("output byte count overflow"))?;
+    if buffered_total != header_info.new_data_size as u64 {
+        return Err(std::io::Error::other(
+            "decoded output size differs from declared size",
+        ));
+    }
+    flush_region_cache(
+        &mut cache,
+        output_stream,
+        &mut total_written,
+        &mut last_reported,
+        on_progress,
+    )?;
+    if total_written > last_reported
+        && let Some(callback) = on_progress
+    {
+        callback(total_written);
     }
     SHARED_BUFFER_POOL.return_buf(shared_buffer);
     CACHE_BUFFER_POOL.return_buf(cache.into_inner());
@@ -190,61 +314,215 @@ fn write_cache_to_output(
     Ok(())
 }
 
+fn prepare_region_cache(mut cache: Vec<u8>, chunk_size: usize) -> Vec<u8> {
+    cache.clear();
+    if cache.capacity() < chunk_size {
+        cache.reserve_exact(chunk_size);
+    } else if cache.capacity() > chunk_size {
+        cache.shrink_to(chunk_size);
+    }
+    cache
+}
+
 #[allow(clippy::too_many_arguments)]
-fn tbytes_copy_old_clip_patch(
-    out_cache: &mut Cursor<Vec<u8>>,
-    input_stream: &mut dyn SeekableRead,
-    old_data: Option<&[u8]>,
-    rle_loader: &mut RleRefClip,
-    old_pos: i64,
-    add_length: i64,
+fn write_reader_region(
+    cache: &mut Cursor<Vec<u8>>,
+    source: &mut dyn Read,
+    length: i64,
+    chunk_size: usize,
+    output: &mut dyn Write,
+    total_written: &mut u64,
+    last_reported: &mut u64,
+    on_progress: Option<&dyn Fn(u64)>,
     shared_buffer: &mut [u8],
+    rle_loader: &mut RleRefClip,
     rle_ctrl_stream: &mut dyn Read,
     rle_code_stream: &mut dyn Read,
 ) -> std::io::Result<()> {
-    if add_length < 0 {
-        return Err(std::io::Error::other("add_length is negative"));
+    if length < 0 {
+        return Err(std::io::Error::other("region length is negative"));
     }
-    let last_pos = out_cache.position();
-    if let Some(slice) = old_data {
-        // Direct slice write — no seek, no chunked read_exact.
-        let start = old_pos as usize;
-        let end = start
-            .checked_add(add_length as usize)
-            .ok_or_else(|| std::io::Error::other("old_pos + add_length overflow"))?;
-        if end > slice.len() {
-            return Err(std::io::Error::other(
-                "patch references old data beyond slice bounds",
-            ));
+    let mut remaining = length as u64;
+    while remaining > 0 {
+        let chunk_length = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(chunk_size);
+        let chunk_length_i64 = i64::try_from(chunk_length)
+            .map_err(|_| std::io::Error::other("region chunk exceeds i64"))?;
+        ensure_region_cache_room(
+            cache,
+            chunk_length,
+            chunk_size,
+            output,
+            total_written,
+            last_reported,
+            on_progress,
+        )?;
+        let region_start = cache.get_ref().len();
+        debug_assert_eq!(cache.position(), region_start as u64);
+        tbytes_copy_stream_inner(source, cache, shared_buffer, chunk_length)?;
+        cache.set_position(region_start as u64);
+        apply_region_rle(
+            cache,
+            region_start,
+            chunk_length_i64,
+            shared_buffer,
+            rle_loader,
+            rle_ctrl_stream,
+            rle_code_stream,
+        )
+        .map_err(|error| {
+            std::io::Error::new(error.kind(), format!("decode output region chunk: {error}"))
+        })?;
+        if cache.get_ref().len() == chunk_size {
+            flush_region_cache(cache, output, total_written, last_reported, on_progress)?;
         }
-        out_cache.write_all(&slice[start..end])?;
-    } else {
-        input_stream.seek(SeekFrom::Start(old_pos as u64))?;
-        tbytes_copy_stream_inner(input_stream, out_cache, shared_buffer, add_length as usize)?;
+        remaining -= chunk_length as u64;
     }
-    out_cache.seek(SeekFrom::Start(last_pos))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_slice_region(
+    cache: &mut Cursor<Vec<u8>>,
+    source: &[u8],
+    source_offset: i64,
+    length: i64,
+    chunk_size: usize,
+    output: &mut dyn Write,
+    total_written: &mut u64,
+    last_reported: &mut u64,
+    on_progress: Option<&dyn Fn(u64)>,
+    shared_buffer: &mut [u8],
+    rle_loader: &mut RleRefClip,
+    rle_ctrl_stream: &mut dyn Read,
+    rle_code_stream: &mut dyn Read,
+) -> std::io::Result<()> {
+    if source_offset < 0 || length < 0 {
+        return Err(std::io::Error::other("slice region has negative range"));
+    }
+    let start = usize::try_from(source_offset)
+        .map_err(|_| std::io::Error::other("slice region offset does not fit memory"))?;
+    let length = usize::try_from(length)
+        .map_err(|_| std::io::Error::other("slice region length does not fit memory"))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| std::io::Error::other("slice region end overflow"))?;
+    let source = source
+        .get(start..end)
+        .ok_or_else(|| std::io::Error::other("slice region exceeds old data"))?;
+    let mut remaining = source;
+    while !remaining.is_empty() {
+        let chunk_length = remaining.len().min(chunk_size);
+        let chunk_length_i64 = i64::try_from(chunk_length)
+            .map_err(|_| std::io::Error::other("region chunk exceeds i64"))?;
+        ensure_region_cache_room(
+            cache,
+            chunk_length,
+            chunk_size,
+            output,
+            total_written,
+            last_reported,
+            on_progress,
+        )?;
+        let region_start = cache.get_ref().len();
+        debug_assert_eq!(cache.position(), region_start as u64);
+        cache.write_all(&remaining[..chunk_length])?;
+        cache.set_position(region_start as u64);
+        apply_region_rle(
+            cache,
+            region_start,
+            chunk_length_i64,
+            shared_buffer,
+            rle_loader,
+            rle_ctrl_stream,
+            rle_code_stream,
+        )
+        .map_err(|error| {
+            std::io::Error::new(error.kind(), format!("decode slice region chunk: {error}"))
+        })?;
+        if cache.get_ref().len() == chunk_size {
+            flush_region_cache(cache, output, total_written, last_reported, on_progress)?;
+        }
+        remaining = &remaining[chunk_length..];
+    }
+    Ok(())
+}
+
+fn apply_region_rle(
+    cache: &mut Cursor<Vec<u8>>,
+    region_start: usize,
+    length: i64,
+    shared_buffer: &mut [u8],
+    rle_loader: &mut RleRefClip,
+    rle_ctrl_stream: &mut dyn Read,
+    rle_code_stream: &mut dyn Read,
+) -> std::io::Result<()> {
     tbytes_determine_rle_type(
         rle_loader,
-        out_cache,
-        add_length,
+        cache,
+        length,
         shared_buffer,
         rle_ctrl_stream,
         rle_code_stream,
-    )
+    )?;
+    let expected_position = region_start
+        .checked_add(length as usize)
+        .ok_or_else(|| std::io::Error::other("decoded region cursor overflow"))?;
+    if cache.position() != expected_position as u64 {
+        return Err(std::io::Error::other(
+            "RLE decoder did not consume the complete output region",
+        ));
+    }
+    Ok(())
 }
 
-pub(crate) fn tbytes_copy_stream_from_old_clip(
-    out_cache: &mut Cursor<Vec<u8>>,
-    copy_reader: &mut dyn Read,
-    copy_length: i64,
-    shared_buffer: &mut [u8],
+fn ensure_region_cache_room(
+    cache: &mut Cursor<Vec<u8>>,
+    chunk_length: usize,
+    cache_limit: usize,
+    output: &mut dyn Write,
+    total_written: &mut u64,
+    last_reported: &mut u64,
+    on_progress: Option<&dyn Fn(u64)>,
 ) -> std::io::Result<()> {
-    if copy_length < 0 {
-        return Err(std::io::Error::other("copy_length is negative"));
+    if chunk_length > cache_limit {
+        return Err(std::io::Error::other(
+            "output region chunk exceeds cache limit",
+        ));
     }
-    let last_pos = out_cache.position();
-    tbytes_copy_stream_inner(copy_reader, out_cache, shared_buffer, copy_length as usize)?;
-    out_cache.seek(SeekFrom::Start(last_pos))?;
+    if cache
+        .get_ref()
+        .len()
+        .checked_add(chunk_length)
+        .is_none_or(|needed| needed > cache_limit)
+    {
+        flush_region_cache(cache, output, total_written, last_reported, on_progress)?;
+    }
+    Ok(())
+}
+
+fn flush_region_cache(
+    cache: &mut Cursor<Vec<u8>>,
+    output: &mut dyn Write,
+    total_written: &mut u64,
+    last_reported: &mut u64,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> std::io::Result<()> {
+    let cache_len = cache.get_ref().len();
+    if cache_len == 0 {
+        return Ok(());
+    }
+    write_cache_to_output(cache, output)?;
+    *total_written = total_written
+        .checked_add(cache_len as u64)
+        .ok_or_else(|| std::io::Error::other("output byte count overflow"))?;
+    if let Some(callback) = on_progress
+        && total_written.saturating_sub(*last_reported) >= PROGRESS_INTERVAL
+    {
+        callback(*total_written);
+        *last_reported = *total_written;
+    }
     Ok(())
 }
 
@@ -294,7 +572,7 @@ fn tbytes_determine_rle_type(
     mut rle_ctrl_stream: &mut dyn Read,
     rle_code_stream: &mut dyn Read,
 ) -> std::io::Result<()> {
-    // Drain any run left pending from a previous cover before consuming the
+    // Drain any run left pending from a previous region before consuming the
     // next ctrl record.
     drain_rle_pending(
         rle_loader,
@@ -548,12 +826,7 @@ impl<'a> Iterator for CoverHeaderIterator<'a> {
                         )));
                     }
                 };
-                Ok(CoverHeader::new(
-                    old_pos,
-                    new_pos_back,
-                    cover_length,
-                    self.remaining,
-                ))
+                Ok(CoverHeader::new(old_pos, new_pos_back, cover_length))
             }
             CoverReader::Streaming { reader } => {
                 let mut p_sign_buf = [0u8; 1];
@@ -622,12 +895,7 @@ impl<'a> Iterator for CoverHeaderIterator<'a> {
                         )));
                     }
                 };
-                Ok(CoverHeader::new(
-                    old_pos,
-                    new_pos_back,
-                    cover_length,
-                    self.remaining,
-                ))
+                Ok(CoverHeader::new(old_pos, new_pos_back, cover_length))
             }
         };
 
@@ -703,6 +971,79 @@ mod tests {
 
     use super::RleRefClip;
     use super::{tbytes_set_rle, tbytes_set_rle_single};
+
+    #[test]
+    fn region_cache_clears_contents_and_keeps_capacity_sufficient() {
+        let exact = super::prepare_region_cache(vec![0x5a; 16], 16);
+        assert!(exact.is_empty());
+        assert!(exact.capacity() >= 16);
+
+        let oversized = super::prepare_region_cache(vec![0x5a; 64], 16);
+        assert!(oversized.is_empty());
+        assert!(oversized.capacity() >= 16);
+
+        let undersized = super::prepare_region_cache(Vec::with_capacity(4), 16);
+        assert!(undersized.is_empty());
+        assert!(undersized.capacity() >= 16);
+    }
+
+    #[test]
+    fn reader_region_copies_exact_chunks_from_sequential_source() {
+        fn encode_rle_identity_run(length: usize) -> Vec<u8> {
+            let mut value = i64::try_from(length - 1).unwrap();
+            let mut chunks = Vec::new();
+            loop {
+                chunks.push((value & 0x7f) as u8);
+                value >>= 7;
+                if value == 0 {
+                    break;
+                }
+            }
+            chunks.reverse();
+            let mut first = (chunks[0] & 0x1f) | 0x20;
+            if chunks.len() == 1 {
+                first &= !0x20;
+            }
+            let mut encoded = vec![first];
+            for (index, chunk) in chunks.iter().enumerate().skip(1) {
+                encoded.push(*chunk | if index + 1 < chunks.len() { 0x80 } else { 0 });
+            }
+            encoded
+        }
+
+        let source = (0..3 * 1024 * 1024)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let mut input = Cursor::new(source.clone());
+        let mut cache = Cursor::new(Vec::with_capacity(512 * 1024));
+        let mut output = Vec::new();
+        let mut total_written = 0;
+        let mut last_reported = 0;
+        let mut shared_buffer = vec![0u8; 1024 * 1024];
+        let mut rle_loader = RleRefClip::default();
+        let mut rle_ctrl = Cursor::new(encode_rle_identity_run(source.len()));
+        let mut rle_code = Cursor::new([]);
+
+        super::write_reader_region(
+            &mut cache,
+            &mut input,
+            source.len() as i64,
+            512 * 1024,
+            &mut output,
+            &mut total_written,
+            &mut last_reported,
+            None,
+            &mut shared_buffer,
+            &mut rle_loader,
+            &mut rle_ctrl,
+            &mut rle_code,
+        )
+        .unwrap();
+
+        assert_eq!(output, source);
+        assert_eq!(input.position(), 3 * 1024 * 1024);
+        assert_eq!(total_written, 3 * 1024 * 1024);
+    }
 
     #[test]
     fn rle_ref_clip_default_initialization() {
@@ -1153,20 +1494,34 @@ mod tests {
         assert_eq!(copy_length, 8, "nothing consumed");
     }
 
-    /// tbytes_copy_stream_from_old_clip with negative copy_length should return
-    /// an error.
     #[test]
-    fn tbytes_copy_stream_from_old_clip_negative_copy_length_fails() {
-        use super::tbytes_copy_stream_from_old_clip;
-
+    fn reader_region_rejects_negative_length_before_reading() {
         let mut cache = Cursor::new(Vec::new());
         let mut reader: &[u8] = &[];
         let mut shared_buffer = [0u8; 32];
-        let result =
-            tbytes_copy_stream_from_old_clip(&mut cache, &mut reader, -1, &mut shared_buffer);
-        assert!(result.is_err(), "negative copy_length should fail");
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("copy_length is negative"), "msg={msg}");
+        let mut output = Vec::new();
+        let mut total_written = 0;
+        let mut last_reported = 0;
+        let mut rle_loader = RleRefClip::default();
+        let mut rle_ctrl = Cursor::new([]);
+        let mut rle_code = Cursor::new([]);
+        let result = super::write_reader_region(
+            &mut cache,
+            &mut reader,
+            -1,
+            16,
+            &mut output,
+            &mut total_written,
+            &mut last_reported,
+            None,
+            &mut shared_buffer,
+            &mut rle_loader,
+            &mut rle_ctrl,
+            &mut rle_code,
+        );
+        assert!(result.is_err());
+        assert!(output.is_empty());
+        assert_eq!(total_written, 0);
     }
 
     /// tbytes_set_rle_single with basic non-zero addition (add 0x10).
