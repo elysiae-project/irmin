@@ -72,6 +72,7 @@ struct Config {
     window_size_bytes: usize,
     cover_pattern: CoverPattern,
     fixture_backing: FixtureBacking,
+    sweep_sizes_mib: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -494,72 +495,100 @@ fn run_cli() -> Result<(), String> {
     let config = parse_args(&args)?;
     let (workdir, filesystem_info) = create_benchmark_workdir(config.fixture_backing)?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut results = Vec::with_capacity(config.repeat);
-
-    for iteration in 0..config.repeat {
-        let fixture_dir = workdir.path().join(format!("run-{iteration}"));
-        fs::create_dir_all(&fixture_dir).map_err(|error| error.to_string())?;
-        prepare_fixture(
-            config.scenario,
-            &fixture_dir,
-            config.size_mib,
-            config.chunks,
-            config.cover_pattern,
-        )?;
-        let mut local_server = if config.scenario == Scenario::SophonInstall {
-            Some(LocalChunkServer::start(fixture_dir.clone())?)
-        } else {
-            None
-        };
-        let server_url = local_server
-            .as_ref()
-            .map(|server| server.base_url.clone())
-            .unwrap_or_default();
-
-        let output = Command::new(&executable)
-            .args(["--child", config.scenario.name()])
-            .arg(&fixture_dir)
-            .arg(config.size_mib.to_string())
-            .arg(config.chunks.to_string())
-            .arg(server_url)
-            .arg(config.cover_pattern.name())
-            .arg(config.fixture_backing.name())
-            .arg(
-                filesystem_info
-                    .map(|info| format!("{:x}", info.magic))
-                    .unwrap_or_default(),
-            )
-            .arg(match config.source_backend {
-                SourceBackend::Mmap => "mmap".to_owned(),
-                SourceBackend::File => "file".to_owned(),
-                SourceBackend::Windowed => format!("windowed:{}", config.window_size_bytes),
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(format!(
-                "{} child failed: {}",
-                config.scenario.name(),
-                output.status
-            ));
+    let sizes = config
+        .sweep_sizes_mib
+        .clone()
+        .unwrap_or_else(|| vec![config.size_mib]);
+    let mut sweep_results = Vec::with_capacity(sizes.len());
+    for (size_index, size_mib) in sizes.into_iter().enumerate() {
+        let mut results = Vec::with_capacity(config.repeat);
+        for iteration in 0..config.repeat {
+            let run_index = size_index * config.repeat + iteration;
+            results.push(run_child_once(
+                &config,
+                &executable,
+                workdir.path(),
+                filesystem_info,
+                size_mib,
+                run_index,
+            )?);
         }
-        let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-        let result: serde_json::Value = serde_json::from_str(stdout.trim())
-            .map_err(|error| format!("invalid child JSON: {error}; output={stdout:?}"))?;
-        results.push(result);
-        if let Some(mut server) = local_server.take() {
-            server.stop();
-        }
+        sweep_results.push((size_mib, results));
     }
-
-    report_results(&config, &results)?;
+    if config.sweep_sizes_mib.is_some() {
+        report_size_sweep(&config, &sweep_results)?;
+    } else {
+        report_results(&config, &sweep_results[0].1)?;
+    }
     if config.keep_workdir {
         eprintln!("fixtures retained at {}", workdir.path().display());
         std::mem::forget(workdir);
     }
     Ok(())
+}
+
+fn run_child_once(
+    config: &Config,
+    executable: &Path,
+    workdir: &Path,
+    filesystem_info: Option<FilesystemInfo>,
+    size_mib: usize,
+    run_index: usize,
+) -> Result<serde_json::Value, String> {
+    let fixture_dir = workdir.join(format!("run-{run_index}"));
+    fs::create_dir_all(&fixture_dir).map_err(|error| error.to_string())?;
+    prepare_fixture(
+        config.scenario,
+        &fixture_dir,
+        size_mib,
+        config.chunks,
+        config.cover_pattern,
+    )?;
+    let mut local_server = if config.scenario == Scenario::SophonInstall {
+        Some(LocalChunkServer::start(fixture_dir.clone())?)
+    } else {
+        None
+    };
+    let server_url = local_server
+        .as_ref()
+        .map(|server| server.base_url.clone())
+        .unwrap_or_default();
+    let output = Command::new(executable)
+        .args(["--child", config.scenario.name()])
+        .arg(&fixture_dir)
+        .arg(size_mib.to_string())
+        .arg(config.chunks.to_string())
+        .arg(server_url)
+        .arg(config.cover_pattern.name())
+        .arg(config.fixture_backing.name())
+        .arg(
+            filesystem_info
+                .map(|info| format!("{:x}", info.magic))
+                .unwrap_or_default(),
+        )
+        .arg(match config.source_backend {
+            SourceBackend::Mmap => "mmap".to_owned(),
+            SourceBackend::File => "file".to_owned(),
+            SourceBackend::Windowed => format!("windowed:{}", config.window_size_bytes),
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} child failed: {}",
+            config.scenario.name(),
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    let result = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("invalid child JSON: {error}; output={stdout:?}"))?;
+    if let Some(mut server) = local_server.take() {
+        server.stop();
+    }
+    Ok(result)
 }
 
 fn create_benchmark_workdir(
@@ -685,6 +714,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut window_size_provided = false;
     let mut cover_pattern = CoverPattern::Sequential;
     let mut fixture_backing = FixtureBacking::Tempfile;
+    let mut sweep_sizes_mib = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -747,6 +777,10 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 index += 1;
                 fixture_backing = FixtureBacking::parse(value_at(args, index, option)?)?;
             }
+            "--sweep-sizes-mib" => {
+                index += 1;
+                sweep_sizes_mib = Some(parse_size_list(value_at(args, index, option)?)?);
+            }
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
@@ -783,6 +817,31 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     if fixture_backing == FixtureBacking::Disk && scenario != Scenario::PreinstallApply {
         return Err("--fixture-backing disk is only supported for preinstall-apply".to_owned());
     }
+    if let Some(sizes) = &sweep_sizes_mib {
+        if scenario != Scenario::PreinstallApply {
+            return Err("--sweep-sizes-mib is only supported for preinstall-apply".to_owned());
+        }
+        if fixture_backing != FixtureBacking::Disk {
+            return Err("--sweep-sizes-mib requires --fixture-backing disk".to_owned());
+        }
+        if source_backend != SourceBackend::Mmap {
+            return Err("--sweep-sizes-mib requires the production mmap backend".to_owned());
+        }
+        if cfg!(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        )) {
+            return Err(
+                "--sweep-sizes-mib is unavailable with jemalloc instrumentation".to_owned(),
+            );
+        }
+        if sizes
+            .iter()
+            .any(|size| size.checked_mul(1024 * 1024).is_none())
+        {
+            return Err("a sweep size is too large".to_owned());
+        }
+    }
     if source_backend == SourceBackend::Windowed && window_size_bytes > 64 * 1024 * 1024 {
         return Err("window size must not exceed 64 MiB".to_owned());
     }
@@ -798,7 +857,21 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         window_size_bytes,
         cover_pattern,
         fixture_backing,
+        sweep_sizes_mib,
     })
+}
+
+fn parse_size_list(value: &str) -> Result<Vec<usize>, String> {
+    let mut sizes = value
+        .split(',')
+        .map(|size| parse_positive(size.trim(), "--sweep-sizes-mib"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if sizes.is_empty() {
+        return Err("--sweep-sizes-mib requires at least one size".to_owned());
+    }
+    sizes.sort_unstable();
+    sizes.dedup();
+    Ok(sizes)
 }
 
 fn value_at<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -818,7 +891,7 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
@@ -1533,6 +1606,122 @@ fn report_results(config: &Config, results: &[serde_json::Value]) -> Result<(), 
     Ok(())
 }
 
+fn report_size_sweep(
+    config: &Config,
+    results: &[(usize, Vec<serde_json::Value>)],
+) -> Result<(), String> {
+    let points = results
+        .iter()
+        .map(|(size_mib, runs)| {
+            let median = |field: &str| median_optional_u64(runs, field);
+            serde_json::json!({
+                "size_mib": size_mib,
+                "repeat_count": runs.len(),
+                "median_peak_rss_kib": median("peak_rss_kib"),
+                "median_peak_delta_kib": median("peak_delta_kib"),
+                "median_sampled_peak_anon_kib": median("sampled_max_rss_anon_kib"),
+                "median_sampled_peak_file_kib": median("sampled_max_rss_file_kib"),
+                "median_sampled_peak_shmem_kib": median("sampled_max_rss_shmem_kib"),
+                "runs": runs,
+            })
+        })
+        .collect::<Vec<_>>();
+    let fit = |field: &str| fit_sweep_points(&points, field);
+    let summary = serde_json::json!({
+        "scenario": config.scenario.name(),
+        "fixture_kind": "synthetic-preinstall",
+        "representative": false,
+        "fixture_backing": config.fixture_backing.name(),
+        "fixture_cache_state": "warm",
+        "allocator": "system",
+        "fit_kind": "ordinary_least_squares",
+        "points": points,
+        "fits": {
+            "peak_rss": fit("median_peak_rss_kib"),
+            "peak_delta": fit("median_peak_delta_kib"),
+            "sampled_peak_anon": fit("median_sampled_peak_anon_kib"),
+            "sampled_peak_file": fit("median_sampled_peak_file_kib"),
+            "sampled_peak_shmem": fit("median_sampled_peak_shmem_kib"),
+        },
+        "notes": [
+            "Warm-cache disk-backed synthetic measurements; not representative preinstall validation.",
+            "RSS components come from a coherent sampled peak snapshot; fits are descriptive linear approximations.",
+        ],
+    });
+    if config.json {
+        println!("{}", serde_json::to_string(&summary).unwrap());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    }
+    Ok(())
+}
+
+fn median_optional_u64(runs: &[serde_json::Value], field: &str) -> Option<u64> {
+    let mut values = runs
+        .iter()
+        .filter_map(|run| run.get(field).and_then(serde_json::Value::as_u64))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+
+fn linear_fit(samples: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let count = samples.len() as f64;
+    let mean_x = samples.iter().map(|(x, _)| x).sum::<f64>() / count;
+    let mean_y = samples.iter().map(|(_, y)| y).sum::<f64>() / count;
+    let variance = samples
+        .iter()
+        .map(|(x, _)| (x - mean_x).powi(2))
+        .sum::<f64>();
+    if variance == 0.0 {
+        return None;
+    }
+    let covariance = samples
+        .iter()
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>();
+    let slope = covariance / variance;
+    let intercept = mean_y - slope * mean_x;
+    let residual_sum_squares = samples
+        .iter()
+        .map(|(x, y)| (y - (slope * x + intercept)).powi(2))
+        .sum::<f64>();
+    let total_sum_squares = samples
+        .iter()
+        .map(|(_, y)| (y - mean_y).powi(2))
+        .sum::<f64>();
+    let r_squared = if total_sum_squares == 0.0 {
+        1.0
+    } else {
+        1.0 - residual_sum_squares / total_sum_squares
+    };
+    Some((slope, intercept, r_squared))
+}
+
+fn fit_sweep_points(points: &[serde_json::Value], field: &str) -> Option<serde_json::Value> {
+    let samples = points
+        .iter()
+        .filter_map(|point| {
+            let size = point.get("size_mib")?.as_u64()?;
+            let value = point.get(field)?.as_u64()?;
+            Some((size as f64, value as f64))
+        })
+        .collect::<Vec<_>>();
+    let (slope, intercept, r_squared) = linear_fit(&samples)?;
+    Some(serde_json::json!({
+        "slope_kib_per_mib": slope,
+        "intercept_kib": intercept,
+        "r_squared": r_squared,
+        "point_count": samples.len(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,6 +1766,37 @@ mod tests {
                 "hdiff".into(),
                 "--size-mib".into(),
                 usize::MAX.to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--sweep-sizes-mib".into(),
+                "16,32,128".into(),
+                "--fixture-backing".into(),
+                "disk".into(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--sweep-sizes-mib".into(),
+                "16,0,128".into(),
+                "--fixture-backing".into(),
+                "disk".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--sweep-sizes-mib".into(),
+                "16,32".into(),
             ])
             .is_err()
         );
@@ -1649,6 +1869,84 @@ mod tests {
         assert!(is_memory_backed_filesystem(RAMFS_MAGIC));
         assert!(!is_memory_backed_filesystem(0xef53));
         assert!(!is_memory_backed_filesystem(0x9123683e));
+    }
+
+    #[test]
+    fn parses_size_list_sorts_and_deduplicates() {
+        assert_eq!(parse_size_list("128,16,32,16").unwrap(), [16, 32, 128]);
+        assert!(parse_size_list("").is_err());
+        assert!(parse_size_list("16,nope").is_err());
+    }
+
+    #[test]
+    fn sweep_requires_disk_backing_and_system_allocator() {
+        let base = [
+            "--scenario",
+            "preinstall-apply",
+            "--sweep-sizes-mib",
+            "16,32",
+            "--fixture-backing",
+            "disk",
+        ]
+        .map(str::to_owned);
+        if cfg!(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        )) {
+            assert!(
+                parse_args(&base)
+                    .unwrap_err()
+                    .contains("jemalloc instrumentation")
+            );
+        } else {
+            assert!(parse_args(&base).is_ok());
+        }
+        let without_disk = [
+            "--scenario",
+            "preinstall-apply",
+            "--sweep-sizes-mib",
+            "16,32",
+        ]
+        .map(str::to_owned);
+        assert!(parse_args(&without_disk).is_err());
+    }
+
+    #[test]
+    fn linear_fit_recovers_slope_and_intercept() {
+        let (slope, intercept, r_squared) =
+            linear_fit(&[(16.0, 42.0), (32.0, 74.0), (64.0, 138.0)])
+                .expect("three distinct samples fit a line");
+        assert!((slope - 2.0).abs() < f64::EPSILON);
+        assert!((intercept - 10.0).abs() < f64::EPSILON);
+        assert!((r_squared - 1.0).abs() < f64::EPSILON);
+        assert!(linear_fit(&[(16.0, 1.0)]).is_none());
+        assert!(linear_fit(&[(16.0, 1.0), (16.0, 2.0)]).is_none());
+    }
+
+    #[test]
+    fn sweep_fit_uses_point_medians_and_skips_missing_values() {
+        let points = [
+            serde_json::json!({"size_mib": 16, "median_peak_delta_kib": 42}),
+            serde_json::json!({"size_mib": 32, "median_peak_delta_kib": 74}),
+            serde_json::json!({"size_mib": 64, "median_peak_delta_kib": 138}),
+            serde_json::json!({"size_mib": 128, "median_peak_delta_kib": null}),
+        ];
+        let fit = fit_sweep_points(&points, "median_peak_delta_kib").unwrap();
+        assert_eq!(fit["point_count"], 3);
+        assert!((fit["slope_kib_per_mib"].as_f64().unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((fit["intercept_kib"].as_f64().unwrap() - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn median_ignores_missing_samples_and_uses_upper_middle() {
+        let runs = vec![
+            serde_json::json!({"peak": 9}),
+            serde_json::json!({"other": 3}),
+            serde_json::json!({"peak": 2}),
+            serde_json::json!({"peak": 5}),
+        ];
+        assert_eq!(median_optional_u64(&runs, "peak"), Some(5));
+        assert_eq!(median_optional_u64(&runs, "missing"), None);
     }
 
     #[cfg(target_os = "linux")]
