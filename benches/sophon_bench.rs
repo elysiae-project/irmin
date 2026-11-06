@@ -999,40 +999,34 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch
 }
 
-#[derive(Clone, Copy)]
-enum V20CoverPattern {
-    LongRuns,
-    Alternating,
-    GapHeavy,
-}
-
 fn gen_hdiff_v20_pattern_patch(
     old: &[u8],
     new: &[u8],
-    pattern: V20CoverPattern,
+    block_size: usize,
+    cover_period_blocks: usize,
+    covered_blocks_per_period: usize,
 ) -> (Vec<u8>, Vec<u8>, usize) {
-    const BLOCK_SIZE: usize = 4096;
     assert_eq!(old.len(), new.len());
-    assert_eq!(old.len() % BLOCK_SIZE, 0);
-    let blocks = old.len() / BLOCK_SIZE;
-    let unchanged = |block: usize| match pattern {
-        V20CoverPattern::LongRuns => !matches!((block / 64) % 2, 1),
-        V20CoverPattern::Alternating => block % 2 == 0,
-        V20CoverPattern::GapHeavy => block % 8 == 0,
-    };
+    assert!(block_size > 0);
+    assert_eq!(old.len() % block_size, 0);
+    assert!(cover_period_blocks > 0);
+    assert!(covered_blocks_per_period > 0);
+    assert!(covered_blocks_per_period < cover_period_blocks);
+    let blocks = old.len() / block_size;
+    let unchanged = |block: usize| block % cover_period_blocks < covered_blocks_per_period;
     let mut prepared_new = new.to_vec();
     for block in 0..blocks {
         if !unchanged(block) {
-            let offset = block * BLOCK_SIZE;
-            for (index, byte) in prepared_new[offset..offset + BLOCK_SIZE]
+            let offset = block * block_size;
+            for (index, byte) in prepared_new[offset..offset + block_size]
                 .iter_mut()
                 .enumerate()
             {
-                *byte = byte.wrapping_add((index as u8).wrapping_mul(17).wrapping_add(1));
+                *byte = byte.wrapping_add((index as u8).wrapping_mul(17) | 1);
             }
         } else {
-            prepared_new[block * BLOCK_SIZE..(block + 1) * BLOCK_SIZE]
-                .copy_from_slice(&old[block * BLOCK_SIZE..(block + 1) * BLOCK_SIZE]);
+            prepared_new[block * block_size..(block + 1) * block_size]
+                .copy_from_slice(&old[block * block_size..(block + 1) * block_size]);
         }
     }
 
@@ -1042,13 +1036,13 @@ fn gen_hdiff_v20_pattern_patch(
         if unchanged(block) {
             run_start.get_or_insert(block);
         } else if let Some(start) = run_start.take() {
-            let position = (start * BLOCK_SIZE) as u64;
-            covers.push((position, position, ((block - start) * BLOCK_SIZE) as u64));
+            let position = (start * block_size) as u64;
+            covers.push((position, position, ((block - start) * block_size) as u64));
         }
     }
     if let Some(start) = run_start {
-        let position = (start * BLOCK_SIZE) as u64;
-        covers.push((position, position, ((blocks - start) * BLOCK_SIZE) as u64));
+        let position = (start * block_size) as u64;
+        covers.push((position, position, ((blocks - start) * block_size) as u64));
     }
 
     let mut cover_data = Vec::new();
@@ -1114,49 +1108,91 @@ fn hash_file_xxh64(path: &Path) -> u64 {
 fn bench_v20_cover_shapes(c: &mut Criterion) {
     let mut group = c.benchmark_group("hdiffpatch_v20_cover_shapes");
     group.sample_size(10);
-    for size_mib in [4usize, 64] {
-        let size_bytes = size_mib * 1024 * 1024;
-        let old = gen_prng_data(0xC0FFEE, size_bytes);
-        for (name, pattern) in [
-            ("long_runs", V20CoverPattern::LongRuns),
-            ("many_short", V20CoverPattern::Alternating),
-            ("gap_heavy", V20CoverPattern::GapHeavy),
-        ] {
-            let (patch, expected, cover_count) = gen_hdiff_v20_pattern_patch(&old, &old, pattern);
-            assert!(cover_count > 0, "{name} should contain copied covers");
-            if matches!(pattern, V20CoverPattern::Alternating) {
-                assert!(cover_count >= size_bytes / (2 * 4096));
-            }
-            let dir = tempfile::tempdir().unwrap();
-            let old_path = dir.path().join("old.bin");
-            let patch_path = dir.path().join("patch.hdiff");
-            let out_path = dir.path().join("out.bin");
-            fs::write(&old_path, &old).unwrap();
-            fs::write(&patch_path, &patch).unwrap();
-            let expected_hash = xxhash_rust::xxh64::xxh64(&expected, 0);
-            let mut hdiff = HDiff::new(
-                old_path.to_string_lossy().into_owned(),
-                patch_path.to_string_lossy().into_owned(),
-                out_path.to_string_lossy().into_owned(),
-            );
-            assert!(hdiff.apply(None), "{name}/{size_mib} MiB patch failed");
-            assert_eq!(fs::metadata(&out_path).unwrap().len(), size_bytes as u64);
-            assert_eq!(hash_file_xxh64(&out_path), expected_hash);
+    let size_mib = 4usize;
+    let size_bytes = size_mib * 1024 * 1024;
+    let old = gen_prng_data(0xC0FFEE, size_bytes);
+    for (label, block_size, period, cover_run) in [
+        ("covers_16", 4096, 64, 32),
+        ("covers_256", 4096, 4, 2),
+        ("covers_2048", 1024, 2, 1),
+        ("covers_4096", 512, 2, 1),
+    ] {
+        let (patch, expected, cover_count) =
+            gen_hdiff_v20_pattern_patch(&old, &old, block_size, period, cover_run);
+        let expected_count = (size_bytes / block_size).div_ceil(period);
+        assert_eq!(cover_count, expected_count);
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.bin");
+        let patch_path = dir.path().join("patch.hdiff");
+        let out_path = dir.path().join("out.bin");
+        fs::write(&old_path, &old).unwrap();
+        fs::write(&patch_path, &patch).unwrap();
+        let expected_hash = xxhash_rust::xxh64::xxh64(&expected, 0);
+        let mut hdiff = HDiff::new(
+            old_path.to_string_lossy().into_owned(),
+            patch_path.to_string_lossy().into_owned(),
+            out_path.to_string_lossy().into_owned(),
+        );
+        assert!(hdiff.apply(None), "{label} patch failed");
+        assert_eq!(fs::metadata(&out_path).unwrap().len(), size_bytes as u64);
+        assert_eq!(hash_file_xxh64(&out_path), expected_hash);
 
-            group.throughput(Throughput::Bytes(size_bytes as u64));
-            group.bench_function(BenchmarkId::new(name, size_mib), |bencher| {
-                bencher.iter(|| {
-                    let mut hdiff = HDiff::new(
-                        old_path.to_string_lossy().into_owned(),
-                        patch_path.to_string_lossy().into_owned(),
-                        out_path.to_string_lossy().into_owned(),
-                    );
-                    assert!(hdiff.apply(None));
-                });
+        group.throughput(Throughput::Bytes(size_bytes as u64));
+        group.bench_function(BenchmarkId::new(label, size_mib), |bencher| {
+            bencher.iter(|| {
+                let mut hdiff = HDiff::new(
+                    old_path.to_string_lossy().into_owned(),
+                    patch_path.to_string_lossy().into_owned(),
+                    out_path.to_string_lossy().into_owned(),
+                );
+                assert!(hdiff.apply(None));
             });
-        }
+        });
     }
     group.finish();
+}
+
+#[test]
+fn v20_cover_pattern_generator_handles_partial_period() {
+    let block_size = 512;
+    let blocks = 11;
+    let old = gen_prng_data(0x1234, blocks * block_size);
+    let (patch, expected, cover_count) = gen_hdiff_v20_pattern_patch(&old, &old, block_size, 4, 2);
+    assert_eq!(cover_count, 3);
+    for block in 0..blocks {
+        let expected_block = &expected[block * block_size..(block + 1) * block_size];
+        let source_block = &old[block * block_size..(block + 1) * block_size];
+        if block % 4 < 2 {
+            assert_eq!(expected_block, source_block);
+        } else {
+            assert!(
+                expected_block
+                    .iter()
+                    .zip(source_block)
+                    .all(|(actual, source)| actual == &source.wrapping_add(1))
+            );
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("partial.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+    let mut patcher = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        patch_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(patcher.apply(None));
+    assert_eq!(
+        fs::metadata(&out_path).unwrap().len(),
+        expected.len() as u64
+    );
+    assert_eq!(
+        hash_file_xxh64(&out_path),
+        xxhash_rust::xxh64::xxh64(&expected, 0)
+    );
 }
 
 /// Generate a valid HDIFF20&zstd patch file (zstd-compressed diff stream).
