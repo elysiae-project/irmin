@@ -475,6 +475,28 @@ struct CgroupPressure {
     full_total_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct CgroupMemoryStat {
+    anon_bytes: Option<i64>,
+    file_bytes: Option<i64>,
+    file_mapped_bytes: Option<i64>,
+    file_dirty_bytes: Option<i64>,
+    file_writeback_bytes: Option<i64>,
+    shmem_bytes: Option<i64>,
+    kernel_bytes: Option<i64>,
+    slab_bytes: Option<i64>,
+    pagetables_bytes: Option<i64>,
+    pgmajfault: Option<i64>,
+    workingset_refault_file: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct CgroupMemorySnapshot {
+    current_bytes: Option<u64>,
+    peak_bytes: Option<u64>,
+    stat: CgroupMemoryStat,
+}
+
 impl CgroupPressure {
     fn delta(before: &Self, after: &Self) -> Self {
         Self {
@@ -482,6 +504,37 @@ impl CgroupPressure {
             full_total_us: after.full_total_us.saturating_sub(before.full_total_us),
         }
     }
+}
+
+impl CgroupMemorySnapshot {
+    fn delta(before: &Self, after: &Self) -> CgroupMemoryStat {
+        CgroupMemoryStat {
+            anon_bytes: signed_delta(before.stat.anon_bytes, after.stat.anon_bytes),
+            file_bytes: signed_delta(before.stat.file_bytes, after.stat.file_bytes),
+            file_mapped_bytes: signed_delta(
+                before.stat.file_mapped_bytes,
+                after.stat.file_mapped_bytes,
+            ),
+            file_dirty_bytes: signed_delta(before.stat.file_dirty_bytes, after.stat.file_dirty_bytes),
+            file_writeback_bytes: signed_delta(
+                before.stat.file_writeback_bytes,
+                after.stat.file_writeback_bytes,
+            ),
+            shmem_bytes: signed_delta(before.stat.shmem_bytes, after.stat.shmem_bytes),
+            kernel_bytes: signed_delta(before.stat.kernel_bytes, after.stat.kernel_bytes),
+            slab_bytes: signed_delta(before.stat.slab_bytes, after.stat.slab_bytes),
+            pagetables_bytes: signed_delta(before.stat.pagetables_bytes, after.stat.pagetables_bytes),
+            pgmajfault: signed_delta(before.stat.pgmajfault, after.stat.pgmajfault),
+            workingset_refault_file: signed_delta(
+                before.stat.workingset_refault_file,
+                after.stat.workingset_refault_file,
+            ),
+        }
+    }
+}
+
+fn signed_delta(before: Option<i64>, after: Option<i64>) -> Option<i64> {
+    after?.checked_sub(before?)
 }
 
 impl CgroupMemoryEvents {
@@ -1506,7 +1559,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
         }
         let events = read_cgroup_memory_events(&path)?;
         let pressure = read_cgroup_memory_pressure(&path)?;
-        Some((actual, path, events, pressure))
+        let memory = read_cgroup_memory_snapshot(&path);
+        Some((actual, path, events, pressure, memory))
     } else {
         None
     };
@@ -1557,10 +1611,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
     if let ScenarioContext::PreinstallApply(context) = &mut context {
         context.diagnose_hdiff_phases = diagnose_hdiff_phases;
     }
-    let cgroup_after_setup = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
+    let cgroup_after_setup = if let Some((_, path, _, _, _)) = &cgroup_memory_before_setup {
         Some((
             read_cgroup_memory_events(path)?,
             read_cgroup_memory_pressure(path)?,
+            read_cgroup_memory_snapshot(path),
         ))
     } else {
         None
@@ -1595,10 +1650,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let elapsed_ms = started.elapsed().as_millis();
     let operation_end = read_smaps_rollup_snapshot(read_memory_snapshot()?);
     let cpu_after = read_cpu_usage()?;
-    let cgroup_after_operation = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
+    let cgroup_after_operation = if let Some((_, path, _, _, _)) = &cgroup_memory_before_setup {
         Some((
             read_cgroup_memory_events(path)?,
             read_cgroup_memory_pressure(path)?,
+            read_cgroup_memory_snapshot(path),
         ))
     } else {
         None
@@ -1606,27 +1662,45 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let cgroup_setup_events = cgroup_memory_before_setup
         .as_ref()
         .zip(cgroup_after_setup.as_ref())
-        .map(|((_, _, before, _), (after, _))| CgroupMemoryEvents::delta(before, after));
+        .map(|((_, _, before, _, _), (after, _, _))| CgroupMemoryEvents::delta(before, after));
     let cgroup_operation_events = cgroup_after_setup
         .as_ref()
         .zip(cgroup_after_operation.as_ref())
-        .map(|((before, _), (after, _))| CgroupMemoryEvents::delta(before, after));
+        .map(|((before, _, _), (after, _, _))| CgroupMemoryEvents::delta(before, after));
     let cgroup_total_events = cgroup_memory_before_setup
         .as_ref()
         .zip(cgroup_after_operation.as_ref())
-        .map(|((_, _, before, _), (after, _))| CgroupMemoryEvents::delta(before, after));
+        .map(|((_, _, before, _, _), (after, _, _))| CgroupMemoryEvents::delta(before, after));
     let cgroup_setup_pressure = cgroup_memory_before_setup
         .as_ref()
         .zip(cgroup_after_setup.as_ref())
-        .map(|((_, _, _, before), (_, after))| CgroupPressure::delta(before, after));
+        .map(|((_, _, _, before, _), (_, after, _))| CgroupPressure::delta(before, after));
     let cgroup_operation_pressure = cgroup_after_setup
         .as_ref()
         .zip(cgroup_after_operation.as_ref())
-        .map(|((_, before), (_, after))| CgroupPressure::delta(before, after));
+        .map(|((_, before, _), (_, after, _))| CgroupPressure::delta(before, after));
     let cgroup_total_pressure = cgroup_memory_before_setup
         .as_ref()
         .zip(cgroup_after_operation.as_ref())
-        .map(|((_, _, _, before), (_, after))| CgroupPressure::delta(before, after));
+        .map(|((_, _, _, before, _), (_, after, _))| CgroupPressure::delta(before, after));
+    let cgroup_memory_setup_delta = cgroup_memory_before_setup
+        .as_ref()
+        .zip(cgroup_after_setup.as_ref())
+        .map(|((_, _, _, _, before), (_, _, after))| {
+            CgroupMemorySnapshot::delta(before, after)
+        });
+    let cgroup_memory_operation_delta = cgroup_after_setup
+        .as_ref()
+        .zip(cgroup_after_operation.as_ref())
+        .map(|((_, _, before), (_, _, after))| {
+            CgroupMemorySnapshot::delta(before, after)
+        });
+    let cgroup_memory_total_delta = cgroup_memory_before_setup
+        .as_ref()
+        .zip(cgroup_after_operation.as_ref())
+        .map(|((_, _, _, _, before), (_, _, after))| {
+            CgroupMemorySnapshot::delta(before, after)
+        });
     let sampled_peak = sampler.finish();
     #[cfg(all(
         unix,
@@ -1885,7 +1959,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         serde_json::to_value(
             cgroup_memory_before_setup
                 .as_ref()
-                .map(|(limit, _, _, _)| *limit),
+                .map(|(limit, _, _, _, _)| *limit),
         )
         .unwrap_or_default(),
     );
@@ -1912,6 +1986,41 @@ fn run_child(args: &[String]) -> Result<(), String> {
     result.insert(
         "cgroup_memory_pressure_total".to_owned(),
         serde_json::to_value(cgroup_total_pressure).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_snapshot_before_setup".to_owned(),
+        serde_json::to_value(
+            cgroup_memory_before_setup
+                .as_ref()
+                .map(|(_, _, _, _, snapshot)| snapshot),
+        )
+        .unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_snapshot_after_setup".to_owned(),
+        serde_json::to_value(cgroup_after_setup.as_ref().map(|(_, _, snapshot)| snapshot))
+            .unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_snapshot_after_operation".to_owned(),
+        serde_json::to_value(cgroup_after_operation.as_ref().map(|(_, _, snapshot)| snapshot))
+            .unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_stat_delta_setup".to_owned(),
+        serde_json::to_value(cgroup_memory_setup_delta).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_stat_delta_operation".to_owned(),
+        serde_json::to_value(cgroup_memory_operation_delta).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_stat_delta_total".to_owned(),
+        serde_json::to_value(cgroup_memory_total_delta).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_snapshot_note".to_owned(),
+        serde_json::json!("Snapshots and signed deltas are optional cgroup-boundary observations: memory.current and byte-valued memory.stat entries are gauges, while pgmajfault and workingset_refault_file are counters. Gauges may decrease; stat updates can be batched by the kernel. Endpoint deltas can include cleanup and are not reclaim or peak attribution. memory.peak is the raw cgroup high-water since cgroup creation."),
     );
     result.insert(
         "allocator".to_owned(),
@@ -2318,6 +2427,107 @@ fn read_cgroup_memory_pressure(path: &Path) -> Result<CgroupPressure, String> {
         full_total_us: full_total_us
             .ok_or_else(|| "missing full line in memory.pressure".to_owned())?,
     })
+}
+
+fn read_cgroup_memory_snapshot(path: &Path) -> CgroupMemorySnapshot {
+    let current_bytes = fs::read_to_string(path.join("memory.current"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let peak_bytes = fs::read_to_string(path.join("memory.peak"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let stat = fs::read_to_string(path.join("memory.stat"))
+        .ok()
+        .map(|contents| parse_cgroup_memory_stat(&contents))
+        .unwrap_or_default();
+    CgroupMemorySnapshot {
+        current_bytes,
+        peak_bytes,
+        stat,
+    }
+}
+
+fn parse_cgroup_memory_stat(contents: &str) -> CgroupMemoryStat {
+    let mut stat = CgroupMemoryStat::default();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(key) = fields.next() else {
+            continue;
+        };
+        let Some(value) = fields.next().and_then(|value| value.parse::<i64>().ok()) else {
+            continue;
+        };
+        match key {
+            "anon" => stat.anon_bytes = Some(value),
+            "file" => stat.file_bytes = Some(value),
+            "file_mapped" => stat.file_mapped_bytes = Some(value),
+            "file_dirty" => stat.file_dirty_bytes = Some(value),
+            "file_writeback" => stat.file_writeback_bytes = Some(value),
+            "shmem" => stat.shmem_bytes = Some(value),
+            "kernel" => stat.kernel_bytes = Some(value),
+            "slab" => stat.slab_bytes = Some(value),
+            "pagetables" => stat.pagetables_bytes = Some(value),
+            "pgmajfault" => stat.pgmajfault = Some(value),
+            "workingset_refault_file" => stat.workingset_refault_file = Some(value),
+            _ => {}
+        }
+    }
+    stat
+}
+
+#[cfg(test)]
+mod cgroup_memory_stat_tests {
+    use super::{CgroupMemorySnapshot, parse_cgroup_memory_stat, read_cgroup_memory_snapshot};
+    use std::fs;
+
+    #[test]
+    fn parses_cgroup_memory_stat_gauges_and_counters() {
+        let stat = parse_cgroup_memory_stat(
+            "anon 1024\nfile 2048\nfile_mapped 512\nfile_dirty 64\nfile_writeback 32\nshmem 16\nkernel 4096\nslab 128\npagetables 256\npgmajfault 7\nworkingset_refault_file 9\nunknown 11\n",
+        );
+        assert_eq!(stat.anon_bytes, Some(1024));
+        assert_eq!(stat.file_bytes, Some(2048));
+        assert_eq!(stat.file_mapped_bytes, Some(512));
+        assert_eq!(stat.file_dirty_bytes, Some(64));
+        assert_eq!(stat.file_writeback_bytes, Some(32));
+        assert_eq!(stat.shmem_bytes, Some(16));
+        assert_eq!(stat.kernel_bytes, Some(4096));
+        assert_eq!(stat.slab_bytes, Some(128));
+        assert_eq!(stat.pagetables_bytes, Some(256));
+        assert_eq!(stat.pgmajfault, Some(7));
+        assert_eq!(stat.workingset_refault_file, Some(9));
+    }
+
+    #[test]
+    fn cgroup_gauge_deltas_preserve_decreases_and_require_both_samples() {
+        let before = CgroupMemorySnapshot {
+            current_bytes: Some(1000),
+            peak_bytes: Some(2000),
+            stat: parse_cgroup_memory_stat("anon 10\nfile 20\npgmajfault 5\n"),
+        };
+        let after = CgroupMemorySnapshot {
+            current_bytes: Some(900),
+            peak_bytes: Some(2500),
+            stat: parse_cgroup_memory_stat("anon 8\nfile 24\npgmajfault 8\n"),
+        };
+        let delta = CgroupMemorySnapshot::delta(&before, &after);
+        assert_eq!(delta.anon_bytes, Some(-2));
+        assert_eq!(delta.file_bytes, Some(4));
+        assert_eq!(delta.pgmajfault, Some(3));
+        assert_eq!(delta.file_mapped_bytes, None);
+    }
+
+    #[test]
+    fn absent_cgroup_memory_files_produce_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = read_cgroup_memory_snapshot(dir.path());
+        assert_eq!(snapshot.current_bytes, None);
+        assert_eq!(snapshot.peak_bytes, None);
+        assert_eq!(snapshot.stat.anon_bytes, None);
+        assert_eq!(snapshot.stat.file_bytes, None);
+        fs::write(dir.path().join("memory.current"), "123\n").unwrap();
+        assert_eq!(read_cgroup_memory_snapshot(dir.path()).current_bytes, Some(123));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3539,6 +3749,24 @@ mod tests {
             let error = parse_args(&base).unwrap_err();
             assert!(error.contains("bench-diagnostics"));
         }
+    }
+
+    #[test]
+    fn download_plan_rejects_cgroup_memory_limit_configuration() {
+        assert!(parse_args(&[
+            "--scenario".into(),
+            "preinstall-download-plan".into(),
+            "--memory-max-mib".into(),
+            "64".into(),
+        ])
+        .is_err());
+        assert!(parse_args(&[
+            "--scenario".into(),
+            "preinstall-download-plan".into(),
+            "--sweep-sizes-mib".into(),
+            "4,8".into(),
+        ])
+        .is_err());
     }
 
     #[cfg(target_os = "linux")]
