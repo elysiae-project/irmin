@@ -186,7 +186,7 @@ pub const HDIFF20_STEP_STRESS_MAX_SIZE_MIB: usize = 8;
 const HDIFF20_STEP_STRESS_BYTES_PER_COVER: usize = 5;
 const HDIFF20_STEP_STRESS_SMALL_STEP_COVERS: usize = 4096;
 
-/// Per-step cover plus RLE section lengths for a synthetic one-byte-cover stress fixture.
+/// Per-step cover plus RLE section lengths for a synthetic one-byte-cover stress fixture with a changed leading literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hdiff20StepFixtureShape {
     pub output_bytes: usize,
@@ -201,12 +201,13 @@ pub fn hdiff20_step_stress_shape(size_mib: usize) -> Result<Hdiff20StepFixtureSh
         ));
     }
 
-    let max_covers_per_step =
-        MAX_HDIFF20_STEP_SIZE / HDIFF20_STEP_STRESS_BYTES_PER_COVER;
     let output_bytes = size_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| "HDIFF20 step-stress fixture size is too large".to_owned())?;
-    let mut remaining_covers = output_bytes;
+    let cover_count = output_bytes - 1;
+    let max_covers_per_step =
+        MAX_HDIFF20_STEP_SIZE / HDIFF20_STEP_STRESS_BYTES_PER_COVER;
+    let mut remaining_covers = cover_count;
     let mut step_cover_counts = Vec::new();
 
     step_cover_counts.push(remaining_covers.min(max_covers_per_step));
@@ -227,7 +228,7 @@ pub fn hdiff20_step_stress_shape(size_mib: usize) -> Result<Hdiff20StepFixtureSh
         .collect();
     Ok(Hdiff20StepFixtureShape {
         output_bytes,
-        cover_count: output_bytes,
+        cover_count,
         step_sizes_bytes,
     })
 }
@@ -238,9 +239,14 @@ pub fn prepare_hdiff20_step_stress_fixture(
 ) -> Result<Hdiff20StepFixtureShape, String> {
     let shape = hdiff20_step_stress_shape(size_mib)?;
     let old = deterministic_data(0x20_5EED, shape.output_bytes);
+    let mut new = Vec::with_capacity(shape.output_bytes);
+    new.push(old[0] ^ 0xff);
+    new.extend_from_slice(&old[..shape.output_bytes - 1]);
     let mut diff_stream = Vec::new();
     let mut max_step_size = 0usize;
+    let mut is_first_step = true;
     for step_size in &shape.step_sizes_bytes {
+        let first_step = is_first_step;
         let cover_count = *step_size / HDIFF20_STEP_STRESS_BYTES_PER_COVER;
         let cover_size = cover_count
             .checked_mul(3)
@@ -260,8 +266,12 @@ pub fn prepare_hdiff20_step_stress_fixture(
         cover_data
             .try_reserve_exact(cover_size)
             .map_err(|error| format!("failed to reserve HDIFF20 cover fixture: {error}"))?;
-        for _ in 0..cover_count {
-            cover_data.extend_from_slice(&[0, 0, 1]);
+        for cover_index in 0..cover_count {
+            if first_step && cover_index == 0 {
+                cover_data.extend_from_slice(&[0, 1, 1]);
+            } else {
+                cover_data.extend_from_slice(&[0, 0, 1]);
+            }
         }
 
         let mut rle_data = Vec::new();
@@ -276,6 +286,10 @@ pub fn prepare_hdiff20_step_stress_fixture(
         diff_stream.extend_from_slice(&encode_varint(rle_size as u64));
         diff_stream.extend_from_slice(&cover_data);
         diff_stream.extend_from_slice(&rle_data);
+        if first_step {
+            diff_stream.push(new[0]);
+            is_first_step = false;
+        }
     }
 
     let mut patch = b"HDIFF20&nocomp\0".to_vec();
@@ -292,7 +306,7 @@ pub fn prepare_hdiff20_step_stress_fixture(
     patch.extend_from_slice(&diff_stream);
 
     fs::write(dir.join("old.bin"), &old).map_err(|error| error.to_string())?;
-    fs::write(dir.join("new.bin"), &old).map_err(|error| error.to_string())?;
+    fs::write(dir.join("new.bin"), &new).map_err(|error| error.to_string())?;
     fs::write(dir.join("patch.hdiff"), patch).map_err(|error| error.to_string())?;
     Ok(shape)
 }
@@ -385,7 +399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shape = prepare_hdiff20_step_stress_fixture(dir.path(), 4).unwrap();
         assert_eq!(shape.output_bytes, 4 * 1024 * 1024);
-        assert_eq!(shape.cover_count, shape.output_bytes);
+        assert_eq!(shape.cover_count, shape.output_bytes - 1);
         assert_eq!(shape.step_sizes_bytes.len(), 2);
         assert_eq!(shape.step_sizes_bytes[0], MAX_HDIFF20_STEP_SIZE / 5 * 5);
         assert!(
@@ -404,12 +418,13 @@ mod tests {
         assert_eq!(shape.step_sizes_bytes[0], shape.step_sizes_bytes[2]);
         assert!(shape.step_sizes_bytes[1] < shape.step_sizes_bytes[0]);
         assert_eq!(shape.step_sizes_bytes[0], MAX_HDIFF20_STEP_SIZE / 5 * 5);
-        assert_eq!(shape.cover_count, shape.output_bytes);
+        assert_eq!(shape.cover_count, shape.output_bytes - 1);
 
         let seven_mib = hdiff20_step_stress_shape(7).unwrap();
         assert_eq!(seven_mib.step_sizes_bytes.len(), 4);
         assert_eq!(seven_mib.step_sizes_bytes[0], seven_mib.step_sizes_bytes[2]);
         assert!(seven_mib.step_sizes_bytes[3] > 0);
+        assert_eq!(seven_mib.cover_count, seven_mib.output_bytes - 1);
     }
 
     #[test]

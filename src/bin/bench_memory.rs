@@ -1,3 +1,5 @@
+#[cfg(feature = "bench-alloc-stats")]
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -9,6 +11,207 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+
+#[cfg(feature = "bench-alloc-stats")]
+mod allocation_stats {
+    use super::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct CountingAllocator;
+
+    static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static OPERATION_PEAK_DELTA: AtomicU64 = AtomicU64::new(0);
+    static OPERATION_BASELINE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static OPERATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static PEAK_LOCK: AtomicBool = AtomicBool::new(false);
+    static ALLOCATION_WINDOW_LOCK: AtomicBool = AtomicBool::new(false);
+    static ALLOCATION_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(not(target_env = "msvc"))]
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    #[cfg(target_env = "msvc")]
+    compile_error!("bench-alloc-stats currently requires a non-MSVC target");
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                update_live(layout.size() as i128, layout.size() as u64);
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                update_live(layout.size() as i128, layout.size() as u64);
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            update_live(-(layout.size() as i128), 0);
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new_ptr.is_null() {
+                let old_size = layout.size() as u64;
+                let new_size = new_size as u64;
+                if new_size >= old_size {
+                    update_live((new_size - old_size) as i128, new_size);
+                } else {
+                    update_live(-((old_size - new_size) as i128), new_size);
+                }
+            }
+            new_ptr
+        }
+    }
+
+    struct FlagGuard(&'static AtomicBool);
+
+    impl FlagGuard {
+        fn acquire(flag: &'static AtomicBool) -> Self {
+            while flag
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                std::hint::spin_loop();
+            }
+            Self(flag)
+        }
+    }
+
+    impl Drop for FlagGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    fn update_live(delta: i128, request_bytes: u64) {
+        let _guard = FlagGuard::acquire(&PEAK_LOCK);
+        let current = LIVE_BYTES.load(Ordering::Relaxed);
+        let live = if delta >= 0 {
+            current.saturating_add(delta as u64)
+        } else {
+            current.saturating_sub((-delta) as u64)
+        };
+        LIVE_BYTES.store(live, Ordering::Relaxed);
+        if OPERATION_ACTIVE.load(Ordering::Relaxed) {
+            let baseline = OPERATION_BASELINE_BYTES.load(Ordering::Relaxed);
+            OPERATION_PEAK_DELTA.fetch_max(live.saturating_sub(baseline), Ordering::Relaxed);
+            ALLOCATION_REQUEST_BYTES.fetch_add(request_bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn start() -> Result<(), &'static str> {
+        let window_guard = FlagGuard::acquire(&ALLOCATION_WINDOW_LOCK);
+        let peak_guard = FlagGuard::acquire(&PEAK_LOCK);
+        if OPERATION_ACTIVE.load(Ordering::Relaxed) {
+            drop(peak_guard);
+            drop(window_guard);
+            return Err("allocator measurement windows cannot overlap");
+        }
+        let baseline = LIVE_BYTES.load(Ordering::SeqCst);
+        OPERATION_BASELINE_BYTES.store(baseline, Ordering::SeqCst);
+        OPERATION_PEAK_DELTA.store(0, Ordering::SeqCst);
+        ALLOCATION_REQUEST_BYTES.store(0, Ordering::Relaxed);
+        OPERATION_ACTIVE.store(true, Ordering::Release);
+        drop(peak_guard);
+        drop(window_guard);
+        Ok(())
+    }
+
+    pub fn finish() -> Result<AllocationSnapshot, &'static str> {
+        let window_guard = FlagGuard::acquire(&ALLOCATION_WINDOW_LOCK);
+        let peak_guard = FlagGuard::acquire(&PEAK_LOCK);
+        if !OPERATION_ACTIVE.load(Ordering::Relaxed) {
+            drop(peak_guard);
+            drop(window_guard);
+            return Err("allocator measurement window is not active");
+        }
+        OPERATION_ACTIVE.store(false, Ordering::Release);
+        let baseline = OPERATION_BASELINE_BYTES.load(Ordering::SeqCst);
+        let snapshot = AllocationSnapshot {
+            peak_live_bytes: OPERATION_PEAK_DELTA.load(Ordering::Relaxed),
+            live_bytes_at_end: LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(baseline),
+            allocation_request_bytes: ALLOCATION_REQUEST_BYTES.load(Ordering::Relaxed),
+        };
+        drop(peak_guard);
+        drop(window_guard);
+        Ok(snapshot)
+    }
+
+    pub struct AllocationWindow {
+        active: bool,
+    }
+
+    impl AllocationWindow {
+        pub fn start() -> Result<Self, &'static str> {
+            start()?;
+            Ok(Self { active: true })
+        }
+
+        pub fn finish(mut self) -> Result<AllocationSnapshot, &'static str> {
+            let snapshot = finish()?;
+            self.active = false;
+            Ok(snapshot)
+        }
+    }
+
+    impl Drop for AllocationWindow {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = finish();
+                self.active = false;
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, serde::Serialize)]
+    pub struct AllocationSnapshot {
+        /// Maximum positive live requested-byte growth over the operation baseline.
+        pub peak_live_bytes: u64,
+        /// Live requested-byte growth still present when the operation ended.
+        pub live_bytes_at_end: u64,
+        /// Successful alloc/zeroed sizes plus successful realloc destination sizes.
+        pub allocation_request_bytes: u64,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::AllocationWindow;
+
+        #[test]
+        fn allocator_measurement_tracks_requests_and_window_lifecycle() {
+            let existing = vec![0u8; 2 * 1024 * 1024];
+            let window = AllocationWindow::start().unwrap();
+            let first = vec![0u8; 1024 * 1024];
+            let second = vec![0u8; 512 * 1024];
+            drop(first);
+            let snapshot = window.finish().unwrap();
+            assert!(snapshot.allocation_request_bytes >= 1536 * 1024);
+            drop(second);
+            drop(existing);
+
+            let window = AllocationWindow::start().unwrap();
+            let overlapping = AllocationWindow::start();
+            assert!(overlapping.is_err());
+            assert!(window.finish().is_ok());
+            let window = AllocationWindow::start().unwrap();
+            assert!(window.finish().is_ok());
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "bench-alloc-stats",
+    any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+))]
+compile_error!("bench-alloc-stats cannot be combined with jemalloc allocator features");
 
 use fast_md5::Md5;
 use irmin_rs::api_scrape::{Compression, DownloadInfo};
@@ -577,13 +780,10 @@ fn run_cli() -> Result<(), String> {
         .iter()
         .map(|size| (*size, Vec::with_capacity(config.repeat)))
         .collect::<std::collections::BTreeMap<_, _>>();
-    for (run_index, (size_mib, _repeat)) in size_run_order(
-        &sizes,
-        config.repeat,
-        config.interleave_sizes,
-    )
-    .into_iter()
-    .enumerate()
+    for (run_index, (size_mib, _repeat)) in
+        size_run_order(&sizes, config.repeat, config.interleave_sizes)
+            .into_iter()
+            .enumerate()
     {
         let result = run_child_once(
             &config,
@@ -1213,7 +1413,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let jemalloc_baseline = jemalloc_snapshot();
     let cpu_before = read_cpu_usage()?;
     let started = Instant::now();
+    #[cfg(feature = "bench-alloc-stats")]
+    let allocation_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
     let verification = run_operation(context, hdiff_source_backend)?;
+    #[cfg(feature = "bench-alloc-stats")]
+    let allocation_snapshot = allocation_window.finish().map_err(str::to_owned)?;
     let elapsed_ms = started.elapsed().as_millis();
     let operation_end = read_memory_snapshot()?;
     let cpu_after = read_cpu_usage()?;
@@ -1337,6 +1541,29 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "hwm_reset": hwm_reset,
         "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
     });
+    #[cfg(feature = "bench-alloc-stats")]
+    {
+        result.as_object_mut().unwrap().insert(
+            "allocator_net_live_growth_peak_bytes".to_owned(),
+            serde_json::json!(allocation_snapshot.peak_live_bytes),
+        );
+        result.as_object_mut().unwrap().insert(
+            "allocator_heap_live_delta_end_bytes".to_owned(),
+            serde_json::json!(allocation_snapshot.live_bytes_at_end),
+        );
+        result.as_object_mut().unwrap().insert(
+            "allocator_allocation_request_bytes".to_owned(),
+            serde_json::json!(allocation_snapshot.allocation_request_bytes),
+        );
+        result.as_object_mut().unwrap().insert(
+            "allocator_heap_measurement".to_owned(),
+            serde_json::json!("process_wide_system_requested_bytes_net_growth"),
+        );
+        result.as_object_mut().unwrap().insert(
+            "allocator_peak_is_approximate".to_owned(),
+            serde_json::json!(true),
+        );
+    }
     let result = result.as_object_mut().unwrap();
     result.insert(
         "sampling_interval_ms".to_owned(),
@@ -2350,17 +2577,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(uncovered_sweep.cover_pattern, CoverPattern::UncoveredPrefix);
-        assert!(parse_args(&[
-            "--scenario".into(),
-            "preinstall-apply".into(),
-            "--cover-pattern".into(),
-            "hdiff20-steps".into(),
-            "--fixture-backing".into(),
-            "disk".into(),
-            "--sweep-sizes-mib".into(),
-            "4,9".into(),
-        ])
-        .is_err());
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--cover-pattern".into(),
+                "hdiff20-steps".into(),
+                "--fixture-backing".into(),
+                "disk".into(),
+                "--sweep-sizes-mib".into(),
+                "4,9".into(),
+            ])
+            .is_err()
+        );
         let hdiff20_steps = parse_args(&[
             "--scenario".into(),
             "hdiff".into(),
@@ -2888,8 +3117,8 @@ mod tests {
     fn uncovered_prefix_fixture_runs_through_preinstall_apply() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::UncoveredPrefix).unwrap();
-        let context = prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, "")
-            .unwrap();
+        let context =
+            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
