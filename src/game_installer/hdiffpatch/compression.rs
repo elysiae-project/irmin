@@ -4,7 +4,7 @@ use flate2::read::DeflateDecoder;
 
 use super::CompressionMode;
 use crate::game_installer::assembly_opt::{
-    return_dctx, take_dctx, window_log_for_size, MAX_WINDOW_LOG,
+    MAX_WINDOW_LOG, return_dctx, take_dctx, window_log_for_size,
 };
 
 /// True when a zstd decode error indicates the `WindowLogMax` cap was
@@ -12,6 +12,27 @@ use crate::game_installer::assembly_opt::{
 fn is_window_too_small_err(e: &std::io::Error) -> bool {
     let msg = e.to_string();
     msg.contains("out of bound") || msg.contains("too much memory for decoding")
+}
+
+fn read_buffered_exact(mut reader: impl Read, length: u64) -> std::io::Result<Vec<u8>> {
+    let length = usize::try_from(length)
+        .map_err(|_| std::io::Error::other("buffered stream size does not fit memory"))?;
+    let mut output = vec![0; length];
+    reader.read_exact(&mut output)?;
+    let mut probe = [0; 1];
+    loop {
+        match reader.read(&mut probe) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+            Ok(0) => return Ok(output),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "buffered stream exceeds declared size",
+                ));
+            }
+        }
+    }
 }
 
 pub(crate) fn get_clip_stream(
@@ -42,13 +63,11 @@ pub(crate) fn get_clip_stream(
                     "buffered stream exceeds maximum size",
                 ));
             }
-            #[allow(clippy::uninit_vec)]
-            let mut buf = {
-                let mut v = Vec::with_capacity(length as usize);
-                unsafe { v.set_len(length as usize) };
-                v
+            let limited = LimitedFile {
+                file,
+                remaining: length,
             };
-            file.read_exact(&mut buf)?;
+            let buf = read_buffered_exact(limited, length)?;
             return Ok((Box::new(Cursor::new(buf)), file_bytes));
         }
         let limited = LimitedFile {
@@ -79,47 +98,40 @@ pub(crate) fn get_clip_stream(
                 let mut ctx = take_dctx();
                 let mut used_window_log = tight_log;
 
-                let out = {
+                let first_result = {
                     ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
                         .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
                     ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(tight_log))
                         .map_err(|_| std::io::Error::other("zstd DCtx WindowLogMax"))?;
-                    let mut out = Vec::with_capacity(length as usize);
-                    {
-                        let mut decoder = zstd::stream::read::Decoder::with_context(
-                            std::io::BufReader::with_capacity(256 * 1024, limited),
-                            &mut ctx,
-                        );
-                        match decoder.read_to_end(&mut out) {
-                            Ok(_) => out,
-                            Err(ref e) if is_window_too_small_err(e) => Vec::new(),
-                            Err(e) => return Err(e),
-                        }
-                    }
+                    let mut decoder = zstd::stream::read::Decoder::with_context(
+                        std::io::BufReader::with_capacity(256 * 1024, limited),
+                        &mut ctx,
+                    );
+                    read_buffered_exact(&mut decoder, length)
                 };
 
-                let out = if !out.is_empty() {
-                    out
-                } else {
-                    used_window_log = MAX_WINDOW_LOG;
-                    ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-                        .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
-                    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(MAX_WINDOW_LOG))
+                let out = match first_result {
+                    Ok(output) => output,
+                    Err(error) if is_window_too_small_err(&error) => {
+                        used_window_log = MAX_WINDOW_LOG;
+                        ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
+                            .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
+                        ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                            MAX_WINDOW_LOG,
+                        ))
                         .map_err(|_| std::io::Error::other("zstd DCtx WindowLogMax"))?;
-                    retry_file.seek(SeekFrom::Start(start))?;
-                    let retry_limited = LimitedFile {
-                        file: retry_file,
-                        remaining: comp_length,
-                    };
-                    let mut out = Vec::with_capacity(length as usize);
-                    {
+                        retry_file.seek(SeekFrom::Start(start))?;
+                        let retry_limited = LimitedFile {
+                            file: retry_file,
+                            remaining: comp_length,
+                        };
                         let mut retry = zstd::stream::read::Decoder::with_context(
                             std::io::BufReader::with_capacity(256 * 1024, retry_limited),
                             &mut ctx,
                         );
-                        retry.read_to_end(&mut out)?;
+                        read_buffered_exact(&mut retry, length)?
                     }
-                    out
+                    Err(error) => return Err(error),
                 };
 
                 return_dctx(ctx, used_window_log);
@@ -143,7 +155,7 @@ pub(crate) fn get_clip_stream(
                 file,
                 remaining: comp_length,
             };
-            let mut decoder =
+            let decoder =
                 DeflateDecoder::new(std::io::BufReader::with_capacity(256 * 1024, limited));
 
             if is_buffered {
@@ -152,8 +164,7 @@ pub(crate) fn get_clip_stream(
                         "buffered zlib stream exceeds maximum size",
                     ));
                 }
-                let mut out = Vec::with_capacity(length as usize);
-                decoder.read_to_end(&mut out)?;
+                let out = read_buffered_exact(decoder, length)?;
                 Ok((Box::new(Cursor::new(out)), file_bytes))
             } else {
                 Ok((Box::new(decoder), file_bytes))
@@ -164,7 +175,7 @@ pub(crate) fn get_clip_stream(
                 file,
                 remaining: comp_length,
             };
-            let mut decoder =
+            let decoder =
                 lz4::Decoder::new(std::io::BufReader::with_capacity(256 * 1024, limited))?;
 
             if is_buffered {
@@ -173,8 +184,7 @@ pub(crate) fn get_clip_stream(
                         "buffered lz4 stream exceeds maximum size",
                     ));
                 }
-                let mut out = Vec::with_capacity(length as usize);
-                decoder.read_to_end(&mut out)?;
+                let out = read_buffered_exact(decoder, length)?;
                 Ok((Box::new(Cursor::new(out)), file_bytes))
             } else {
                 Ok((Box::new(decoder), file_bytes))
@@ -208,7 +218,7 @@ impl Read for LimitedFile {
 #[cfg(test)]
 mod tests {
     use super::super::CompressionMode;
-    use super::{get_clip_stream, LimitedFile};
+    use super::{LimitedFile, get_clip_stream, read_buffered_exact};
     use std::io::Read;
 
     #[test]
@@ -248,6 +258,111 @@ mod tests {
         let mut buf = [0u8; 10];
         let n = limited.read(&mut buf).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn read_buffered_exact_accepts_only_declared_length() {
+        assert_eq!(read_buffered_exact(&b"abc"[..], 3).unwrap(), b"abc");
+        assert_eq!(
+            read_buffered_exact(&b"ab"[..], 3).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_buffered_exact(&b"abcd"[..], 3).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_buffered_exact(&b"x"[..], 0).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn get_clip_stream_nocomp_buffered_truncation_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.bin");
+        std::fs::write(&path, b"short").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let result = get_clip_stream(file, CompressionMode::Nocomp, 0, 6, 6, true);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("truncated buffered stream unexpectedly succeeded"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn get_clip_stream_zstd_buffered_rejects_declared_size_mismatch() {
+        let compressed = zstd::encode_all(&b"hello"[..], 3).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.zst");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let short = get_clip_stream(
+            std::fs::File::open(&path).unwrap(),
+            CompressionMode::Zstd,
+            0,
+            4,
+            compressed.len() as u64,
+            true,
+        );
+        let short = match short {
+            Err(error) => error,
+            Ok(_) => panic!("overlong decoded output unexpectedly succeeded"),
+        };
+        assert_eq!(short.kind(), std::io::ErrorKind::InvalidData);
+
+        let long = get_clip_stream(
+            std::fs::File::open(&path).unwrap(),
+            CompressionMode::Zstd,
+            0,
+            6,
+            compressed.len() as u64,
+            true,
+        );
+        let long = match long {
+            Err(error) => error,
+            Ok(_) => panic!("short decoded output unexpectedly succeeded"),
+        };
+        assert_eq!(long.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn get_clip_stream_zstd_buffered_retries_with_larger_window() {
+        use std::io::Write;
+
+        let original = vec![0x5au8; 64 * 1024];
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        encoder
+            .set_parameter(zstd::zstd_safe::CParameter::WindowLog(20))
+            .unwrap();
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut tight_decoder = zstd::stream::read::Decoder::new(compressed.as_slice()).unwrap();
+        tight_decoder
+            .set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                crate::game_installer::assembly_opt::window_log_for_size(original.len() as u64),
+            ))
+            .unwrap();
+        let tight_error =
+            read_buffered_exact(&mut tight_decoder, original.len() as u64).unwrap_err();
+        assert!(super::is_window_too_small_err(&tight_error));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-window.zst");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let (mut reader, _) = get_clip_stream(
+            std::fs::File::open(&path).unwrap(),
+            CompressionMode::Zstd,
+            0,
+            original.len() as u64,
+            compressed.len() as u64,
+            true,
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
     }
 
     #[test]
@@ -379,8 +494,8 @@ mod tests {
 
     #[test]
     fn get_clip_stream_zlib_buffered_roundtrip() {
-        use flate2::write::DeflateEncoder;
         use flate2::Compression;
+        use flate2::write::DeflateEncoder;
 
         let original = b"Hello World from zlib raw-deflate roundtrip test!";
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
@@ -414,8 +529,8 @@ mod tests {
 
     #[test]
     fn get_clip_stream_zlib_unbuffered_roundtrip() {
-        use flate2::write::DeflateEncoder;
         use flate2::Compression;
+        use flate2::write::DeflateEncoder;
 
         let original = b"Unbuffered zlib raw-deflate roundtrip test data.";
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
