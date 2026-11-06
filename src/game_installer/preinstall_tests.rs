@@ -2798,3 +2798,205 @@ async fn legacy_recovery_rejects_substituted_target_and_manifest_ids() {
         ));
     }
 }
+
+#[tokio::test]
+async fn bounded_download_stream_deduplicates_chunks_and_respects_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let chunks = ["a", "b", "a", "c", "d", "e", "f", "g", "h", "i", "j"]
+        .into_iter()
+        .map(|chunk_name| SophonManifestAssetChunk {
+            chunk_name: chunk_name.to_owned(),
+            chunk_decompressed_hash_md5: String::new(),
+            chunk_on_file_offset: 0,
+            chunk_size: 1,
+            chunk_size_decompressed: 1,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: String::new(),
+            chunk_old_offset: -1,
+        })
+        .collect::<Vec<_>>();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut downloads = build_unique_chunk_stream(&chunks, 3, {
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        let started = Arc::clone(&started);
+        move |_| {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            started.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                max_active.fetch_max(current, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                Ok::<(), SophonError>(())
+            }
+        }
+    });
+    while let Some(result) = downloads.next().await {
+        result.unwrap();
+    }
+
+    assert_eq!(started.load(Ordering::Relaxed), 10);
+    assert!(max_active.load(Ordering::Relaxed) <= 3);
+    assert!(max_active.load(Ordering::Relaxed) > 1);
+}
+
+#[tokio::test]
+async fn bounded_download_stream_stops_scheduling_after_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let chunks = (0..100)
+        .map(|index| SophonManifestAssetChunk {
+            chunk_name: format!("chunk-{index}"),
+            chunk_decompressed_hash_md5: String::new(),
+            chunk_on_file_offset: 0,
+            chunk_size: 1,
+            chunk_size_decompressed: 1,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: String::new(),
+            chunk_old_offset: -1,
+        })
+        .collect::<Vec<_>>();
+    let scheduled = AtomicUsize::new(0);
+    let result = run_unique_chunks_bounded(&chunks, 4, |_| {
+        let index = scheduled.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if index == 0 {
+                Err(SophonError::Cancelled)
+            } else {
+                std::future::pending::<SophonResult<()>>().await
+            }
+        }
+    })
+    .await;
+
+    assert!(matches!(result, Err(SophonError::Cancelled)));
+    assert!(scheduled.load(Ordering::Relaxed) <= 4);
+}
+
+#[tokio::test]
+async fn bounded_download_stream_rejects_zero_limit() {
+    let chunks = [SophonManifestAssetChunk {
+        chunk_name: "chunk".to_owned(),
+        chunk_decompressed_hash_md5: String::new(),
+        chunk_on_file_offset: 0,
+        chunk_size: 1,
+        chunk_size_decompressed: 1,
+        chunk_compressed_hash_xxh: 0,
+        chunk_compressed_hash_md5: String::new(),
+        chunk_old_offset: -1,
+    }];
+    let result = run_unique_chunks_bounded(&chunks, 0, |_| async {
+        panic!("zero concurrency must not construct any chunk future")
+    })
+    .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let output_parts = [b"first-".as_slice(), b"second-", b"third"];
+    let mut asset_chunks = Vec::new();
+    let mut expected = Vec::new();
+
+    for (index, data) in output_parts.iter().enumerate() {
+        let chunk_name = format!("unique-{index}");
+        let compressed = zstd::encode_all(*data, 1).unwrap();
+        let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+        let decompressed_hash = hex::encode(fast_md5::digest(data));
+        Mock::given(path(format!("/chunks/{chunk_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        asset_chunks.push(SophonManifestAssetChunk {
+            chunk_name: chunk_name.clone(),
+            chunk_decompressed_hash_md5: decompressed_hash,
+            chunk_on_file_offset: expected.len() as u64,
+            chunk_size: compressed.len() as u64,
+            chunk_size_decompressed: data.len() as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: compressed_hash,
+            chunk_old_offset: -1,
+        });
+        expected.extend_from_slice(data);
+        if index == 0 {
+            let mut duplicate = asset_chunks[0].clone();
+            duplicate.chunk_on_file_offset = expected.len() as u64;
+            asset_chunks.push(duplicate);
+            expected.extend_from_slice(data);
+        }
+    }
+
+    let target_hash = hex::encode(fast_md5::digest(&expected));
+    let manifest = SophonManifestProto {
+        assets: vec![SophonManifestAssetProperty {
+            asset_name: "downloaded.bin".to_owned(),
+            asset_chunks: asset_chunks.clone(),
+            asset_type: 0,
+            asset_size: expected.len() as u64,
+            asset_hash_md5: target_hash.clone(),
+        }],
+    };
+    let download_info = DownloadInfo {
+        url_prefix: server.uri(),
+        url_suffix: "chunks".to_owned(),
+        ..make_download_info()
+    };
+    let context = DownloadOverContext {
+        manifests: [("game".to_owned(), (download_info.clone(), manifest))]
+            .into_iter()
+            .collect(),
+    };
+    let asset = PatchAssetInfo {
+        target_file_path: "downloaded.bin".to_owned(),
+        target_file_size: expected.len() as u64,
+        target_file_hash: target_hash,
+        patch_method: PatchMethod::DownloadOver,
+        patch_name: String::new(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 0,
+        patch_chunk_length: 0,
+        original_file_path: None,
+        original_file_hash: None,
+        original_file_size: None,
+        matching_field: "game".to_owned(),
+    };
+
+    apply_download_over(
+        &Client::new(),
+        dir.path(),
+        &PreinstallState {
+            tag: "target".to_owned(),
+            game_id: "synthetic".to_owned(),
+            vo_lang: "en-us".to_owned(),
+            installed_tag: "source".to_owned(),
+            target_snapshot: None,
+            patch_assets: vec![asset.clone()],
+            deleted_files: Vec::new(),
+            downloaded_chunks: Default::default(),
+            diff_downloads: Default::default(),
+            main_chunk_download: download_info.clone(),
+            main_manifest_ids: Vec::new(),
+        },
+        &asset,
+        &context,
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fs::read(dir.path().join("downloaded.bin")).unwrap(),
+        expected
+    );
+}

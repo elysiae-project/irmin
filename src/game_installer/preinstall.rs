@@ -20,7 +20,7 @@ fn now_nanos() -> u64 {
 use dashmap::DashMap;
 
 use futures_util::StreamExt;
-use futures_util::future::try_join_all;
+use futures_util::future::{Future, ready, try_join_all};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3194,27 +3194,12 @@ async fn apply_download_over(
         tokio::task::spawn_blocking(move || fs::create_dir_all(&cd)).await??;
     }
 
-    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(super::DOWNLOAD_CONCURRENCY));
-    let mut seen_chunks = rustc_hash::FxHashSet::default();
-    let chunk_futures = file_entry
-        .asset_chunks
-        .iter()
-        .filter(|chunk| seen_chunks.insert(chunk.chunk_name.as_str()))
-        .map(|chunk| {
-            let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
-            chunk_path.set_extension("zstd");
-            let client = client.clone();
-            let chunk_download = chunk_download.clone();
-            let chunk = chunk.clone();
-            let handle = handle.clone();
-            let permit = Arc::clone(&download_semaphore);
-            async move {
-                let _permit = permit.acquire().await.expect("semaphore not closed");
-                download_chunk_with_retries(&client, &chunk_download, &chunk, &chunk_path, &handle)
-                    .await
-            }
-        });
-    try_join_all(chunk_futures).await?;
+    run_unique_chunks_bounded(
+        &file_entry.asset_chunks,
+        super::DOWNLOAD_CONCURRENCY,
+        |chunk| make_download_over_chunk_future(chunk, &chunks_dir, client, chunk_download, handle),
+    )
+    .await?;
 
     {
         let gd = game_dir.to_path_buf();
@@ -3262,6 +3247,167 @@ async fn apply_download_over(
     }
 
     Ok(())
+}
+
+#[cfg(feature = "benchmark")]
+fn build_download_over_chunk_futures(
+    asset_chunks: &[SophonManifestAssetChunk],
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl std::future::Future<Output = SophonResult<Vec<()>>> + 'static {
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(super::DOWNLOAD_CONCURRENCY));
+    let mut seen_chunks = rustc_hash::FxHashSet::default();
+    let mut chunk_futures = Vec::with_capacity(asset_chunks.len());
+    for chunk in asset_chunks {
+        if !seen_chunks.insert(chunk.chunk_name.as_str()) {
+            continue;
+        }
+        let permit = Arc::clone(&download_semaphore);
+        let download =
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
+        chunk_futures.push(async move {
+            let _permit = permit.acquire().await.expect("semaphore not closed");
+            download.await
+        });
+    }
+    try_join_all(chunk_futures)
+}
+
+fn make_download_over_chunk_future(
+    chunk: &SophonManifestAssetChunk,
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl Future<Output = SophonResult<()>> + 'static {
+    let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
+    chunk_path.set_extension("zstd");
+    let client = client.clone();
+    let chunk_download = chunk_download.clone();
+    let chunk = chunk.clone();
+    let handle = handle.clone();
+    async move {
+        download_chunk_with_retries(&client, &chunk_download, &chunk, &chunk_path, &handle).await
+    }
+}
+
+// The move closure owns the future factory for the stream's lifetime.
+#[allow(clippy::redundant_closure)]
+fn build_unique_chunk_stream<'a, F, Fut>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    limit: usize,
+    mut make_future: F,
+) -> impl futures_util::Stream<Item = Fut::Output> + 'a
+where
+    F: FnMut(&'a SophonManifestAssetChunk) -> Fut + 'a,
+    Fut: Future + 'a,
+{
+    let mut seen_chunks = rustc_hash::FxHashSet::default();
+    futures_util::stream::iter(asset_chunks.iter())
+        .filter(move |chunk| ready(seen_chunks.insert(chunk.chunk_name.as_str())))
+        .map(move |chunk| make_future(chunk))
+        .buffer_unordered(limit)
+}
+
+async fn run_unique_chunks_bounded<'a, F, Fut>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    limit: usize,
+    make_future: F,
+) -> SophonResult<()>
+where
+    F: FnMut(&'a SophonManifestAssetChunk) -> Fut + 'a,
+    Fut: Future<Output = SophonResult<()>> + 'a,
+{
+    if limit == 0 {
+        return Err(SophonError::Io(std::io::Error::other(
+            "download concurrency limit must be positive",
+        )));
+    }
+    let mut downloads = build_unique_chunk_stream(asset_chunks, limit, make_future);
+    while let Some(result) = downloads.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_future_batch(
+    asset_chunks: &[SophonManifestAssetChunk],
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl std::future::Future<Output = SophonResult<Vec<()>>> + 'static {
+    build_download_over_chunk_futures(asset_chunks, chunks_dir, client, chunk_download, handle)
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_chunk_future(
+    chunk: &SophonManifestAssetChunk,
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl std::future::Future<Output = SophonResult<()>> + 'static {
+    make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle)
+}
+
+#[cfg(feature = "benchmark")]
+pub async fn benchmark_download_over_bounded_stream<'a>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    chunks_dir: &'a Path,
+    client: &'a Client,
+    chunk_download: &'a DownloadInfo,
+    handle: &'a DownloadHandle,
+) -> SophonResult<()> {
+    let mut downloads =
+        build_unique_chunk_stream(asset_chunks, super::DOWNLOAD_CONCURRENCY, |chunk| {
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle)
+        });
+    while let Some(result) = downloads.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_bounded_drain_stream<'a>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    chunks_dir: &'a Path,
+    client: &'a Client,
+    chunk_download: &'a DownloadInfo,
+    handle: &'a DownloadHandle,
+) -> impl futures_util::Stream<Item = SophonResult<()>> + 'a {
+    build_unique_chunk_stream(asset_chunks, super::DOWNLOAD_CONCURRENCY, move |chunk| {
+        let download =
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
+        async move {
+            tokio::task::yield_now().await;
+            drop(download);
+            Ok(())
+        }
+    })
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_bounded_pending_stream<'a>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    chunks_dir: &'a Path,
+    client: &'a Client,
+    chunk_download: &'a DownloadInfo,
+    handle: &'a DownloadHandle,
+    started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl futures_util::Stream<Item = SophonResult<()>> + 'a {
+    build_unique_chunk_stream(asset_chunks, super::DOWNLOAD_CONCURRENCY, move |chunk| {
+        started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let download = make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
+        async move {
+            std::future::pending::<()>().await;
+            download.await
+        }
+    })
 }
 
 use crate::SophonProgress;

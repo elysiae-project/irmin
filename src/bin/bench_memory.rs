@@ -226,6 +226,7 @@ mod allocation_stats {
 compile_error!("bench-alloc-stats cannot be combined with jemalloc allocator features");
 
 use fast_md5::Md5;
+use futures_util::StreamExt;
 use irmin_rs::api_scrape::{Compression, DownloadInfo};
 use irmin_rs::bench_support::{
     apply_hdiff_fixture_with_backend, compare_hdiff_fixture, deterministic_data,
@@ -253,6 +254,7 @@ use irmin_rs::types::CompletedFiles;
 enum Scenario {
     Hdiff,
     PreinstallApply,
+    PreinstallDownloadPlan,
     Assembly,
     SophonInstall,
 }
@@ -262,10 +264,11 @@ impl Scenario {
         match value {
             "hdiff" => Ok(Self::Hdiff),
             "preinstall-apply" => Ok(Self::PreinstallApply),
+            "preinstall-download-plan" => Ok(Self::PreinstallDownloadPlan),
             "assembly" => Ok(Self::Assembly),
             "sophon-install" => Ok(Self::SophonInstall),
             _ => Err(format!(
-                "unknown scenario '{value}'; expected hdiff, preinstall-apply, assembly, or sophon-install"
+                "unknown scenario '{value}'; expected hdiff, preinstall-apply, preinstall-download-plan, assembly, or sophon-install"
             )),
         }
     }
@@ -274,6 +277,7 @@ impl Scenario {
         match self {
             Self::Hdiff => "hdiff",
             Self::PreinstallApply => "preinstall-apply",
+            Self::PreinstallDownloadPlan => "preinstall-download-plan",
             Self::Assembly => "assembly",
             Self::SophonInstall => "sophon-install",
         }
@@ -1245,10 +1249,28 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     if preinstall_mode == PreinstallMode::CopyOver && cover_pattern != CoverPattern::Sequential {
         return Err("copyover mode requires the sequential cover pattern".to_owned());
     }
-    if !matches!(scenario, Scenario::Hdiff | Scenario::PreinstallApply)
-        && cover_pattern != CoverPattern::Sequential
+    if !matches!(
+        scenario,
+        Scenario::Hdiff | Scenario::PreinstallApply | Scenario::PreinstallDownloadPlan
+    ) && cover_pattern != CoverPattern::Sequential
     {
         return Err("--cover-pattern is only supported for HDiff scenarios".to_owned());
+    }
+    if scenario == Scenario::PreinstallDownloadPlan {
+        if !cfg!(feature = "bench-alloc-stats") {
+            return Err(
+                "preinstall-download-plan requires --features bench-alloc-stats".to_owned(),
+            );
+        }
+        if chunks > 100_000 {
+            return Err("preinstall-download-plan supports at most 100000 chunks".to_owned());
+        }
+        if sweep_sizes_mib.is_some() {
+            return Err("preinstall-download-plan does not support size sweeps".to_owned());
+        }
+        if preinstall_mode != PreinstallMode::Patch {
+            return Err("preinstall-download-plan does not use --preinstall-mode".to_owned());
+        }
     }
     if source_backend != SourceBackend::Windowed && window_size_provided {
         return Err("--window-mib/--window-kib require --source-backend windowed".to_owned());
@@ -1381,7 +1403,7 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|preinstall-download-plan|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
@@ -1473,6 +1495,9 @@ fn run_child(args: &[String]) -> Result<(), String> {
         }
         _ => return Err("invalid child source backend".to_owned()),
     };
+    if scenario == Scenario::PreinstallDownloadPlan {
+        return run_download_plan_child(&fixture_dir, chunks, size_mib, filesystem_info);
+    }
     let context = prepare_child_context(
         scenario,
         &fixture_dir,
@@ -1767,6 +1792,247 @@ fn run_child(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_download_plan_child(
+    fixture_dir: &Path,
+    chunk_count: usize,
+    size_mib: usize,
+    filesystem: FilesystemInfo,
+) -> Result<(), String> {
+    #[cfg(not(feature = "bench-alloc-stats"))]
+    {
+        let _ = (fixture_dir, chunk_count, size_mib, filesystem);
+        return Err("preinstall-download-plan requires --features bench-alloc-stats".to_owned());
+    }
+    #[cfg(feature = "bench-alloc-stats")]
+    {
+        let total_bytes = size_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "download-plan size is too large".to_owned())?;
+        let base_chunk_size = total_bytes / chunk_count;
+        let larger_chunks = total_bytes % chunk_count;
+        let mut chunk_offset = 0usize;
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for index in 0..chunk_count {
+            let chunk_size = base_chunk_size + usize::from(index < larger_chunks);
+            let chunk_offset_u64 = u64::try_from(chunk_offset)
+                .map_err(|_| "download-plan chunk offset does not fit u64".to_owned())?;
+            chunks.push(SophonManifestAssetChunk {
+                    chunk_name: format!("download-plan-{index:08}.zstd"),
+                    chunk_decompressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                    chunk_on_file_offset: chunk_offset_u64,
+                    chunk_size: chunk_size as u64,
+                    chunk_size_decompressed: chunk_size as u64,
+                    chunk_compressed_hash_xxh: 0,
+                    chunk_compressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                    chunk_old_offset: -1,
+                });
+            chunk_offset = chunk_offset
+                .checked_add(chunk_size)
+                .ok_or_else(|| "download-plan chunk offset overflow".to_owned())?;
+        }
+        let client = reqwest::Client::new();
+        let plan_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let chunk_download = DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: "http://127.0.0.1:0/unused".to_owned(),
+            url_suffix: String::new(),
+        };
+        let handle = DownloadHandle::new();
+        let chunks_dir = fixture_dir.join("chunks");
+        let mut sampler = MemorySampler::start();
+        thread::sleep(std::time::Duration::from_millis(5));
+        let baseline = read_memory_snapshot()?;
+        let hwm_reset = reset_hwm().is_ok();
+        let operation_baseline = read_memory_snapshot()?;
+        let started = Instant::now();
+        let eager_started = Instant::now();
+        let eager_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
+        let eager_batch = irmin_rs::game_installer::benchmark_download_over_future_batch(
+            &chunks,
+            &chunks_dir,
+            &client,
+            &chunk_download,
+            &handle,
+        );
+        let eager_inline_future_bytes = std::mem::size_of_val(&eager_batch);
+        drop(eager_batch);
+        let eager_allocation = eager_window.finish().map_err(str::to_owned)?;
+        let eager_materialization_ms = eager_started.elapsed().as_millis();
+        let rss_after_eager = read_memory_snapshot()?;
+
+        let single_started = Instant::now();
+        let single_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
+        let single_future = irmin_rs::game_installer::benchmark_download_over_chunk_future(
+            &chunks[0],
+            &chunks_dir,
+            &client,
+            &chunk_download,
+            &handle,
+        );
+        let single_inline_future_bytes = std::mem::size_of_val(&single_future);
+        let single_future_growth_bytes = allocation_stats::current_live_growth()
+            .map_err(str::to_owned)?
+            .unwrap_or(0);
+        drop(single_future);
+        let single_allocation = single_window.finish().map_err(str::to_owned)?;
+        let single_future_construction_ms = single_started.elapsed().as_millis();
+        let bounded_in_flight_estimate_bytes = single_future_growth_bytes
+            .saturating_mul(irmin_rs::game_installer::DOWNLOAD_CONCURRENCY as u64);
+        let bounded_future_state_estimate_bytes = (single_future_growth_bytes
+            .saturating_add(single_inline_future_bytes as u64))
+        .saturating_mul(irmin_rs::game_installer::DOWNLOAD_CONCURRENCY as u64);
+
+        let pending_started = Instant::now();
+        let pending_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
+        let pending_future_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending_stream =
+            irmin_rs::game_installer::benchmark_download_over_bounded_pending_stream(
+                &chunks,
+                &chunks_dir,
+                &client,
+                &chunk_download,
+                &handle,
+                std::sync::Arc::clone(&pending_future_count),
+            );
+        let pending_stream_inline_size_bytes = std::mem::size_of_val(&pending_stream);
+        let mut pending_stream = Box::pin(pending_stream);
+        let waker = futures_util::task::noop_waker_ref();
+        let mut context = std::task::Context::from_waker(waker);
+        let poll_result =
+            futures_util::Stream::poll_next(pending_stream.as_mut(), &mut context);
+        if !matches!(poll_result, std::task::Poll::Pending) {
+            return Err("bounded pending stream completed unexpectedly".to_owned());
+        }
+        let pending_future_count = pending_future_count.load(std::sync::atomic::Ordering::Relaxed);
+        let expected_pending_future_count =
+            chunk_count.min(irmin_rs::game_installer::DOWNLOAD_CONCURRENCY);
+        if pending_future_count != expected_pending_future_count {
+            return Err(format!(
+                "bounded pending stream retained {pending_future_count} futures; expected {expected_pending_future_count}"
+            ));
+        }
+        let pending_live_growth = allocation_stats::current_live_growth()
+            .map_err(str::to_owned)?
+            .unwrap_or(0);
+        drop(pending_stream);
+        let pending_allocation = pending_window.finish().map_err(str::to_owned)?;
+        let rss_after_pending = read_memory_snapshot()?;
+
+        let drain_started = Instant::now();
+        let drain_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
+        let drain_stream =
+            irmin_rs::game_installer::benchmark_download_over_bounded_drain_stream(
+                &chunks,
+                &chunks_dir,
+                &client,
+                &chunk_download,
+                &handle,
+            );
+        let drained_chunks = plan_runtime.block_on(async move {
+            let mut drain_stream = Box::pin(drain_stream);
+            let mut completed = 0usize;
+            while let Some(result) = drain_stream.next().await {
+                result.map_err(|error| error.to_string())?;
+                completed += 1;
+            }
+            Ok::<_, String>(completed)
+        })?;
+        let drain_allocation = drain_window.finish().map_err(str::to_owned)?;
+        let drain_elapsed_ms = drain_started.elapsed().as_millis();
+        let rss_after_drain = read_memory_snapshot()?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let operation_end = read_memory_snapshot()?;
+        let sampled_peak = sampler.finish();
+        let kernel_hwm_peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
+        let peak_rss_kib = kernel_hwm_peak_rss_kib.max(sampled_peak.vm_rss_kib);
+        let rss_baseline_kib = if hwm_reset {
+            operation_baseline.vm_rss_kib
+        } else {
+            baseline.vm_rss_kib
+        };
+        let eager_metrics = serde_json::json!({
+            "heap_peak_bytes": eager_allocation.peak_live_bytes,
+            "heap_live_delta_end_bytes": eager_allocation.live_bytes_at_end,
+            "allocation_request_bytes": eager_allocation.allocation_request_bytes,
+            "inline_future_size_bytes": eager_inline_future_bytes,
+            "rss_after_drop_kib": rss_after_eager.vm_rss_kib,
+            "rss_anon_after_drop_kib": rss_after_eager.rss_anon_kib,
+            "rss_file_after_drop_kib": rss_after_eager.rss_file_kib,
+        });
+        let bounded_pending_metrics = serde_json::json!({
+            "concurrency": irmin_rs::game_installer::DOWNLOAD_CONCURRENCY,
+            "pending_future_count": pending_future_count,
+            "pending_live_growth_bytes": pending_live_growth,
+            "allocator_peak_bytes": pending_allocation.peak_live_bytes,
+            "pending_stream_inline_size_bytes": pending_stream_inline_size_bytes,
+            "rss_after_poll_kib": rss_after_pending.vm_rss_kib,
+            "rss_anon_after_poll_kib": rss_after_pending.rss_anon_kib,
+            "rss_file_after_poll_kib": rss_after_pending.rss_file_kib,
+        });
+        let bounded_drain_metrics = serde_json::json!({
+            "concurrency": irmin_rs::game_installer::DOWNLOAD_CONCURRENCY,
+            "stream_items_drained": drained_chunks,
+            "dedup_entry_count": chunk_count,
+            "dedup_metadata_scales_with_unique_chunks": true,
+            "in_flight_heap_estimate_bytes": bounded_in_flight_estimate_bytes,
+            "bounded_stream_allocator_peak_bytes": drain_allocation.peak_live_bytes,
+            "bounded_stream_allocator_live_end_bytes": drain_allocation.live_bytes_at_end,
+            "rss_after_drop_kib": rss_after_drain.vm_rss_kib,
+            "rss_anon_after_drop_kib": rss_after_drain.rss_anon_kib,
+            "rss_file_after_drop_kib": rss_after_drain.rss_file_kib,
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "scenario": Scenario::PreinstallDownloadPlan.name(),
+                "fixture_kind": "synthetic-download-future-plan",
+                "representative": false,
+                "size_mib": size_mib,
+                "unique_chunk_count": chunk_count,
+                "chunk_count_distribution": "even_with_remainder_in_early_chunks",
+                "fixture_backing": "none",
+                "fixture_fs_magic": format!("0x{:x}", filesystem.magic),
+                "fixture_fs_type": filesystem.name,
+                "operation": "compare_eager_batch_with_bounded_pending_and_drain_phases",
+                "eager": eager_metrics,
+                "eager_materialization_ms": eager_materialization_ms,
+                "single_production_future_inline_size_bytes": single_inline_future_bytes,
+                "single_production_future_heap_peak_bytes": single_allocation.peak_live_bytes,
+                "single_future_construction_ms": single_future_construction_ms,
+                "bounded_future_state_estimate_bytes": bounded_future_state_estimate_bytes,
+                "bounded_pending": bounded_pending_metrics,
+                "bounded_pending_poll_elapsed_ns": pending_started.elapsed().as_nanos(),
+                "bounded_drain": bounded_drain_metrics,
+                "bounded_future_drain_ms": drain_elapsed_ms,
+                "allocator_metric_scope": "process_wide_system_requested_bytes_net_growth",
+                "rss_baseline_kib": rss_baseline_kib,
+                "peak_rss_kib": peak_rss_kib,
+                "peak_delta_kib": peak_rss_kib.saturating_sub(rss_baseline_kib),
+                "operation_end_rss": operation_end,
+                "sampled_peak_rss": sampled_peak,
+                "elapsed_ms": elapsed_ms,
+                "sampling_interval_ms": 2,
+                "notes": [
+                    "Eager batch uses the production try_join_all builder and is dropped without polling or network I/O.",
+                    "The bounded_pending phase polls the production buffer_unordered stream once; each future holds the actual production download future behind a pending gate before network I/O.",
+                    "The bounded_drain phase drains all items by yielding once and dropping the inner download future; it measures O(N) dedup metadata and scheduler bookkeeping, not HTTP buffers.",
+                    "The single-future estimate multiplies one actual production chunk-future allocation by DOWNLOAD_CONCURRENCY.",
+                    "Bounded phases follow the eager phase in this child; allocator net live deltas are phase scoped, but process VmHWM remains eager-inclusive.",
+                    "Excludes base manifest metadata and active HTTP buffers; isolates retained chunk-future materialization.",
+                    "Heap values are requested-byte net growth, not RSS or physical residency."
+                ]
+            }))
+            .unwrap()
+        );
+        Ok(())
+    }
+}
+
 fn reset_hwm() -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -2014,6 +2280,7 @@ fn prepare_fixture(
                 prepare_hdiff_fixture(dir, size_mib, cover_pattern)
             }
         }
+        Scenario::PreinstallDownloadPlan => Ok(()),
         Scenario::Assembly => prepare_assembly_fixture(dir, size_mib, chunks),
         Scenario::SophonInstall => prepare_install_fixture(dir, size_mib, chunks),
     }
@@ -2121,6 +2388,9 @@ fn prepare_child_context(
         return Err("asset_count must be between 1 and 8".to_owned());
     }
     match scenario {
+        Scenario::PreinstallDownloadPlan => {
+            Err("preinstall-download-plan uses its dedicated operation".to_owned())
+        }
         Scenario::Hdiff => Ok(ScenarioContext::Hdiff {
             dir: dir.to_path_buf(),
         }),

@@ -208,6 +208,16 @@ pub use installer::{
 };
 pub use plugin_install::{install_channel_sdks, install_plugins};
 #[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_bounded_drain_stream;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_bounded_pending_stream;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_bounded_stream;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_chunk_future;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_future_batch;
+#[cfg(feature = "benchmark")]
 pub use preinstall::prepare_synthetic_apply_state as prepare_benchmark_preinstall_state;
 #[cfg(feature = "benchmark")]
 pub use preinstall::prepare_synthetic_copyover_state as prepare_benchmark_copyover_state;
