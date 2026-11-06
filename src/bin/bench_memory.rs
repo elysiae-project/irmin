@@ -414,6 +414,12 @@ struct MemorySnapshot {
     rss_anon_kib: Option<u64>,
     rss_file_kib: Option<u64>,
     rss_shmem_kib: Option<u64>,
+    pss_kib: Option<u64>,
+    private_clean_kib: Option<u64>,
+    private_dirty_kib: Option<u64>,
+    shared_clean_kib: Option<u64>,
+    shared_dirty_kib: Option<u64>,
+    smaps_anonymous_kib: Option<u64>,
 }
 
 #[cfg(all(
@@ -521,8 +527,9 @@ impl MemorySampler {
             while !thread_stop.load(Ordering::Acquire) {
                 if let Ok(snapshot) = read_memory_snapshot()
                     && let Ok(mut current_peak) = thread_peak.lock()
+                    && snapshot.vm_rss_kib > current_peak.vm_rss_kib
                 {
-                    update_memory_peak(&mut current_peak, snapshot);
+                    update_memory_peak_with_rollup(&mut current_peak, snapshot);
                 }
                 #[cfg(all(
                     unix,
@@ -547,8 +554,9 @@ impl MemorySampler {
             }
             if let Ok(snapshot) = read_memory_snapshot()
                 && let Ok(mut current_peak) = thread_peak.lock()
+                && snapshot.vm_rss_kib > current_peak.vm_rss_kib
             {
-                update_memory_peak(&mut current_peak, snapshot);
+                update_memory_peak_with_rollup(&mut current_peak, snapshot);
             }
             #[cfg(all(
                 unix,
@@ -613,6 +621,10 @@ fn update_memory_peak(peak: &mut MemorySnapshot, current: MemorySnapshot) {
     if current.vm_rss_kib > peak.vm_rss_kib {
         *peak = current;
     }
+}
+
+fn update_memory_peak_with_rollup(peak: &mut MemorySnapshot, current: MemorySnapshot) {
+    update_memory_peak(peak, read_smaps_rollup_snapshot(current));
 }
 
 #[cfg(all(
@@ -1581,7 +1593,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         && cover_pattern == CoverPattern::Hdiff20Steps)
         .then(irmin_rs::game_installer::hdiffpatch::step_buffer_diagnostics);
     let elapsed_ms = started.elapsed().as_millis();
-    let operation_end = read_memory_snapshot()?;
+    let operation_end = read_smaps_rollup_snapshot(read_memory_snapshot()?);
     let cpu_after = read_cpu_usage()?;
     let cgroup_after_operation = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
         Some((
@@ -1721,7 +1733,6 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "sampled_max_rss_file_kib": sampled_peak.rss_file_kib,
         "sampled_max_rss_shmem_kib": sampled_peak.rss_shmem_kib,
         "cpu_scope": "process_including_sampler",
-        "sampled_peak_is_coherent_snapshot": true,
         "hwm_reset": hwm_reset,
         "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
     });
@@ -1772,6 +1783,67 @@ fn run_child(args: &[String]) -> Result<(), String> {
             );
         }
     }
+    for (key, value) in [
+        ("operation_end_pss_kib", operation_end.pss_kib),
+        (
+            "operation_end_private_clean_kib",
+            operation_end.private_clean_kib,
+        ),
+        (
+            "operation_end_private_dirty_kib",
+            operation_end.private_dirty_kib,
+        ),
+        (
+            "operation_end_shared_clean_kib",
+            operation_end.shared_clean_kib,
+        ),
+        (
+            "operation_end_shared_dirty_kib",
+            operation_end.shared_dirty_kib,
+        ),
+        (
+            "operation_end_smaps_anonymous_kib",
+            operation_end.smaps_anonymous_kib,
+        ),
+        ("sampled_peak_pss_kib", sampled_peak.pss_kib),
+        (
+            "sampled_peak_private_clean_kib",
+            sampled_peak.private_clean_kib,
+        ),
+        (
+            "sampled_peak_private_dirty_kib",
+            sampled_peak.private_dirty_kib,
+        ),
+        (
+            "sampled_peak_shared_clean_kib",
+            sampled_peak.shared_clean_kib,
+        ),
+        (
+            "sampled_peak_shared_dirty_kib",
+            sampled_peak.shared_dirty_kib,
+        ),
+        (
+            "sampled_peak_smaps_anonymous_kib",
+            sampled_peak.smaps_anonymous_kib,
+        ),
+    ] {
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert(key.to_owned(), serde_json::json!(value));
+    }
+    result.as_object_mut().unwrap().insert(
+        "smaps_rollup_sampled_only_at_new_rss_high_water".to_owned(),
+        serde_json::json!(true),
+    );
+    result.as_object_mut().unwrap().insert(
+        "sampled_peak_components_share_rss_high_water_sample".to_owned(),
+        serde_json::json!(true),
+    );
+    result.as_object_mut().unwrap().insert(
+        "smaps_rollup_sampling_note".to_owned(),
+        serde_json::json!("/proc/self/status and /proc/self/smaps_rollup are read sequentially, not atomically."),
+    );
     #[cfg(feature = "bench-diagnostics")]
     if let Some(timings) = phase_timings {
         result.as_object_mut().unwrap().insert(
@@ -2041,7 +2113,7 @@ fn run_download_plan_child(
         let drain_elapsed_ms = drain_started.elapsed().as_millis();
         let rss_after_drain = read_memory_snapshot()?;
         let elapsed_ms = started.elapsed().as_millis();
-        let operation_end = read_memory_snapshot()?;
+        let operation_end = read_smaps_rollup_snapshot(read_memory_snapshot()?);
         let sampled_peak = sampler.finish();
         let kernel_hwm_peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
         let peak_rss_kib = kernel_hwm_peak_rss_kib.max(sampled_peak.vm_rss_kib);
@@ -2336,6 +2408,14 @@ fn read_memory_snapshot() -> Result<MemorySnapshot, String> {
     Ok(parse_memory_status(&status))
 }
 
+fn read_smaps_rollup_snapshot(mut snapshot: MemorySnapshot) -> MemorySnapshot {
+    #[cfg(target_os = "linux")]
+    if let Ok(contents) = fs::read_to_string("/proc/self/smaps_rollup") {
+        parse_smaps_rollup(&contents, &mut snapshot);
+    }
+    snapshot
+}
+
 fn parse_memory_status(status: &str) -> MemorySnapshot {
     let mut snapshot = MemorySnapshot::default();
     for line in status.lines() {
@@ -2356,6 +2436,27 @@ fn parse_memory_status(status: &str) -> MemorySnapshot {
         }
     }
     snapshot
+}
+
+fn parse_smaps_rollup(contents: &str, snapshot: &mut MemorySnapshot) {
+    for line in contents.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let value = rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok());
+        match (key, value) {
+            ("Pss", Some(value)) => snapshot.pss_kib = Some(value),
+            ("Private_Clean", Some(value)) => snapshot.private_clean_kib = Some(value),
+            ("Private_Dirty", Some(value)) => snapshot.private_dirty_kib = Some(value),
+            ("Shared_Clean", Some(value)) => snapshot.shared_clean_kib = Some(value),
+            ("Shared_Dirty", Some(value)) => snapshot.shared_dirty_kib = Some(value),
+            ("Anonymous", Some(value)) => snapshot.smaps_anonymous_kib = Some(value),
+            _ => {}
+        }
+    }
 }
 
 fn prepare_fixture(
@@ -3684,6 +3785,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_smaps_rollup_private_and_shared_fields() {
+        let mut snapshot = MemorySnapshot::default();
+        parse_smaps_rollup(
+            "1000-2000 ---p 00000000 00:00 0 [rollup]\nRss: 2048 kB\nPss: 1536 kB\nShared_Clean: 700 kB\nShared_Dirty: 50 kB\nPrivate_Clean: 100 kB\nPrivate_Dirty: 900 kB\nAnonymous: 920 kB\n",
+            &mut snapshot,
+        );
+        assert_eq!(snapshot.pss_kib, Some(1536));
+        assert_eq!(snapshot.shared_clean_kib, Some(700));
+        assert_eq!(snapshot.shared_dirty_kib, Some(50));
+        assert_eq!(snapshot.private_clean_kib, Some(100));
+        assert_eq!(snapshot.private_dirty_kib, Some(900));
+        assert_eq!(snapshot.smaps_anonymous_kib, Some(920));
+    }
+
+    #[test]
+    fn smaps_rollup_parser_ignores_missing_and_malformed_values() {
+        let mut snapshot = MemorySnapshot::default();
+        parse_smaps_rollup("Pss: unavailable kB\nPrivate_Dirty: 12 kB\n", &mut snapshot);
+        assert_eq!(snapshot.pss_kib, None);
+        assert_eq!(snapshot.private_dirty_kib, Some(12));
+        assert_eq!(snapshot.shared_clean_kib, None);
+    }
+
+    #[test]
     fn memory_peak_tracks_components_independently() {
         let mut peak = MemorySnapshot::default();
         update_memory_peak(
@@ -3694,6 +3819,12 @@ mod tests {
                 rss_anon_kib: Some(700),
                 rss_file_kib: Some(300),
                 rss_shmem_kib: Some(100),
+                pss_kib: Some(800),
+                private_clean_kib: Some(50),
+                private_dirty_kib: Some(650),
+                shared_clean_kib: Some(250),
+                shared_dirty_kib: Some(50),
+                smaps_anonymous_kib: Some(675),
             },
         );
         update_memory_peak(
@@ -3704,6 +3835,12 @@ mod tests {
                 rss_anon_kib: Some(400),
                 rss_file_kib: Some(600),
                 rss_shmem_kib: Some(800),
+                pss_kib: Some(700),
+                private_clean_kib: Some(100),
+                private_dirty_kib: Some(300),
+                shared_clean_kib: Some(500),
+                shared_dirty_kib: Some(100),
+                smaps_anonymous_kib: Some(400),
             },
         );
         assert_eq!(peak.vm_rss_kib, 900);
@@ -3711,6 +3848,12 @@ mod tests {
         assert_eq!(peak.rss_anon_kib, Some(700));
         assert_eq!(peak.rss_file_kib, Some(300));
         assert_eq!(peak.rss_shmem_kib, Some(100));
+        assert_eq!(peak.pss_kib, Some(800));
+        assert_eq!(peak.private_clean_kib, Some(50));
+        assert_eq!(peak.private_dirty_kib, Some(650));
+        assert_eq!(peak.shared_clean_kib, Some(250));
+        assert_eq!(peak.shared_dirty_kib, Some(50));
+        assert_eq!(peak.smaps_anonymous_kib, Some(675));
     }
 
     #[cfg(all(
