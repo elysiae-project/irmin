@@ -105,6 +105,14 @@ cargo bench --features benchmark
 
 `benches/sophon_bench.rs` measures the hot paths: manifest parsing, chunk scheduling, assembly, and HDiff patching. `src/bin/bench_memory.rs` samples peak RSS during installs. Enable the `sophon-profiling` cargo feature for jemalloc allocator stats.
 
+### Preinstall memory diagnostics
+
+Run `scripts/bench-preinstall-memory.sh [OUTPUT_DIR]` on Linux to capture the synthetic 4/64/256 MiB HDiff phase and full-preinstall cases, plus a cgroup-limited run. It writes `environment.txt`, six phase/standard JSON results, and one cgroup-limited JSON result. By default it creates a timestamped directory under `/tmp/opencode` when available, otherwise under `/tmp`; a supplied output directory must be absent or empty. The script records the kernel, CPU, filesystem, cgroup, swap, Git revision, worktree cleanliness, and lockfile checksum, but does not collect environment variables or real game data. It uses disk-backed fixtures; the cgroup case also requires a usable cgroup v2 hierarchy and `systemd-run --user --scope` access. Set `CGROUP_MEMORY_MAX_MIB` to change the cgroup run's limit.
+
+These fixtures are diagnostic, not representative. Interpret `allocator_net_live_growth_peak_bytes` as requested heap growth, not RSS. `sampled_max_rss_anon_kib` and `sampled_max_rss_file_kib` split process RSS; sampled PSS and private/shared `smaps_rollup` fields are collected sequentially at RSS high-water samples, not atomically. Under a cgroup limit, `memory.current`, `memory.peak`, and `memory.stat` describe the whole cgroup; `memory.peak` is a cgroup-lifetime high-water, while `memory.stat` fields are boundary gauges/counters and their deltas can include setup or cleanup. File-backed RSS or cgroup charge is not by itself proof of an application heap leak, and reclaim pressure/PSI should be considered before calling it harmless.
+
+To investigate a reported preinstall peak, record what the “700 MB” metric means and which tool produced it, then rerun with the real or size-equivalent asset and capture the target kernel, filesystem, cgroup memory/swap limits, asset sizes and patch methods, concurrency, cache state, `memory.events`, PSI pressure, and whether the issue is OOM, latency, or only a dashboard reading. Without pressure and outcome data, the run cannot establish whether reclaim is harming the workload. Avoid changing mmap or page-cache policy from synthetic results alone.
+
 ## License
 
 BSD-3-Clause. The Elysiae Project.
