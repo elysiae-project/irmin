@@ -2020,7 +2020,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
     );
     result.insert(
         "cgroup_memory_snapshot_note".to_owned(),
-        serde_json::json!("Snapshots and signed deltas are optional cgroup-boundary observations: memory.current and byte-valued memory.stat entries are gauges, while pgmajfault and workingset_refault_file are counters. Gauges may decrease; stat updates can be batched by the kernel. Endpoint deltas can include cleanup and are not reclaim or peak attribution. memory.peak is the raw cgroup high-water since cgroup creation."),
+        serde_json::json!("These optional readings are cgroup-wide boundary snapshots, not process-only values. memory.current and memory.peak are reported as snapshot values; signed endpoint deltas apply to selected memory.stat fields. Byte-valued memory.stat gauges can decrease; memory.stat updates, including counters, can be batched. pgmajfault and workingset_refault_file are counters. Endpoint deltas can include cleanup and are not reclaim or peak attribution. memory.peak is the raw cgroup high-water since cgroup creation."),
     );
     result.insert(
         "allocator".to_owned(),
