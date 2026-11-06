@@ -71,6 +71,7 @@ struct Config {
     source_backend: SourceBackend,
     window_size_bytes: usize,
     cover_pattern: CoverPattern,
+    fixture_backing: FixtureBacking,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -108,6 +109,38 @@ enum SourceBackend {
     Mmap,
     File,
     Windowed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FixtureBacking {
+    #[default]
+    Tempfile,
+    Disk,
+}
+
+impl FixtureBacking {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "tempfile" => Ok(Self::Tempfile),
+            "disk" => Ok(Self::Disk),
+            _ => Err(format!(
+                "unknown fixture backing '{value}'; expected tempfile or disk"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tempfile => "tempfile",
+            Self::Disk => "disk",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FilesystemInfo {
+    magic: u64,
+    name: &'static str,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -459,10 +492,7 @@ fn run_cli() -> Result<(), String> {
     }
 
     let config = parse_args(&args)?;
-    let workdir = tempfile::Builder::new()
-        .prefix("irmin-memory-bench-")
-        .tempdir()
-        .map_err(|error| error.to_string())?;
+    let (workdir, filesystem_info) = create_benchmark_workdir(config.fixture_backing)?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut results = Vec::with_capacity(config.repeat);
 
@@ -493,6 +523,12 @@ fn run_cli() -> Result<(), String> {
             .arg(config.chunks.to_string())
             .arg(server_url)
             .arg(config.cover_pattern.name())
+            .arg(config.fixture_backing.name())
+            .arg(
+                filesystem_info
+                    .map(|info| format!("{:x}", info.magic))
+                    .unwrap_or_default(),
+            )
             .arg(match config.source_backend {
                 SourceBackend::Mmap => "mmap".to_owned(),
                 SourceBackend::File => "file".to_owned(),
@@ -526,6 +562,116 @@ fn run_cli() -> Result<(), String> {
     Ok(())
 }
 
+fn create_benchmark_workdir(
+    backing: FixtureBacking,
+) -> Result<(tempfile::TempDir, Option<FilesystemInfo>), String> {
+    match backing {
+        FixtureBacking::Tempfile => {
+            let workdir = tempfile::Builder::new()
+                .prefix("irmin-memory-bench-")
+                .tempdir()
+                .map_err(|error| error.to_string())?;
+            let filesystem = filesystem_info(workdir.path())?;
+            Ok((workdir, Some(filesystem)))
+        }
+        FixtureBacking::Disk => {
+            #[cfg(target_os = "linux")]
+            {
+                let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("target"));
+                let root = if target_dir.is_absolute() {
+                    target_dir.join("bench-memory")
+                } else {
+                    std::env::current_dir()
+                        .map_err(|error| error.to_string())?
+                        .join(target_dir)
+                        .join("bench-memory")
+                };
+                fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+                let workdir = tempfile::Builder::new()
+                    .prefix("irmin-memory-bench-")
+                    .tempdir_in(&root)
+                    .map_err(|error| error.to_string())?;
+                let filesystem = filesystem_info(workdir.path())?;
+                if is_memory_backed_filesystem(filesystem.magic) {
+                    return Err(format!(
+                        "disk-backed fixture requested, but {} is on {} (0x{:x})",
+                        workdir.path().display(),
+                        filesystem.name,
+                        filesystem.magic
+                    ));
+                }
+                Ok((workdir, Some(filesystem)))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err("disk-backed fixture checks require Linux".to_owned())
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const TMPFS_MAGIC: u64 = 0x01021994;
+#[cfg(target_os = "linux")]
+const RAMFS_MAGIC: u64 = 0x858458f6;
+
+fn filesystem_info(path: &Path) -> Result<FilesystemInfo, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|error| error.to_string())?;
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        let result = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let stats = unsafe { stats.assume_init() };
+        let magic = stats.f_type as u64;
+        let name = filesystem_name_for_magic(magic);
+        Ok(FilesystemInfo { magic, name })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(FilesystemInfo {
+            magic: 0,
+            name: "unknown",
+        })
+    }
+}
+
+fn filesystem_name_for_magic(magic: u64) -> &'static str {
+    #[cfg(target_os = "linux")]
+    match magic {
+        TMPFS_MAGIC => "tmpfs",
+        RAMFS_MAGIC => "ramfs",
+        0xef53 => "ext",
+        0x58465342 => "xfs",
+        0x9123683e => "btrfs",
+        0x794c7630 => "overlayfs",
+        _ => "unknown",
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = magic;
+        "unknown"
+    }
+}
+
+fn is_memory_backed_filesystem(magic: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(magic, TMPFS_MAGIC | RAMFS_MAGIC)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = magic;
+        false
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut scenario = None;
     let mut size_mib = 64;
@@ -538,6 +684,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut window_size_bytes = 256 * 1024;
     let mut window_size_provided = false;
     let mut cover_pattern = CoverPattern::Sequential;
+    let mut fixture_backing = FixtureBacking::Tempfile;
     let mut index = 0;
 
     while index < args.len() {
@@ -596,6 +743,10 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 index += 1;
                 cover_pattern = CoverPattern::parse(value_at(args, index, option)?)?;
             }
+            "--fixture-backing" => {
+                index += 1;
+                fixture_backing = FixtureBacking::parse(value_at(args, index, option)?)?;
+            }
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
@@ -629,6 +780,9 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     if scenario == Scenario::SophonInstall && (size_mib * 1024 * 1024) % chunks != 0 {
         return Err("sophon-install size-mib must divide evenly into chunks".to_owned());
     }
+    if fixture_backing == FixtureBacking::Disk && scenario != Scenario::PreinstallApply {
+        return Err("--fixture-backing disk is only supported for preinstall-apply".to_owned());
+    }
     if source_backend == SourceBackend::Windowed && window_size_bytes > 64 * 1024 * 1024 {
         return Err("window size must not exceed 64 MiB".to_owned());
     }
@@ -643,6 +797,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         source_backend,
         window_size_bytes,
         cover_pattern,
+        fixture_backing,
     })
 }
 
@@ -663,19 +818,32 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 7 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL COVER_PATTERN SOURCE_BACKEND".to_owned());
+    if args.len() != 9 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
     let size_mib = parse_positive(&args[2], "--size-mib")?;
     let chunks = parse_positive(&args[3], "--chunks")?;
     let cover_pattern = CoverPattern::parse(&args[5])?;
-    let source_backend = args[6].as_str();
+    let fixture_backing = FixtureBacking::parse(&args[6])?;
+    let reported_fs_magic = if args[7].is_empty() {
+        None
+    } else {
+        Some(
+            u64::from_str_radix(&args[7], 16)
+                .map_err(|_| "invalid fixture filesystem magic".to_owned())?,
+        )
+    };
+    let source_backend = args[8].as_str();
+    let filesystem_info = filesystem_info(&fixture_dir)?;
+    if reported_fs_magic != Some(filesystem_info.magic) {
+        return Err("fixture filesystem changed between setup and child run".to_owned());
+    }
     let window_stats = Arc::new(WindowStats::default());
     let hdiff_source_backend = match source_backend {
         "mmap" => HDiffSourceBackend::Mmap,
@@ -727,7 +895,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
         any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
     ))]
     let jemalloc_end = jemalloc_snapshot();
-    let peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
+    let kernel_hwm_peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
+    let peak_rss_kib = kernel_hwm_peak_rss_kib.max(sampled_peak.vm_rss_kib);
     verify_output(verification)?;
     let mut result = serde_json::json!({
         "scenario": scenario.name(),
@@ -735,6 +904,10 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "representative": false,
         "asset_count": (scenario == Scenario::PreinstallApply).then_some(1),
         "cover_pattern": cover_pattern.name(),
+        "fixture_backing": fixture_backing.name(),
+        "fixture_fs_magic": format!("0x{:x}", filesystem_info.magic),
+        "fixture_fs_type": filesystem_info.name,
+        "fixture_cache_state": "warm",
         "source_backend": source_backend,
         "window_cache_hits": window_stats.hits.load(Ordering::Relaxed),
         "window_cache_misses": window_stats.misses.load(Ordering::Relaxed),
@@ -752,6 +925,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "baseline_rss_anon_kib": operation_baseline.rss_anon_kib,
         "baseline_rss_shmem_kib": operation_baseline.rss_shmem_kib,
         "peak_rss_kib": peak_rss_kib,
+        "kernel_hwm_peak_rss_kib": kernel_hwm_peak_rss_kib,
         "peak_delta_kib": peak_rss_kib.saturating_sub(if hwm_reset {
             operation_baseline.vm_rss_kib
         } else {
@@ -1432,6 +1606,76 @@ mod tests {
                 "reverse".into(),
             ])
             .is_ok()
+        );
+        let tempfile_default =
+            parse_args(&["--scenario".into(), "preinstall-apply".into()]).unwrap();
+        assert_eq!(tempfile_default.fixture_backing, FixtureBacking::Tempfile);
+        let disk = parse_args(&[
+            "--scenario".into(),
+            "preinstall-apply".into(),
+            "--fixture-backing".into(),
+            "disk".into(),
+        ])
+        .unwrap();
+        assert_eq!(disk.fixture_backing, FixtureBacking::Disk);
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--fixture-backing".into(),
+                "invalid".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--fixture-backing".into(),
+                "disk".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_classifier_identifies_memory_and_disk_filesystems() {
+        assert_eq!(filesystem_name_for_magic(TMPFS_MAGIC), "tmpfs");
+        assert_eq!(filesystem_name_for_magic(RAMFS_MAGIC), "ramfs");
+        assert_eq!(filesystem_name_for_magic(0xef53), "ext");
+        assert_eq!(filesystem_name_for_magic(0xdeadbeef), "unknown");
+        assert!(is_memory_backed_filesystem(TMPFS_MAGIC));
+        assert!(is_memory_backed_filesystem(RAMFS_MAGIC));
+        assert!(!is_memory_backed_filesystem(0xef53));
+        assert!(!is_memory_backed_filesystem(0x9123683e));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_workdir_rejects_memory_backed_target_when_present() {
+        match create_benchmark_workdir(FixtureBacking::Disk) {
+            Ok((workdir, Some(filesystem))) => {
+                assert!(!matches!(filesystem.magic, TMPFS_MAGIC | RAMFS_MAGIC));
+                assert!(workdir.path().exists());
+            }
+            Ok((_, None)) => panic!("disk workdir must report filesystem information"),
+            Err(error) if error.contains("on tmpfs") || error.contains("on ramfs") => {
+                eprintln!("skipping disk workdir assertion: {error}");
+            }
+            Err(error) => panic!("disk workdir setup failed unexpectedly: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tempfile_workdir_reports_actual_filesystem() {
+        let (workdir, filesystem) = create_benchmark_workdir(FixtureBacking::Tempfile).unwrap();
+        let filesystem = filesystem.expect("tempfile backing reports its filesystem");
+        assert!(workdir.path().exists());
+        assert_eq!(
+            filesystem_info(workdir.path()).unwrap().magic,
+            filesystem.magic
         );
     }
 
