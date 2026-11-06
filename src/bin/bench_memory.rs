@@ -1,6 +1,8 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -73,6 +75,7 @@ struct Config {
     cover_pattern: CoverPattern,
     fixture_backing: FixtureBacking,
     sweep_sizes_mib: Option<Vec<usize>>,
+    memory_max_mib: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,6 +189,31 @@ struct MemorySampler {
 struct CpuUsage {
     user_micros: u64,
     system_micros: u64,
+    minor_faults: u64,
+    major_faults: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct CgroupMemoryEvents {
+    low: u64,
+    high: u64,
+    max: u64,
+    oom: u64,
+    oom_kill: u64,
+    oom_group_kill: u64,
+}
+
+impl CgroupMemoryEvents {
+    fn delta(before: &Self, after: &Self) -> Self {
+        Self {
+            low: after.low.saturating_sub(before.low),
+            high: after.high.saturating_sub(before.high),
+            max: after.max.saturating_sub(before.max),
+            oom: after.oom.saturating_sub(before.oom),
+            oom_kill: after.oom_kill.saturating_sub(before.oom_kill),
+            oom_group_kill: after.oom_group_kill.saturating_sub(before.oom_group_kill),
+        }
+    }
 }
 
 impl MemorySampler {
@@ -537,14 +565,17 @@ fn run_child_once(
 ) -> Result<serde_json::Value, String> {
     let fixture_dir = workdir.join(format!("run-{run_index}"));
     fs::create_dir_all(&fixture_dir).map_err(|error| error.to_string())?;
-    prepare_fixture(
-        config.scenario,
-        &fixture_dir,
-        size_mib,
-        config.chunks,
-        config.cover_pattern,
-    )?;
-    let mut local_server = if config.scenario == Scenario::SophonInstall {
+    let prepare_in_child = config.memory_max_mib.is_some();
+    if !prepare_in_child {
+        prepare_fixture(
+            config.scenario,
+            &fixture_dir,
+            size_mib,
+            config.chunks,
+            config.cover_pattern,
+        )?;
+    }
+    let mut local_server = if !prepare_in_child && config.scenario == Scenario::SophonInstall {
         Some(LocalChunkServer::start(fixture_dir.clone())?)
     } else {
         None
@@ -553,29 +584,29 @@ fn run_child_once(
         .as_ref()
         .map(|server| server.base_url.clone())
         .unwrap_or_default();
-    let output = Command::new(executable)
-        .args(["--child", config.scenario.name()])
-        .arg(&fixture_dir)
-        .arg(size_mib.to_string())
-        .arg(config.chunks.to_string())
-        .arg(server_url)
-        .arg(config.cover_pattern.name())
-        .arg(config.fixture_backing.name())
-        .arg(
-            filesystem_info
-                .map(|info| format!("{:x}", info.magic))
-                .unwrap_or_default(),
-        )
-        .arg(match config.source_backend {
-            SourceBackend::Mmap => "mmap".to_owned(),
-            SourceBackend::File => "file".to_owned(),
-            SourceBackend::Windowed => format!("windowed:{}", config.window_size_bytes),
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|error| error.to_string())?;
+    let output = run_measured_child(
+        config,
+        executable,
+        &fixture_dir,
+        filesystem_info,
+        size_mib,
+        &server_url,
+        prepare_in_child,
+    )?;
     if !output.status.success() {
+        #[cfg(unix)]
+        if let Some(signal) = output.status.signal() {
+            let likely_oom = config.memory_max_mib.is_some() && signal == libc::SIGKILL;
+            return Err(format!(
+                "{} child terminated by signal {signal}{}",
+                config.scenario.name(),
+                if likely_oom {
+                    " under a memory limit (likely cgroup OOM)"
+                } else {
+                    ""
+                }
+            ));
+        }
         return Err(format!(
             "{} child failed: {}",
             config.scenario.name(),
@@ -589,6 +620,99 @@ fn run_child_once(
         server.stop();
     }
     Ok(result)
+}
+
+fn child_command_args(
+    config: &Config,
+    fixture_dir: &Path,
+    filesystem_info: Option<FilesystemInfo>,
+    size_mib: usize,
+    server_url: &str,
+    prepare_in_child: bool,
+) -> Vec<String> {
+    vec![
+        "--child".to_owned(),
+        config.scenario.name().to_owned(),
+        fixture_dir.to_string_lossy().into_owned(),
+        size_mib.to_string(),
+        config.chunks.to_string(),
+        server_url.to_owned(),
+        config.cover_pattern.name().to_owned(),
+        config.fixture_backing.name().to_owned(),
+        filesystem_info
+            .map(|info| format!("{:x}", info.magic))
+            .unwrap_or_default(),
+        match config.source_backend {
+            SourceBackend::Mmap => "mmap".to_owned(),
+            SourceBackend::File => "file".to_owned(),
+            SourceBackend::Windowed => format!("windowed:{}", config.window_size_bytes),
+        },
+        if prepare_in_child {
+            "prepare".to_owned()
+        } else {
+            "prepared".to_owned()
+        },
+    ]
+}
+
+fn run_measured_child(
+    config: &Config,
+    executable: &Path,
+    fixture_dir: &Path,
+    filesystem_info: Option<FilesystemInfo>,
+    size_mib: usize,
+    server_url: &str,
+    prepare_in_child: bool,
+) -> Result<std::process::Output, String> {
+    let child_args = child_command_args(
+        config,
+        fixture_dir,
+        filesystem_info,
+        size_mib,
+        server_url,
+        prepare_in_child,
+    );
+    let mut command = if let Some(memory_max_mib) = config.memory_max_mib {
+        #[cfg(target_os = "linux")]
+        {
+            let memory_max_bytes = memory_max_mib
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "memory limit is too large".to_owned())?;
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if page_size <= 0 {
+                return Err("failed to read system page size".to_owned());
+            }
+            let page_size = page_size as u64;
+            let memory_max_bytes = memory_max_bytes / page_size * page_size;
+            if memory_max_bytes == 0 {
+                return Err("memory limit is smaller than one system page".to_owned());
+            }
+            let memory_max_property = format!("--property=MemoryMax={memory_max_bytes}");
+            let mut command = Command::new("systemd-run");
+            command
+                .args(["--user", "--scope", "--quiet", &memory_max_property, "--"])
+                .arg(executable)
+                .args(&child_args)
+                .env("IRMIN_BENCH_MEMORY_MAX_BYTES", memory_max_bytes.to_string());
+            command
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = memory_max_mib;
+            return Err("memory-limited benchmark scopes require Linux systemd".to_owned());
+        }
+    } else {
+        let mut command = Command::new(executable);
+        command
+            .args(&child_args)
+            .env_remove("IRMIN_BENCH_MEMORY_MAX_BYTES");
+        command
+    };
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("failed to launch measured child: {error}"))
 }
 
 fn create_benchmark_workdir(
@@ -715,6 +839,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut cover_pattern = CoverPattern::Sequential;
     let mut fixture_backing = FixtureBacking::Tempfile;
     let mut sweep_sizes_mib = None;
+    let mut memory_max_mib = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -781,6 +906,11 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 index += 1;
                 sweep_sizes_mib = Some(parse_size_list(value_at(args, index, option)?)?);
             }
+            "--memory-max-mib" => {
+                index += 1;
+                memory_max_mib =
+                    Some(parse_positive(value_at(args, index, option)?, option)? as u64);
+            }
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
@@ -841,6 +971,19 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         {
             return Err("a sweep size is too large".to_owned());
         }
+        if memory_max_mib.is_some() && !cfg!(target_os = "linux") {
+            return Err("--memory-max-mib requires Linux".to_owned());
+        }
+        if memory_max_mib.is_some()
+            && cfg!(all(
+                unix,
+                any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+            ))
+        {
+            return Err("memory-limited sweep requires the system allocator".to_owned());
+        }
+    } else if memory_max_mib.is_some() {
+        return Err("--memory-max-mib requires --sweep-sizes-mib".to_owned());
     }
     if source_backend == SourceBackend::Windowed && window_size_bytes > 64 * 1024 * 1024 {
         return Err("window size must not exceed 64 MiB".to_owned());
@@ -858,6 +1001,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         cover_pattern,
         fixture_backing,
         sweep_sizes_mib,
+        memory_max_mib,
     })
 }
 
@@ -891,12 +1035,12 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 9 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND".to_owned());
+    if args.len() != 10 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
@@ -913,9 +1057,38 @@ fn run_child(args: &[String]) -> Result<(), String> {
         )
     };
     let source_backend = args[8].as_str();
+    let prepare_in_child = match args[9].as_str() {
+        "prepare" => true,
+        "prepared" => false,
+        _ => return Err("invalid child fixture preparation mode".to_owned()),
+    };
+    let expected_memory_max = std::env::var("IRMIN_BENCH_MEMORY_MAX_BYTES")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "invalid requested cgroup memory limit".to_owned())
+        })
+        .transpose()?;
+    let cgroup_memory_before_setup = if let Some(expected) = expected_memory_max {
+        let (actual, path) = read_cgroup_memory_limit()?;
+        if actual != expected {
+            return Err(format!(
+                "requested memory.max {expected} bytes but child cgroup reports {actual} bytes"
+            ));
+        }
+        let events = read_cgroup_memory_events(&path)?;
+        Some((actual, path, events))
+    } else {
+        None
+    };
     let filesystem_info = filesystem_info(&fixture_dir)?;
     if reported_fs_magic != Some(filesystem_info.magic) {
         return Err("fixture filesystem changed between setup and child run".to_owned());
+    }
+    if prepare_in_child {
+        prepare_fixture(scenario, &fixture_dir, size_mib, chunks, cover_pattern)?;
     }
     let window_stats = Arc::new(WindowStats::default());
     let hdiff_source_backend = match source_backend {
@@ -936,6 +1109,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
         _ => return Err("invalid child source backend".to_owned()),
     };
     let context = prepare_child_context(scenario, &fixture_dir, size_mib, chunks, &args[4])?;
+    let cgroup_events_after_setup = if let Some((_, path, _)) = &cgroup_memory_before_setup {
+        Some(read_cgroup_memory_events(path)?)
+    } else {
+        None
+    };
     let mut sampler = MemorySampler::start();
     thread::sleep(std::time::Duration::from_millis(5));
     let baseline = read_memory_snapshot()?;
@@ -952,6 +1130,23 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let elapsed_ms = started.elapsed().as_millis();
     let operation_end = read_memory_snapshot()?;
     let cpu_after = read_cpu_usage()?;
+    let cgroup_events_after_operation = if let Some((_, path, _)) = &cgroup_memory_before_setup {
+        Some(read_cgroup_memory_events(path)?)
+    } else {
+        None
+    };
+    let cgroup_setup_events = cgroup_memory_before_setup
+        .as_ref()
+        .zip(cgroup_events_after_setup.as_ref())
+        .map(|((_, _, before), after)| CgroupMemoryEvents::delta(before, after));
+    let cgroup_operation_events = cgroup_events_after_setup
+        .as_ref()
+        .zip(cgroup_events_after_operation.as_ref())
+        .map(|(before, after)| CgroupMemoryEvents::delta(before, after));
+    let cgroup_total_events = cgroup_memory_before_setup
+        .as_ref()
+        .zip(cgroup_events_after_operation.as_ref())
+        .map(|((_, _, before), after)| CgroupMemoryEvents::delta(before, after));
     let sampled_peak = sampler.finish();
     #[cfg(all(
         unix,
@@ -981,6 +1176,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "fixture_fs_magic": format!("0x{:x}", filesystem_info.magic),
         "fixture_fs_type": filesystem_info.name,
         "fixture_cache_state": "warm",
+        "fixture_prepared_inside_memory_limit": prepare_in_child,
         "source_backend": source_backend,
         "window_cache_hits": window_stats.hits.load(Ordering::Relaxed),
         "window_cache_misses": window_stats.misses.load(Ordering::Relaxed),
@@ -994,6 +1190,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "elapsed_ms": elapsed_ms,
         "user_cpu_ms": cpu_after.user_micros.saturating_sub(cpu_before.user_micros) / 1000,
         "system_cpu_ms": cpu_after.system_micros.saturating_sub(cpu_before.system_micros) / 1000,
+        "minor_faults": cpu_after.minor_faults.saturating_sub(cpu_before.minor_faults),
+        "major_faults": cpu_after.major_faults.saturating_sub(cpu_before.major_faults),
         "baseline_rss_kib": if hwm_reset { operation_baseline.vm_rss_kib } else { baseline.vm_rss_kib },
         "baseline_rss_anon_kib": operation_baseline.rss_anon_kib,
         "baseline_rss_shmem_kib": operation_baseline.rss_shmem_kib,
@@ -1027,6 +1225,27 @@ fn run_child(args: &[String]) -> Result<(), String> {
         } else {
             2
         }),
+    );
+    result.insert(
+        "cgroup_memory_max_bytes".to_owned(),
+        serde_json::to_value(
+            cgroup_memory_before_setup
+                .as_ref()
+                .map(|(limit, _, _)| *limit),
+        )
+        .unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_events_setup".to_owned(),
+        serde_json::to_value(cgroup_setup_events).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_events_operation".to_owned(),
+        serde_json::to_value(cgroup_operation_events).unwrap_or_default(),
+    );
+    result.insert(
+        "cgroup_memory_events_total".to_owned(),
+        serde_json::to_value(cgroup_total_events).unwrap_or_default(),
     );
     result.insert(
         "allocator".to_owned(),
@@ -1090,6 +1309,133 @@ fn reset_hwm() -> std::io::Result<()> {
     }
 }
 
+fn read_cgroup_memory_limit() -> Result<(u64, PathBuf), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let membership = fs::read_to_string("/proc/self/cgroup")
+            .map_err(|error| format!("failed reading cgroup membership: {error}"))?;
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .ok_or_else(|| "process is not in a unified cgroup v2 hierarchy".to_owned())?;
+        let membership_path = Path::new(relative);
+        if !membership_path.is_absolute()
+            || membership_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err("invalid cgroup v2 membership path".to_owned());
+        }
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|error| format!("failed reading cgroup mountinfo: {error}"))?;
+        let (mount_root, mount_point) = find_cgroup2_mount(&mountinfo, &membership_path)?;
+        let relative_to_mount = membership_path
+            .strip_prefix(&mount_root)
+            .map_err(|_| "cgroup membership is outside the mounted cgroup2 root".to_owned())?;
+        if relative_to_mount
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err("cgroup membership escapes the mounted cgroup2 root".to_owned());
+        }
+        let path = mount_point.join(relative_to_mount);
+        let value = fs::read_to_string(path.join("memory.max"))
+            .map_err(|error| format!("failed reading child cgroup memory.max: {error}"))?;
+        let limit = value.trim().parse::<u64>().map_err(|_| {
+            format!("child cgroup memory.max is not a finite byte limit: {value:?}")
+        })?;
+        Ok((limit, path))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("cgroup memory limits require Linux".to_owned())
+    }
+}
+
+fn read_cgroup_memory_events(path: &Path) -> Result<CgroupMemoryEvents, String> {
+    let contents = fs::read_to_string(path.join("memory.events"))
+        .map_err(|error| format!("failed reading cgroup memory.events: {error}"))?;
+    let mut events = CgroupMemoryEvents::default();
+    for line in contents.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next() else {
+            return Err(format!("malformed cgroup memory.events line: {line:?}"));
+        };
+        let value = value
+            .parse::<u64>()
+            .map_err(|_| format!("invalid cgroup memory.events counter: {line:?}"))?;
+        match key {
+            "low" => events.low = value,
+            "high" => events.high = value,
+            "max" => events.max = value,
+            "oom" => events.oom = value,
+            "oom_kill" => events.oom_kill = value,
+            "oom_group_kill" => events.oom_group_kill = value,
+            _ => {}
+        }
+    }
+    Ok(events)
+}
+
+#[cfg(target_os = "linux")]
+fn find_cgroup2_mount(
+    mountinfo: &str,
+    membership_path: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let mut selected: Option<(PathBuf, PathBuf)> = None;
+    for line in mountinfo.lines() {
+        let Some((before_separator, after_separator)) = line.split_once(" - ") else {
+            continue;
+        };
+        let before = before_separator.split_whitespace().collect::<Vec<_>>();
+        let after = after_separator.split_whitespace().collect::<Vec<_>>();
+        if after.first() != Some(&"cgroup2") || before.len() < 5 {
+            continue;
+        }
+        let root = unescape_mountinfo_path(before[3])?;
+        let mount_point = unescape_mountinfo_path(before[4])?;
+        let root = PathBuf::from(root);
+        if membership_path.strip_prefix(&root).is_ok()
+            && selected.as_ref().is_none_or(|(current_root, _)| {
+                root.components().count() > current_root.components().count()
+            })
+        {
+            selected = Some((root, PathBuf::from(mount_point)));
+        }
+    }
+    selected.ok_or_else(|| "no cgroup2 mount covers the process membership path".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo_path(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if index + 3 >= bytes.len()
+                || !bytes[index + 1..index + 4]
+                    .iter()
+                    .all(|digit| (b'0'..=b'7').contains(digit))
+            {
+                return Err("invalid escape in cgroup mountinfo path".to_owned());
+            }
+            let value = (bytes[index + 1] - b'0') * 64
+                + (bytes[index + 2] - b'0') * 8
+                + (bytes[index + 3] - b'0');
+            decoded.push(value);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|error| error.to_string())
+}
+
 fn read_cpu_usage() -> Result<CpuUsage, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1107,6 +1453,8 @@ fn read_cpu_usage() -> Result<CpuUsage, String> {
         Ok(CpuUsage {
             user_micros: timeval_micros(usage.ru_utime),
             system_micros: timeval_micros(usage.ru_stime),
+            minor_faults: usage.ru_minflt.max(0) as u64,
+            major_faults: usage.ru_majflt.max(0) as u64,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -1622,6 +1970,17 @@ fn report_size_sweep(
                 "median_sampled_peak_anon_kib": median("sampled_max_rss_anon_kib"),
                 "median_sampled_peak_file_kib": median("sampled_max_rss_file_kib"),
                 "median_sampled_peak_shmem_kib": median("sampled_max_rss_shmem_kib"),
+                "median_major_faults": median("major_faults"),
+                "median_operation_cgroup_max_events": median_nested_u64(
+                    runs,
+                    "cgroup_memory_events_operation",
+                    "max",
+                ),
+                "median_operation_cgroup_high_events": median_nested_u64(
+                    runs,
+                    "cgroup_memory_events_operation",
+                    "high",
+                ),
                 "runs": runs,
             })
         })
@@ -1646,6 +2005,7 @@ fn report_size_sweep(
         "notes": [
             "Warm-cache disk-backed synthetic measurements; not representative preinstall validation.",
             "RSS components come from a coherent sampled peak snapshot; fits are descriptive linear approximations.",
+            "Major/minor faults are process-wide; cgroup memory.events are split into setup, operation, and total deltas when memory-limited.",
         ],
     });
     if config.json {
@@ -1660,6 +2020,18 @@ fn median_optional_u64(runs: &[serde_json::Value], field: &str) -> Option<u64> {
     let mut values = runs
         .iter()
         .filter_map(|run| run.get(field).and_then(serde_json::Value::as_u64))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+
+fn median_nested_u64(runs: &[serde_json::Value], object: &str, field: &str) -> Option<u64> {
+    let mut values = runs
+        .iter()
+        .filter_map(|run| run.get(object)?.get(field)?.as_u64())
         .collect::<Vec<_>>();
     if values.is_empty() {
         return None;
@@ -1921,6 +2293,83 @@ mod tests {
         assert!((r_squared - 1.0).abs() < f64::EPSILON);
         assert!(linear_fit(&[(16.0, 1.0)]).is_none());
         assert!(linear_fit(&[(16.0, 1.0), (16.0, 2.0)]).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup2_mountinfo_resolves_namespace_root_and_escaped_mountpoint() {
+        let mountinfo = "33 22 0:29 /user.slice/user-1000.slice /sys/fs/cgroup/user.slice rw,nosuid - cgroup2 cgroup rw";
+        let membership =
+            Path::new("/user.slice/user-1000.slice/user@1000.service/app.slice/test.scope");
+        let (root, point) = find_cgroup2_mount(mountinfo, membership).unwrap();
+        assert_eq!(root, PathBuf::from("/user.slice/user-1000.slice"));
+        assert_eq!(point, PathBuf::from("/sys/fs/cgroup/user.slice"));
+
+        let escaped = "33 22 0:29 / /sys/fs/cgroup/my\\040cg rw,nosuid - cgroup2 cgroup rw";
+        let (root, point) = find_cgroup2_mount(escaped, Path::new("/child.scope")).unwrap();
+        assert_eq!(root, PathBuf::from("/"));
+        assert_eq!(point, PathBuf::from("/sys/fs/cgroup/my cg"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup2_mountinfo_prefers_most_specific_covering_mount() {
+        let mountinfo = concat!(
+            "31 22 0:29 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+            "33 22 0:29 /user.slice /sys/fs/cgroup/user.slice rw - cgroup2 cgroup rw\n",
+        );
+        let membership = Path::new("/user.slice/user-1000.slice/test.scope");
+        let (root, point) = find_cgroup2_mount(mountinfo, membership).unwrap();
+        assert_eq!(root, PathBuf::from("/user.slice"));
+        assert_eq!(point, PathBuf::from("/sys/fs/cgroup/user.slice"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup2_mountinfo_rejects_invalid_escapes() {
+        let mountinfo = "33 22 0:29 / /sys/fs/cgroup/my\\999 cg rw,nosuid - cgroup2 cgroup rw";
+        assert!(find_cgroup2_mount(mountinfo, Path::new("/child.scope")).is_err());
+    }
+
+    #[test]
+    fn cgroup_memory_event_deltas_track_limit_pressure() {
+        let before = CgroupMemoryEvents {
+            low: 1,
+            high: 2,
+            max: 3,
+            oom: 4,
+            oom_kill: 5,
+            oom_group_kill: 6,
+        };
+        let after = CgroupMemoryEvents {
+            low: 1,
+            high: 4,
+            max: 7,
+            oom: 4,
+            oom_kill: 6,
+            oom_group_kill: 6,
+        };
+        let delta = CgroupMemoryEvents::delta(&before, &after);
+        assert_eq!(delta.high, 2);
+        assert_eq!(delta.max, 4);
+        assert_eq!(delta.oom, 0);
+        assert_eq!(delta.oom_kill, 1);
+    }
+
+    #[test]
+    fn parses_cgroup_memory_events_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("memory.events"),
+            "low 0\nhigh 4\nmax 7\noom 2\noom_kill 1\n",
+        )
+        .unwrap();
+        let events = read_cgroup_memory_events(dir.path()).unwrap();
+        assert_eq!(events.high, 4);
+        assert_eq!(events.max, 7);
+        assert_eq!(events.oom, 2);
+        assert_eq!(events.oom_kill, 1);
+        assert_eq!(events.oom_group_kill, 0);
     }
 
     #[test]
