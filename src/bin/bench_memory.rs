@@ -119,9 +119,32 @@ struct MemorySnapshot {
     rss_shmem_kib: Option<u64>,
 }
 
+#[cfg(all(
+    unix,
+    any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct JemallocSnapshot {
+    allocated_bytes: u64,
+    active_bytes: u64,
+    resident_bytes: u64,
+    mapped_bytes: u64,
+    retained_bytes: u64,
+}
+
 struct MemorySampler {
     stop: Arc<AtomicBool>,
     peak: Arc<std::sync::Mutex<MemorySnapshot>>,
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    jemalloc_peak: Arc<std::sync::Mutex<JemallocSnapshot>>,
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    jemalloc_sampled: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -137,6 +160,26 @@ impl MemorySampler {
         let peak = Arc::new(std::sync::Mutex::new(MemorySnapshot::default()));
         let thread_stop = Arc::clone(&stop);
         let thread_peak = Arc::clone(&peak);
+        #[cfg(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        ))]
+        let jemalloc_peak = Arc::new(std::sync::Mutex::new(JemallocSnapshot::default()));
+        #[cfg(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        ))]
+        let thread_jemalloc_peak = Arc::clone(&jemalloc_peak);
+        #[cfg(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        ))]
+        let jemalloc_sampled = Arc::new(AtomicBool::new(false));
+        #[cfg(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        ))]
+        let thread_jemalloc_sampled = Arc::clone(&jemalloc_sampled);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 if let Ok(snapshot) = read_memory_snapshot()
@@ -144,17 +187,56 @@ impl MemorySampler {
                 {
                     update_memory_peak(&mut current_peak, snapshot);
                 }
-                thread::sleep(std::time::Duration::from_millis(2));
+                #[cfg(all(
+                    unix,
+                    any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+                ))]
+                if let Some(snapshot) = jemalloc_snapshot()
+                    && let Ok(mut current_peak) = thread_jemalloc_peak.lock()
+                {
+                    update_jemalloc_peak(&mut current_peak, snapshot);
+                    thread_jemalloc_sampled.store(true, Ordering::Release);
+                }
+                thread::sleep(std::time::Duration::from_millis(
+                    if cfg!(all(
+                        unix,
+                        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+                    )) {
+                        10
+                    } else {
+                        2
+                    },
+                ));
             }
             if let Ok(snapshot) = read_memory_snapshot()
                 && let Ok(mut current_peak) = thread_peak.lock()
             {
                 update_memory_peak(&mut current_peak, snapshot);
             }
+            #[cfg(all(
+                unix,
+                any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+            ))]
+            if let Some(snapshot) = jemalloc_snapshot()
+                && let Ok(mut current_peak) = thread_jemalloc_peak.lock()
+            {
+                update_jemalloc_peak(&mut current_peak, snapshot);
+                thread_jemalloc_sampled.store(true, Ordering::Release);
+            }
         });
         Self {
             stop,
             peak,
+            #[cfg(all(
+                unix,
+                any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+            ))]
+            jemalloc_peak,
+            #[cfg(all(
+                unix,
+                any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+            ))]
+            jemalloc_sampled,
             thread: Some(thread),
         }
     }
@@ -169,10 +251,54 @@ impl MemorySampler {
             .map(|snapshot| snapshot.clone())
             .unwrap_or_default()
     }
+
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    fn jemalloc_peak(&self) -> JemallocSnapshot {
+        self.jemalloc_peak
+            .lock()
+            .map(|snapshot| *snapshot)
+            .unwrap_or_default()
+    }
+
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    fn has_jemalloc_sample(&self) -> bool {
+        self.jemalloc_sampled.load(Ordering::Acquire)
+    }
 }
 
 fn update_memory_peak(peak: &mut MemorySnapshot, current: MemorySnapshot) {
     if current.vm_rss_kib > peak.vm_rss_kib {
+        *peak = current;
+    }
+}
+
+#[cfg(all(
+    unix,
+    any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+))]
+fn jemalloc_snapshot() -> Option<JemallocSnapshot> {
+    tikv_jemalloc_ctl::epoch::advance().ok()?;
+    Some(JemallocSnapshot {
+        allocated_bytes: tikv_jemalloc_ctl::stats::allocated::read().ok()? as u64,
+        active_bytes: tikv_jemalloc_ctl::stats::active::read().ok()? as u64,
+        resident_bytes: tikv_jemalloc_ctl::stats::resident::read().ok()? as u64,
+        mapped_bytes: tikv_jemalloc_ctl::stats::mapped::read().ok()? as u64,
+        retained_bytes: tikv_jemalloc_ctl::stats::retained::read().ok()? as u64,
+    })
+}
+
+#[cfg(all(
+    unix,
+    any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+))]
+fn update_jemalloc_peak(peak: &mut JemallocSnapshot, current: JemallocSnapshot) {
+    if current.allocated_bytes > peak.allocated_bytes {
         *peak = current;
     }
 }
@@ -574,6 +700,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let baseline = read_memory_snapshot()?;
     let hwm_reset = reset_hwm().is_ok();
     let operation_baseline = read_memory_snapshot()?;
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    let jemalloc_baseline = jemalloc_snapshot();
     let cpu_before = read_cpu_usage()?;
     let started = Instant::now();
     let verification = run_operation(context, hdiff_source_backend)?;
@@ -581,50 +712,120 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let operation_end = read_memory_snapshot()?;
     let cpu_after = read_cpu_usage()?;
     let sampled_peak = sampler.finish();
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    let jemalloc_sampled_peak = sampler.jemalloc_peak();
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    let jemalloc_peak_available = sampler.has_jemalloc_sample();
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    let jemalloc_end = jemalloc_snapshot();
     let peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
     verify_output(verification)?;
-    println!(
-        "{}",
-        serde_json::json!({
-            "scenario": scenario.name(),
-            "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
-            "representative": false,
-            "asset_count": (scenario == Scenario::PreinstallApply).then_some(1),
-            "cover_pattern": cover_pattern.name(),
-            "source_backend": source_backend,
-            "window_cache_hits": window_stats.hits.load(Ordering::Relaxed),
-            "window_cache_misses": window_stats.misses.load(Ordering::Relaxed),
-            "window_cache_bytes_read": window_stats.bytes_read.load(Ordering::Relaxed),
-            "size_mib": size_mib,
-            "chunks": if matches!(scenario, Scenario::Assembly | Scenario::SophonInstall) {
-                Some(chunks)
-            } else {
-                None
-            },
-            "elapsed_ms": elapsed_ms,
-            "user_cpu_ms": cpu_after.user_micros.saturating_sub(cpu_before.user_micros) / 1000,
-            "system_cpu_ms": cpu_after.system_micros.saturating_sub(cpu_before.system_micros) / 1000,
-            "baseline_rss_kib": if hwm_reset { operation_baseline.vm_rss_kib } else { baseline.vm_rss_kib },
-            "peak_rss_kib": peak_rss_kib,
-            "peak_delta_kib": peak_rss_kib.saturating_sub(if hwm_reset {
-                operation_baseline.vm_rss_kib
-            } else {
-                baseline.vm_rss_kib
-            }),
-            "operation_end_rss_anon_kib": operation_end.rss_anon_kib,
-            "operation_end_rss_file_kib": operation_end.rss_file_kib,
-            "operation_end_rss_shmem_kib": operation_end.rss_shmem_kib,
-            "sampled_max_vm_rss_kib": sampled_peak.vm_rss_kib,
-            "sampled_max_rss_anon_kib": sampled_peak.rss_anon_kib,
-            "sampled_max_rss_file_kib": sampled_peak.rss_file_kib,
-            "sampled_max_rss_shmem_kib": sampled_peak.rss_shmem_kib,
-            "sampling_interval_ms": 2,
-            "cpu_scope": "process_including_sampler",
-            "sampled_peak_is_coherent_snapshot": true,
-            "hwm_reset": hwm_reset,
-            "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
-        })
+    let mut result = serde_json::json!({
+        "scenario": scenario.name(),
+        "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
+        "representative": false,
+        "asset_count": (scenario == Scenario::PreinstallApply).then_some(1),
+        "cover_pattern": cover_pattern.name(),
+        "source_backend": source_backend,
+        "window_cache_hits": window_stats.hits.load(Ordering::Relaxed),
+        "window_cache_misses": window_stats.misses.load(Ordering::Relaxed),
+        "window_cache_bytes_read": window_stats.bytes_read.load(Ordering::Relaxed),
+        "size_mib": size_mib,
+        "chunks": if matches!(scenario, Scenario::Assembly | Scenario::SophonInstall) {
+            Some(chunks)
+        } else {
+            None
+        },
+        "elapsed_ms": elapsed_ms,
+        "user_cpu_ms": cpu_after.user_micros.saturating_sub(cpu_before.user_micros) / 1000,
+        "system_cpu_ms": cpu_after.system_micros.saturating_sub(cpu_before.system_micros) / 1000,
+        "baseline_rss_kib": if hwm_reset { operation_baseline.vm_rss_kib } else { baseline.vm_rss_kib },
+        "baseline_rss_anon_kib": operation_baseline.rss_anon_kib,
+        "baseline_rss_shmem_kib": operation_baseline.rss_shmem_kib,
+        "peak_rss_kib": peak_rss_kib,
+        "peak_delta_kib": peak_rss_kib.saturating_sub(if hwm_reset {
+            operation_baseline.vm_rss_kib
+        } else {
+            baseline.vm_rss_kib
+        }),
+        "operation_end_rss_anon_kib": operation_end.rss_anon_kib,
+        "operation_end_rss_file_kib": operation_end.rss_file_kib,
+        "operation_end_rss_shmem_kib": operation_end.rss_shmem_kib,
+        "sampled_max_vm_rss_kib": sampled_peak.vm_rss_kib,
+        "sampled_max_rss_anon_kib": sampled_peak.rss_anon_kib,
+        "sampled_max_rss_file_kib": sampled_peak.rss_file_kib,
+        "sampled_max_rss_shmem_kib": sampled_peak.rss_shmem_kib,
+        "cpu_scope": "process_including_sampler",
+        "sampled_peak_is_coherent_snapshot": true,
+        "hwm_reset": hwm_reset,
+        "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
+    });
+    let result = result.as_object_mut().unwrap();
+    result.insert(
+        "sampling_interval_ms".to_owned(),
+        serde_json::json!(if cfg!(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        )) {
+            10
+        } else {
+            2
+        }),
     );
+    result.insert(
+        "allocator".to_owned(),
+        serde_json::json!(if cfg!(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        )) {
+            "jemalloc-instrumented"
+        } else {
+            "system"
+        }),
+    );
+    result.insert(
+        "jemalloc_sampled_peak_is_approximate".to_owned(),
+        serde_json::json!(cfg!(all(
+            unix,
+            any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+        ))),
+    );
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    {
+        result.insert(
+            "jemalloc_sampled_peak_available".to_owned(),
+            serde_json::json!(jemalloc_peak_available),
+        );
+        result.insert(
+            "jemalloc_baseline".to_owned(),
+            serde_json::to_value(jemalloc_baseline).unwrap_or_default(),
+        );
+        result.insert(
+            "jemalloc_end".to_owned(),
+            serde_json::to_value(jemalloc_end).unwrap_or_default(),
+        );
+        result.insert(
+            "jemalloc_sampled_peak".to_owned(),
+            if jemalloc_peak_available {
+                serde_json::to_value(jemalloc_sampled_peak).unwrap_or_default()
+            } else {
+                serde_json::Value::Null
+            },
+        );
+    }
+    println!("{}", serde_json::to_string(result).unwrap());
     Ok(())
 }
 
@@ -1273,6 +1474,41 @@ mod tests {
         assert_eq!(peak.rss_anon_kib, Some(700));
         assert_eq!(peak.rss_file_kib, Some(300));
         assert_eq!(peak.rss_shmem_kib, Some(100));
+    }
+
+    #[cfg(all(
+        unix,
+        any(feature = "benchmark-jemalloc", feature = "sophon-profiling")
+    ))]
+    #[test]
+    fn jemalloc_peak_keeps_coherent_snapshot_with_highest_allocation() {
+        let mut peak = JemallocSnapshot::default();
+        update_jemalloc_peak(
+            &mut peak,
+            JemallocSnapshot {
+                allocated_bytes: 100,
+                active_bytes: 120,
+                resident_bytes: 140,
+                mapped_bytes: 160,
+                retained_bytes: 180,
+            },
+        );
+        update_jemalloc_peak(
+            &mut peak,
+            JemallocSnapshot {
+                allocated_bytes: 90,
+                active_bytes: 300,
+                resident_bytes: 400,
+                mapped_bytes: 500,
+                retained_bytes: 600,
+            },
+        );
+
+        assert_eq!(peak.allocated_bytes, 100);
+        assert_eq!(peak.active_bytes, 120);
+        assert_eq!(peak.resident_bytes, 140);
+        assert_eq!(peak.mapped_bytes, 160);
+        assert_eq!(peak.retained_bytes, 180);
     }
 
     #[test]

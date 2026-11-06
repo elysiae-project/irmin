@@ -52,7 +52,10 @@ pub use types::DownloadType;
 /// Summary of a resumable operation.
 pub use types::ResumeInfo;
 
-/// Global allocator. Enabled under `sophon-profiling` for jemalloc stats.
-#[cfg(all(unix, feature = "sophon-profiling"))]
+/// Global allocator used by jemalloc profiling and benchmark builds.
+#[cfg(all(
+    unix,
+    any(feature = "sophon-profiling", feature = "benchmark-jemalloc")
+))]
 #[global_allocator]
 static GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
