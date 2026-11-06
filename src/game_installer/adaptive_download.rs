@@ -4,8 +4,8 @@
 //! throughput is still increasing. Stops scaling when bandwidth saturates
 //! or the ceiling is reached. Workers die naturally when the queue empties.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Initial number of download workers.
@@ -58,7 +58,7 @@ impl AdaptiveDownload {
         let now = now_nanos();
         let prev_time = self.last_time.load(Ordering::Relaxed);
         let elapsed_ns = now.saturating_sub(prev_time);
-        if elapsed_ns < (MEASURE_INTERVAL_MS as u64) * 1_000_000 {
+        if elapsed_ns < MEASURE_INTERVAL_MS * 1_000_000 {
             return None;
         }
 
@@ -104,6 +104,12 @@ impl AdaptiveDownload {
         }
 
         None
+    }
+}
+
+impl Default for AdaptiveDownload {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -1391,10 +1391,10 @@ fn notify_eager_file_complete(
             // Flush output data to disk before marking bitmap — prevents
             // corruption if power is lost before kernel writeback.
             // Skip in non-Full mode: crash-resume is disabled.
-            if ctx.verify_mode == super::VerifyMode::Full {
-                if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
-                    let _ = handle.sync_data();
-                }
+            if ctx.verify_mode == super::VerifyMode::Full
+                && let Some(handle) = ctx.output_allocator.get_handle(file_idx)
+            {
+                let _ = handle.sync_data();
             }
             // Close the cached output FD.
             ctx.output_allocator.close_file(file_idx);

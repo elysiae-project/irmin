@@ -1127,17 +1127,7 @@ async fn process_preinstall_chunk(
 
     let chunk_path = ctx.chunks_dir.join(&chunk_info.patch_name);
 
-    download_patch_chunk_with_retries(
-        &ctx.client,
-        diff_download,
-        &chunk_info.patch_name,
-        &chunk_path,
-        &chunk_info.patch_md5,
-        super::MAX_RETRIES,
-        &ctx.handle,
-        &ctx.downloaded_bytes,
-    )
-    .await?;
+    download_patch_chunk_with_retries(&chunk_info, ctx, diff_download, &chunk_path).await?;
 
     let actual = fs::metadata(&chunk_path)?.len();
     if actual != chunk_info.patch_size {
@@ -1260,7 +1250,7 @@ pub async fn preinstall_download(
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
         let map = Arc::clone(&chunk_bytes_map);
         let upd = Arc::clone(&updater);
-        let futures = plan.unique_chunks.iter().cloned().map(|chunk| {
+        let futures = plan.unique_chunks.iter().map(|chunk| {
             let permit = Arc::clone(&semaphore);
             let checked = Arc::clone(&checked_arc);
             let offset = Arc::clone(&resume_offset_arc);
@@ -1268,16 +1258,19 @@ pub async fn preinstall_download(
             let upd = Arc::clone(&upd);
             let last_emit = Arc::clone(&last_check_emit);
             let chunks_dir = chunks_dir.clone();
+            let patch_name = chunk.patch_name.clone();
+            let patch_md5 = chunk.patch_md5.clone();
+            let patch_size = chunk.patch_size;
             async move {
                 let _permit = permit.acquire().await.expect("semaphore not closed");
-                let path = chunks_dir.join(&chunk.patch_name);
+                let path = chunks_dir.join(&patch_name);
                 let ok = tokio::task::spawn_blocking(move || {
-                    is_file_already_patched(&path, chunk.patch_size, &chunk.patch_md5)
+                    is_file_already_patched(&path, patch_size, &patch_md5)
                 })
                 .await?;
                 if ok {
-                    map.insert(chunk.patch_name.clone(), chunk.patch_size);
-                    offset.fetch_add(chunk.patch_size, Ordering::Relaxed);
+                    map.insert(patch_name.clone(), patch_size);
+                    offset.fetch_add(patch_size, Ordering::Relaxed);
                 }
                 let checked = checked.fetch_add(1, Ordering::Relaxed) + 1;
                 // Emit by elapsed time (not a fixed file multiple) so the bar
@@ -1601,43 +1594,52 @@ pub async fn preinstall_download(
 }
 
 async fn download_patch_chunk_with_retries(
-    client: &Client,
+    chunk_info: &PatchChunkInfo,
+    ctx: &PreinstallWorkerCtx,
     diff_download: &DownloadInfo,
-    patch_name: &str,
     dest: &Path,
-    expected_md5: &str,
-    max_retries: u32,
-    handle: &DownloadHandle,
-    progress: &Arc<AtomicU64>,
 ) -> SophonResult<()> {
-    validate_patch_name(patch_name)?;
-    let url = diff_download.url_for(patch_name);
+    validate_patch_name(&chunk_info.patch_name)?;
+    let url = diff_download.url_for(&chunk_info.patch_name);
     let mut last_err = String::new();
 
-    for attempt in 0..max_retries {
-        if handle.is_cancelled() {
+    for attempt in 0..super::MAX_RETRIES {
+        if ctx.handle.is_cancelled() {
             return Err(SophonError::Cancelled);
         }
-        match download_patch_chunk_inner(client, &url, dest, expected_md5, handle, progress).await {
+        match download_patch_chunk_inner(
+            &ctx.client,
+            &url,
+            dest,
+            &chunk_info.patch_md5,
+            &ctx.handle,
+            &ctx.downloaded_bytes,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = err.to_string();
                 if !err.is_retryable() {
                     return Err(err);
                 }
-                if attempt < max_retries - 1 {
+                if attempt < super::MAX_RETRIES - 1 {
                     log::warn!(
                         "Patch chunk {patch_name} failed (attempt {attempt_num}/{max_retries}): {last_err}",
+                        patch_name = chunk_info.patch_name,
                         attempt_num = attempt + 1,
+                        max_retries = super::MAX_RETRIES,
                     );
                     let delay = retry_delay(attempt);
-                    if cancelable_sleep(handle, delay).await.is_err() {
+                    if cancelable_sleep(&ctx.handle, delay).await.is_err() {
                         return Err(SophonError::Cancelled);
                     }
                 } else {
                     log::warn!(
                         "Patch chunk {patch_name} failed (final attempt {attempt_num}/{max_retries}): {last_err}",
+                        patch_name = chunk_info.patch_name,
                         attempt_num = attempt + 1,
+                        max_retries = super::MAX_RETRIES,
                     );
                 }
             }
@@ -1645,8 +1647,8 @@ async fn download_patch_chunk_with_retries(
     }
 
     Err(SophonError::DownloadFailed {
-        chunk: patch_name.to_string(),
-        attempts: max_retries,
+        chunk: chunk_info.patch_name.clone(),
+        attempts: super::MAX_RETRIES,
         error: last_err,
     })
 }
@@ -1778,12 +1780,12 @@ async fn download_patch_chunk_inner(
                         actual: total_len,
                     });
                 }
-                if let Some(ref mut h) = hasher {
-                    if let Err(e) = h.update(&bytes) {
-                        progress.fetch_sub(total_len, Ordering::Relaxed);
-                        let _ = tokio::fs::remove_file(dest).await;
-                        return Err(e.into());
-                    }
+                if let Some(ref mut h) = hasher
+                    && let Err(e) = h.update(&bytes)
+                {
+                    progress.fetch_sub(total_len, Ordering::Relaxed);
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(e.into());
                 }
                 if let Err(e) = file.write_all(&bytes).await {
                     progress.fetch_sub(total_len, Ordering::Relaxed);

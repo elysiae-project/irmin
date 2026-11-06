@@ -109,6 +109,8 @@ fn get_available_space(path: &Path) -> Option<u64> {
     if ret != 0 {
         return None;
     }
+    // statvfs field widths differ across Unix targets.
+    #[allow(clippy::unnecessary_cast)]
     let space = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
     SPACE_CACHE.with(|cell| *cell.borrow_mut() = Some((Instant::now(), space, cpath)));
     Some(space)
