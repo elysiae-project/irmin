@@ -162,6 +162,18 @@ mod allocation_stats {
         }
     }
 
+    pub(super) fn current_live_growth() -> Result<Option<u64>, &'static str> {
+        let _window_guard = FlagGuard::acquire(&ALLOCATION_WINDOW_LOCK);
+        let _peak_guard = FlagGuard::acquire(&PEAK_LOCK);
+        if !OPERATION_ACTIVE.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let baseline = OPERATION_BASELINE_BYTES.load(Ordering::Relaxed);
+        Ok(Some(
+            LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(baseline),
+        ))
+    }
+
     impl Drop for AllocationWindow {
         fn drop(&mut self) {
             if self.active {
@@ -273,6 +285,7 @@ struct Config {
     scenario: Scenario,
     size_mib: usize,
     chunks: usize,
+    asset_count: usize,
     repeat: usize,
     budget_mib: Option<u64>,
     json: bool,
@@ -621,7 +634,7 @@ struct InstallContext {
 }
 
 struct PreinstallApplyContext {
-    game_dir: PathBuf,
+    game_dirs: Vec<PathBuf>,
     expected_path: PathBuf,
     expected_size: usize,
     runtime: tokio::runtime::Runtime,
@@ -632,8 +645,10 @@ enum Verification {
     Hdiff(PathBuf),
     FileCompare {
         expected: PathBuf,
-        actual: PathBuf,
+        actuals: Vec<PathBuf>,
         size: usize,
+        #[cfg(feature = "bench-alloc-stats")]
+        asset_heap_live_growth_bytes: Vec<u64>,
     },
     Assembly {
         expected: PathBuf,
@@ -889,6 +904,7 @@ fn child_command_args(
         fixture_dir.to_string_lossy().into_owned(),
         size_mib.to_string(),
         config.chunks.to_string(),
+        config.asset_count.to_string(),
         server_url.to_owned(),
         config.cover_pattern.name().to_owned(),
         config.fixture_backing.name().to_owned(),
@@ -1082,6 +1098,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut scenario = None;
     let mut size_mib = 64;
     let mut chunks = 8;
+    let mut asset_count = 1;
     let mut repeat = 3;
     let mut budget_mib = None;
     let mut json = false;
@@ -1110,6 +1127,10 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--chunks" => {
                 index += 1;
                 chunks = parse_positive(value_at(args, index, option)?, option)?;
+            }
+            "--asset-count" => {
+                index += 1;
+                asset_count = parse_positive(value_at(args, index, option)?, option)?;
             }
             "--repeat" => {
                 index += 1;
@@ -1177,6 +1198,12 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err(
             "--source-backend overrides are only supported for the hdiff scenario".to_owned(),
         );
+    }
+    if asset_count > 8 {
+        return Err("--asset-count must not exceed 8".to_owned());
+    }
+    if asset_count != 1 && scenario != Scenario::PreinstallApply {
+        return Err("--asset-count overrides are only supported for preinstall-apply".to_owned());
     }
     if !matches!(scenario, Scenario::Hdiff | Scenario::PreinstallApply)
         && cover_pattern != CoverPattern::Sequential
@@ -1268,6 +1295,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         scenario,
         size_mib,
         chunks,
+        asset_count,
         repeat,
         budget_mib,
         json,
@@ -1312,29 +1340,33 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 10 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE".to_owned());
+    if args.len() != 11 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
     let size_mib = parse_positive(&args[2], "--size-mib")?;
     let chunks = parse_positive(&args[3], "--chunks")?;
-    let cover_pattern = CoverPattern::parse(&args[5])?;
-    let fixture_backing = FixtureBacking::parse(&args[6])?;
-    let reported_fs_magic = if args[7].is_empty() {
+    let asset_count = parse_positive(&args[4], "--asset-count")?;
+    if asset_count > 8 || (asset_count != 1 && scenario != Scenario::PreinstallApply) {
+        return Err("child asset count is unsupported for this scenario".to_owned());
+    }
+    let cover_pattern = CoverPattern::parse(&args[6])?;
+    let fixture_backing = FixtureBacking::parse(&args[7])?;
+    let reported_fs_magic = if args[8].is_empty() {
         None
     } else {
         Some(
-            u64::from_str_radix(&args[7], 16)
+            u64::from_str_radix(&args[8], 16)
                 .map_err(|_| "invalid fixture filesystem magic".to_owned())?,
         )
     };
-    let source_backend = args[8].as_str();
-    let prepare_in_child = match args[9].as_str() {
+    let source_backend = args[9].as_str();
+    let prepare_in_child = match args[10].as_str() {
         "prepare" => true,
         "prepared" => false,
         _ => return Err("invalid child fixture preparation mode".to_owned()),
@@ -1392,7 +1424,14 @@ fn run_child(args: &[String]) -> Result<(), String> {
         }
         _ => return Err("invalid child source backend".to_owned()),
     };
-    let context = prepare_child_context(scenario, &fixture_dir, size_mib, chunks, &args[4])?;
+    let context = prepare_child_context(
+        scenario,
+        &fixture_dir,
+        size_mib,
+        chunks,
+        asset_count,
+        &args[5],
+    )?;
     let cgroup_after_setup = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
         Some((
             read_cgroup_memory_events(path)?,
@@ -1471,6 +1510,14 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let jemalloc_end = jemalloc_snapshot();
     let kernel_hwm_peak_rss_kib = operation_end.vm_hwm_kib.max(operation_end.vm_rss_kib);
     let peak_rss_kib = kernel_hwm_peak_rss_kib.max(sampled_peak.vm_rss_kib);
+    #[cfg(feature = "bench-alloc-stats")]
+    let asset_heap_live_growth_bytes = match &verification {
+        Verification::FileCompare {
+            asset_heap_live_growth_bytes,
+            ..
+        } => Some(asset_heap_live_growth_bytes.clone()),
+        _ => None,
+    };
     verify_output(verification)?;
     let fixture_shape = if cover_pattern == CoverPattern::UncoveredPrefix {
         let (prefix_size, suffix_size) = uncovered_prefix_fixture_sizes(size_mib)?;
@@ -1496,7 +1543,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "scenario": scenario.name(),
         "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
         "representative": false,
-        "asset_count": (scenario == Scenario::PreinstallApply).then_some(1),
+        "asset_count": (scenario == Scenario::PreinstallApply).then_some(asset_count),
         "cover_pattern": cover_pattern.name(),
         "fixture_shape": fixture_shape,
         "fixture_backing": fixture_backing.name(),
@@ -1543,6 +1590,12 @@ fn run_child(args: &[String]) -> Result<(), String> {
     });
     #[cfg(feature = "bench-alloc-stats")]
     {
+        if let Some(checkpoints) = asset_heap_live_growth_bytes {
+            result.as_object_mut().unwrap().insert(
+                "allocator_live_growth_after_asset_bytes".to_owned(),
+                serde_json::json!(checkpoints),
+            );
+        }
         result.as_object_mut().unwrap().insert(
             "allocator_net_live_growth_peak_bytes".to_owned(),
             serde_json::json!(allocation_snapshot.peak_live_bytes),
@@ -1983,27 +2036,41 @@ fn prepare_child_context(
     dir: &Path,
     size_mib: usize,
     chunks: usize,
+    asset_count: usize,
     server_url: &str,
 ) -> Result<ScenarioContext, String> {
+    if asset_count == 0 || asset_count > 8 {
+        return Err("asset_count must be between 1 and 8".to_owned());
+    }
     match scenario {
         Scenario::Hdiff => Ok(ScenarioContext::Hdiff {
             dir: dir.to_path_buf(),
         }),
         Scenario::PreinstallApply => {
-            let game_dir = dir.join("synthetic-game");
-            let (_, expected_size) = irmin_rs::game_installer::prepare_benchmark_preinstall_state(
-                &game_dir,
-                &dir.join("old.bin"),
-                &dir.join("new.bin"),
-                &dir.join("patch.hdiff"),
-                "benchmark/asset.bin",
-            )
-            .map_err(|error| error.to_string())?;
+            let mut game_dirs = Vec::with_capacity(asset_count);
+            let mut expected_size = None;
+            for index in 0..asset_count {
+                let game_dir = if asset_count == 1 {
+                    dir.join("synthetic-game")
+                } else {
+                    dir.join(format!("synthetic-game-{index:02}"))
+                };
+                let (_, size) = irmin_rs::game_installer::prepare_benchmark_preinstall_state(
+                    &game_dir,
+                    &dir.join("old.bin"),
+                    &dir.join("new.bin"),
+                    &dir.join("patch.hdiff"),
+                    "benchmark/asset.bin",
+                )
+                .map_err(|error| error.to_string())?;
+                expected_size.get_or_insert(size);
+                game_dirs.push(game_dir);
+            }
             Ok(ScenarioContext::PreinstallApply(Box::new(
                 PreinstallApplyContext {
-                    game_dir,
+                    game_dirs,
                     expected_path: dir.join("new.bin"),
-                    expected_size: usize::try_from(expected_size)
+                    expected_size: usize::try_from(expected_size.unwrap_or_default())
                         .map_err(|_| "benchmark output too large".to_owned())?,
                     runtime: tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
@@ -2179,25 +2246,40 @@ fn run_operation(
         }
         ScenarioContext::PreinstallApply(context) => {
             let PreinstallApplyContext {
-                game_dir,
+                game_dirs,
                 expected_path,
                 expected_size,
                 runtime,
                 client,
             } = *context;
-            runtime
-                .block_on(irmin_rs::game_installer::apply_preinstall(
-                    &client,
-                    &game_dir,
-                    "synthetic-target",
-                    Arc::new(|_| {}),
-                    &DownloadHandle::new(),
-                ))
-                .map_err(|error| format!("preinstall apply failed: {error}"))?;
+            #[cfg(feature = "bench-alloc-stats")]
+            let mut asset_heap_live_growth_bytes = Vec::with_capacity(game_dirs.len());
+            for game_dir in &game_dirs {
+                runtime
+                    .block_on(irmin_rs::game_installer::apply_preinstall(
+                        &client,
+                        game_dir,
+                        "synthetic-target",
+                        Arc::new(|_| {}),
+                        &DownloadHandle::new(),
+                    ))
+                    .map_err(|error| format!("preinstall apply failed: {error}"))?;
+                #[cfg(feature = "bench-alloc-stats")]
+                if let Some(checkpoint) =
+                    allocation_stats::current_live_growth().map_err(str::to_owned)?
+                {
+                    asset_heap_live_growth_bytes.push(checkpoint);
+                }
+            }
             Ok(Verification::FileCompare {
                 expected: expected_path,
-                actual: game_dir.join("benchmark/asset.bin"),
+                actuals: game_dirs
+                    .into_iter()
+                    .map(|game_dir| game_dir.join("benchmark/asset.bin"))
+                    .collect(),
                 size: expected_size,
+                #[cfg(feature = "bench-alloc-stats")]
+                asset_heap_live_growth_bytes,
             })
         }
         ScenarioContext::Assembly { context } => {
@@ -2278,9 +2360,15 @@ fn verify_output(verification: Verification) -> Result<(), String> {
         Verification::Hdiff(dir) => compare_hdiff_fixture(&dir),
         Verification::FileCompare {
             expected,
-            actual,
+            actuals,
             size,
-        } => compare_files_streaming(&expected, &actual, size),
+            ..
+        } => {
+            for actual in actuals {
+                compare_files_streaming(&expected, &actual, size)?;
+            }
+            Ok(())
+        }
         Verification::Assembly {
             expected,
             actual,
@@ -2524,6 +2612,7 @@ mod tests {
 
     #[test]
     fn parses_required_scenario_and_positive_values() {
+        assert!(usage().contains("--asset-count N"));
         assert!(parse_args(&[]).is_err());
         assert!(parse_positive("0", "--repeat").is_err());
         assert!(parse_positive("abc", "--repeat").is_err());
@@ -2600,6 +2689,36 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(hdiff20_steps.cover_pattern, CoverPattern::Hdiff20Steps);
+        let sequence = parse_args(&[
+            "--scenario".into(),
+            "preinstall-apply".into(),
+            "--size-mib".into(),
+            "4".into(),
+            "--cover-pattern".into(),
+            "hdiff20-steps".into(),
+            "--asset-count".into(),
+            "3".into(),
+        ])
+        .unwrap();
+        assert_eq!(sequence.asset_count, 3);
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--asset-count".into(),
+                "9".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "hdiff".into(),
+                "--asset-count".into(),
+                "2".into(),
+            ])
+            .is_err()
+        );
         assert!(
             parse_args(&[
                 "--scenario".into(),
@@ -3078,7 +3197,7 @@ mod tests {
     fn generated_hdiff_fixture_applies_to_expected_output() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
-        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
+        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3087,7 +3206,7 @@ mod tests {
     fn hdiff20_step_fixture_runs_through_direct_apply_verification() {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
-        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 4, 1, "").unwrap();
+        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 4, 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3097,8 +3216,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
         let context =
-            prepare_child_context(Scenario::PreinstallApply, dir.path(), 4, 1, "").unwrap();
+            prepare_child_context(Scenario::PreinstallApply, dir.path(), 4, 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[cfg(feature = "bench-alloc-stats")]
+    #[test]
+    fn sequential_preinstall_assets_report_retained_heap_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
+        let context =
+            prepare_child_context(Scenario::PreinstallApply, dir.path(), 4, 1, 2, "").unwrap();
+        let window = allocation_stats::AllocationWindow::start().unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        let snapshot = window.finish().unwrap();
+        assert!(snapshot.peak_live_bytes > 0);
+        if let Verification::FileCompare {
+            actuals,
+            asset_heap_live_growth_bytes,
+            ..
+        } = &verification
+        {
+            assert_eq!(actuals.len(), 2);
+            assert_eq!(asset_heap_live_growth_bytes.len(), 2);
+        } else {
+            panic!("expected preinstall file verification");
+        }
         verify_output(verification).unwrap();
     }
 
@@ -3107,7 +3251,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::UncoveredPrefix).unwrap();
         for backend in [HDiffSourceBackend::Mmap, HDiffSourceBackend::File] {
-            let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
+            let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, 1, "").unwrap();
             let verification = run_operation(context, backend).unwrap();
             verify_output(verification).unwrap();
         }
@@ -3118,7 +3262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::UncoveredPrefix).unwrap();
         let context =
-            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, "").unwrap();
+            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3128,7 +3272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
         let context =
-            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, "").unwrap();
+            prepare_child_context(Scenario::PreinstallApply, dir.path(), 1, 1, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3213,7 +3357,7 @@ mod tests {
     fn generated_assembly_fixture_assembles_and_matches_expected() {
         let dir = tempfile::tempdir().unwrap();
         prepare_assembly_fixture(dir.path(), 1, 2).unwrap();
-        let context = prepare_child_context(Scenario::Assembly, dir.path(), 1, 2, "").unwrap();
+        let context = prepare_child_context(Scenario::Assembly, dir.path(), 1, 2, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
@@ -3223,9 +3367,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_install_fixture(dir.path(), 1, 2).unwrap();
         let server = LocalChunkServer::start(dir.path().to_path_buf()).unwrap();
-        let context =
-            prepare_child_context(Scenario::SophonInstall, dir.path(), 1, 2, &server.base_url)
-                .unwrap();
+        let context = prepare_child_context(
+            Scenario::SophonInstall,
+            dir.path(),
+            1,
+            2,
+            1,
+            &server.base_url,
+        )
+        .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
