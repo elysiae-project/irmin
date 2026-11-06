@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::sync::atomic::AtomicU32;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -998,6 +999,166 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch
 }
 
+#[derive(Clone, Copy)]
+enum V20CoverPattern {
+    LongRuns,
+    Alternating,
+    GapHeavy,
+}
+
+fn gen_hdiff_v20_pattern_patch(
+    old: &[u8],
+    new: &[u8],
+    pattern: V20CoverPattern,
+) -> (Vec<u8>, Vec<u8>, usize) {
+    const BLOCK_SIZE: usize = 4096;
+    assert_eq!(old.len(), new.len());
+    assert_eq!(old.len() % BLOCK_SIZE, 0);
+    let blocks = old.len() / BLOCK_SIZE;
+    let unchanged = |block: usize| match pattern {
+        V20CoverPattern::LongRuns => !matches!((block / 64) % 2, 1),
+        V20CoverPattern::Alternating => block % 2 == 0,
+        V20CoverPattern::GapHeavy => block % 8 == 0,
+    };
+    let mut prepared_new = new.to_vec();
+    for block in 0..blocks {
+        if !unchanged(block) {
+            let offset = block * BLOCK_SIZE;
+            for (index, byte) in prepared_new[offset..offset + BLOCK_SIZE]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = byte.wrapping_add((index as u8).wrapping_mul(17).wrapping_add(1));
+            }
+        } else {
+            prepared_new[block * BLOCK_SIZE..(block + 1) * BLOCK_SIZE]
+                .copy_from_slice(&old[block * BLOCK_SIZE..(block + 1) * BLOCK_SIZE]);
+        }
+    }
+
+    let mut covers = Vec::<(u64, u64, u64)>::new();
+    let mut run_start = None;
+    for block in 0..blocks {
+        if unchanged(block) {
+            run_start.get_or_insert(block);
+        } else if let Some(start) = run_start.take() {
+            let position = (start * BLOCK_SIZE) as u64;
+            covers.push((position, position, ((block - start) * BLOCK_SIZE) as u64));
+        }
+    }
+    if let Some(start) = run_start {
+        let position = (start * BLOCK_SIZE) as u64;
+        covers.push((position, position, ((blocks - start) * BLOCK_SIZE) as u64));
+    }
+
+    let mut cover_data = Vec::new();
+    let mut last_old_end = 0u64;
+    let mut last_new_end = 0u64;
+    let mut rle_data = Vec::new();
+    let mut diff_stream = Vec::new();
+    for &(old_pos, new_pos, length) in &covers {
+        let old_delta = old_pos.abs_diff(last_old_end);
+        let old_sign = u8::from(old_pos < last_old_end);
+        cover_data.extend_from_slice(&encode_tagged_1bit(old_sign, old_delta as i64));
+        cover_data.extend_from_slice(&encode_7bit_varint((new_pos - last_new_end) as i64));
+        cover_data.extend_from_slice(&encode_7bit_varint(length as i64));
+        rle_data.extend_from_slice(&encode_7bit_varint(length as i64));
+        rle_data.extend_from_slice(&encode_7bit_varint(0));
+        last_old_end = old_pos + length;
+        last_new_end = new_pos + length;
+    }
+    diff_stream.extend_from_slice(&encode_7bit_varint(cover_data.len() as i64));
+    diff_stream.extend_from_slice(&encode_7bit_varint(rle_data.len() as i64));
+    diff_stream.extend_from_slice(&cover_data);
+    diff_stream.extend_from_slice(&rle_data);
+    let mut previous_new_end = 0u64;
+    for &(_, new_pos, length) in &covers {
+        if new_pos > previous_new_end {
+            diff_stream
+                .extend_from_slice(&prepared_new[previous_new_end as usize..new_pos as usize]);
+        }
+        previous_new_end = new_pos + length;
+    }
+    if previous_new_end < prepared_new.len() as u64 {
+        diff_stream.extend_from_slice(&prepared_new[previous_new_end as usize..]);
+    }
+
+    let mut patch = b"HDIFF20&nocomp\0".to_vec();
+    for value in [
+        prepared_new.len() as i64,
+        old.len() as i64,
+        covers.len() as i64,
+        (cover_data.len() + rle_data.len()) as i64,
+        diff_stream.len() as i64,
+        0,
+    ] {
+        patch.extend_from_slice(&encode_7bit_varint(value));
+    }
+    patch.extend_from_slice(&diff_stream);
+    (patch, prepared_new, covers.len())
+}
+
+fn hash_file_xxh64(path: &Path) -> u64 {
+    let mut file = fs::File::open(path).unwrap();
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).unwrap();
+        if read == 0 {
+            return hasher.digest();
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn bench_v20_cover_shapes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hdiffpatch_v20_cover_shapes");
+    group.sample_size(10);
+    for size_mib in [4usize, 64] {
+        let size_bytes = size_mib * 1024 * 1024;
+        let old = gen_prng_data(0xC0FFEE, size_bytes);
+        for (name, pattern) in [
+            ("long_runs", V20CoverPattern::LongRuns),
+            ("many_short", V20CoverPattern::Alternating),
+            ("gap_heavy", V20CoverPattern::GapHeavy),
+        ] {
+            let (patch, expected, cover_count) = gen_hdiff_v20_pattern_patch(&old, &old, pattern);
+            assert!(cover_count > 0, "{name} should contain copied covers");
+            if matches!(pattern, V20CoverPattern::Alternating) {
+                assert!(cover_count >= size_bytes / (2 * 4096));
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let old_path = dir.path().join("old.bin");
+            let patch_path = dir.path().join("patch.hdiff");
+            let out_path = dir.path().join("out.bin");
+            fs::write(&old_path, &old).unwrap();
+            fs::write(&patch_path, &patch).unwrap();
+            let expected_hash = xxhash_rust::xxh64::xxh64(&expected, 0);
+            let mut hdiff = HDiff::new(
+                old_path.to_string_lossy().into_owned(),
+                patch_path.to_string_lossy().into_owned(),
+                out_path.to_string_lossy().into_owned(),
+            );
+            assert!(hdiff.apply(None), "{name}/{size_mib} MiB patch failed");
+            assert_eq!(fs::metadata(&out_path).unwrap().len(), size_bytes as u64);
+            assert_eq!(hash_file_xxh64(&out_path), expected_hash);
+
+            group.throughput(Throughput::Bytes(size_bytes as u64));
+            group.bench_function(BenchmarkId::new(name, size_mib), |bencher| {
+                bencher.iter(|| {
+                    let mut hdiff = HDiff::new(
+                        old_path.to_string_lossy().into_owned(),
+                        patch_path.to_string_lossy().into_owned(),
+                        out_path.to_string_lossy().into_owned(),
+                    );
+                    assert!(hdiff.apply(None));
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 /// Generate a valid HDIFF20&zstd patch file (zstd-compressed diff stream).
 fn gen_hdiff_v20_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     let block_size = 4096usize;
@@ -1539,6 +1700,7 @@ criterion_group!(
     bench_protobuf_decode,
     bench_buffer_pool,
     bench_hdiffpatch_e2e,
+    bench_v20_cover_shapes,
     bench_eager_decompress,
 );
 criterion_main!(benches);

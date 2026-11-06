@@ -101,7 +101,7 @@ impl PatchSF {
         if io_buf.capacity() < IO_BUF_SIZE {
             io_buf = Vec::with_capacity(IO_BUF_SIZE);
         }
-        unsafe { io_buf.set_len(IO_BUF_SIZE) };
+        io_buf.resize(IO_BUF_SIZE, 0);
         let mut step_buf = STEP_BUF_POOL.take(0);
         let result = patch_loop(
             &mut diff,
@@ -153,10 +153,7 @@ fn patch_loop(
                 "patch step size exceeds maximum allowed",
             ));
         }
-        if step_buf.capacity() < step_end {
-            step_buf.reserve_exact(step_end - step_buf.capacity());
-        }
-        unsafe { step_buf.set_len(step_end) };
+        prepare_step_buffer(step_buf, step_end);
         diff.read_exact(&mut step_buf[..step_end])?;
 
         let (covers_slice, rle_slice) = step_buf[..step_end].split_at(buf_cover_size);
@@ -247,6 +244,10 @@ fn patch_loop(
         }
     }
     Ok(())
+}
+
+fn prepare_step_buffer(step_buf: &mut Vec<u8>, step_end: usize) {
+    step_buf.resize(step_end, 0);
 }
 
 fn decode_cover(
@@ -493,6 +494,32 @@ fn copy_n(
 mod tests {
     use super::super::{CompressionMode, DiffChunkInfo, DiffSingleChunkInfo};
     use super::*;
+
+    #[test]
+    fn prepare_step_buffer_grows_from_reused_capacity_safely() {
+        let mut buffer = Vec::with_capacity(8);
+        buffer.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.capacity(), 8);
+
+        prepare_step_buffer(&mut buffer, 12);
+
+        assert_eq!(buffer.len(), 12);
+        assert!(buffer.capacity() >= 12);
+        assert_eq!(&buffer[..4], &[1, 2, 3, 4]);
+        assert!(buffer[4..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn prepare_step_buffer_truncates_reused_contents() {
+        let mut buffer = vec![0xA5; 32];
+
+        prepare_step_buffer(&mut buffer, 5);
+
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(buffer, [0xA5; 5]);
+        assert!(buffer.capacity() >= 32);
+    }
 
     #[test]
     fn rle_varint_empty_buffer_returns_none() {

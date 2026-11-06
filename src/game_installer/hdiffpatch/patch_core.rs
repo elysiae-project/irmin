@@ -60,14 +60,11 @@ fn write_cover_stream_inner(
     header_info: &HeaderInfo,
     on_progress: Option<&dyn Fn(u64)>,
 ) -> std::io::Result<()> {
-    // Safety: every index 0..MAX_ARRAY_POOL_LEN is populated by read_exact
-    // or write_all before being read in the RLE decode loop.
-    #[allow(clippy::uninit_vec)]
     let mut shared_buffer = SHARED_BUFFER_POOL.take(MAX_ARRAY_POOL_LEN);
     if shared_buffer.capacity() < MAX_ARRAY_POOL_LEN {
         shared_buffer = Vec::with_capacity(MAX_ARRAY_POOL_LEN);
     }
-    unsafe { shared_buffer.set_len(MAX_ARRAY_POOL_LEN) };
+    shared_buffer.resize(MAX_ARRAY_POOL_LEN, 0);
     let mut cache = Cursor::new(CACHE_BUFFER_POOL.take(MAX_MEM_BUFFER_LEN as usize));
 
     let mut new_pos_back = 0i64;
@@ -445,12 +442,7 @@ impl<'a> CoverHeaderIterator<'a> {
             });
         }
         let reader = if cover_size < MAX_MEM_BUFFER_LEN {
-            #[allow(clippy::uninit_vec)]
-            let mut buffer = {
-                let mut v = Vec::with_capacity(cover_size as usize);
-                unsafe { v.set_len(cover_size as usize) };
-                v
-            };
+            let mut buffer = vec![0; cover_size as usize];
             cover_reader.read_exact(&mut buffer).map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
