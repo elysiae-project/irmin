@@ -63,6 +63,7 @@ impl CoverHeader {
 
 pub(crate) const K_SIGN_TAG_BIT: u8 = 1;
 pub(crate) const K_BYTE_RLE_TYPE: u8 = 2;
+pub(crate) const MAX_HDIFF20_STEP_SIZE: usize = 16 * 1024 * 1024;
 /// Preferred maximum patch working-buffer length in bytes.
 pub const MAX_MEM_BUFFER_LEN: i64 = 1 << 20;
 /// Maximum reusable byte-array capacity used by the patch implementation.

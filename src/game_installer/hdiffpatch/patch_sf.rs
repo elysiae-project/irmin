@@ -4,10 +4,10 @@ use std::io::Cursor;
 use std::io::{Read, SeekFrom, Write};
 
 use super::compression::get_clip_stream;
+use super::header::MAX_HDIFF20_STEP_SIZE;
 use super::parser::{BinaryExtensions, read_long_7bit_from_slice};
 use super::{BufferPool, HeaderInfo, SeekableRead};
 
-const MAX_STEP_SIZE: usize = 16 * 1024 * 1024;
 const IO_BUF_SIZE: usize = 256 * 1024;
 
 static WORK_BUF_POOL: BufferPool = BufferPool::new(1);
@@ -148,7 +148,7 @@ fn patch_loop(
             .checked_add(buf_rle_size)
             .ok_or_else(|| std::io::Error::other("step size overflow"))?;
 
-        if step_end > MAX_STEP_SIZE {
+        if step_end > MAX_HDIFF20_STEP_SIZE {
             return Err(std::io::Error::other(
                 "patch step size exceeds maximum allowed",
             ));
@@ -854,13 +854,13 @@ mod tests {
     }
 
     /// When the step size (buf_cover_size + buf_rle_size) exceeds
-    /// MAX_STEP_SIZE (16 MB), the patch loop should return an error.
+    /// MAX_HDIFF20_STEP_SIZE (16 MiB), the patch loop should return an error.
     #[test]
     fn patch_sf_step_end_exceeds_max_step_size() {
         let dir = tempfile::tempdir().unwrap();
         let patch_path = dir.path().join("patch.hdiff");
 
-        // Varint encode MAX_STEP_SIZE + 1 = 16777217 for buf_cover_size,
+        // Varint encode MAX_HDIFF20_STEP_SIZE + 1 = 16777217 for buf_cover_size,
         // then varint encode 0 for buf_rle_size.
         // 16777217 in 7-bit groups from MSB: 8, 0, 0, 1
         // Encoding: 0x88 0x80 0x80 0x01 (with continuation bits on first 3)
@@ -881,14 +881,17 @@ mod tests {
                 ..Default::default()
             },
             new_data_size: 0,
-            step_mem_size: (16 * 1024 * 1024) as i64, // MAX_STEP_SIZE
+            step_mem_size: MAX_HDIFF20_STEP_SIZE as i64,
             ..Default::default()
         };
         let patcher = PatchSF::new(header);
         let mut input = Cursor::new(Vec::new());
         let mut output = Cursor::new(Vec::new());
         let result = patcher.patch(&mut input, &mut output, patch_path.to_str().unwrap(), None);
-        assert!(result.is_err(), "should fail when step_end > MAX_STEP_SIZE");
+        assert!(
+            result.is_err(),
+            "should fail when step_end > MAX_HDIFF20_STEP_SIZE"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("exceeds maximum"),
@@ -937,8 +940,8 @@ mod tests {
         assert!(result.is_err(), "should fail with insufficient diff data");
     }
 
-    /// When step_end exceeds both MAX_STEP_SIZE and step_buf capacity, the
-    /// MAX_STEP_SIZE check fires first since it is checked before buffer
+    /// When step_end exceeds both MAX_HDIFF20_STEP_SIZE and step_buf capacity,
+    /// the size check fires first since it is checked before buffer
     /// capacity. This variant uses two medium-sized values that sum past
     /// the limit.
     #[test]
@@ -946,11 +949,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let patch_path = dir.path().join("patch.hdiff");
 
-        // buf_cover_size = 16777217 (MAX_STEP_SIZE + 1)
+        // buf_cover_size = 16777217 (MAX_HDIFF20_STEP_SIZE + 1)
         // 16777217 -> 7-bit groups: 8, 0, 0, 1 -> 0x88 0x80 0x80 0x01
-        // buf_rle_size = 16777216 (MAX_STEP_SIZE)
+        // buf_rle_size = 16777216 (MAX_HDIFF20_STEP_SIZE)
         // 16777216 -> 7-bit groups: 8, 0, 0, 0 -> 0x88 0x80 0x80 0x00
-        // step_end = 16777217 + 16777216 = 33554433 >> MAX_STEP_SIZE
+        // step_end = 16777217 + 16777216 = 33554433 > MAX_HDIFF20_STEP_SIZE
         let diff_data: Vec<u8> = vec![
             0x88, 0x80, 0x80, 0x01, // buf_cover_size = 16777217
             0x88, 0x80, 0x80, 0x00, // buf_rle_size = 16777216
@@ -978,7 +981,7 @@ mod tests {
         let result = patcher.patch(&mut input, &mut output, patch_path.to_str().unwrap(), None);
         assert!(
             result.is_err(),
-            "sum of step sizes exceeding MAX_STEP_SIZE should fail"
+            "sum of step sizes exceeding MAX_HDIFF20_STEP_SIZE should fail"
         );
         let msg = result.unwrap_err().to_string();
         assert!(

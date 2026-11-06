@@ -14,7 +14,8 @@ pub(crate) use diff::SeekableRead;
 #[allow(unused_imports)]
 pub(crate) use header::{
     CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, K_BYTE_RLE_TYPE, K_SIGN_TAG_BIT,
-    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, RleRefClip,
+    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_HDIFF20_STEP_SIZE, MAX_MEM_BUFFER_LEN,
+    RleRefClip,
 };
 
 #[cfg(feature = "benchmark")]

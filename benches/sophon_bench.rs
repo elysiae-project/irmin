@@ -1152,6 +1152,46 @@ fn bench_v20_cover_shapes(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_v20_step_buffer_stress(c: &mut Criterion) {
+    use irmin_rs::bench_support::prepare_hdiff20_step_stress_fixture;
+
+    let size_mib = 7;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shape = prepare_hdiff20_step_stress_fixture(dir.path(), size_mib).unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    let new_path = dir.path().join("new.bin");
+    let out_path = dir.path().join("out.bin");
+    let expected_hash = hash_file_xxh64(&new_path);
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        patch_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(hdiff.apply(None), "HDIFF20 step-stress fixture failed");
+    assert_eq!(hash_file_xxh64(&out_path), expected_hash);
+    assert_eq!(
+        fs::metadata(&out_path).unwrap().len(),
+        shape.output_bytes as u64
+    );
+
+    let mut group = c.benchmark_group("hdiffpatch_v20_step_buffer");
+    group.sample_size(10);
+    group.throughput(Throughput::Bytes(shape.output_bytes as u64));
+    group.bench_function(BenchmarkId::new("large_small_large", size_mib), |bencher| {
+        bencher.iter(|| {
+            let mut hdiff = HDiff::new(
+                old_path.to_string_lossy().into_owned(),
+                patch_path.to_string_lossy().into_owned(),
+                out_path.to_string_lossy().into_owned(),
+            );
+            assert!(hdiff.apply(None));
+        });
+    });
+    group.finish();
+}
+
 #[test]
 fn v20_cover_pattern_generator_handles_partial_period() {
     let block_size = 512;
@@ -1779,6 +1819,7 @@ criterion_group!(
     bench_buffer_pool,
     bench_hdiffpatch_e2e,
     bench_v20_cover_shapes,
+    bench_v20_step_buffer_stress,
     bench_v13_large_uncovered_prefix,
     bench_eager_decompress,
 );

@@ -14,9 +14,10 @@ use fast_md5::Md5;
 use irmin_rs::api_scrape::{Compression, DownloadInfo};
 use irmin_rs::bench_support::{
     apply_hdiff_fixture_with_backend, compare_hdiff_fixture, deterministic_data,
-    make_v13_zstd_reordered_patch,
+    hdiff20_step_stress_shape, make_v13_zstd_reordered_patch,
     prepare_hdiff_fixture as prepare_shared_hdiff_fixture,
     prepare_hdiff_uncovered_prefix_fixture as prepare_shared_uncovered_prefix_fixture,
+    prepare_hdiff20_step_stress_fixture as prepare_shared_hdiff20_step_fixture,
     uncovered_prefix_fixture_sizes,
 };
 use irmin_rs::game_installer::VerifyMode;
@@ -89,6 +90,7 @@ enum CoverPattern {
     Reverse,
     Thrash,
     UncoveredPrefix,
+    Hdiff20Steps,
 }
 
 impl CoverPattern {
@@ -98,8 +100,9 @@ impl CoverPattern {
             "reverse" => Ok(Self::Reverse),
             "thrash" => Ok(Self::Thrash),
             "uncovered-prefix" => Ok(Self::UncoveredPrefix),
+            "hdiff20-steps" => Ok(Self::Hdiff20Steps),
             _ => Err(format!(
-                "unknown cover pattern '{value}'; expected sequential, reverse, thrash, or uncovered-prefix"
+                "unknown cover pattern '{value}'; expected sequential, reverse, thrash, uncovered-prefix, or hdiff20-steps"
             )),
         }
     }
@@ -110,6 +113,7 @@ impl CoverPattern {
             Self::Reverse => "reverse",
             Self::Thrash => "thrash",
             Self::UncoveredPrefix => "uncovered-prefix",
+            Self::Hdiff20Steps => "hdiff20-steps",
         }
     }
 }
@@ -992,6 +996,12 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     if cover_pattern == CoverPattern::UncoveredPrefix {
         uncovered_prefix_fixture_sizes(size_mib)?;
     }
+    if cover_pattern == CoverPattern::Hdiff20Steps {
+        if !matches!(scenario, Scenario::Hdiff | Scenario::PreinstallApply) {
+            return Err("hdiff20-steps requires an HDiff scenario".to_owned());
+        }
+        hdiff20_step_stress_shape(size_mib)?;
+    }
     if scenario == Scenario::Assembly && (size_mib * 1024 * 1024) % chunks != 0 {
         return Err("assembly size-mib must divide evenly into chunks".to_owned());
     }
@@ -1028,6 +1038,11 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         if cover_pattern == CoverPattern::UncoveredPrefix {
             for &size in sizes {
                 uncovered_prefix_fixture_sizes(size)?;
+            }
+        }
+        if cover_pattern == CoverPattern::Hdiff20Steps {
+            for &size in sizes {
+                hdiff20_step_stress_shape(size)?;
             }
         }
         if memory_max_mib.is_some() && !cfg!(target_os = "linux") {
@@ -1097,7 +1112,7 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
@@ -1126,6 +1141,9 @@ fn run_child(args: &[String]) -> Result<(), String> {
     };
     if cover_pattern == CoverPattern::UncoveredPrefix {
         uncovered_prefix_fixture_sizes(size_mib)?;
+    }
+    if cover_pattern == CoverPattern::Hdiff20Steps {
+        hdiff20_step_stress_shape(size_mib)?;
     }
     let expected_memory_max = std::env::var("IRMIN_BENCH_MEMORY_MAX_BYTES")
         .ok()
@@ -1256,6 +1274,16 @@ fn run_child(args: &[String]) -> Result<(), String> {
             "uncovered_prefix_bytes": prefix_size,
             "covered_suffix_bytes": suffix_size,
             "output_bytes": prefix_size + suffix_size,
+        }))
+    } else if cover_pattern == CoverPattern::Hdiff20Steps {
+        let shape = hdiff20_step_stress_shape(size_mib)?;
+        Some(serde_json::json!({
+            "output_bytes": shape.output_bytes,
+            "cover_count": shape.cover_count,
+            "step_sizes_bytes": shape.step_sizes_bytes,
+            "covers_per_output_byte": 1,
+            "step_sizes_include_cover_and_rle_sections": true,
+            "step_layout_is_synthetic_stress": true,
         }))
     } else {
         None
@@ -1657,6 +1685,10 @@ fn prepare_hdiff_fixture(
         prepare_shared_uncovered_prefix_fixture(dir, size_mib)?;
         return Ok(());
     }
+    if cover_pattern == CoverPattern::Hdiff20Steps {
+        prepare_shared_hdiff20_step_fixture(dir, size_mib)?;
+        return Ok(());
+    }
     if cover_pattern == CoverPattern::Sequential {
         return prepare_shared_hdiff_fixture(dir, size_mib);
     }
@@ -1676,6 +1708,7 @@ fn prepare_hdiff_fixture(
         }
         CoverPattern::Sequential => unreachable!(),
         CoverPattern::UncoveredPrefix => unreachable!(),
+        CoverPattern::Hdiff20Steps => unreachable!(),
     };
     let (patch, new) = make_v13_zstd_reordered_patch(&old, &permutation);
     fs::write(dir.join("old.bin"), &old).map_err(|error| error.to_string())?;
@@ -2317,6 +2350,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(uncovered_sweep.cover_pattern, CoverPattern::UncoveredPrefix);
+        assert!(parse_args(&[
+            "--scenario".into(),
+            "preinstall-apply".into(),
+            "--cover-pattern".into(),
+            "hdiff20-steps".into(),
+            "--fixture-backing".into(),
+            "disk".into(),
+            "--sweep-sizes-mib".into(),
+            "4,9".into(),
+        ])
+        .is_err());
+        let hdiff20_steps = parse_args(&[
+            "--scenario".into(),
+            "hdiff".into(),
+            "--cover-pattern".into(),
+            "hdiff20-steps".into(),
+            "--size-mib".into(),
+            "7".into(),
+        ])
+        .unwrap();
+        assert_eq!(hdiff20_steps.cover_pattern, CoverPattern::Hdiff20Steps);
         assert!(
             parse_args(&[
                 "--scenario".into(),
@@ -2796,6 +2850,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
         let context = prepare_child_context(Scenario::Hdiff, dir.path(), 1, 1, "").unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn hdiff20_step_fixture_runs_through_direct_apply_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
+        let context = prepare_child_context(Scenario::Hdiff, dir.path(), 4, 1, "").unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn hdiff20_step_fixture_runs_through_preinstall_apply_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 4, CoverPattern::Hdiff20Steps).unwrap();
+        let context =
+            prepare_child_context(Scenario::PreinstallApply, dir.path(), 4, 1, "").unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }
