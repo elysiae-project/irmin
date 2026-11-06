@@ -30,6 +30,8 @@ pub use header::MAX_ARRAY_POOL_LEN as BENCH_MAX_ARRAY_POOL_LEN;
 pub use parser::read_long_7bit_from_slice;
 #[cfg(feature = "benchmark")]
 pub use patch_core::enumerate_cover_headers_checked;
+#[cfg(feature = "bench-alloc-stats")]
+pub use patch_sf::{reset_step_buffer_diagnostics, step_buffer_diagnostics};
 
 pub(crate) fn trim_idle_buffers() {
     patch_core::trim_idle_buffers();

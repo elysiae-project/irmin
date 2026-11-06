@@ -10,6 +10,27 @@ use super::{BufferPool, HeaderInfo, SeekableRead};
 
 const IO_BUF_SIZE: usize = 256 * 1024;
 
+#[cfg(feature = "bench-alloc-stats")]
+static MAX_STEP_BUFFER_CAPACITY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "bench-alloc-stats")]
+static MAX_STEP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "bench-alloc-stats")]
+pub fn reset_step_buffer_diagnostics() {
+    MAX_STEP_BUFFER_CAPACITY.store(0, std::sync::atomic::Ordering::Relaxed);
+    MAX_STEP_END.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "bench-alloc-stats")]
+pub fn step_buffer_diagnostics() -> (usize, usize) {
+    (
+        MAX_STEP_BUFFER_CAPACITY.load(std::sync::atomic::Ordering::Relaxed),
+        MAX_STEP_END.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 static WORK_BUF_POOL: BufferPool = BufferPool::new(1);
 static STEP_BUF_POOL: BufferPool = BufferPool::new(1);
 
@@ -154,6 +175,12 @@ fn patch_loop(
             ));
         }
         prepare_step_buffer(step_buf, step_end);
+        #[cfg(feature = "bench-alloc-stats")]
+        {
+            MAX_STEP_END.fetch_max(step_end, std::sync::atomic::Ordering::Relaxed);
+            MAX_STEP_BUFFER_CAPACITY
+                .fetch_max(step_buf.capacity(), std::sync::atomic::Ordering::Relaxed);
+        }
         diff.read_exact(&mut step_buf[..step_end])?;
 
         let (covers_slice, rle_slice) = step_buf[..step_end].split_at(buf_cover_size);
@@ -248,6 +275,21 @@ fn patch_loop(
 
 fn prepare_step_buffer(step_buf: &mut Vec<u8>, step_end: usize) {
     step_buf.resize(step_end, 0);
+}
+
+#[cfg(all(test, feature = "bench-alloc-stats"))]
+mod diagnostics_tests {
+    #[test]
+    fn step_buffer_diagnostics_reset_and_report_maxima() {
+        super::reset_step_buffer_diagnostics();
+        super::MAX_STEP_BUFFER_CAPACITY.fetch_max(128, std::sync::atomic::Ordering::Relaxed);
+        super::MAX_STEP_BUFFER_CAPACITY.fetch_max(64, std::sync::atomic::Ordering::Relaxed);
+        super::MAX_STEP_END.fetch_max(96, std::sync::atomic::Ordering::Relaxed);
+        super::MAX_STEP_END.fetch_max(32, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(super::step_buffer_diagnostics(), (128, 96));
+        super::reset_step_buffer_diagnostics();
+        assert_eq!(super::step_buffer_diagnostics(), (0, 0));
+    }
 }
 
 fn decode_cover(

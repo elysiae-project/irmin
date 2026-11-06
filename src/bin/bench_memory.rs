@@ -1529,9 +1529,19 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let started = Instant::now();
     #[cfg(feature = "bench-alloc-stats")]
     let allocation_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
+    #[cfg(feature = "bench-alloc-stats")]
+    if matches!(scenario, Scenario::Hdiff | Scenario::PreinstallApply)
+        && cover_pattern == CoverPattern::Hdiff20Steps
+    {
+        irmin_rs::game_installer::hdiffpatch::reset_step_buffer_diagnostics();
+    }
     let verification = run_operation(context, hdiff_source_backend)?;
     #[cfg(feature = "bench-alloc-stats")]
     let allocation_snapshot = allocation_window.finish().map_err(str::to_owned)?;
+    #[cfg(feature = "bench-alloc-stats")]
+    let step_buffer_diagnostics = (matches!(scenario, Scenario::Hdiff | Scenario::PreinstallApply)
+        && cover_pattern == CoverPattern::Hdiff20Steps)
+        .then(irmin_rs::game_installer::hdiffpatch::step_buffer_diagnostics);
     let elapsed_ms = started.elapsed().as_millis();
     let operation_end = read_memory_snapshot()?;
     let cpu_after = read_cpu_usage()?;
@@ -1698,6 +1708,24 @@ fn run_child(args: &[String]) -> Result<(), String> {
             "allocator_peak_is_approximate".to_owned(),
             serde_json::json!(true),
         );
+        if let Some((capacity_bytes, max_step_end_bytes)) = step_buffer_diagnostics {
+            result.as_object_mut().unwrap().insert(
+                "hdiff20_max_retained_step_buffer_capacity_bytes".to_owned(),
+                serde_json::json!(capacity_bytes),
+            );
+            result.as_object_mut().unwrap().insert(
+                "hdiff20_max_requested_step_length_bytes".to_owned(),
+                serde_json::json!(max_step_end_bytes),
+            );
+            result.as_object_mut().unwrap().insert(
+                "hdiff20_buffer_diagnostic_scope".to_owned(),
+                serde_json::json!("process_wide_maxima_during_benchmark_operation"),
+            );
+            result.as_object_mut().unwrap().insert(
+                "hdiff20_buffer_diagnostic_note".to_owned(),
+                serde_json::json!("These maxima are correlated observations, not time-aligned or additive components of the allocator peak."),
+            );
+        }
     }
     let result = result.as_object_mut().unwrap();
     result.insert(
