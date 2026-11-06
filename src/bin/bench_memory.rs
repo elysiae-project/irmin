@@ -226,6 +226,7 @@ mod allocation_stats {
 compile_error!("bench-alloc-stats cannot be combined with jemalloc allocator features");
 
 use fast_md5::Md5;
+#[cfg(feature = "bench-alloc-stats")]
 use futures_util::StreamExt;
 use irmin_rs::api_scrape::{Compression, DownloadInfo};
 use irmin_rs::bench_support::{
@@ -291,6 +292,7 @@ struct Config {
     chunks: usize,
     asset_count: usize,
     preinstall_mode: PreinstallMode,
+    diagnose_hdiff_phases: bool,
     repeat: usize,
     budget_mib: Option<u64>,
     json: bool,
@@ -670,10 +672,18 @@ struct PreinstallApplyContext {
     expected_size: usize,
     runtime: tokio::runtime::Runtime,
     client: reqwest::Client,
+    diagnose_hdiff_phases: bool,
 }
 
 enum Verification {
     Hdiff(PathBuf),
+    #[cfg(feature = "bench-diagnostics")]
+    HdiffPreinstall {
+        expected: PathBuf,
+        actual: PathBuf,
+        size: usize,
+        timings: irmin_rs::game_installer::HdiffPhaseTimings,
+    },
     FileCompare {
         expected: PathBuf,
         actuals: Vec<PathBuf>,
@@ -954,6 +964,11 @@ fn child_command_args(
         } else {
             "prepared".to_owned()
         },
+        if config.diagnose_hdiff_phases {
+            "diagnose-hdiff-phases".to_owned()
+        } else {
+            "standard".to_owned()
+        },
     ]
 }
 
@@ -1133,6 +1148,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut chunks = 8;
     let mut asset_count = 1;
     let mut preinstall_mode = PreinstallMode::Patch;
+    let mut diagnose_hdiff_phases = false;
     let mut repeat = 3;
     let mut budget_mib = None;
     let mut json = false;
@@ -1170,6 +1186,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 index += 1;
                 preinstall_mode = PreinstallMode::parse(value_at(args, index, option)?)?;
             }
+            "--diagnose-hdiff-phases" => diagnose_hdiff_phases = true,
             "--repeat" => {
                 index += 1;
                 repeat = parse_positive(value_at(args, index, option)?, option)?;
@@ -1248,6 +1265,18 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     }
     if preinstall_mode == PreinstallMode::CopyOver && cover_pattern != CoverPattern::Sequential {
         return Err("copyover mode requires the sequential cover pattern".to_owned());
+    }
+    if diagnose_hdiff_phases {
+        if !cfg!(feature = "bench-diagnostics") {
+            return Err("--diagnose-hdiff-phases requires --features bench-diagnostics".to_owned());
+        }
+        if scenario != Scenario::PreinstallApply
+            || preinstall_mode != PreinstallMode::Patch
+            || asset_count != 1
+            || sweep_sizes_mib.is_some()
+        {
+            return Err("--diagnose-hdiff-phases requires one preinstall-apply Patch run without size sweeps".to_owned());
+        }
     }
     if !matches!(
         scenario,
@@ -1359,6 +1388,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         chunks,
         asset_count,
         preinstall_mode,
+        diagnose_hdiff_phases,
         repeat,
         budget_mib,
         json,
@@ -1403,12 +1433,12 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|preinstall-download-plan|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|preinstall-download-plan|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--diagnose-hdiff-phases] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 12 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT PREINSTALL_MODE SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE".to_owned());
+    if args.len() != 13 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT PREINSTALL_MODE SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE DIAGNOSTIC_MODE".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
@@ -1434,6 +1464,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "prepare" => true,
         "prepared" => false,
         _ => return Err("invalid child fixture preparation mode".to_owned()),
+    };
+    let diagnose_hdiff_phases = match args[12].as_str() {
+        "diagnose-hdiff-phases" => true,
+        "standard" => false,
+        _ => return Err("invalid child diagnostic mode".to_owned()),
     };
     if cover_pattern == CoverPattern::UncoveredPrefix {
         uncovered_prefix_fixture_sizes(size_mib)?;
@@ -1498,7 +1533,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
     if scenario == Scenario::PreinstallDownloadPlan {
         return run_download_plan_child(&fixture_dir, chunks, size_mib, filesystem_info);
     }
-    let context = prepare_child_context(
+    let mut context = prepare_child_context(
         scenario,
         &fixture_dir,
         size_mib,
@@ -1507,6 +1542,9 @@ fn run_child(args: &[String]) -> Result<(), String> {
         preinstall_mode,
         &args[6],
     )?;
+    if let ScenarioContext::PreinstallApply(context) = &mut context {
+        context.diagnose_hdiff_phases = diagnose_hdiff_phases;
+    }
     let cgroup_after_setup = if let Some((_, path, _, _)) = &cgroup_memory_before_setup {
         Some((
             read_cgroup_memory_events(path)?,
@@ -1603,6 +1641,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
         } => Some(asset_heap_live_growth_bytes.clone()),
         _ => None,
     };
+    #[cfg(feature = "bench-diagnostics")]
+    let phase_timings = verification_phase_timings(&verification);
     verify_output(verification)?;
     let fixture_shape = if cover_pattern == CoverPattern::UncoveredPrefix {
         let (prefix_size, suffix_size) = uncovered_prefix_fixture_sizes(size_mib)?;
@@ -1632,6 +1672,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let mut result = serde_json::json!({
         "scenario": scenario.name(),
         "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
+        "operation_mode": if diagnose_hdiff_phases {
+            "single_asset_hdiff_phase_diagnostics"
+        } else {
+            "standard_scenario"
+        },
         "representative": false,
         "asset_count": (scenario == Scenario::PreinstallApply).then_some(asset_count),
         "preinstall_mode": (scenario == Scenario::PreinstallApply)
@@ -1726,6 +1771,30 @@ fn run_child(args: &[String]) -> Result<(), String> {
                 serde_json::json!("These maxima are correlated observations, not time-aligned or additive components of the allocator peak."),
             );
         }
+    }
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(timings) = phase_timings {
+        result.as_object_mut().unwrap().insert(
+            "hdiff_phase_wall_time_ns".to_owned(),
+            serde_json::json!({
+                "original_metadata_and_hash_validation": timings.original_metadata_and_hash_validation.as_nanos(),
+                "patch_application": timings.patch_application.as_nanos(),
+                "output_verification": timings.output_verification.as_nanos(),
+            }),
+        );
+        result.as_object_mut().unwrap().insert(
+            "hdiff_phase_timing_scope".to_owned(),
+            serde_json::json!("synchronous_single_asset_worker_wall_time"),
+        );
+        result.as_object_mut().unwrap().insert(
+            "hdiff_phase_timing_notes".to_owned(),
+            serde_json::json!([
+                "Original timing covers existing-file metadata and hash checks; path setup and synthetic state loading are excluded.",
+                "Patch timing includes HDiff apply, temporary-output sync, atomic persist, and directory sync.",
+                "Output verification timing covers post-apply output size/hash checks and the final rename to the target path.",
+                "This diagnostic bypasses async preinstall orchestration and is synthetic-only; it does not explain the reported production memory peak."
+            ]),
+        );
     }
     let result = result.as_object_mut().unwrap();
     result.insert(
@@ -1829,7 +1898,7 @@ fn run_download_plan_child(
     #[cfg(not(feature = "bench-alloc-stats"))]
     {
         let _ = (fixture_dir, chunk_count, size_mib, filesystem);
-        return Err("preinstall-download-plan requires --features bench-alloc-stats".to_owned());
+        Err("preinstall-download-plan requires --features bench-alloc-stats".to_owned())
     }
     #[cfg(feature = "bench-alloc-stats")]
     {
@@ -1845,15 +1914,15 @@ fn run_download_plan_child(
             let chunk_offset_u64 = u64::try_from(chunk_offset)
                 .map_err(|_| "download-plan chunk offset does not fit u64".to_owned())?;
             chunks.push(SophonManifestAssetChunk {
-                    chunk_name: format!("download-plan-{index:08}.zstd"),
-                    chunk_decompressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
-                    chunk_on_file_offset: chunk_offset_u64,
-                    chunk_size: chunk_size as u64,
-                    chunk_size_decompressed: chunk_size as u64,
-                    chunk_compressed_hash_xxh: 0,
-                    chunk_compressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
-                    chunk_old_offset: -1,
-                });
+                chunk_name: format!("download-plan-{index:08}.zstd"),
+                chunk_decompressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                chunk_on_file_offset: chunk_offset_u64,
+                chunk_size: chunk_size as u64,
+                chunk_size_decompressed: chunk_size as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                chunk_old_offset: -1,
+            });
             chunk_offset = chunk_offset
                 .checked_add(chunk_size)
                 .ok_or_else(|| "download-plan chunk offset overflow".to_owned())?;
@@ -1931,8 +2000,7 @@ fn run_download_plan_child(
         let mut pending_stream = Box::pin(pending_stream);
         let waker = futures_util::task::noop_waker_ref();
         let mut context = std::task::Context::from_waker(waker);
-        let poll_result =
-            futures_util::Stream::poll_next(pending_stream.as_mut(), &mut context);
+        let poll_result = futures_util::Stream::poll_next(pending_stream.as_mut(), &mut context);
         if !matches!(poll_result, std::task::Poll::Pending) {
             return Err("bounded pending stream completed unexpectedly".to_owned());
         }
@@ -1953,14 +2021,13 @@ fn run_download_plan_child(
 
         let drain_started = Instant::now();
         let drain_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
-        let drain_stream =
-            irmin_rs::game_installer::benchmark_download_over_bounded_drain_stream(
-                &chunks,
-                &chunks_dir,
-                &client,
-                &chunk_download,
-                &handle,
-            );
+        let drain_stream = irmin_rs::game_installer::benchmark_download_over_bounded_drain_stream(
+            &chunks,
+            &chunks_dir,
+            &client,
+            &chunk_download,
+            &handle,
+        );
         let drained_chunks = plan_runtime.block_on(async move {
             let mut drain_stream = Box::pin(drain_stream);
             let mut completed = 0usize;
@@ -2461,6 +2528,7 @@ fn prepare_child_context(
                         .build()
                         .map_err(|error| error.to_string())?,
                     client: reqwest::Client::new(),
+                    diagnose_hdiff_phases: false,
                 },
             )))
         }
@@ -2635,10 +2703,37 @@ fn run_operation(
                 expected_size,
                 runtime,
                 client,
+                #[cfg(feature = "bench-diagnostics")]
+                diagnose_hdiff_phases,
+                ..
             } = *context;
             #[cfg(feature = "bench-alloc-stats")]
             let mut asset_heap_live_growth_bytes = Vec::with_capacity(game_dirs.len());
+            #[cfg(feature = "bench-diagnostics")]
+            let mut hdiff_phase_timings = None;
             for game_dir in &game_dirs {
+                #[cfg(feature = "bench-diagnostics")]
+                if diagnose_hdiff_phases {
+                    let target_relative_path = "benchmark/asset.bin";
+                    let timings = irmin_rs::game_installer::apply_synthetic_hdiff_for_benchmark(
+                        game_dir,
+                        "synthetic-target",
+                        target_relative_path,
+                    )
+                    .map_err(|error| format!("diagnostic preinstall apply failed: {error}"))?;
+                    hdiff_phase_timings = Some(timings);
+                } else {
+                    runtime
+                        .block_on(irmin_rs::game_installer::apply_preinstall(
+                            &client,
+                            game_dir,
+                            "synthetic-target",
+                            Arc::new(|_| {}),
+                            &DownloadHandle::new(),
+                        ))
+                        .map_err(|error| format!("preinstall apply failed: {error}"))?;
+                }
+                #[cfg(not(feature = "bench-diagnostics"))]
                 runtime
                     .block_on(irmin_rs::game_installer::apply_preinstall(
                         &client,
@@ -2654,6 +2749,15 @@ fn run_operation(
                 {
                     asset_heap_live_growth_bytes.push(checkpoint);
                 }
+            }
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = hdiff_phase_timings {
+                return Ok(Verification::HdiffPreinstall {
+                    expected: expected_path,
+                    actual: game_dirs[0].join("benchmark/asset.bin"),
+                    size: expected_size,
+                    timings,
+                });
             }
             Ok(Verification::FileCompare {
                 expected: expected_path,
@@ -2742,6 +2846,13 @@ fn run_operation(
 fn verify_output(verification: Verification) -> Result<(), String> {
     match verification {
         Verification::Hdiff(dir) => compare_hdiff_fixture(&dir),
+        #[cfg(feature = "bench-diagnostics")]
+        Verification::HdiffPreinstall {
+            expected,
+            actual,
+            size,
+            ..
+        } => compare_files_streaming(&expected, &actual, size),
         Verification::FileCompare {
             expected,
             actuals,
@@ -2763,6 +2874,16 @@ fn verify_output(verification: Verification) -> Result<(), String> {
             actual,
             size,
         } => compare_files_streaming(&expected, &actual, size),
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn verification_phase_timings(
+    verification: &Verification,
+) -> Option<irmin_rs::game_installer::HdiffPhaseTimings> {
+    match verification {
+        Verification::HdiffPreinstall { timings, .. } => Some(*timings),
+        _ => None,
     }
 }
 
@@ -3284,6 +3405,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn phase_diagnostic_flag_requires_supported_single_patch_run() {
+        let base = [
+            "--scenario".to_owned(),
+            "preinstall-apply".to_owned(),
+            "--diagnose-hdiff-phases".to_owned(),
+        ];
+        if cfg!(feature = "bench-diagnostics") {
+            let config = parse_args(&base).unwrap();
+            assert!(config.diagnose_hdiff_phases);
+            assert_eq!(config.asset_count, 1);
+            assert_eq!(config.preinstall_mode, PreinstallMode::Patch);
+
+            let mut copyover = base.to_vec();
+            copyover.extend(["--preinstall-mode".to_owned(), "copyover".to_owned()]);
+            assert!(parse_args(&copyover).is_err());
+
+            let mut multiple_assets = base.to_vec();
+            multiple_assets.extend(["--asset-count".to_owned(), "2".to_owned()]);
+            assert!(parse_args(&multiple_assets).is_err());
+
+            let mut sweep = base.to_vec();
+            sweep.extend([
+                "--fixture-backing".to_owned(),
+                "disk".to_owned(),
+                "--sweep-sizes-mib".to_owned(),
+                "4,8".to_owned(),
+            ]);
+            assert!(parse_args(&sweep).is_err());
+        } else {
+            let error = parse_args(&base).unwrap_err();
+            assert!(error.contains("bench-diagnostics"));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn filesystem_classifier_identifies_memory_and_disk_filesystems() {
@@ -3782,6 +3938,79 @@ mod tests {
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    fn hdiff_phase_diagnostics_match_synthetic_output() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
+        let game_dir = dir.path().join("timed-game");
+        irmin_rs::game_installer::prepare_benchmark_preinstall_state(
+            &game_dir,
+            &dir.path().join("old.bin"),
+            &dir.path().join("new.bin"),
+            &dir.path().join("patch.hdiff"),
+            "benchmark/asset.bin",
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let timings = irmin_rs::game_installer::apply_synthetic_hdiff_for_benchmark(
+            &game_dir,
+            "synthetic-target",
+            "benchmark/asset.bin",
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(!timings.original_metadata_and_hash_validation.is_zero());
+        assert!(!timings.patch_application.is_zero());
+        assert!(!timings.output_verification.is_zero());
+        assert!(
+            timings.original_metadata_and_hash_validation
+                + timings.patch_application
+                + timings.output_verification
+                <= elapsed
+        );
+        compare_files_streaming(
+            &dir.path().join("new.bin"),
+            &game_dir.join("benchmark/asset.bin"),
+            1024 * 1024,
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    fn hdiff_phase_diagnostics_preserve_target_on_patch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_hdiff_fixture(dir.path(), 1, CoverPattern::Sequential).unwrap();
+        let game_dir = dir.path().join("timed-failure-game");
+        irmin_rs::game_installer::prepare_benchmark_preinstall_state(
+            &game_dir,
+            &dir.path().join("old.bin"),
+            &dir.path().join("new.bin"),
+            &dir.path().join("patch.hdiff"),
+            "benchmark/asset.bin",
+        )
+        .unwrap();
+        let target_path = game_dir.join("benchmark/asset.bin");
+        let original = fs::read(&target_path).unwrap();
+        fs::write(
+            game_dir.join("patching/chunk/synthetic.hdiff"),
+            b"invalid hdiff data",
+        )
+        .unwrap();
+
+        assert!(
+            irmin_rs::game_installer::apply_synthetic_hdiff_for_benchmark(
+                &game_dir,
+                "synthetic-target",
+                "benchmark/asset.bin",
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(target_path).unwrap(), original);
     }
 
     #[test]

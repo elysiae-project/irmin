@@ -2726,10 +2726,85 @@ fn apply_hdiff_patch(
     asset: &PatchAssetInfo,
     cache: &FilterCache,
 ) -> SophonResult<()> {
+    apply_hdiff_patch_impl(
+        game_dir,
+        chunks_dir,
+        asset,
+        cache,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
+    )
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HdiffPhaseTimings {
+    pub original_metadata_and_hash_validation: std::time::Duration,
+    pub patch_application: std::time::Duration,
+    pub output_verification: std::time::Duration,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Default)]
+struct TimingHdiffPhaseObserver {
+    timings: HdiffPhaseTimings,
+    phase_started: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+impl TimingHdiffPhaseObserver {
+    fn start(&mut self) {
+        self.phase_started = Some(std::time::Instant::now());
+    }
+
+    fn finish(&mut self) -> std::time::Duration {
+        self.phase_started
+            .take()
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+pub fn apply_synthetic_hdiff_for_benchmark(
+    game_dir: &Path,
+    preinstall_tag: &str,
+    target_relative_path: &str,
+) -> SophonResult<HdiffPhaseTimings> {
+    let _buffer_pool_trim = HdiffPoolTrimGuard;
+    let state = load_preinstall_state(game_dir, preinstall_tag)?;
+    let asset = state
+        .patch_assets
+        .iter()
+        .find(|asset| asset.target_file_path == target_relative_path)
+        .ok_or_else(|| invalid_state("Benchmark patch asset was not found"))?;
+    let filter_cache = FilterCache::new(game_dir);
+    let mut observer = TimingHdiffPhaseObserver::default();
+    apply_hdiff_patch_impl(
+        game_dir,
+        &patching_chunk_dir(game_dir),
+        asset,
+        &filter_cache,
+        Some(&mut observer),
+    )?;
+    Ok(observer.timings)
+}
+
+fn apply_hdiff_patch_impl(
+    game_dir: &Path,
+    chunks_dir: &Path,
+    asset: &PatchAssetInfo,
+    cache: &FilterCache,
+    #[cfg(feature = "bench-diagnostics")] mut observer: Option<&mut TimingHdiffPhaseObserver>,
+) -> SophonResult<()> {
     let original_path = match &asset.original_file_path {
         Some(p) => validate_asset_path(game_dir, p)?,
         None => validate_asset_path(game_dir, &asset.target_file_path)?,
     };
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.start();
+    }
     let mut diff_ref_guard: DiffRefGuard = DiffRefGuard(None);
     if !original_path.exists() {
         let is_blank = asset.original_file_hash.as_deref() == Some(BLANK_FILE_MD5)
@@ -2832,6 +2907,10 @@ fn apply_hdiff_patch(
             original_path.to_string_lossy().to_string(),
         ));
     }
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.timings.original_metadata_and_hash_validation = observer.finish();
+    }
 
     validate_patch_name(&asset.patch_name)?;
     let chunk_path = chunks_dir.join(&asset.patch_name);
@@ -2858,10 +2937,18 @@ fn apply_hdiff_patch(
     let tp = temp_output.to_string_lossy().into_owned();
     let diff_offset = asset.patch_offset;
 
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.start();
+    }
     let patch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let mut hdiff = super::hdiffpatch::HDiff::with_offset(op, dp, tp, diff_offset);
         hdiff.apply(None)
     }));
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.timings.patch_application = observer.finish();
+    }
 
     {
         if let Ok(f) = fs::File::open(&chunk_path) {
@@ -2871,6 +2958,10 @@ fn apply_hdiff_patch(
 
     match patch_result {
         Ok(true) => {
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.start();
+            }
             let actual_size = fs::metadata(&temp_output)?.len();
             if actual_size != asset.target_file_size {
                 let _ = fs::remove_file(&temp_output);
@@ -2891,6 +2982,10 @@ fn apply_hdiff_patch(
                 });
             }
             fs::rename(&temp_output, &target_path)?;
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(observer) = observer {
+                observer.timings.output_verification = observer.finish();
+            }
             Ok(())
         }
         Ok(false) => {
@@ -3402,7 +3497,8 @@ pub fn benchmark_download_over_bounded_pending_stream<'a>(
 ) -> impl futures_util::Stream<Item = SophonResult<()>> + 'a {
     build_unique_chunk_stream(asset_chunks, super::DOWNLOAD_CONCURRENCY, move |chunk| {
         started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let download = make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
+        let download =
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
         async move {
             std::future::pending::<()>().await;
             download.await

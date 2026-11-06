@@ -221,6 +221,8 @@ pub use preinstall::benchmark_download_over_future_batch;
 pub use preinstall::prepare_synthetic_apply_state as prepare_benchmark_preinstall_state;
 #[cfg(feature = "benchmark")]
 pub use preinstall::prepare_synthetic_copyover_state as prepare_benchmark_copyover_state;
+#[cfg(feature = "bench-diagnostics")]
+pub use preinstall::{HdiffPhaseTimings, apply_synthetic_hdiff_for_benchmark};
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
 pub use update::{UpdateInfo, check_update};
 
