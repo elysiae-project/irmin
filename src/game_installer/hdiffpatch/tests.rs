@@ -1631,6 +1631,78 @@ fn build_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch
 }
 
+fn build_v13_zstd_patch_with_single_cover(
+    old: &[u8],
+    new: &[u8],
+    old_pos: usize,
+    new_pos: usize,
+    cover_length: usize,
+) -> Vec<u8> {
+    assert!(cover_length > 0);
+    assert!(
+        old_pos
+            .checked_add(cover_length)
+            .is_some_and(|end| end <= old.len())
+    );
+    assert!(
+        new_pos
+            .checked_add(cover_length)
+            .is_some_and(|end| end <= new.len())
+    );
+    assert_eq!(
+        &old[old_pos..old_pos + cover_length],
+        &new[new_pos..new_pos + cover_length]
+    );
+    let old_pos_i64 = i64::try_from(old_pos).unwrap();
+    let new_pos_i64 = i64::try_from(new_pos).unwrap();
+    let cover_length_i64 = i64::try_from(cover_length).unwrap();
+    let new_size = i64::try_from(new.len()).unwrap();
+    let old_size = i64::try_from(old.len()).unwrap();
+
+    let cover_buf = [
+        encode_tagged_1bit(0, old_pos_i64),
+        encode_7bit_varint(new_pos_i64),
+        encode_7bit_varint(cover_length_i64),
+    ]
+    .concat();
+
+    let mut rle_ctrl_buf = Vec::new();
+    if new_pos > 0 {
+        rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, new_pos_i64 - 1));
+    }
+    rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, cover_length_i64 - 1));
+    assert_eq!(new_pos_i64 + cover_length_i64, new_size);
+
+    let mut new_data_diff = Vec::with_capacity(new.len() - cover_length);
+    new_data_diff.extend_from_slice(&new[..new_pos]);
+    assert_eq!(new_data_diff.len(), new_pos);
+
+    let cover_compressed = zstd::encode_all(cover_buf.as_slice(), 3).unwrap();
+    let rle_ctrl_compressed = zstd::encode_all(rle_ctrl_buf.as_slice(), 3).unwrap();
+    let new_data_compressed = zstd::encode_all(new_data_diff.as_slice(), 3).unwrap();
+    let mut patch = Vec::new();
+    patch.extend_from_slice(b"HDIFF13&zstd\0");
+    for value in [
+        new_size,
+        old_size,
+        1,
+        cover_buf.len() as i64,
+        cover_compressed.len() as i64,
+        rle_ctrl_buf.len() as i64,
+        rle_ctrl_compressed.len() as i64,
+        0,
+        0,
+        new_data_diff.len() as i64,
+        new_data_compressed.len() as i64,
+    ] {
+        patch.extend_from_slice(&encode_7bit_varint(value));
+    }
+    patch.extend_from_slice(&cover_compressed);
+    patch.extend_from_slice(&rle_ctrl_compressed);
+    patch.extend_from_slice(&new_data_compressed);
+    patch
+}
+
 fn patch_has_v13_covers(patch: &[u8]) -> bool {
     use super::parser::BinaryExtensions;
 
@@ -1688,6 +1760,17 @@ fn hdiff_e2e_v13_zstd_rle_run_exceeds_buffer_applies_correctly() {
         new,
         "oversized RLE run output mismatch"
     );
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_large_gap_before_cover_applies_correctly() {
+    let old = test_prng_data(4001, 1024);
+    let gap = test_prng_data(4002, 3 * 1024 * 1024 + 17);
+    let mut new = gap.clone();
+    new.extend_from_slice(&old[256..768]);
+    let patch = build_v13_zstd_patch_with_single_cover(&old, &new, 256, gap.len(), 512);
+    let result = hdiff_e2e_apply(&old, &patch);
+    assert_eq!(result, new);
 }
 
 #[test]
