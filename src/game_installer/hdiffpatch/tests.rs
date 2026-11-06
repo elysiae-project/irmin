@@ -11,6 +11,25 @@ fn hdiff_v13_zstd_empty_original() {
 }
 
 #[test]
+fn hdiff_v13_zstd_zero_cover_outputs_match_declared_size() {
+    let old = vec![0x6d; 512];
+    let mut changed = old.clone();
+    changed[0] ^= 0xff;
+    for (old, new) in [
+        (&[][..], &[][..]),
+        (&[][..], &[0xa5][..]),
+        (old.as_slice(), changed.as_slice()),
+    ] {
+        let patch = build_v13_zstd_patch(old, new);
+        if !old.is_empty() {
+            assert!(patch_has_v13_covers(&patch));
+        }
+        let result = hdiff_e2e_apply(old, &patch);
+        assert_eq!(result, new);
+    }
+}
+
+#[test]
 fn hdiff_existing_empty_source_applies_newfile_patch() {
     let dir = tempfile::tempdir().unwrap();
     let old_path = dir.path().join("empty-old.bin");
