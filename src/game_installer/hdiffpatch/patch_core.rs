@@ -359,22 +359,23 @@ pub(crate) fn tbytes_set_rle(
         .min(MAX_ARRAY_POOL_SECOND_OFFSET as i64) as usize;
     let last_pos = out_cache.position() as usize;
     rle_code_stream.read_exact(&mut shared_buffer[..decode_step])?;
-    // Direct cache read — avoids Cursor::read_exact overhead.
-    let cache_data = out_cache.get_ref();
-    if last_pos + decode_step > cache_data.len() {
+    let cache_data = out_cache.get_mut();
+    let end_pos = last_pos
+        .checked_add(decode_step)
+        .ok_or_else(|| std::io::Error::other("RLE vector cache range overflow"))?;
+    if end_pos > cache_data.len() {
         return Err(std::io::Error::other("RLE vector: cache underflow"));
     }
-    shared_buffer[MAX_ARRAY_POOL_SECOND_OFFSET..MAX_ARRAY_POOL_SECOND_OFFSET + decode_step]
-        .copy_from_slice(&cache_data[last_pos..last_pos + decode_step]);
-    tbytes_set_rle_vector_software(
-        rle_loader,
-        out_cache,
-        copy_length,
-        decode_step,
-        shared_buffer,
-        0,
-        MAX_ARRAY_POOL_SECOND_OFFSET,
-    )
+    for (old_byte, &delta) in cache_data[last_pos..end_pos]
+        .iter_mut()
+        .zip(&shared_buffer[..decode_step])
+    {
+        *old_byte = old_byte.wrapping_add(delta);
+    }
+    out_cache.set_position(end_pos as u64);
+    rle_loader.mem_copy_length -= decode_step as i64;
+    *copy_length -= decode_step as i64;
+    Ok(())
 }
 
 pub(crate) fn tbytes_set_rle_single(
@@ -410,57 +411,6 @@ pub(crate) fn tbytes_set_rle_single(
     }
     *copy_length -= mem_set_step;
     rle_loader.mem_set_length -= mem_set_step;
-    Ok(())
-}
-
-pub(crate) fn tbytes_set_rle_vector_software(
-    rle_loader: &mut RleRefClip,
-    out_cache: &mut Cursor<Vec<u8>>,
-    copy_length: &mut i64,
-    decode_step: usize,
-    buf: &mut [u8],
-    rle_idx: usize,
-    old_idx: usize,
-) -> std::io::Result<()> {
-    // XOR rle data (at rle_idx) with old cache data (at old_idx) in shared_buffer.
-    if rle_idx + decode_step <= old_idx || old_idx + decode_step <= rle_idx {
-        if rle_idx < old_idx {
-            let (lo, rest) = buf.split_at_mut(old_idx);
-            let dst = &mut lo[rle_idx..];
-            let src = &rest[..decode_step];
-            for (d, s) in dst.iter_mut().zip(src.iter()) {
-                *d = d.wrapping_add(*s);
-            }
-        } else {
-            let (lo, rest) = buf.split_at_mut(rle_idx);
-            let dst = &mut rest[..decode_step];
-            let src = &lo[old_idx..old_idx + decode_step];
-            for (d, s) in dst.iter_mut().zip(src.iter()) {
-                *d = d.wrapping_add(*s);
-            }
-        }
-    } else {
-        for i in 0..decode_step {
-            let v = buf[old_idx + i];
-            buf[rle_idx + i] = buf[rle_idx + i].wrapping_add(v);
-        }
-    }
-    // Write result directly into cache Vec, bypassing Cursor::write_all.
-    let pos = out_cache.position() as usize;
-    let cache_data = out_cache.get_mut();
-    let result = &buf[rle_idx..rle_idx + decode_step];
-    if pos + decode_step <= cache_data.len() {
-        cache_data[pos..pos + decode_step].copy_from_slice(result);
-    } else {
-        // Extend if writing past current length (rare: initial fill).
-        if pos > cache_data.len() {
-            cache_data.resize(pos, 0);
-        }
-        cache_data.extend_from_slice(result);
-    }
-    out_cache.set_position((pos + decode_step) as u64);
-    rle_loader.mem_copy_length -= decode_step as i64;
-    *copy_length -= decode_step as i64;
     Ok(())
 }
 
@@ -760,7 +710,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::RleRefClip;
-    use super::{tbytes_set_rle_single, tbytes_set_rle_vector_software};
+    use super::{tbytes_set_rle, tbytes_set_rle_single};
 
     #[test]
     fn rle_ref_clip_default_initialization() {
@@ -938,168 +888,6 @@ mod tests {
         );
     }
 
-    /// Test wrapping_add edge case: 0xFF + 0x01 = 0x00
-    #[test]
-    fn tbytes_set_rle_vector_wrapping_add_edge_case() {
-        let mut rle_loader = RleRefClip {
-            mem_copy_length: 2,
-            mem_set_length: 0,
-            mem_set_value: 0,
-        };
-
-        let mut cache = Cursor::new(Vec::new());
-        let mut copy_length: i64 = 2;
-        let mut buf = [0u8; 32];
-
-        // Set up buffer with test values at offset positions
-        // rle_idx = 0 (rle data), old_idx = MAX_ARRAY_POOL_SECOND_OFFSET (16)
-        let rle_idx = 0;
-        let old_idx = 16;
-
-        buf[rle_idx] = 0xFF;
-        buf[old_idx] = 0x01; // 0xFF + 0x01 = 0x00 (wrapped)
-
-        let result = tbytes_set_rle_vector_software(
-            &mut rle_loader,
-            &mut cache,
-            &mut copy_length,
-            1, // decode_step = 1
-            &mut buf,
-            rle_idx,
-            old_idx,
-        );
-
-        assert!(
-            result.is_ok(),
-            "tbytes_set_rle_vector_software should succeed"
-        );
-        assert_eq!(buf[rle_idx], 0x00, "0xFF + 0x01 should wrap to 0x00");
-        assert_eq!(
-            rle_loader.mem_copy_length, 1,
-            "mem_copy_length should be decremented"
-        );
-        assert_eq!(copy_length, 1, "copy_length should be decremented");
-    }
-
-    /// Test wrapping_add with 0x80 + 0x80 = 0x00
-    #[test]
-    fn tbytes_set_rle_vector_wrapping_add_0x80_0x80() {
-        let mut rle_loader = RleRefClip {
-            mem_copy_length: 1,
-            mem_set_length: 0,
-            mem_set_value: 0,
-        };
-
-        let mut cache = Cursor::new(Vec::new());
-        let mut copy_length: i64 = 1;
-        let mut buf = [0u8; 32];
-
-        let rle_idx = 4;
-        let old_idx = 20;
-
-        buf[rle_idx] = 0x80;
-        buf[old_idx] = 0x80; // 0x80 + 0x80 = 0x00 (wrapped, 128 + 128 = 256 mod 256)
-
-        let result = tbytes_set_rle_vector_software(
-            &mut rle_loader,
-            &mut cache,
-            &mut copy_length,
-            1,
-            &mut buf,
-            rle_idx,
-            old_idx,
-        );
-
-        assert!(
-            result.is_ok(),
-            "tbytes_set_rle_vector_software should succeed"
-        );
-        assert_eq!(buf[rle_idx], 0x00, "0x80 + 0x80 should wrap to 0x00");
-    }
-
-    /// Test multi-byte decode_step with wrapping at boundary
-    #[test]
-    fn tbytes_set_rle_vector_multi_byte_with_wrapping() {
-        let mut rle_loader = RleRefClip {
-            mem_copy_length: 3,
-            mem_set_length: 0,
-            mem_set_value: 0,
-        };
-
-        let mut cache = Cursor::new(Vec::new());
-        let mut copy_length: i64 = 3;
-        let mut buf = [0u8; 32];
-
-        let rle_idx = 0;
-        let old_idx = 16;
-
-        // First byte: no overflow
-        buf[rle_idx] = 0x10;
-        buf[old_idx] = 0x20; // 0x10 + 0x20 = 0x30
-
-        // Second byte: boundary case
-        buf[rle_idx + 1] = 0xFE;
-        buf[old_idx + 1] = 0x03; // 0xFE + 0x03 = 0x01 (wrapped, 254 + 3 = 257 mod 256 = 1)
-
-        // Third byte: normal case
-        buf[rle_idx + 2] = 0x7F;
-        buf[old_idx + 2] = 0x01; // 0x7F + 0x01 = 0x80
-
-        let result = tbytes_set_rle_vector_software(
-            &mut rle_loader,
-            &mut cache,
-            &mut copy_length,
-            3,
-            &mut buf,
-            rle_idx,
-            old_idx,
-        );
-
-        assert!(
-            result.is_ok(),
-            "tbytes_set_rle_vector_software should succeed"
-        );
-        assert_eq!(buf[rle_idx], 0x30, "0x10 + 0x20 should be 0x30");
-        assert_eq!(buf[rle_idx + 1], 0x01, "0xFE + 0x03 should wrap to 0x01");
-        assert_eq!(buf[rle_idx + 2], 0x80, "0x7F + 0x01 should be 0x80");
-    }
-
-    /// Test mem_copy_length is properly decremented
-    #[test]
-    fn tbytes_set_rle_vector_decrements_mem_copy_length() {
-        let mut rle_loader = RleRefClip {
-            mem_copy_length: 5,
-            mem_set_length: 0,
-            mem_set_value: 0,
-        };
-
-        let mut cache = Cursor::new(Vec::new());
-        let mut copy_length: i64 = 5;
-        let mut buf = [0u8; 32];
-
-        // Fill buf with test data at offset positions
-        for i in 0..5 {
-            buf[i] = 0;
-            buf[16 + i] = i as u8;
-        }
-
-        let _ = tbytes_set_rle_vector_software(
-            &mut rle_loader,
-            &mut cache,
-            &mut copy_length,
-            3, // decode_step = 3
-            &mut buf,
-            0,
-            16,
-        );
-
-        assert_eq!(
-            rle_loader.mem_copy_length, 2,
-            "mem_copy_length should be 5 - 3 = 2"
-        );
-        assert_eq!(copy_length, 2, "copy_length should be 5 - 3 = 2");
-    }
-
     /// When mem_set_length exceeds shared_buffer.len(), the step should be
     /// capped to the buffer size. Only shared_buffer.len() bytes are processed.
     #[test]
@@ -1195,8 +983,6 @@ mod tests {
     /// should return immediately without doing anything.
     #[test]
     fn tbytes_set_rle_empty_stream_no_modification() {
-        use super::tbytes_set_rle;
-
         let mut rle_loader = RleRefClip {
             mem_copy_length: 0,
             mem_set_length: 0,
@@ -1227,61 +1013,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tbytes_set_rle_literal_adds_in_place_and_updates_counters() {
+        let mut rle_loader = RleRefClip {
+            mem_copy_length: 4,
+            mem_set_length: 0,
+            mem_set_value: 0,
+        };
+        let mut cache = Cursor::new(vec![0xff, 0x80, 0x10, 0x7f]);
+        let mut copy_length = 4;
+        let mut shared_buffer = [0; 8];
+        let mut rle_code: &[u8] = &[0x01, 0x80, 0xfe, 0x02];
+
+        tbytes_set_rle(
+            &mut rle_loader,
+            &mut cache,
+            &mut copy_length,
+            &mut shared_buffer,
+            &mut rle_code,
+        )
+        .unwrap();
+
+        assert_eq!(cache.get_ref(), &[0x00, 0x00, 0x0e, 0x81]);
+        assert_eq!(cache.position(), 4);
+        assert_eq!(rle_loader.mem_copy_length, 0);
+        assert_eq!(copy_length, 0);
+        assert!(rle_code.is_empty());
+    }
+
+    #[test]
+    fn tbytes_set_rle_literal_processes_maximum_chunks() {
+        use super::MAX_ARRAY_POOL_SECOND_OFFSET;
+
+        let len = MAX_ARRAY_POOL_SECOND_OFFSET + 3;
+        let original = vec![0x80; len];
+        let deltas = vec![0x80; len];
+        let mut cache = Cursor::new(original);
+        let mut rle_loader = RleRefClip {
+            mem_copy_length: len as i64,
+            ..Default::default()
+        };
+        let mut copy_length = len as i64;
+        let mut shared_buffer = vec![0; MAX_ARRAY_POOL_SECOND_OFFSET * 2];
+        let mut rle_code = deltas.as_slice();
+
+        while copy_length > 0 {
+            tbytes_set_rle(
+                &mut rle_loader,
+                &mut cache,
+                &mut copy_length,
+                &mut shared_buffer,
+                &mut rle_code,
+            )
+            .unwrap();
+        }
+
+        assert!(cache.get_ref().iter().all(|&byte| byte == 0));
+        assert_eq!(rle_loader.mem_copy_length, 0);
+        assert!(rle_code.is_empty());
+    }
+
+    #[test]
+    fn tbytes_set_rle_literal_rejects_cache_underflow() {
+        let mut cache = Cursor::new(vec![0xaa, 0xbb]);
+        cache.set_position(1);
+        let mut rle_loader = RleRefClip {
+            mem_copy_length: 2,
+            ..Default::default()
+        };
+        let mut copy_length = 2;
+        let mut shared_buffer = [0; 4];
+        let mut rle_code: &[u8] = &[1, 2];
+
+        let error = tbytes_set_rle(
+            &mut rle_loader,
+            &mut cache,
+            &mut copy_length,
+            &mut shared_buffer,
+            &mut rle_code,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "RLE vector: cache underflow");
+        assert_eq!(cache.get_ref(), &[0xaa, 0xbb]);
+        assert_eq!(cache.position(), 1);
+        assert_eq!(copy_length, 2);
+        assert_eq!(rle_loader.mem_copy_length, 2);
+    }
+
     /// When mem_copy_length exceeds MAX_ARRAY_POOL_SECOND_OFFSET, the decode
     /// step is capped to MAX_ARRAY_POOL_SECOND_OFFSET in tbytes_set_rle.
     #[test]
     fn tbytes_set_rle_caps_decode_step_to_second_offset() {
         use super::MAX_ARRAY_POOL_SECOND_OFFSET;
-        use std::io::Cursor;
 
-        // Setup: mem_copy_length much larger than MAX_ARRAY_POOL_SECOND_OFFSET
-        // decode_step = min(mem_copy_length, copy_length, MAX_ARRAY_POOL_SECOND_OFFSET)
-        // This tests the cap by MAX_ARRAY_POOL_SECOND_OFFSET
-        let offset = MAX_ARRAY_POOL_SECOND_OFFSET;
-        // We can't easily test the full tbytes_set_rle with real I/O here because
-        // it reads from rle_code_stream and cache. Instead, verify the constant
-        // and the capping logic is exercised via tbytes_set_rle_vector_software.
-        // Test that decode_step exceeding available data returns correctly.
+        let len = MAX_ARRAY_POOL_SECOND_OFFSET + 100;
+        let mut cache = Cursor::new(vec![0; len]);
         let mut rle_loader = RleRefClip {
-            mem_copy_length: offset as i64 + 100, // exceeds offset
-            mem_set_length: 0,
-            mem_set_value: 0,
+            mem_copy_length: len as i64,
+            ..Default::default()
         };
+        let mut copy_length = len as i64;
+        let mut shared_buffer = vec![0; MAX_ARRAY_POOL_SECOND_OFFSET * 2];
+        let deltas = vec![1; len];
+        let mut rle_code = deltas.as_slice();
 
-        let mut cache = Cursor::new(Vec::new());
-        let mut copy_length: i64 = offset as i64 + 100;
-        // Need large enough buffer for rle_idx and old_idx regions
-        let mut buf = vec![0u8; offset * 2 + 100];
-
-        // Fill with test data at old_idx
-        for i in 0..offset {
-            buf[offset + i] = (i % 256) as u8;
-        }
-
-        // decode_step = min(mem_copy_length, copy_length, MAX_ARRAY_POOL_SECOND_OFFSET)
-        // min(offset+100, offset+100, offset) = offset
-        let result = tbytes_set_rle_vector_software(
+        tbytes_set_rle(
             &mut rle_loader,
             &mut cache,
             &mut copy_length,
-            offset, // decode_step = MAX_ARRAY_POOL_SECOND_OFFSET
-            &mut buf,
-            0,      // rle_idx
-            offset, // old_idx
-        );
+            &mut shared_buffer,
+            &mut rle_code,
+        )
+        .unwrap();
 
-        assert!(
-            result.is_ok(),
-            "should succeed with decode_step at MAX_ARRAY_POOL_SECOND_OFFSET"
-        );
-        assert_eq!(
-            rle_loader.mem_copy_length, 100,
-            "mem_copy_length should have 100 remaining after cap"
-        );
-        assert_eq!(
-            copy_length, 100,
-            "copy_length should have 100 remaining after cap"
-        );
+        assert_eq!(copy_length, 100);
+        assert_eq!(rle_loader.mem_copy_length, 100);
     }
 
     /// When mem_copy_length is zero, tbytes_set_rle skips the vector step
