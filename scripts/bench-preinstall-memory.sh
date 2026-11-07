@@ -52,6 +52,43 @@ environment_file="$output_dir/environment.txt"
 record_environment "$environment_file" date -u
 record_environment "$environment_file" uname -a
 record_environment "$environment_file" lscpu
+compiler=${RUSTC:-rustc}
+if ! (cd "$repo_root" && "$compiler" -Vv) >>"$environment_file" 2>&1; then
+    printf 'configured rustc version probe failed (RUSTC is treated as one executable path)\n' >>"$environment_file"
+fi
+if ! (cd "$repo_root" && cargo -V) >>"$environment_file" 2>&1; then
+    printf 'Cargo version probe failed\n' >>"$environment_file"
+fi
+{
+    printf '\nBuild environment:\n'
+    printf 'profile=release (--release)\n'
+    printf 'provenance_scope=script command and repository-local/CARGO_HOME Cargo and toolchain config; ancestor Cargo config may also affect the effective build\n'
+    printf 'CARGO_BUILD_TARGET=%s\n' "${CARGO_BUILD_TARGET:-<host default or cargo config>}"
+    for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTC RUSTC_WRAPPER; do
+        value=${!name:-}
+        if [[ ${!name+x} ]]; then
+            hash=$(printf '%s' "$value" | hash_stdin || printf 'unavailable')
+            printf '%s_set=true sha256=%s\n' "$name" "$hash"
+        else
+            printf '%s_set=false\n' "$name"
+        fi
+    done
+    for name in CARGO_PROFILE_RELEASE_OPT_LEVEL CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS CARGO_PROFILE_RELEASE_DEBUG CARGO_PROFILE_RELEASE_PANIC; do
+        value=${!name:-}
+        printf '%s=%s\n' "$name" "${value:-<unset>}"
+    done
+    for config in \
+        "$repo_root"/.cargo/config \
+        "$repo_root"/.cargo/config.toml \
+        "$repo_root"/rust-toolchain \
+        "$repo_root"/rust-toolchain.toml \
+        "${CARGO_HOME:-$HOME/.cargo}/config" \
+        "${CARGO_HOME:-$HOME/.cargo}/config.toml"; do
+        if [[ -f $config ]]; then
+            hash_file "$config"
+        fi
+    done
+} >>"$environment_file"
 {
     printf '\nFilesystem:\n'
     if ! df -T "$repo_root" "$output_dir" /tmp; then
@@ -93,7 +130,7 @@ record_environment "$environment_file" lscpu
     fi
     printf '\nCargo.lock checksum:\n'
     if [[ -f $repo_root/Cargo.lock ]]; then
-        sha256sum "$repo_root/Cargo.lock" || printf 'Cargo.lock checksum unavailable\n'
+        hash_file "$repo_root/Cargo.lock"
     else
         printf 'Cargo.lock missing\n'
     fi
@@ -105,14 +142,46 @@ run_benchmark() {
     local temp_file
     shift
     printf 'Running %s\n' "$label"
+    local -a command=(
+        cargo run --locked --manifest-path "$repo_root/Cargo.toml" --release
+        --bin bench_memory --features 'bench-alloc-stats bench-diagnostics' --
+        "$@" --json
+    )
+    {
+        printf '\nRun %s:\n' "$label"
+        printf ' cd %q &&' "$repo_root"
+        printf ' %q' "${command[@]}"
+        printf '\n'
+    } >>"$environment_file"
     temp_file=$(mktemp "$output_dir/.${label}.XXXXXX")
-    if ! cargo run --locked --manifest-path "$repo_root/Cargo.toml" --release --bin bench_memory \
-        --features 'bench-alloc-stats bench-diagnostics' -- \
-        "$@" --json >"$temp_file"; then
+    if ! (cd "$repo_root" && "${command[@]}" >"$temp_file"); then
         rm -f -- "$temp_file"
         return 1
     fi
     mv -- "$temp_file" "$output_file"
+}
+
+hash_stdin() {
+    local result
+    if command -v sha256sum >/dev/null 2>&1; then
+        result=$(sha256sum | awk '{print $1}') && [[ -n $result ]] || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        result=$(shasum -a 256 | awk '{print $1}') && [[ -n $result ]] || return 1
+    else
+        return 1
+    fi
+    printf '%s' "$result"
+}
+
+hash_file() {
+    local file=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" || printf 'Checksum unavailable for %s\n' "${file##*/}"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" || printf 'Checksum unavailable for %s\n' "${file##*/}"
+    else
+        printf 'Checksum utility unavailable for %s\n' "${file##*/}"
+    fi
 }
 
 for size_mib in 4 64 256; do
