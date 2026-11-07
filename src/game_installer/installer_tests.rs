@@ -108,6 +108,19 @@
     }
 
     #[test]
+    fn download_item_index_is_absent_when_deduplication_is_disabled() {
+        assert!(uses_chunk_deduplication(super::VerifyMode::Full));
+        assert!(!uses_chunk_deduplication(super::VerifyMode::Deferred));
+        assert!(!uses_chunk_deduplication(super::VerifyMode::None));
+        assert!(new_download_items_index(super::VerifyMode::Deferred, 100).is_none());
+        assert!(new_download_items_index(super::VerifyMode::None, 100).is_none());
+
+        let index = new_download_items_index(super::VerifyMode::Full, 100).unwrap();
+        assert!(index.is_empty());
+        assert!(index.capacity() >= 100);
+    }
+
+    #[test]
     fn compute_totals_no_dupes() {
         let files = vec![
             make_file(

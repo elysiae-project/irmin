@@ -156,6 +156,19 @@ struct DownloadItem {
 
 type FileEntry = (u32, u32, u32);
 
+#[inline]
+fn uses_chunk_deduplication(verify_mode: super::VerifyMode) -> bool {
+    verify_mode == super::VerifyMode::Full
+}
+
+fn new_download_items_index<'a>(
+    verify_mode: super::VerifyMode,
+    total_chunks: usize,
+) -> Option<FxHashMap<&'a str, u32>> {
+    uses_chunk_deduplication(verify_mode)
+        .then(|| FxHashMap::with_capacity_and_hasher(total_chunks, Default::default()))
+}
+
 /// One manifest category together with its chunk download endpoint and identity.
 pub struct SophonInstaller {
     pub manifest: SophonManifestProto,
@@ -617,7 +630,7 @@ fn register_chunks_for_file<'a>(
     tmp_dir_idx: usize,
     chunk_entries: &mut Vec<Vec<FileEntry>>,
     download_items: &mut Vec<DownloadItem>,
-    download_items_index: &mut FxHashMap<&'a str, u32>,
+    download_items_index: &mut Option<FxHashMap<&'a str, u32>>,
     chunk_refcounts: &mut Vec<AtomicU32>,
     pending_counts: &mut Vec<AtomicU32>,
     installer_idx: usize,
@@ -647,7 +660,10 @@ fn register_chunks_for_file<'a>(
         // When force_eager, skip dedup — create independent DownloadItems per file.
         // Shared chunks get downloaded multiple times but avoid .zstd intermediates.
         let item_idx = if !force_eager {
-            if let Some(&idx) = download_items_index.get(name) {
+            let index = download_items_index
+                .as_mut()
+                .expect("dedup index is initialized for full verification mode");
+            if let Some(&idx) = index.get(name) {
                 if is_pre {
                     download_items[idx as usize].is_pre_downloaded = true;
                 }
@@ -665,7 +681,7 @@ fn register_chunks_for_file<'a>(
                     is_pre_downloaded: is_pre,
                     use_eager: file_is_eager,
                 });
-                download_items_index.insert(name, idx);
+                index.insert(name, idx);
                 idx
             }
         } else {
@@ -715,8 +731,8 @@ async fn build_download_state(
     let total_chunks: usize = ctx.all_files.num_chunks();
     let total_files: usize = ctx.all_files.num_files();
     let mut download_items: Vec<DownloadItem> = Vec::with_capacity(total_chunks);
-    let mut download_items_index: FxHashMap<&str, u32> =
-        FxHashMap::with_capacity_and_hasher(total_chunks, Default::default());
+    let force_eager = !uses_chunk_deduplication(ctx.verify_mode);
+    let mut download_items_index = new_download_items_index(ctx.verify_mode, total_chunks);
     let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::with_capacity(total_chunks);
     let mut chunk_refcounts: Vec<AtomicU32> = Vec::with_capacity(total_chunks);
     let mut pending_counts: Vec<AtomicU32> = Vec::with_capacity(total_files);
@@ -755,7 +771,7 @@ async fn build_download_state(
                 tmp_dir_idx,
                 pre_downloaded,
                 &mut eager_tainted_files,
-                ctx.verify_mode != super::VerifyMode::Full,
+                force_eager,
             );
 
             if pending_counts.len() == pending_before {
@@ -782,7 +798,7 @@ async fn build_download_state(
         entries = chunk_entries.len(),
     );
 
-    let total_flat_entries: usize = chunk_entries.iter().map(|v| v.len()).sum();
+    let total_flat_entries: usize = chunk_entries.iter().map(Vec::len).sum();
     let mut chunk_entry_offsets: Vec<u32> = Vec::with_capacity(chunk_entries.len() + 1);
     let mut flat_chunk_entries: Vec<FileEntry> = Vec::with_capacity(total_flat_entries);
     chunk_entry_offsets.push(0);
