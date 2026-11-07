@@ -1182,6 +1182,26 @@ struct PreinstallWorkerCtx {
     chunks_since_save: Arc<AtomicUsize>,
 }
 
+fn snapshot_downloaded_chunks(
+    chunk_bytes_map: Arc<DashMap<String, u64>>,
+    state_saver: &super::installer::StateSaver,
+) -> rustc_hash::FxHashSet<String> {
+    let snapshot: HashMap<String, u64> = chunk_bytes_map
+        .iter()
+        .map(|entry| (entry.key().clone(), *entry.value()))
+        .collect();
+    state_saver(&snapshot);
+    drop(snapshot);
+
+    match Arc::try_unwrap(chunk_bytes_map) {
+        Ok(map) => map.into_iter().map(|(name, _)| name).collect(),
+        Err(map) => {
+            log::warn!("Preinstall chunk map still has references; cloning final chunk names");
+            map.iter().map(|entry| entry.key().clone()).collect()
+        }
+    }
+}
+
 async fn process_preinstall_chunk(
     chunk_info: &PatchChunkInfo,
     ctx: &PreinstallWorkerCtx,
@@ -1631,12 +1651,7 @@ pub async fn preinstall_download(
     }
 
     // Persist all downloaded chunks.
-    let final_map = Arc::clone(&chunk_bytes_map);
-    let map: HashMap<String, u64> = final_map
-        .iter()
-        .map(|r| (r.key().clone(), *r.value()))
-        .collect();
-    state_saver(&map);
+    let downloaded_chunks = snapshot_downloaded_chunks(chunk_bytes_map, &state_saver);
 
     updater(SophonProgress::Downloading {
         downloaded_bytes: total_bytes,
@@ -1645,13 +1660,6 @@ pub async fn preinstall_download(
         eta_seconds: 0.0,
     });
 
-    let downloaded_chunks: rustc_hash::FxHashSet<String> = match Arc::try_unwrap(chunk_bytes_map) {
-        Ok(map) => map.into_iter().map(|(k, _)| k).collect(),
-        Err(arc) => {
-            log::warn!("chunk_bytes_map DashMap still has references, using iter");
-            arc.iter().map(|r| r.key().clone()).collect()
-        }
-    };
     let tag_str = plan.tag.clone();
     let state = PreinstallState {
         tag: plan.tag,

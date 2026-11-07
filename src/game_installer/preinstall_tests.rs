@@ -12,6 +12,51 @@ fn insert_unique_chunk_name_skips_duplicate_owned_key() {
     assert!(seen.contains("chunk-b"));
 }
 
+#[test]
+fn snapshot_downloaded_chunks_saves_sizes_and_moves_names() {
+    let map = Arc::new(DashMap::new());
+    map.insert("chunk-a".to_owned(), 11);
+    map.insert("chunk-b".to_owned(), 22);
+    let saved = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let saved_for_callback = Arc::clone(&saved);
+    let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
+        *saved_for_callback.lock().unwrap() = snapshot.clone();
+    });
+
+    let names = snapshot_downloaded_chunks(map, &saver);
+
+    assert_eq!(
+        *saved.lock().unwrap(),
+        HashMap::from([("chunk-a".to_owned(), 11), ("chunk-b".to_owned(), 22),])
+    );
+    assert_eq!(
+        names,
+        rustc_hash::FxHashSet::from_iter(["chunk-a".into(), "chunk-b".into()])
+    );
+}
+
+#[test]
+fn snapshot_downloaded_chunks_clones_names_when_map_is_shared() {
+    let map = Arc::new(DashMap::new());
+    map.insert("chunk-a".to_owned(), 11);
+    map.insert("chunk-b".to_owned(), 22);
+    let extra_owner = Arc::clone(&map);
+    let saved = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let saved_for_callback = Arc::clone(&saved);
+    let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
+        *saved_for_callback.lock().unwrap() = snapshot.clone();
+    });
+
+    let names = snapshot_downloaded_chunks(map, &saver);
+
+    assert_eq!(
+        names,
+        rustc_hash::FxHashSet::from_iter(["chunk-a".into(), "chunk-b".into()])
+    );
+    assert_eq!(extra_owner.len(), 2);
+    assert_eq!(saved.lock().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn first_stream_error_drains_all_results_and_returns_first_error() {
     let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
