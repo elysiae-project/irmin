@@ -61,6 +61,25 @@ async fn run_no_hash(chunks: &[Bytes], sink: &mut VecWriter) -> u64 {
     written
 }
 
+fn run_memcpy_ceiling(payload: &[u8], sink: &mut Vec<u8>) -> usize {
+    sink.clear();
+    sink.extend_from_slice(payload);
+    black_box(&*sink);
+    sink.len()
+}
+
+fn run_md5_ceiling(payload: &[u8]) -> [u8; 16] {
+    let mut hasher = fast_md5::Md5::new();
+    hasher.update(payload);
+    black_box(hasher.finalize())
+}
+
+fn run_xxh64_ceiling(payload: &[u8]) -> u64 {
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    hasher.update(payload);
+    black_box(hasher.digest())
+}
+
 async fn run_md5(
     chunks: &[Bytes],
     sink: &mut VecWriter,
@@ -109,6 +128,20 @@ fn bench_download_stream_core(c: &mut Criterion) {
     expected_xxh64.update(&payload);
     let expected_xxh64 = expected_xxh64.digest();
     let mut sink = VecWriter(Vec::with_capacity(TOTAL_BYTES));
+    let mut memcpy_sink = Vec::with_capacity(TOTAL_BYTES);
+    assert_eq!(run_memcpy_ceiling(&payload, &mut memcpy_sink), TOTAL_BYTES);
+    assert_eq!(run_md5_ceiling(&payload), expected_md5);
+    assert_eq!(run_xxh64_ceiling(&payload), expected_xxh64);
+
+    group.bench_function("memcpy_ceiling", |b| {
+        b.iter(|| run_memcpy_ceiling(&payload, &mut memcpy_sink));
+    });
+    group.bench_function("md5_single_buffer_ceiling", |b| {
+        b.iter(|| black_box(run_md5_ceiling(&payload)));
+    });
+    group.bench_function("xxh64_single_buffer_ceiling", |b| {
+        b.iter(|| black_box(run_xxh64_ceiling(&payload)));
+    });
 
     for chunk_size in [4, 16, 64, 256].map(|kib| kib * 1024) {
         let chunks = make_chunks(&payload, chunk_size);
