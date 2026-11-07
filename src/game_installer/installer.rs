@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
 use futures_util::future::try_join_all;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::StreamExt;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -214,11 +214,12 @@ fn insert_new_chunk_name<'a>(seen_chunks: &mut rustc_hash::FxHashSet<&'a str>, n
     seen_chunks.insert(name)
 }
 
-fn repair_download_stream<I, F, Fut>(
+fn bounded_stoppable_stream<I, F, Fut>(
     items: Vec<I>,
     limit: usize,
     stopped: Arc<AtomicBool>,
     make_future: F,
+    operation: &str,
 ) -> SophonResult<impl futures_util::Stream<Item = Fut::Output>>
 where
     I: 'static,
@@ -228,7 +229,7 @@ where
     if limit == 0 {
         return Err(SophonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "repair download concurrency limit must be positive",
+            format!("{operation} concurrency limit must be positive"),
         )));
     }
     Ok(futures_util::stream::iter(items)
@@ -3032,58 +3033,64 @@ async fn repair_assets(
     });
 
     // Phase 1: Verify all files in parallel (bounded by semaphore)
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
     let scanned_count = Arc::new(AtomicU64::new(0));
     let error_count = Arc::new(AtomicU64::new(0));
 
     let stopped = Arc::new(AtomicBool::new(false));
-    let mut verify_stream = FuturesUnordered::new();
-    for (asset, chunk_download) in all_assets {
-        let permit = Arc::clone(&semaphore);
-        let verify_cache = Arc::clone(&verify_cache);
-        let game_dir = game_dir.to_path_buf();
-        let scanned_count = Arc::clone(&scanned_count);
-        let error_count = Arc::clone(&error_count);
-        let stopped = Arc::clone(&stopped);
-
-        verify_stream.push(async move {
-            let _permit = permit.acquire().await.map_err(|_| SophonError::Cancelled)?;
-            if stopped.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-            validate_asset_name(&asset.asset_name)?;
-
-            let file_path = game_dir.join(&asset.asset_name);
-            let asset_size = asset.asset_size;
-            let asset_md5 = asset.asset_hash_md5.clone();
-
-            let is_valid = tokio::task::spawn_blocking({
-                let file_path = file_path.clone();
-                move || {
-                    cache::check_file_md5_cached(
-                        &file_path,
-                        asset_size,
-                        &asset_md5,
-                        &game_dir,
-                        &verify_cache,
-                    )
+    let verify_cache_for_stream = Arc::clone(&verify_cache);
+    let game_dir_for_stream = game_dir.to_path_buf();
+    let scanned_count_for_stream = Arc::clone(&scanned_count);
+    let error_count_for_stream = Arc::clone(&error_count);
+    let verify_stopped = Arc::clone(&stopped);
+    let mut verify_stream = bounded_stoppable_stream(
+        all_assets,
+        16,
+        Arc::clone(&stopped),
+        move |(asset, chunk_download)| {
+            let verify_cache = Arc::clone(&verify_cache_for_stream);
+            let game_dir = game_dir_for_stream.clone();
+            let scanned_count = Arc::clone(&scanned_count_for_stream);
+            let error_count = Arc::clone(&error_count_for_stream);
+            let stopped = Arc::clone(&verify_stopped);
+            async move {
+                if stopped.load(Ordering::Acquire) {
+                    return Ok(None);
                 }
-            })
-            .await??;
+                validate_asset_name(&asset.asset_name)?;
 
-            let scanned = scanned_count.fetch_add(1, Ordering::Relaxed) + 1;
+                let file_path = game_dir.join(&asset.asset_name);
+                let asset_size = asset.asset_size;
+                let asset_md5 = asset.asset_hash_md5.clone();
 
-            if !is_valid {
-                error_count.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, SophonError>(Some((asset, chunk_download, file_path)))
-            } else {
-                if scanned.is_multiple_of(100) {
-                    log::debug!("Verified {scanned}/{total_files} files");
+                let is_valid = tokio::task::spawn_blocking({
+                    let file_path = file_path.clone();
+                    move || {
+                        cache::check_file_md5_cached(
+                            &file_path,
+                            asset_size,
+                            &asset_md5,
+                            &game_dir,
+                            &verify_cache,
+                        )
+                    }
+                })
+                .await??;
+
+                let scanned = scanned_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                if !is_valid {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, SophonError>(Some((asset, chunk_download, file_path)))
+                } else {
+                    if scanned.is_multiple_of(100) {
+                        log::debug!("Verified {scanned}/{total_files} files");
+                    }
+                    Ok(None)
                 }
-                Ok(None)
             }
-        });
-    }
+        },
+        "verification",
+    )?;
 
     let mut failed_verifications: Vec<(
         SophonManifestAssetProperty,
@@ -3199,7 +3206,7 @@ async fn repair_assets(
         let dl_completed_for_stream = Arc::clone(&dl_completed);
         let dl_bytes_for_stream = Arc::clone(&dl_bytes);
         let stream_stopped = Arc::clone(&stopped_for_stream);
-        let mut dl_stream = repair_download_stream(
+        let mut dl_stream = bounded_stoppable_stream(
             redownload_items,
             super::DOWNLOAD_CONCURRENCY,
             stream_stopped,
@@ -3244,6 +3251,7 @@ async fn repair_assets(
                     result
                 }
             },
+            "repair",
         )?;
         while let Some(result) = dl_stream.next().await {
             if let Err(err) = result {

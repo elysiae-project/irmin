@@ -263,41 +263,47 @@
     }
 
     #[tokio::test]
-    async fn repair_download_stream_bounds_futures_and_stops_after_error() {
+    async fn bounded_stoppable_stream_bounds_futures_and_stops_after_error() {
         let stopped = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(AtomicUsize::new(0));
         let mapped = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(tokio::sync::Barrier::new(4));
-        let mut stream = repair_download_stream(vec![0usize; 100], 4, Arc::clone(&stopped), {
-            let active = Arc::clone(&active);
-            let max_active = Arc::clone(&max_active);
-            let started = Arc::clone(&started);
-            let mapped = Arc::clone(&mapped);
-            let barrier = Arc::clone(&barrier);
-            move |item| {
-                mapped.fetch_add(1, Ordering::Relaxed);
+        let mut stream = bounded_stoppable_stream(
+            vec![0usize; 100],
+            4,
+            Arc::clone(&stopped),
+            {
                 let active = Arc::clone(&active);
                 let max_active = Arc::clone(&max_active);
                 let started = Arc::clone(&started);
-                let stopped = Arc::clone(&stopped);
+                let mapped = Arc::clone(&mapped);
                 let barrier = Arc::clone(&barrier);
-                async move {
-                    started.fetch_add(1, Ordering::Relaxed);
-                    let current = active.fetch_add(1, Ordering::AcqRel) + 1;
-                    max_active.fetch_max(current, Ordering::Relaxed);
-                    barrier.wait().await;
-                    active.fetch_sub(1, Ordering::AcqRel);
-                    if item == 0 {
-                        stopped.store(true, Ordering::Release);
-                        Err(SophonError::Io(std::io::Error::other("synthetic failure")))
-                    } else {
-                        Ok(())
+                move |item| {
+                    mapped.fetch_add(1, Ordering::Relaxed);
+                    let active = Arc::clone(&active);
+                    let max_active = Arc::clone(&max_active);
+                    let started = Arc::clone(&started);
+                    let stopped = Arc::clone(&stopped);
+                    let barrier = Arc::clone(&barrier);
+                    async move {
+                        started.fetch_add(1, Ordering::Relaxed);
+                        let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        max_active.fetch_max(current, Ordering::Relaxed);
+                        barrier.wait().await;
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        if item == 0 {
+                            stopped.store(true, Ordering::Release);
+                            Err(SophonError::Io(std::io::Error::other("synthetic failure")))
+                        } else {
+                            Ok(())
+                        }
                     }
                 }
-            }
-        })
+            },
+            "test",
+        )
         .unwrap();
 
         let mut first_error = None;
@@ -315,19 +321,25 @@
     }
 
     #[tokio::test]
-    async fn repair_download_stream_processes_all_items_without_errors() {
+    async fn bounded_stoppable_stream_processes_all_items_without_errors() {
         let stopped = Arc::new(AtomicBool::new(false));
         let started = Arc::new(AtomicUsize::new(0));
-        let mut stream = repair_download_stream((0..37usize).collect(), 5, stopped, {
-            let started = Arc::clone(&started);
-            move |_| {
+        let mut stream = bounded_stoppable_stream(
+            (0..37usize).collect(),
+            5,
+            stopped,
+            {
                 let started = Arc::clone(&started);
-                async move {
-                    started.fetch_add(1, Ordering::Relaxed);
-                    Ok::<_, SophonError>(())
+                move |_| {
+                    let started = Arc::clone(&started);
+                    async move {
+                        started.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, SophonError>(())
+                    }
                 }
-            }
-        })
+            },
+            "test",
+        )
         .unwrap();
 
         while let Some(result) = stream.next().await {
@@ -338,12 +350,13 @@
     }
 
     #[test]
-    fn repair_download_stream_rejects_zero_concurrency() {
-        let result = repair_download_stream(
+    fn bounded_stoppable_stream_rejects_zero_concurrency() {
+        let result = bounded_stoppable_stream(
             Vec::<usize>::new(),
             0,
             Arc::new(AtomicBool::new(false)),
             |_| async { Ok::<_, SophonError>(()) },
+            "test",
         );
 
         assert!(matches!(result, Err(SophonError::Io(_))));
