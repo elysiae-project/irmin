@@ -9,12 +9,42 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 
 use super::CHUNK_WRITE_BUFFER_SIZE;
 use super::assembly_opt::{
-    md5_hex_eq, md5_to_hex, posix_advise, return_md5, take_md5, xxh64_hex_eq,
+    Md5, md5_hex_eq, md5_to_hex, posix_advise, return_md5, take_md5, xxh64_hex_eq,
 };
 use super::compact_manifest::ChunkRef;
 use super::error::{SophonError, SophonResult};
 use super::handle::DownloadHandle;
 use crate::api_scrape::DownloadInfo;
+
+struct PooledMd5 {
+    hasher: Option<Md5>,
+}
+
+impl PooledMd5 {
+    fn new(hasher: Md5) -> Self {
+        Self {
+            hasher: Some(hasher),
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut Md5 {
+        self.hasher
+            .as_mut()
+            .expect("pooled MD5 hasher is available")
+    }
+
+    fn finish(&mut self) -> std::io::Result<[u8; 16]> {
+        self.get_mut().finish()
+    }
+}
+
+impl Drop for PooledMd5 {
+    fn drop(&mut self) {
+        if let Some(hasher) = self.hasher.take() {
+            return_md5(hasher);
+        }
+    }
+}
 
 pub(crate) struct EvictingWriter {
     inner: BufWriter<tokio::fs::File>,
@@ -457,7 +487,7 @@ async fn do_download_chunk(
 async fn stream_and_verify(
     file: &mut EvictingWriter,
     resp: reqwest::Response,
-    hasher: &mut Option<super::assembly_opt::Md5>,
+    hasher: &mut Option<PooledMd5>,
     xxh64_hasher: &mut Option<xxhash_rust::xxh64::Xxh64>,
     expected_total: u64,
     starting_len: u64,
@@ -507,7 +537,7 @@ async fn stream_and_verify(
                     return Err(SophonError::Io(err));
                 }
                 if let Some(h) = hasher.as_mut() {
-                    h.update(&bytes)?;
+                    h.get_mut().update(&bytes)?;
                 }
                 if let Some(h) = xxh64_hasher.as_mut() {
                     h.update(&bytes);
@@ -582,9 +612,7 @@ async fn stream_and_verify(
     }
 
     file.flush_and_evict_all().await.ok();
-    if let Some(h) = hasher.take() {
-        return_md5(h);
-    }
+    hasher.take();
     if let Some(h) = xxh64_hasher.take() {
         super::assembly_opt::return_xxh64(h);
     }
@@ -615,7 +643,7 @@ async fn download_full_file_with_response(
     let file = create_preallocated_file(dest, chunk.chunk_size).await?;
     let mut file = EvictingWriter::new(file);
     let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
-        Some(take_md5()?)
+        Some(PooledMd5::new(take_md5()?))
     } else {
         None
     };
@@ -673,7 +701,7 @@ async fn download_with_resume(
     check_available_space(dest, remaining)?;
 
     let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
-        Some(take_md5()?)
+        Some(PooledMd5::new(take_md5()?))
     } else {
         None
     };
@@ -689,8 +717,8 @@ async fn download_with_resume(
         let mut xh = xxh64_hasher.take();
         let result = tokio::task::spawn_blocking(move || {
             pread_hash_slice(&dest_owned, existing_size, &mut |chunk| {
-                if let Some(ref mut hasher) = h {
-                    hasher.update(chunk)?;
+                if let Some(hasher) = h.as_mut() {
+                    hasher.get_mut().update(chunk)?;
                 }
                 if let Some(ref mut xxh) = xh {
                     xxh.update(chunk);
@@ -749,6 +777,67 @@ mod tests {
 
         let file = create_preallocated_file(&path, u64::MAX).await.unwrap();
         assert_eq!(file.metadata().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_stream_verification_returns_pooled_md5() {
+        use crate::api_scrape::Compression;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"downloaded bytes";
+        Mock::given(method("GET"))
+            .and(path("/chunks/payload"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+
+        let chunk = ChunkRef {
+            chunk_name: "payload",
+            chunk_decompressed_hash_md5: "",
+            chunk_size: body.len() as u64,
+            chunk_size_decompressed: body.len() as u64,
+            chunk_compressed_hash_md5: "00000000000000000000000000000000",
+            chunk_old_offset: -1,
+        };
+        let download = DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: server.uri(),
+            url_suffix: "chunks".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload");
+
+        assert!(matches!(
+            download_chunk(&Client::new(), &download, chunk, &dest, None, None, false).await,
+            Err(SophonError::Md5Mismatch { .. })
+        ));
+        assert!(!dest.exists());
+
+        let mut reused = take_md5().unwrap();
+        reused.update(b"hello world").unwrap();
+        assert_eq!(
+            md5_to_hex(&reused.finish().unwrap()),
+            "5eb63bbbe01eeed093cb22bb8f5acdc3"
+        );
+        return_md5(reused);
+    }
+
+    #[test]
+    fn pooled_md5_returns_context_on_drop() {
+        {
+            let mut hasher = PooledMd5::new(take_md5().unwrap());
+            hasher.get_mut().update(b"dirty context").unwrap();
+        }
+
+        let mut hasher = take_md5().unwrap();
+        hasher.update(b"hello world").unwrap();
+        let digest = hasher.finish().unwrap();
+        return_md5(hasher);
+        assert_eq!(md5_to_hex(&digest), "5eb63bbbe01eeed093cb22bb8f5acdc3");
     }
 
     #[test]

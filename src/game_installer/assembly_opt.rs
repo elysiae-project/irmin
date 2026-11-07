@@ -55,6 +55,11 @@ impl Md5 {
         let state = std::mem::replace(&mut self.inner, fast_md5::Md5::new());
         Ok(state.finalize())
     }
+
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        self.inner = fast_md5::Md5::new();
+    }
 }
 
 thread_local! {
@@ -66,7 +71,9 @@ pub(crate) fn take_md5() -> SophonResult<Md5> {
 }
 
 pub(crate) fn return_md5(md5: Md5) {
-    MD5_POOL.with(|cell| cell.borrow_mut().replace(md5));
+    let mut md5 = md5;
+    md5.reset();
+    let _ = MD5_POOL.try_with(|cell| cell.borrow_mut().replace(md5));
 }
 
 pub(crate) fn take_xxh64() -> xxhash_rust::xxh64::Xxh64 {
