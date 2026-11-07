@@ -1258,7 +1258,10 @@ pub async fn preinstall_download(
             "Source installation or target identity changed since preinstall planning",
         ));
     }
-    let mut planned_chunks = rustc_hash::FxHashMap::default();
+    let mut planned_chunks = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        plan.unique_chunks.len(),
+        Default::default(),
+    );
     for chunk in &plan.unique_chunks {
         validate_patch_name(&chunk.patch_name)?;
         if planned_chunks
@@ -1361,10 +1364,8 @@ pub async fn preinstall_download(
                 Ok::<(), SophonError>(())
             }
         });
-        let first_error = first_stream_error(
-            futures_util::stream::iter(futures).buffer_unordered(16),
-        )
-        .await;
+        let first_error =
+            first_stream_error(futures_util::stream::iter(futures).buffer_unordered(16)).await;
         if let Some(err) = first_error {
             return Err(err);
         }
@@ -2426,9 +2427,7 @@ fn regenerate_hk4e_pkg_version(
 
     super::game_filters::filter_hk4e_asset_list(game_dir, &mut assets, vo_lang);
 
-    let manifest = Arc::new(
-        super::compact_manifest::CompactManifest::try_from_properties(assets)?,
-    );
+    let manifest = Arc::new(super::compact_manifest::CompactManifest::try_from_properties(assets)?);
     super::game_filters::write_pkg_version_from_manifest(game_dir, &manifest, vo_lang)?;
     Ok(())
 }
