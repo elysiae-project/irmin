@@ -145,6 +145,173 @@
     }
 
     #[test]
+    fn register_chunks_records_offsets_in_file_order() {
+        let manifest = CompactManifest::from(vec![make_file(
+            "mixed.pak",
+            "hash",
+            vec![
+                make_chunk("download-0", 11),
+                SophonManifestAssetChunk {
+                    chunk_old_offset: 4096,
+                    ..make_chunk("old", 13)
+                },
+                make_chunk("download-1", 17),
+            ],
+        )]);
+        let mut entries = Vec::new();
+        let mut items = Vec::new();
+        let mut index = new_download_items_index(super::VerifyMode::Full, manifest.num_chunks());
+        let mut refcounts = Vec::new();
+        let mut pending = Vec::new();
+        let mut tainted = rustc_hash::FxHashSet::default();
+
+        register_chunks_for_file(
+            &manifest,
+            0,
+            0,
+            &mut entries,
+            &mut items,
+            &mut index,
+            &mut refcounts,
+            &mut pending,
+            0,
+            &FxHashMap::default(),
+            &mut tainted,
+            false,
+        );
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].chunk_idx, 0);
+        assert_eq!(items[0].output_offset, 0);
+        assert_eq!(items[1].chunk_idx, 2);
+        assert_eq!(items[1].output_offset, 24);
+        for item in &items {
+            assert_eq!(
+                item.output_offset,
+                manifest.file_chunk_offset(0, item.chunk_idx as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn register_chunks_records_offsets_after_leading_old_and_empty_chunks() {
+        let manifest = CompactManifest::from(vec![make_file(
+            "leading-old.pak",
+            "hash",
+            vec![
+                SophonManifestAssetChunk {
+                    chunk_old_offset: 4096,
+                    ..make_chunk("old", 0)
+                },
+                make_chunk("empty", 0),
+                make_chunk("download", 17),
+            ],
+        )]);
+        let mut entries = Vec::new();
+        let mut items = Vec::new();
+        let mut index = new_download_items_index(super::VerifyMode::Full, manifest.num_chunks());
+        let mut refcounts = Vec::new();
+        let mut pending = Vec::new();
+        let mut tainted = rustc_hash::FxHashSet::default();
+
+        register_chunks_for_file(
+            &manifest,
+            0,
+            0,
+            &mut entries,
+            &mut items,
+            &mut index,
+            &mut refcounts,
+            &mut pending,
+            0,
+            &FxHashMap::default(),
+            &mut tainted,
+            false,
+        );
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].output_offset, 0);
+        assert_eq!(items[1].output_offset, 0);
+        for item in &items {
+            assert_eq!(
+                item.output_offset,
+                manifest.file_chunk_offset(0, item.chunk_idx as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn shared_chunks_are_tainted_out_of_eager_mode() {
+        let manifest = CompactManifest::from(vec![
+            make_file("a.pak", "hash-a", vec![make_chunk("shared", 11)]),
+            make_file("b.pak", "hash-b", vec![make_chunk("shared", 11)]),
+        ]);
+        let mut entries = Vec::new();
+        let mut items = Vec::new();
+        let mut index = new_download_items_index(super::VerifyMode::Full, manifest.num_chunks());
+        let mut refcounts = Vec::new();
+        let mut pending = Vec::new();
+        let mut tainted = rustc_hash::FxHashSet::default();
+
+        for file_idx in 0..manifest.num_files() {
+            register_chunks_for_file(
+                &manifest,
+                file_idx,
+                file_idx,
+                &mut entries,
+                &mut items,
+                &mut index,
+                &mut refcounts,
+                &mut pending,
+                file_idx,
+                &FxHashMap::default(),
+                &mut tainted,
+                false,
+            );
+        }
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(tainted.len(), 2);
+        disable_eager_for_tainted_files(&mut items, &tainted);
+        assert!(!items[0].use_eager);
+    }
+
+    #[test]
+    fn repeated_chunk_names_within_file_are_tainted_out_of_eager_mode() {
+        let manifest = CompactManifest::from(vec![make_file(
+            "repeated.pak",
+            "hash",
+            vec![make_chunk("same", 11), make_chunk("same", 17)],
+        )]);
+        let mut entries = Vec::new();
+        let mut items = Vec::new();
+        let mut index = new_download_items_index(super::VerifyMode::Full, manifest.num_chunks());
+        let mut refcounts = Vec::new();
+        let mut pending = Vec::new();
+        let mut tainted = rustc_hash::FxHashSet::default();
+
+        register_chunks_for_file(
+            &manifest,
+            0,
+            0,
+            &mut entries,
+            &mut items,
+            &mut index,
+            &mut refcounts,
+            &mut pending,
+            0,
+            &FxHashMap::default(),
+            &mut tainted,
+            false,
+        );
+
+        assert_eq!(items.len(), 1);
+        assert!(tainted.contains(&0));
+        disable_eager_for_tainted_files(&mut items, &tainted);
+        assert!(!items[0].use_eager);
+    }
+
+    #[test]
     fn adaptive_download_scaling_checks_for_unclaimed_items() {
         assert_eq!(next_download_worker_count(4, 16, 2), 6);
         assert_eq!(next_download_worker_count(4, 16, 20), 16);

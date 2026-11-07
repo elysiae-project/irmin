@@ -150,6 +150,7 @@ pub(crate) struct InstallerData {
 struct DownloadItem {
     file_idx: u32,
     chunk_idx: u32,
+    output_offset: u64,
     installer_idx: u32,
     is_pre_downloaded: bool,
     use_eager: bool,
@@ -210,8 +211,22 @@ fn download_work_abandoned(remaining: &AtomicUsize, handle: &DownloadHandle) -> 
     !handle.is_cancelled() && !download_work_finished(remaining)
 }
 
-fn insert_new_chunk_name<'a>(seen_chunks: &mut rustc_hash::FxHashSet<&'a str>, name: &'a str) -> bool {
+fn insert_new_chunk_name<'a>(
+    seen_chunks: &mut rustc_hash::FxHashSet<&'a str>,
+    name: &'a str,
+) -> bool {
     seen_chunks.insert(name)
+}
+
+fn disable_eager_for_tainted_files(
+    download_items: &mut [DownloadItem],
+    eager_tainted_files: &rustc_hash::FxHashSet<u32>,
+) {
+    for item in download_items {
+        if eager_tainted_files.contains(&item.file_idx) {
+            item.use_eager = false;
+        }
+    }
 }
 
 const PARALLEL_RESUME_VALIDATION_THRESHOLD: usize = 64;
@@ -220,10 +235,8 @@ fn validated_resume_chunks(
     chunks: Vec<Option<(String, u64)>>,
 ) -> rustc_hash::FxHashMap<String, u64> {
     let valid_count = chunks.iter().filter(|entry| entry.is_some()).count();
-    let mut validated = rustc_hash::FxHashMap::with_capacity_and_hasher(
-        valid_count,
-        rustc_hash::FxBuildHasher,
-    );
+    let mut validated =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(valid_count, rustc_hash::FxBuildHasher);
     validated.extend(chunks.into_iter().flatten());
     validated
 }
@@ -274,9 +287,10 @@ fn validate_resume_chunk_entries(
 
 fn validate_resume_chunk_batch(entries: &mut [Option<(String, u64)>], chunks_dir: &Path) {
     for entry in entries {
-        if !entry.as_ref().is_some_and(|(name, size)| {
-            chunk_still_valid_for_resume(name, *size, chunks_dir)
-        }) {
+        if !entry
+            .as_ref()
+            .is_some_and(|(name, size)| chunk_still_valid_for_resume(name, *size, chunks_dir))
+        {
             *entry = None;
         }
     }
@@ -301,9 +315,7 @@ where
         )));
     }
     Ok(futures_util::stream::iter(items)
-        .take_while(move |_| {
-            futures_util::future::ready(!stopped.load(Ordering::Acquire))
-        })
+        .take_while(move |_| futures_util::future::ready(!stopped.load(Ordering::Acquire)))
         .map(make_future)
         .buffer_unordered(limit))
 }
@@ -807,9 +819,12 @@ fn register_chunks_for_file<'a>(
     let file_is_eager = all_pure_downloads;
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
+    let mut output_offset = 0u64;
     for ci in range.start..range.end {
         let global_chunk_idx = ci as usize;
         let chunk = all_files.chunk(global_chunk_idx);
+        let chunk_offset = output_offset;
+        output_offset += chunk.chunk_size_decompressed;
         if chunk.chunk_old_offset >= 0 {
             continue;
         }
@@ -837,6 +852,7 @@ fn register_chunks_for_file<'a>(
                 download_items.push(DownloadItem {
                     file_idx: file_idx as u32,
                     chunk_idx: (global_chunk_idx - range.start as usize) as u32,
+                    output_offset: chunk_offset,
                     installer_idx: installer_idx as u32,
                     is_pre_downloaded: is_pre,
                     use_eager: file_is_eager,
@@ -850,6 +866,7 @@ fn register_chunks_for_file<'a>(
             download_items.push(DownloadItem {
                 file_idx: file_idx as u32,
                 chunk_idx: (global_chunk_idx - range.start as usize) as u32,
+                output_offset: chunk_offset,
                 installer_idx: installer_idx as u32,
                 is_pre_downloaded: is_pre,
                 use_eager: true,
@@ -945,11 +962,7 @@ async fn build_download_state(
     // A file must go entirely through eager OR entirely through assembly.
     // Skip when force_eager (non-Full mode): all chunks are independent.
     if !eager_tainted_files.is_empty() && ctx.verify_mode == super::VerifyMode::Full {
-        for item in download_items.iter_mut() {
-            if eager_tainted_files.contains(&item.file_idx) {
-                item.use_eager = false;
-            }
-        }
+        disable_eager_for_tainted_files(&mut download_items, &eager_tainted_files);
     }
 
     log::info!(
@@ -1471,11 +1484,6 @@ async fn process_eager_item(
         return Err(SophonError::Cancelled);
     }
 
-    // Compute chunk offset within the output file.
-    let chunk_offset = ctx
-        .all_files
-        .file_chunk_offset(file_idx, item.chunk_idx as usize);
-
     // Decompress and write to output file.
     let out_file = ctx
         .output_allocator
@@ -1496,6 +1504,7 @@ async fn process_eager_item(
             chunk.chunk_compressed_hash_md5.to_string()
         };
         let expected_size = chunk.chunk_size_decompressed;
+        let chunk_offset = item.output_offset;
         move || {
             super::eager_decompress::eager_decompress_chunk(
                 &compressed_data,
