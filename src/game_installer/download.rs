@@ -37,10 +37,58 @@ pub struct DownloadPhaseTimings {
     pub hash: std::time::Duration,
     /// Time spent flushing and advising the kernel after integrity checks.
     pub final_flush_and_evict: std::time::Duration,
+    /// Sum of per-chunk time measurements, separate from accumulated phase totals.
+    pub per_chunk: DownloadPhaseSamples,
+    /// Fixed buckets for response body chunk lengths: <=4, <=16, <=64, <=256 KiB, >256 KiB.
+    pub chunk_size_buckets: [u64; 5],
+    /// Hash algorithm selected for this stream.
+    pub hash_algorithm: DownloadHashAlgorithm,
     /// Total response body bytes consumed by the stream.
     pub bytes: u64,
     /// Number of response body chunks consumed by the stream.
     pub stream_chunks: u64,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DownloadPhaseSamples {
+    /// Count of stream polls, including the final poll that observes EOF.
+    pub stream_wait_count: u64,
+    pub write_count: u64,
+    pub hash_count: u64,
+    pub stream_wait_min: std::time::Duration,
+    pub stream_wait_max: std::time::Duration,
+    pub write_min: std::time::Duration,
+    pub write_max: std::time::Duration,
+    pub hash_min: std::time::Duration,
+    pub hash_max: std::time::Duration,
+    pub stream_wait_sum: std::time::Duration,
+    pub write_sum: std::time::Duration,
+    pub hash_sum: std::time::Duration,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DownloadHashAlgorithm {
+    #[default]
+    None,
+    Md5,
+    Xxh64,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn download_chunk_size_bucket(len: usize) -> usize {
+    if len <= 4 * 1024 {
+        0
+    } else if len <= 16 * 1024 {
+        1
+    } else if len <= 64 * 1024 {
+        2
+    } else if len <= 256 * 1024 {
+        3
+    } else {
+        4
+    }
 }
 
 impl ChunkHasher for PooledMd5 {
@@ -643,7 +691,16 @@ async fn stream_and_verify(
         };
         #[cfg(feature = "bench-diagnostics")]
         if let Some(timings) = timings.as_deref_mut() {
-            timings.stream_wait += wait_started.elapsed();
+            let elapsed = wait_started.elapsed();
+            timings.stream_wait += elapsed;
+            if timings.per_chunk.stream_wait_count == 0 {
+                timings.per_chunk.stream_wait_min = elapsed;
+            } else {
+                timings.per_chunk.stream_wait_min = timings.per_chunk.stream_wait_min.min(elapsed);
+            }
+            timings.per_chunk.stream_wait_max = timings.per_chunk.stream_wait_max.max(elapsed);
+            timings.per_chunk.stream_wait_sum += elapsed;
+            timings.per_chunk.stream_wait_count += 1;
         }
 
         match result {
@@ -652,6 +709,7 @@ async fn stream_and_verify(
                 if let Some(timings) = timings.as_deref_mut() {
                     timings.stream_chunks += 1;
                     timings.bytes += bytes.len() as u64;
+                    timings.chunk_size_buckets[download_chunk_size_bucket(bytes.len())] += 1;
                 }
                 let next_total_len =
                     match check_download_chunk_size(&bytes, expected_total, total_len) {
@@ -677,7 +735,16 @@ async fn stream_and_verify(
                 let write_result = file.write_all(&bytes).await;
                 #[cfg(feature = "bench-diagnostics")]
                 if let Some(timings) = timings.as_deref_mut() {
-                    timings.write += write_started.elapsed();
+                    let elapsed = write_started.elapsed();
+                    timings.write += elapsed;
+                    if timings.per_chunk.write_count == 0 {
+                        timings.per_chunk.write_min = elapsed;
+                    } else {
+                        timings.per_chunk.write_min = timings.per_chunk.write_min.min(elapsed);
+                    }
+                    timings.per_chunk.write_max = timings.per_chunk.write_max.max(elapsed);
+                    timings.per_chunk.write_sum += elapsed;
+                    timings.per_chunk.write_count += 1;
                 }
                 if let Err(error) = write_result {
                     let _ = tokio::fs::remove_file(dest).await;
@@ -689,7 +756,16 @@ async fn stream_and_verify(
                     update_download_hashes(&bytes, hasher.as_mut(), xxh64_hasher.as_mut());
                 #[cfg(feature = "bench-diagnostics")]
                 if let Some(timings) = timings.as_deref_mut() {
-                    timings.hash += hash_started.elapsed();
+                    let elapsed = hash_started.elapsed();
+                    timings.hash += elapsed;
+                    if timings.per_chunk.hash_count == 0 {
+                        timings.per_chunk.hash_min = elapsed;
+                    } else {
+                        timings.per_chunk.hash_min = timings.per_chunk.hash_min.min(elapsed);
+                    }
+                    timings.per_chunk.hash_max = timings.per_chunk.hash_max.max(elapsed);
+                    timings.per_chunk.hash_sum += elapsed;
+                    timings.per_chunk.hash_count += 1;
                 }
                 if let Err(error) = hash_result {
                     return Err(SophonError::Io(error));
@@ -704,8 +780,6 @@ async fn stream_and_verify(
         }
     }
 
-    #[cfg(feature = "bench-diagnostics")]
-    let final_flush_started = std::time::Instant::now();
     if let Err(err) = file.flush().await {
         let _ = tokio::fs::remove_file(dest).await;
         return Err(SophonError::Io(err));
@@ -766,6 +840,8 @@ async fn stream_and_verify(
         );
     }
 
+    #[cfg(feature = "bench-diagnostics")]
+    let final_flush_started = std::time::Instant::now();
     file.flush_and_evict_all().await.ok();
     #[cfg(feature = "bench-diagnostics")]
     if let Some(timings) = timings.as_deref_mut() {
@@ -776,7 +852,7 @@ async fn stream_and_verify(
         super::assembly_opt::return_xxh64(h);
     }
     #[cfg(feature = "bench-diagnostics")]
-    if let Some(timings) = timings.as_deref_mut() {
+    if let Some(timings) = timings {
         timings.total = total_started.elapsed();
     }
     Ok(())
@@ -789,7 +865,7 @@ async fn download_full_file_with_response(
     dest: &Path,
     handle: Option<&DownloadHandle>,
     skip_hash: bool,
-    #[cfg(feature = "bench-diagnostics")] timings: Option<&mut DownloadPhaseTimings>,
+    #[cfg(feature = "bench-diagnostics")] mut timings: Option<&mut DownloadPhaseTimings>,
 ) -> SophonResult<()> {
     let content_length = resp.content_length();
     if let Some(len) = content_length
@@ -817,6 +893,16 @@ async fn download_full_file_with_response(
         } else {
             None
         };
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.hash_algorithm = if hasher.is_some() {
+            DownloadHashAlgorithm::Md5
+        } else if xxh64_hasher.is_some() {
+            DownloadHashAlgorithm::Xxh64
+        } else {
+            DownloadHashAlgorithm::None
+        };
+    }
 
     stream_and_verify(
         &mut file,
@@ -1063,45 +1149,183 @@ mod tests {
     #[cfg(feature = "bench-diagnostics")]
     #[tokio::test]
     #[ignore = "diagnostic loopback download timing; run explicitly with --ignored"]
-    async fn diagnose_loopback_download_phases() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn diagnose_loopback_download_phase_distributions() {
+        use bytes::Bytes;
+        use futures_util::{StreamExt, stream};
+        use http_body_util::StreamBody;
+        use hyper::body::{Frame, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use std::net::TcpListener as StdTcpListener;
+        use std::sync::mpsc;
+        use std::thread;
 
-        const SIZE: usize = 16 * 1024 * 1024;
-        let body: Vec<u8> = (0..SIZE)
-            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
-            .collect();
-        let expected_hash = fast_md5::digest(&body);
-        let expected_hash = md5_to_hex(&expected_hash);
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/payload"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
-            .mount(&server)
-            .await;
+        let sizes_mib = std::env::var("IRMIN_DOWNLOAD_DIAGNOSTIC_SIZES_MIB")
+            .unwrap_or_else(|_| "16".to_owned());
+        let pattern = Bytes::from(
+            (0..64 * 1024)
+                .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+                .collect::<Vec<_>>(),
+        );
+        let (address_tx, address_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_pattern = pattern.clone();
+        let server = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build diagnostic server runtime");
+            runtime.block_on(async move {
+                let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                address_tx.send(listener.local_addr().unwrap()).unwrap();
+                let mut shutdown = Box::pin(shutdown_rx);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown => break,
+                        accepted = listener.accept() => {
+                            let (socket, _) = accepted.unwrap();
+                            let pattern = server_pattern.clone();
+                            let service = service_fn(move |request: Request<Incoming>| {
+                                let pattern = pattern.clone();
+                                async move {
+                                    let size = request
+                                        .headers()
+                                        .get("x-diagnostic-size")
+                                        .and_then(|value| value.to_str().ok())
+                                        .and_then(|value| value.parse::<usize>().ok())
+                                        .expect("diagnostic request includes a valid size");
+                                    let full_chunks = size / pattern.len();
+                                    let remainder = size % pattern.len();
+                                    let repeat_pattern = pattern.clone();
+                                    let full = stream::repeat_with(move || repeat_pattern.clone())
+                                        .take(full_chunks);
+                                    let tail = (remainder > 0).then(|| pattern.slice(..remainder));
+                                    let body = full
+                                        .chain(stream::iter(tail))
+                                        .map(|bytes| Ok::<_, Infallible>(Frame::data(bytes)));
+                                    let mut response = Response::new(StreamBody::new(body));
+                                    response.headers_mut().insert(
+                                        hyper::header::CONTENT_LENGTH,
+                                        size.to_string().parse().unwrap(),
+                                    );
+                                    Ok::<_, Infallible>(response)
+                                }
+                            });
+                            let connection = http1::Builder::new()
+                                .serve_connection(TokioIo::new(socket), service);
+                            let _ = connection.await;
+                        }
+                    }
+                }
+            });
+        });
+        let address = address_rx.recv().unwrap();
 
-        let chunk = ChunkRef {
-            chunk_name: "payload",
-            chunk_decompressed_hash_md5: "",
-            chunk_size: SIZE as u64,
-            chunk_size_decompressed: SIZE as u64,
-            chunk_compressed_hash_md5: &expected_hash,
-            chunk_old_offset: -1,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("payload");
-        let url = format!("{}/payload", server.uri());
-        let timings = benchmark_download_chunk_with_timings(&Client::new(), &url, chunk, &dest)
-            .await
-            .unwrap();
+        for value in sizes_mib.split(',') {
+            let size_mib = value
+                .parse::<usize>()
+                .expect("diagnostic sizes must be comma-separated MiB integers");
+            assert!(
+                (16..=256).contains(&size_mib),
+                "diagnostic sizes must be between 16 and 256 MiB"
+            );
+            let size = size_mib * 1024 * 1024;
+            let mut expected_md5 = fast_md5::Md5::new();
+            let mut expected_xxh64 = xxhash_rust::xxh64::Xxh64::new(0);
+            for offset in (0..size).step_by(pattern.len()) {
+                let count = pattern.len().min(size - offset);
+                expected_md5.update(&pattern[..count]);
+                expected_xxh64.update(&pattern[..count]);
+            }
+            let md5 = md5_to_hex(&expected_md5.finalize());
+            let xxh64 = format!("{:016x}", expected_xxh64.digest());
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("payload");
 
-        assert_eq!(std::fs::read(&dest).unwrap(), body);
-        assert_eq!(timings.bytes, SIZE as u64);
-        assert!(timings.stream_chunks > 0);
-        assert!(timings.total >= timings.stream_wait);
-        assert!(timings.total >= timings.write);
-        assert!(timings.total >= timings.hash);
-        println!("download phase timings: {timings:#?}");
+            for (algorithm, expected_hash) in [
+                (DownloadHashAlgorithm::Md5, md5.as_str()),
+                (DownloadHashAlgorithm::Xxh64, xxh64.as_str()),
+            ] {
+                let url = format!("http://{address}/payload");
+                let response = Client::new()
+                    .get(&url)
+                    .header("x-diagnostic-size", size.to_string())
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap();
+                let mut file = EvictingWriter::new(
+                    create_preallocated_file(&dest, size as u64).await.unwrap(),
+                );
+                let mut md5_hasher = (algorithm == DownloadHashAlgorithm::Md5)
+                    .then(|| PooledMd5::new(take_md5().unwrap()));
+                let mut xxh64_hasher = (algorithm == DownloadHashAlgorithm::Xxh64)
+                    .then(super::super::assembly_opt::take_xxh64);
+                let mut timings = DownloadPhaseTimings {
+                    hash_algorithm: algorithm,
+                    ..DownloadPhaseTimings::default()
+                };
+                stream_and_verify(
+                    &mut file,
+                    response,
+                    &mut md5_hasher,
+                    &mut xxh64_hasher,
+                    size as u64,
+                    0,
+                    "payload",
+                    expected_hash,
+                    &dest,
+                    None,
+                    Some(&mut timings),
+                )
+                .await
+                .unwrap();
+
+                let mut output = std::fs::File::open(&dest).unwrap();
+                let mut output_md5 = fast_md5::Md5::new();
+                let mut output_xxh64 = xxhash_rust::xxh64::Xxh64::new(0);
+                let mut output_block = [0u8; 64 * 1024];
+                loop {
+                    let count = std::io::Read::read(&mut output, &mut output_block).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    output_md5.update(&output_block[..count]);
+                    output_xxh64.update(&output_block[..count]);
+                }
+                assert_eq!(md5_to_hex(&output_md5.finalize()), md5);
+                assert_eq!(format!("{:016x}", output_xxh64.digest()), xxh64);
+                assert_eq!(timings.bytes, size as u64);
+                assert!(timings.stream_chunks > 0);
+                assert_eq!(timings.hash_algorithm, algorithm);
+                assert_eq!(
+                    timings.chunk_size_buckets.iter().sum::<u64>(),
+                    timings.stream_chunks
+                );
+                assert_eq!(
+                    timings.per_chunk.stream_wait_count,
+                    timings.stream_chunks + 1
+                );
+                assert_eq!(timings.per_chunk.write_count, timings.stream_chunks);
+                assert_eq!(timings.per_chunk.hash_count, timings.stream_chunks);
+                assert_eq!(timings.per_chunk.stream_wait_sum, timings.stream_wait);
+                assert_eq!(timings.per_chunk.write_sum, timings.write);
+                assert_eq!(timings.per_chunk.hash_sum, timings.hash);
+                assert!(timings.per_chunk.stream_wait_min <= timings.per_chunk.stream_wait_max);
+                assert!(timings.per_chunk.write_min <= timings.per_chunk.write_max);
+                assert!(timings.per_chunk.hash_min <= timings.per_chunk.hash_max);
+                println!("size_mib={size_mib} hash={algorithm:?} timings={timings:#?}");
+            }
+        }
+        shutdown_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[cfg(feature = "bench-diagnostics")]
@@ -1129,6 +1353,24 @@ mod tests {
             Err(SophonError::PathTraversal(_))
         ));
         assert!(!dest.exists());
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    fn download_chunk_size_buckets_cover_boundaries() {
+        for (len, expected) in [
+            (0, 0),
+            (4 * 1024, 0),
+            (4 * 1024 + 1, 1),
+            (16 * 1024, 1),
+            (16 * 1024 + 1, 2),
+            (64 * 1024, 2),
+            (64 * 1024 + 1, 3),
+            (256 * 1024, 3),
+            (256 * 1024 + 1, 4),
+        ] {
+            assert_eq!(download_chunk_size_bucket(len), expected, "len={len}");
+        }
     }
 
     #[test]
