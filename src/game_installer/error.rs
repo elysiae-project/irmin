@@ -35,6 +35,9 @@ pub enum SophonError {
         prost::DecodeError,
     ),
 
+    #[error(transparent)]
+    CompactManifestLimit(#[from] super::compact_manifest::CompactManifestLimitError),
+
     #[error("Failed to decompress data: {0}")]
     Decompression(String),
 
@@ -165,6 +168,7 @@ impl SophonError {
             | Self::UnknownGameId(_)
             | Self::JoinError(_)
             | Self::ManifestDecode(_)
+            | Self::CompactManifestLimit(_)
             | Self::AssemblyFailed { .. }
             | Self::IndexOutOfBounds { .. }
             | Self::InvalidSizeString(_)

@@ -9,6 +9,13 @@ use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
 
+const INITIAL_STRING_INDEX_CAPACITY: usize = 1 << 20;
+const INITIAL_STRING_ARENA_CAPACITY: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("manifest exceeds compact u32 index limits: {0}")]
+pub struct CompactManifestLimitError(&'static str);
+
 impl<'a> From<&'a SophonManifestAssetChunk> for ChunkRef<'a> {
     fn from(chunk: &'a SophonManifestAssetChunk) -> Self {
         ChunkRef {
@@ -37,6 +44,12 @@ impl StringArena {
     /// Allocate an arena sized for approximately `spans` strings and
     /// `total_bytes` UTF-8 bytes; capacities may grow if estimates are exceeded.
     pub fn with_capacity(spans: usize, total_bytes: usize) -> Self {
+        let spans = spans
+            .min(u32::MAX as usize - 1)
+            .min(INITIAL_STRING_INDEX_CAPACITY);
+        let total_bytes = total_bytes
+            .min(u32::MAX as usize)
+            .min(INITIAL_STRING_ARENA_CAPACITY);
         Self {
             data: String::with_capacity(total_bytes),
             offsets: Vec::with_capacity(spans + 1),
@@ -47,10 +60,30 @@ impl StringArena {
     /// Append `s` and return its zero-based index. Duplicate values are stored
     /// separately; indices are valid only while this arena's ordering is stable.
     pub fn intern(&mut self, s: &str) -> u32 {
-        let idx = self.offsets.len() as u32;
-        self.offsets.push(self.data.len() as u32);
+        self.try_intern(s)
+            .expect("string exceeds compact u32 index limits")
+    }
+
+    pub fn try_intern(&mut self, s: &str) -> Result<u32, CompactManifestLimitError> {
+        let index = u32::try_from(self.offsets.len())
+            .map_err(|_| CompactManifestLimitError("string index count"))?;
+        let offset = u32::try_from(self.data.len())
+            .map_err(|_| CompactManifestLimitError("string byte offset"))?;
+        let max_string_len = (u32::MAX as usize).min(isize::MAX as usize);
+        self.data
+            .len()
+            .checked_add(s.len())
+            .filter(|&length| length <= max_string_len)
+            .ok_or(CompactManifestLimitError("string byte length"))?;
+        self.data
+            .try_reserve(s.len())
+            .map_err(|_| CompactManifestLimitError("string allocation failed"))?;
+        self.offsets
+            .try_reserve(1)
+            .map_err(|_| CompactManifestLimitError("string index allocation failed"))?;
+        self.offsets.push(offset);
         self.data.push_str(s);
-        idx
+        Ok(index)
     }
 
     /// Intern a string, returning an existing index if an identical string
@@ -299,31 +332,29 @@ impl CompactManifest {
 }
 
 impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
-    fn from(mut properties: Vec<SophonManifestAssetProperty>) -> Self {
-        let total_files = properties.len();
-        let total_chunks: usize = properties.iter().map(|f| f.asset_chunks.len()).sum();
-        let estimated_string_bytes: usize = properties
-            .iter()
-            .map(|f| {
-                f.asset_name.len()
-                    + f.asset_hash_md5.len()
-                    + f.asset_chunks
-                        .iter()
-                        .map(|c| c.chunk_name.len())
-                        .sum::<usize>()
-                    + f.asset_chunks
-                        .iter()
-                        .map(|c| c.chunk_decompressed_hash_md5.len())
-                        .sum::<usize>()
-                    + f.asset_chunks
-                        .iter()
-                        .map(|c| c.chunk_compressed_hash_md5.len())
-                        .sum::<usize>()
-            })
-            .sum();
+    fn from(properties: Vec<SophonManifestAssetProperty>) -> Self {
+        #[allow(clippy::expect_used)]
+        Self::try_from_properties(properties).expect("manifest exceeds compact u32 index limits")
+    }
+}
 
-        let mut arena =
-            StringArena::with_capacity(total_files * 2 + total_chunks * 3, estimated_string_bytes);
+impl CompactManifest {
+    pub fn try_from_properties(
+        mut properties: Vec<SophonManifestAssetProperty>,
+    ) -> Result<Self, CompactManifestLimitError> {
+        let total_files = properties.len();
+        let (total_chunks, estimated_string_bytes) = manifest_storage_estimates(&properties)
+            .ok_or(CompactManifestLimitError(
+                "manifest size arithmetic overflow",
+            ))?;
+        let span_count = validate_limits(total_files, total_chunks)?;
+        validate_allocation_sizes(
+            total_files,
+            total_chunks,
+            span_count,
+            estimated_string_bytes,
+        )?;
+        let mut arena = StringArena::with_capacity(span_count, estimated_string_bytes);
         let mut file_name_idx = Vec::with_capacity(total_files);
         let mut file_hash_idx = Vec::with_capacity(total_files);
         let mut file_type = Vec::with_capacity(total_files);
@@ -338,24 +369,40 @@ impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
         let mut chunk_old_offset = Vec::with_capacity(total_chunks);
 
         for file in properties.drain(..) {
-            file_name_idx.push(arena.intern(&file.asset_name));
-            file_hash_idx.push(arena.intern_dedup(&file.asset_hash_md5));
+            file_name_idx.push(checked_intern(&mut arena, &file.asset_name, false)?);
+            file_hash_idx.push(checked_intern(&mut arena, &file.asset_hash_md5, true)?);
             file_type.push(file.asset_type as u8);
             file_size.push(file.asset_size);
-            file_chunk_start.push(chunk_name_idx.len() as u32);
+            file_chunk_start.push(
+                u32::try_from(chunk_name_idx.len())
+                    .map_err(|_| CompactManifestLimitError("chunk index count"))?,
+            );
             for chunk in file.asset_chunks {
-                chunk_name_idx.push(arena.intern(&chunk.chunk_name));
-                chunk_decomp_hash_idx.push(arena.intern_dedup(&chunk.chunk_decompressed_hash_md5));
-                chunk_comp_hash_idx.push(arena.intern_dedup(&chunk.chunk_compressed_hash_md5));
+                chunk_name_idx.push(checked_intern(&mut arena, &chunk.chunk_name, false)?);
+                chunk_decomp_hash_idx.push(checked_intern(
+                    &mut arena,
+                    &chunk.chunk_decompressed_hash_md5,
+                    true,
+                )?);
+                chunk_comp_hash_idx.push(checked_intern(
+                    &mut arena,
+                    &chunk.chunk_compressed_hash_md5,
+                    true,
+                )?);
                 chunk_size.push(chunk.chunk_size as u32);
                 chunk_size_decompressed.push(chunk.chunk_size_decompressed as u32);
                 chunk_old_offset.push(chunk.chunk_old_offset);
             }
         }
 
+        file_chunk_start.push(
+            u32::try_from(chunk_name_idx.len())
+                .map_err(|_| CompactManifestLimitError("chunk index sentinel"))?,
+        );
+
         arena.clear_dedup();
 
-        Self {
+        Ok(Self {
             arena,
             file_name_idx,
             file_hash_idx,
@@ -368,8 +415,128 @@ impl From<Vec<SophonManifestAssetProperty>> for CompactManifest {
             chunk_size,
             chunk_size_decompressed,
             chunk_old_offset,
+        })
+    }
+}
+
+fn validate_limits(
+    total_files: usize,
+    total_chunks: usize,
+) -> Result<usize, CompactManifestLimitError> {
+    let span_count = total_files
+        .checked_mul(2)
+        .and_then(|files| {
+            total_chunks
+                .checked_mul(3)
+                .and_then(|chunks| files.checked_add(chunks))
+        })
+        .ok_or(CompactManifestLimitError("string entry count overflow"))?;
+    if span_count >= u32::MAX as usize
+        || total_files >= u32::MAX as usize
+        || total_chunks >= u32::MAX as usize
+    {
+        return Err(CompactManifestLimitError("file or string index count"));
+    }
+    total_files
+        .checked_add(1)
+        .ok_or(CompactManifestLimitError("file index sentinel overflow"))?;
+    Ok(span_count)
+}
+
+fn validate_allocation_sizes(
+    total_files: usize,
+    total_chunks: usize,
+    span_count: usize,
+    estimated_string_bytes: usize,
+) -> Result<(), CompactManifestLimitError> {
+    let max_capacity = isize::MAX as usize;
+    let file_capacity = total_files
+        .checked_add(1)
+        .ok_or(CompactManifestLimitError("file index capacity overflow"))?;
+    let arena_index_capacity = span_count
+        .checked_add(1)
+        .ok_or(CompactManifestLimitError("string index capacity overflow"))?;
+    let capacities = [
+        (file_capacity, std::mem::size_of::<u32>()),
+        (arena_index_capacity, std::mem::size_of::<u32>()),
+        (total_chunks, std::mem::size_of::<u32>()),
+        (total_chunks, std::mem::size_of::<u32>()),
+        (total_chunks, std::mem::size_of::<u32>()),
+        (total_chunks, std::mem::size_of::<u32>()),
+        (total_chunks, std::mem::size_of::<u32>()),
+        (total_chunks, std::mem::size_of::<i64>()),
+        (total_files, std::mem::size_of::<u32>()),
+        (total_files, std::mem::size_of::<u32>()),
+        (total_files, std::mem::size_of::<u8>()),
+        (total_files, std::mem::size_of::<u64>()),
+    ];
+    let arena_bytes = estimated_string_bytes.min(INITIAL_STRING_ARENA_CAPACITY);
+    for (count, element_size) in capacities {
+        let bytes = count
+            .checked_mul(element_size)
+            .ok_or(CompactManifestLimitError("allocation size overflow"))?;
+        if bytes > max_capacity {
+            return Err(CompactManifestLimitError(
+                "allocation capacity exceeds isize::MAX",
+            ));
         }
     }
+    if arena_bytes > max_capacity {
+        return Err(CompactManifestLimitError(
+            "allocation capacity exceeds isize::MAX",
+        ));
+    }
+    Ok(())
+}
+
+fn checked_intern(
+    arena: &mut StringArena,
+    value: &str,
+    deduplicate: bool,
+) -> Result<u32, CompactManifestLimitError> {
+    if deduplicate {
+        let mut hasher = rustc_hash::FxHasher::default();
+        value.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(&index) = arena.dedup.get(&key)
+            && arena.get(index) == value
+        {
+            return Ok(index);
+        }
+        arena
+            .dedup
+            .try_reserve(1)
+            .map_err(|_| CompactManifestLimitError("string index allocation failed"))?;
+        let index = arena.try_intern(value)?;
+        arena.dedup.insert(key, index);
+        return Ok(index);
+    }
+    arena.try_intern(value)
+}
+
+fn manifest_storage_estimates(
+    properties: &[SophonManifestAssetProperty],
+) -> Option<(usize, usize)> {
+    properties
+        .iter()
+        .try_fold((0usize, 0usize), |(chunks, bytes), file| {
+            let file_bytes = file
+                .asset_name
+                .len()
+                .checked_add(file.asset_hash_md5.len())?;
+            file.asset_chunks.iter().try_fold(
+                (chunks, bytes.checked_add(file_bytes)?),
+                |(chunks, bytes), chunk| {
+                    let chunk_bytes = chunk
+                        .chunk_name
+                        .len()
+                        .checked_add(chunk.chunk_decompressed_hash_md5.len())?
+                        .checked_add(chunk.chunk_compressed_hash_md5.len())?;
+                    Some((chunks.checked_add(1)?, bytes.checked_add(chunk_bytes)?))
+                },
+            )
+        })
+        .filter(|&(chunks, bytes)| chunks <= u32::MAX as usize && bytes <= u32::MAX as usize)
 }
 
 #[cfg(test)]
@@ -610,6 +777,48 @@ mod tests {
         // Truncation wraps: (u32::MAX + 1) as u32 == 0
         assert_eq!(c.chunk_size, 0);
         assert_eq!(c.chunk_size_decompressed, 0);
+    }
+
+    #[test]
+    fn checked_constructor_rejects_unrepresentable_arena_without_large_allocation() {
+        let file = make_file("a", "h", 0, 0, vec![]);
+        assert!(validate_limits(usize::MAX, 0).is_err());
+        assert!(validate_limits(1, u32::MAX as usize).is_err());
+        if usize::BITS > 32 {
+            assert!(validate_limits(1, u32::MAX as usize + 1).is_err());
+            assert!(validate_allocation_sizes(1, 1, 1, usize::MAX).is_ok());
+        }
+        assert!(validate_allocation_sizes(usize::MAX, 0, 0, 0).is_err());
+        assert!(CompactManifest::try_from_properties(vec![file]).is_ok());
+    }
+
+    #[test]
+    fn compact_index_limits_accept_last_safe_count_and_reject_sentinel_overflow() {
+        if usize::BITS > 32 {
+            let max_chunks_for_one_file = (u32::MAX as usize - 3) / 3;
+            assert!(validate_limits(1, max_chunks_for_one_file).is_ok());
+            assert!(validate_limits(1, max_chunks_for_one_file + 1).is_err());
+            let max_files_without_chunks = (u32::MAX as usize - 1) / 2;
+            assert!(validate_limits(max_files_without_chunks, 0).is_ok());
+            assert!(validate_limits(max_files_without_chunks + 1, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn checked_string_arena_intern_preserves_indices() {
+        let mut arena = StringArena::default();
+        let first = arena.try_intern("alpha").unwrap();
+        let second = arena.try_intern("beta").unwrap();
+        assert_eq!(arena.get(first), "alpha");
+        assert_eq!(arena.get(second), "beta");
+        assert_eq!(arena.intern("gamma"), 2);
+    }
+
+    #[test]
+    fn string_arena_initial_capacities_are_bounded_hints() {
+        let arena = StringArena::with_capacity(usize::MAX, usize::MAX);
+        assert!(arena.offsets.capacity() <= INITIAL_STRING_INDEX_CAPACITY + 1);
+        assert!(arena.data.capacity() <= INITIAL_STRING_ARENA_CAPACITY);
     }
 
     /// Documents that file_type is truncated to u8. Values > 255 wrap.

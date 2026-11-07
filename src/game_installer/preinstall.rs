@@ -2376,7 +2376,9 @@ fn regenerate_hk4e_pkg_version(
 
     super::game_filters::filter_hk4e_asset_list(game_dir, &mut assets, vo_lang);
 
-    let manifest = Arc::new(super::compact_manifest::CompactManifest::from(assets));
+    let manifest = Arc::new(
+        super::compact_manifest::CompactManifest::try_from_properties(assets)?,
+    );
     super::game_filters::write_pkg_version_from_manifest(game_dir, &manifest, vo_lang)?;
     Ok(())
 }
@@ -3312,7 +3314,8 @@ async fn apply_download_over(
         tokio::task::spawn_blocking(move || {
             let tmp_dir = gd.join("tmp-patch-downloadover");
             fs::create_dir_all(&tmp_dir)?;
-            let manifest = super::compact_manifest::CompactManifest::from(vec![file_entry]);
+            let manifest =
+                super::compact_manifest::CompactManifest::try_from_properties(vec![file_entry])?;
             // No deletion ownership: these are shared cached payloads. Keep
             // them on failure/cancellation and for other packages' fallback.
             let chunk_lookup = super::installer::ChunkNameLookup::from_arena(

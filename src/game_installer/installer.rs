@@ -2376,7 +2376,8 @@ pub async fn install(
             }
         }
     }
-    let all_files: Arc<CompactManifest> = Arc::new(CompactManifest::from(all_files_vec));
+    let all_files: Arc<CompactManifest> =
+        Arc::new(CompactManifest::try_from_properties(all_files_vec)?);
     super::reclaim_memory();
     let all_tmp_dirs: Arc<Vec<std::path::PathBuf>> = Arc::new(
         installer_data
@@ -3008,7 +3009,7 @@ async fn verify_installers(
         match code.as_str() {
             "hk4e" => {
                 super::game_filters::write_hk4e_audio_lang_record(&gd, &vo_langs)?;
-                let manifest = Arc::new(CompactManifest::from(index_assets));
+                let manifest = Arc::new(CompactManifest::try_from_properties(index_assets)?);
                 super::game_filters::write_pkg_version_from_manifest(&gd, &manifest, &vo_langs)?;
             }
             "hkrpg" => {
@@ -3336,12 +3337,12 @@ async fn repair_assets(
 
     // One manifest, lookup and refcount set for the entire repair batch.
     // A compressed chunk must outlive every occurrence in every consumer.
-    let manifest = CompactManifest::from(
+    let manifest = CompactManifest::try_from_properties(
         failed_verifications
             .into_iter()
             .map(|(asset, _, _)| asset)
             .collect::<Vec<_>>(),
-    );
+    )?;
     let mut occurrences = FxHashMap::<&str, u32>::default();
     for i in 0..manifest.num_chunks() {
         *occurrences.entry(manifest.chunk(i).chunk_name).or_default() += 1;
