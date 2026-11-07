@@ -7,6 +7,7 @@ usage() {
     printf 'Runs the opt-in in-memory download write/hash Criterion benchmark repeatedly.\n'
     printf 'Default output: /tmp/opencode/irmin-download-stream-<UTC timestamp>\n'
     printf 'Environment probes use Linux /proc and /sys when available; unavailable probes are recorded.\n'
+    printf 'Optional DOWNLOAD_BENCH_MAX_LOAD marks samples provisional when 1-minute load exceeds the value.\n'
     printf 'Requires Bash 4.4 or newer.\n'
 }
 
@@ -49,6 +50,10 @@ repeats=${repeats:-5}
 
 if [[ ! $repeats =~ ^[1-9][0-9]*$ ]] || (( ${#repeats} > 2 )) || (( 10#$repeats > 50 )); then
     printf 'REPEATS must be an integer from 1 to 50\n' >&2
+    exit 2
+fi
+if [[ -n ${DOWNLOAD_BENCH_MAX_LOAD:-} ]] && [[ ! $DOWNLOAD_BENCH_MAX_LOAD =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+    printf 'DOWNLOAD_BENCH_MAX_LOAD must be a nonnegative decimal number\n' >&2
     exit 2
 fi
 if [[ $output_dir != /* ]]; then
@@ -106,6 +111,7 @@ environment_file="$output_dir/environment.txt"
         printf 'worktree_dirty=unavailable\n'
     fi
     printf '\nRun configuration:\nrepeats=%s\n' "$repeats"
+    printf 'DOWNLOAD_BENCH_MAX_LOAD=%s\n' "${DOWNLOAD_BENCH_MAX_LOAD:-<unset>}"
     if [[ ${CARGO_TARGET_DIR+x} ]]; then
         printf 'target_dir_set=true\n'
     else
@@ -119,7 +125,7 @@ environment_file="$output_dir/environment.txt"
             printf '%s_set=false\n' "$name"
         fi
     done
-    if [[ ${CARGO_HOME+x} ]]; then
+    if [[ -n ${CARGO_HOME:-} ]]; then
         cargo_home=${CARGO_HOME}
         cargo_home_available=true
     elif [[ ${HOME+x} ]]; then
@@ -158,7 +164,8 @@ for ((run = 1; run <= repeats; run++)); do
         printf 'Run %d/%d at ' "$run" "$repeats"
         date -u || printf 'date unavailable\n'
         printf 'load_before='
-        cat /proc/loadavg 2>/dev/null || printf 'unavailable\n'
+        load_before=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
+        printf '%s\n' "${load_before:-unavailable}"
         printf "command: cargo bench --locked --bench download_stream_bench --features 'benchmark bench-internals'"
         [[ $test_mode == true ]] && printf ' -- --test'
         printf '\n'
@@ -173,7 +180,19 @@ for ((run = 1; run <= repeats; run++)); do
     fi
     {
         printf '\nload_after='
-        cat /proc/loadavg 2>/dev/null || printf 'unavailable\n'
+        load_after=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
+        printf '%s\n' "${load_after:-unavailable}"
+        numeric='^([0-9]+([.][0-9]*)?|[.][0-9]+)$'
+        if [[ -n ${DOWNLOAD_BENCH_MAX_LOAD:-} && ${load_before:-} =~ $numeric && ${load_after:-} =~ $numeric ]]; then
+            if LC_ALL=C awk -v before="$load_before" -v after="$load_after" -v max="$DOWNLOAD_BENCH_MAX_LOAD" \
+                'BEGIN { exit !((before + after) / 2 <= max) }'; then
+                printf 'load_verdict=below_user_threshold\n'
+            else
+                printf 'load_verdict=above_user_threshold; treat timing as provisional\n'
+            fi
+        else
+            printf 'load_verdict=not_scored\n'
+        fi
     } >>"$log_file"
 done
 
