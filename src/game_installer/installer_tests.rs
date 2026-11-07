@@ -262,6 +262,40 @@
         assert_eq!(seen.len(), 2);
     }
 
+    #[test]
+    fn validated_resume_chunks_moves_only_valid_entries() {
+        let chunks = vec![
+            Some((String::from("kept"), 12)),
+            None,
+            Some((String::from("also-kept"), 34)),
+        ];
+
+        let validated = validated_resume_chunks(chunks);
+
+        assert_eq!(validated.len(), 2);
+        assert_eq!(validated.get("kept"), Some(&12));
+        assert_eq!(validated.get("also-kept"), Some(&34));
+    }
+
+    #[test]
+    fn resume_chunk_validation_handles_parallel_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chunks = Vec::new();
+        for index in 0..70 {
+            let name = format!("resume-{index}");
+            std::fs::write(dir.path().join(format!("{name}.zstd")), b"x").unwrap();
+            chunks.push(Some((name, 1)));
+        }
+        chunks.push(Some(("missing".to_owned(), 1)));
+
+        let validated = validate_resume_chunk_entries(chunks, dir.path());
+
+        assert_eq!(validated.len(), 70);
+        assert_eq!(validated.get("resume-0"), Some(&1));
+        assert_eq!(validated.get("resume-69"), Some(&1));
+        assert!(!validated.contains_key("missing"));
+    }
+
     #[tokio::test]
     async fn bounded_stoppable_stream_bounds_futures_and_stops_after_error() {
         let stopped = Arc::new(AtomicBool::new(false));

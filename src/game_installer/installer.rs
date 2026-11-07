@@ -214,6 +214,74 @@ fn insert_new_chunk_name<'a>(seen_chunks: &mut rustc_hash::FxHashSet<&'a str>, n
     seen_chunks.insert(name)
 }
 
+const PARALLEL_RESUME_VALIDATION_THRESHOLD: usize = 64;
+
+fn validated_resume_chunks(
+    chunks: Vec<Option<(String, u64)>>,
+) -> rustc_hash::FxHashMap<String, u64> {
+    let valid_count = chunks.iter().filter(|entry| entry.is_some()).count();
+    let mut validated = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        valid_count,
+        rustc_hash::FxBuildHasher,
+    );
+    validated.extend(chunks.into_iter().flatten());
+    validated
+}
+
+fn validate_resume_chunk_entries(
+    mut candidates: Vec<Option<(String, u64)>>,
+    chunks_dir: &Path,
+) -> rustc_hash::FxHashMap<String, u64> {
+    if candidates.len() < PARALLEL_RESUME_VALIDATION_THRESHOLD {
+        for entry in &mut candidates {
+            if !entry
+                .as_ref()
+                .is_some_and(|(name, size)| chunk_still_valid_for_resume(name, *size, chunks_dir))
+            {
+                *entry = None;
+            }
+        }
+        return validated_resume_chunks(candidates);
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let chunk_size = candidates.len().div_ceil(num_threads);
+    let worker_panicked = std::thread::scope(|scope| {
+        let handles: Vec<_> = candidates
+            .chunks_mut(chunk_size.max(1))
+            .map(|batch| {
+                scope.spawn(move || {
+                    validate_resume_chunk_batch(batch, chunks_dir);
+                })
+            })
+            .collect();
+        let mut worker_panicked = false;
+        for handle in handles {
+            if let Err(err) = handle.join() {
+                log::error!("Resume chunk validation worker panicked: {err:?}");
+                worker_panicked = true;
+            }
+        }
+        worker_panicked
+    });
+    if worker_panicked {
+        candidates.fill(None);
+    }
+    validated_resume_chunks(candidates)
+}
+
+fn validate_resume_chunk_batch(entries: &mut [Option<(String, u64)>], chunks_dir: &Path) {
+    for entry in entries {
+        if !entry.as_ref().is_some_and(|(name, size)| {
+            chunk_still_valid_for_resume(name, *size, chunks_dir)
+        }) {
+            *entry = None;
+        }
+    }
+}
+
 fn bounded_stoppable_stream<I, F, Fut>(
     items: Vec<I>,
     limit: usize,
@@ -2227,30 +2295,12 @@ pub async fn install(
             let chunks_dir_validate = Arc::clone(&chunks_dir);
             prev_downloaded_chunks = tokio::task::spawn_blocking(move || {
                 let before = prev_downloaded_chunks.len();
-                let num_threads = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let chunks_vec: Vec<_> = prev_downloaded_chunks.into_iter().collect();
-                let chunk_size = chunks_vec.len().div_ceil(num_threads);
-                let validated: rustc_hash::FxHashMap<String, u64> = std::thread::scope(|s| {
-                    let handles: Vec<_> = chunks_vec
-                        .chunks(chunk_size.max(1))
-                        .map(|batch| {
-                            let dir = &chunks_dir_validate;
-                            s.spawn(move || {
-                                batch
-                                    .iter()
-                                    .filter(|(name, size)| chunk_still_valid_for_resume(name, *size, dir))
-                                    .map(|(name, size)| (name.clone(), *size))
-                                    .collect::<Vec<_>>()
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .flat_map(|h| h.join().unwrap_or_default())
-                        .collect()
-                });
+                let candidates: Vec<Option<_>> = prev_downloaded_chunks
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+                let validated =
+                    validate_resume_chunk_entries(candidates, &chunks_dir_validate);
                 let removed = before - validated.len();
                 if removed > 0 {
                     log::warn!(
