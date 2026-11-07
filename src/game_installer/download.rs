@@ -266,6 +266,18 @@ fn pread_hash_xxh64_digest(path: &Path, known_size: Option<u64>) -> SophonResult
     result
 }
 
+async fn create_preallocated_file(path: &Path, len: u64) -> std::io::Result<tokio::fs::File> {
+    let path = path.to_owned();
+    let file = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::create(path)?;
+        let _ = super::sysio::preallocate(&file, len);
+        Ok::<_, std::io::Error>(file)
+    })
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
 async fn verify_existing_file_hash(
     path: &Path,
     expected_hash: &str,
@@ -600,12 +612,7 @@ async fn download_full_file_with_response(
 
     check_available_space(dest, chunk.chunk_size)?;
 
-    let file = tokio::fs::File::create(dest).await?;
-    // Pre-allocate to prevent fragmentation and detect ENOSPC early.
-    {
-        let std_file = file.try_clone().await?.into_std().await;
-        let _ = super::sysio::preallocate(&std_file, chunk.chunk_size);
-    }
+    let file = create_preallocated_file(dest, chunk.chunk_size).await?;
     let mut file = EvictingWriter::new(file);
     let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
         Some(take_md5()?)
@@ -722,6 +729,27 @@ async fn download_with_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn create_preallocated_file_truncates_and_keeps_logical_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preallocated.bin");
+        std::fs::write(&path, b"previous contents").unwrap();
+
+        let file = create_preallocated_file(&path, 4096).await.unwrap();
+        assert_eq!(file.metadata().await.unwrap().len(), 0);
+        drop(file);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_preallocated_file_ignores_invalid_preallocation_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preallocated.bin");
+
+        let file = create_preallocated_file(&path, u64::MAX).await.unwrap();
+        assert_eq!(file.metadata().await.unwrap().len(), 0);
+    }
 
     #[test]
     fn pread_hash_slice_streams_full_file() {

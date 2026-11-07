@@ -94,8 +94,29 @@ pub fn copy_file_region_to(
 /// zeroing or changing file size. Silently ignores unsupported filesystems.
 /// Reserve space for `len` bytes in `file`, returning the operating-system error.
 pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
-    let fd = file.as_raw_fd();
-    let ret = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len as libc::off_t) };
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let ret = {
+        let len = libc::off64_t::try_from(len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "preallocation length exceeds off64_t",
+            )
+        })?;
+        unsafe { libc::fallocate64(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) }
+    };
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let ret = {
+        let len = libc::off_t::try_from(len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "preallocation length exceeds off_t",
+            )
+        })?;
+        unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) }
+    };
     if ret != 0 {
         let e = std::io::Error::last_os_error();
         match e.raw_os_error() {
@@ -109,6 +130,44 @@ pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preallocate_rejects_lengths_outside_native_off_t() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preallocated.bin");
+        let file = File::create(&path).unwrap();
+        let too_large = (libc::off_t::MAX as u64).saturating_add(1);
+
+        assert_eq!(
+            preallocate(&file, too_large).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            preallocate(&file, u64::MAX).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn preallocate_gnu_large_file_range_exceeds_32_bit_off_t() {
+        let len = u64::from(u32::MAX) + 1;
+        let large_file_len = libc::off64_t::try_from(len).unwrap();
+        assert_eq!(large_file_len as u64, len);
+
+        #[cfg(target_pointer_width = "32")]
+        assert!(libc::off_t::try_from(len).is_err());
+    }
+
+    #[test]
+    fn preallocate_zero_length_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preallocated.bin");
+        let file = File::create(&path).unwrap();
+
+        preallocate(&file, 0).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
 
     #[test]
     fn copy_file_range_basic() {
