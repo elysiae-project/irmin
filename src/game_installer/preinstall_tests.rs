@@ -2,6 +2,28 @@ use super::*;
 use fast_md5;
 
 #[tokio::test]
+async fn first_stream_error_drains_all_results_and_returns_first_error() {
+    let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream = futures_util::stream::iter([
+        Ok::<_, SophonError>(()),
+        Err(SophonError::Io(std::io::Error::other("first"))),
+        Err(SophonError::Io(std::io::Error::other("second"))),
+        Ok(()),
+    ])
+    .inspect({
+        let consumed = Arc::clone(&consumed);
+        move |_| {
+            consumed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
+    let error = first_stream_error(stream).await.unwrap();
+
+    assert_eq!(consumed.load(std::sync::atomic::Ordering::Relaxed), 4);
+    assert!(error.to_string().contains("first"));
+}
+
+#[tokio::test]
 async fn preinstall_falls_back_to_current_build_only_for_matching_target_tag() {
     use crate::api_scrape::SophonBuildData;
 

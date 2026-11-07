@@ -773,6 +773,17 @@ fn select_preinstall_build(
     }
 }
 
+async fn first_stream_error<S, T>(stream: S) -> Option<SophonError>
+where
+    S: futures_util::Stream<Item = SophonResult<T>>,
+{
+    stream
+        .fold(None, |first_error, result| {
+            futures_util::future::ready(first_error.or_else(|| result.err()))
+        })
+        .await
+}
+
 /// Resolve available patch manifests into a plan for the upcoming release.
 pub async fn build_preinstall_plan(
     client: &Client,
@@ -1284,11 +1295,9 @@ pub async fn preinstall_download(
     let resume_offset_arc = Arc::new(AtomicU64::new(0));
     let last_check_emit = Arc::new(AtomicU64::new(now_nanos()));
     {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
         let map = Arc::clone(&chunk_bytes_map);
         let upd = Arc::clone(&updater);
         let futures = plan.unique_chunks.iter().map(|chunk| {
-            let permit = Arc::clone(&semaphore);
             let checked = Arc::clone(&checked_arc);
             let offset = Arc::clone(&resume_offset_arc);
             let map = Arc::clone(&map);
@@ -1299,7 +1308,6 @@ pub async fn preinstall_download(
             let patch_md5 = chunk.patch_md5.clone();
             let patch_size = chunk.patch_size;
             async move {
-                let _permit = permit.acquire().await.expect("semaphore not closed");
                 let path = chunks_dir.join(&patch_name);
                 let ok = tokio::task::spawn_blocking(move || {
                     is_file_already_patched(&path, patch_size, &patch_md5)
@@ -1325,12 +1333,12 @@ pub async fn preinstall_download(
                 Ok::<(), SophonError>(())
             }
         });
-        let results = futures_util::stream::iter(futures)
-            .buffer_unordered(16)
-            .collect::<Vec<_>>()
-            .await;
-        for result in results {
-            result?;
+        let first_error = first_stream_error(
+            futures_util::stream::iter(futures).buffer_unordered(16),
+        )
+        .await;
+        if let Some(err) = first_error {
+            return Err(err);
         }
     }
     updater(SophonProgress::CalculatingDownloads {
