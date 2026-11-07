@@ -1999,6 +1999,60 @@ async fn resumed_missing_or_corrupt_patch_chunks_are_downloaded_before_ready() {
     }
 }
 
+#[test]
+fn pending_chunk_cursor_claims_each_index_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    for (chunk_count, worker_count) in [(0usize, 4usize), (1, 8), (7, 3), (64, 16)] {
+        let cursor = AtomicUsize::new(0);
+        let claims = (0..chunk_count)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
+
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let cursor = &cursor;
+                let claims = &claims;
+                scope.spawn(move || {
+                    loop {
+                        let index = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(claim) = claims.get(index) else {
+                            break;
+                        };
+                        claim.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert!(
+            claims
+                .iter()
+                .all(|claim| claim.load(Ordering::Relaxed) == 1)
+        );
+        assert_eq!(
+            chunk_count.saturating_sub(cursor.load(Ordering::Relaxed)),
+            0
+        );
+    }
+}
+
+#[test]
+fn preinstall_worker_scaling_fills_available_target_without_idle_workers() {
+    assert_eq!(preinstall_workers_to_spawn(24, 16, 32), 8);
+    assert_eq!(preinstall_workers_to_spawn(0, 5, 32), 5);
+    assert_eq!(preinstall_workers_to_spawn(4, 0, 32), 0);
+    assert_eq!(preinstall_workers_to_spawn(32, 8, 32), 0);
+    assert_eq!(preinstall_workers_to_spawn(40, 8, 32), 0);
+}
+
+#[test]
+fn preinstall_scheduler_stops_spawning_when_stopping() {
+    assert_eq!(preinstall_workers_to_spawn_if_running(false, 0, 12, 16), 12);
+    assert_eq!(preinstall_workers_to_spawn_if_running(true, 0, 12, 16), 0);
+}
+
 #[tokio::test]
 async fn download_worker_panic_cannot_publish_ready_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -2011,21 +2065,51 @@ async fn download_worker_panic_cannot_publish_ready_state() {
             panic!("worker callback panic");
         }
     });
-    let result = preinstall_download(
-        &Client::new(),
-        plan_from_state(state, vec![chunk]),
-        dir.path(),
-        "nap",
-        "en",
-        handle,
-        updater,
-        Arc::new(|_| {}),
-        HashMap::new(),
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        preinstall_download(
+            &Client::new(),
+            plan_from_state(state, vec![chunk]),
+            dir.path(),
+            "nap",
+            "en",
+            handle,
+            updater,
+            Arc::new(|_| {}),
+            HashMap::new(),
+        ),
     )
-    .await;
+    .await
+    .expect("worker panic must not stall the scheduler");
     assert!(matches!(result, Err(SophonError::JoinError(_))));
     assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
     assert!(!PreinstallState::state_file_path(dir.path(), "2.0").exists());
+}
+
+#[tokio::test]
+async fn preinstall_download_cancel_with_pending_chunks_returns_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let (state, chunk) = patch_download_fixture("http://localhost");
+    let handle = DownloadHandle::new();
+    handle.cancel();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        preinstall_download(
+            &Client::new(),
+            plan_from_state(state, vec![chunk]),
+            dir.path(),
+            "nap",
+            "en",
+            handle,
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            HashMap::new(),
+        ),
+    )
+    .await
+    .expect("cancelled download must not stall the scheduler");
+    assert!(matches!(result, Err(SophonError::Cancelled)));
 }
 
 async fn serve_target_chunks(

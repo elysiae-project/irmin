@@ -1138,6 +1138,23 @@ fn patching_chunk_dir(game_dir: &Path) -> PathBuf {
 
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 
+fn preinstall_workers_to_spawn(active: usize, pending: usize, target: usize) -> usize {
+    target.saturating_sub(active).min(pending)
+}
+
+fn preinstall_workers_to_spawn_if_running(
+    stopping: bool,
+    active: usize,
+    pending: usize,
+    target: usize,
+) -> usize {
+    if stopping {
+        0
+    } else {
+        preinstall_workers_to_spawn(active, pending, target)
+    }
+}
+
 /// Shared state for preinstall download workers. Created once per worker,
 /// passed by reference to each chunk — eliminates per-chunk Arc clones.
 struct PreinstallWorkerCtx {
@@ -1155,7 +1172,7 @@ struct PreinstallWorkerCtx {
 }
 
 async fn process_preinstall_chunk(
-    chunk_info: PatchChunkInfo,
+    chunk_info: &PatchChunkInfo,
     ctx: &PreinstallWorkerCtx,
     diff_download: &Arc<DownloadInfo>,
 ) -> SophonResult<()> {
@@ -1175,12 +1192,12 @@ async fn process_preinstall_chunk(
 
     let chunk_path = ctx.chunks_dir.join(&chunk_info.patch_name);
 
-    download_patch_chunk_with_retries(&chunk_info, ctx, diff_download, &chunk_path).await?;
+    download_patch_chunk_with_retries(chunk_info, ctx, diff_download, &chunk_path).await?;
 
     let actual = fs::metadata(&chunk_path)?.len();
     if actual != chunk_info.patch_size {
         return Err(SophonError::SizeMismatch {
-            item: chunk_info.patch_name,
+            item: chunk_info.patch_name.clone(),
             expected: chunk_info.patch_size,
             actual,
         });
@@ -1363,15 +1380,14 @@ pub async fn preinstall_download(
     }
 
     let total: usize = plan.unique_chunks.len();
-    let queue: Arc<Mutex<VecDeque<PatchChunkInfo>>> = Arc::new(Mutex::new(
+    let pending_chunks: Arc<Vec<PatchChunkInfo>> = Arc::new(
         plan.unique_chunks
             .into_iter()
-            .filter(|c| !chunk_bytes_map.contains_key(&c.patch_name))
+            .filter(|chunk| !chunk_bytes_map.contains_key(&chunk.patch_name))
             .collect(),
-    ));
-    let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(
-        queue.lock().unwrap_or_else(|e| e.into_inner()).len(),
-    ));
+    );
+    let next_chunk = Arc::new(AtomicUsize::new(0));
+    let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(pending_chunks.len()));
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let mut workers = tokio::task::JoinSet::new();
@@ -1444,7 +1460,8 @@ pub async fn preinstall_download(
 
     // Spawn a worker closure factory to avoid repeating the body.
     let spawn_worker = |workers: &mut tokio::task::JoinSet<()>| {
-        let queue = Arc::clone(&queue);
+        let pending_chunks = Arc::clone(&pending_chunks);
+        let next_chunk = Arc::clone(&next_chunk);
         let cancelled = Arc::clone(&cancelled);
         let first_error = Arc::clone(&first_error);
         let remaining = Arc::clone(&remaining);
@@ -1472,12 +1489,9 @@ pub async fn preinstall_download(
                 {
                     return;
                 }
-                let chunk_info = {
-                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-                    match q.pop_front() {
-                        Some(v) => v,
-                        None => break,
-                    }
+                let chunk_index = next_chunk.fetch_add(1, Ordering::Relaxed);
+                let Some(chunk_info) = pending_chunks.get(chunk_index) else {
+                    break;
                 };
                 let diff_download = ctx
                     .diff_downloads
@@ -1514,19 +1528,32 @@ pub async fn preinstall_download(
     // Spawn initial workers and scale up while throughput keeps growing,
     // mirroring the main installer's adaptive download scheduler.
     let adaptive = super::adaptive_download::AdaptiveDownload::new();
-    let initial = adaptive.current_target().min(total);
-    let mut spawned = 0;
+    let initial = adaptive.current_target().min(pending_chunks.len());
     for _ in 0..initial {
         spawn_worker(&mut workers);
-        spawned += 1;
     }
 
     loop {
+        if workers.is_empty() {
+            let pending = pending_chunks
+                .len()
+                .saturating_sub(next_chunk.load(Ordering::Relaxed));
+            let stopping = handle.is_cancelled()
+                || cancelled.load(Ordering::Relaxed) != 0
+                || first_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+            if stopping || pending == 0 {
+                break;
+            }
+        }
+
         tokio::select! {
             biased;
-            result = workers.join_next() => {
+            result = workers.join_next(), if !workers.is_empty() => {
                 match result {
-                    None => break,
+                    None => unreachable!("join_next is guarded by a non-empty worker set"),
                     Some(Err(err)) => {
                         first_error.lock().unwrap_or_else(|e| e.into_inner())
                             .get_or_insert(SophonError::JoinError(err));
@@ -1539,11 +1566,23 @@ pub async fn preinstall_download(
                 adaptive.measure(db);
 
                 let target = adaptive.current_target();
-                let queue_len = queue.lock().unwrap_or_else(|e| e.into_inner()).len();
-                // Spawn up to target, but only if queue has work.
-                while spawned < target && queue_len > spawned {
+                let pending = pending_chunks
+                    .len()
+                    .saturating_sub(next_chunk.load(Ordering::Relaxed));
+                let stopping = handle.is_cancelled()
+                    || cancelled.load(Ordering::Relaxed) != 0
+                    || first_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                let to_spawn = preinstall_workers_to_spawn_if_running(
+                    stopping,
+                    workers.len(),
+                    pending,
+                    target,
+                );
+                for _ in 0..to_spawn {
                     spawn_worker(&mut workers);
-                    spawned += 1;
                 }
 
                 if remaining.load(Ordering::Relaxed) == 0 {
