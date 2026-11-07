@@ -616,6 +616,33 @@ fn bench_chunk_lookup(c: &mut Criterion) {
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let arena = StringArena::from(name_refs.as_slice());
     let lookup = ChunkNameLookup::from_arena(arena);
+    let mut shuffled_indices: Vec<usize> = (0..LOOKUP_CHUNKS).collect();
+    let mut state = 0x9e37_79b9u32;
+    for i in (1..shuffled_indices.len()).rev() {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        shuffled_indices.swap(i, state as usize % (i + 1));
+    }
+    let shuffled_hits: Vec<&str> = shuffled_indices
+        .iter()
+        .map(|&index| names[index].as_str())
+        .collect();
+    let mut mixed_queries: Vec<String> = shuffled_indices
+        .iter()
+        .enumerate()
+        .map(|(i, &index)| {
+            if i % 2 == 0 {
+                names[index].clone()
+            } else if index % 2 == 0 {
+                format!("chunk!{index:08}")
+            } else {
+                format!("chunk~{index:08}")
+            }
+        })
+        .collect();
+    for i in (1..mixed_queries.len()).rev() {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        mixed_queries.swap(i, state as usize % (i + 1));
+    }
 
     let mut group = c.benchmark_group("chunk_lookup");
     group.throughput(Throughput::Elements(LOOKUP_CHUNKS as u64));
@@ -625,6 +652,44 @@ fn bench_chunk_lookup(c: &mut Criterion) {
             let mut found = 0usize;
             for n in &names {
                 if lookup.lookup(n).is_some() {
+                    found += 1;
+                }
+            }
+            std::hint::black_box(found);
+        });
+    });
+
+    assert!(shuffled_hits
+        .iter()
+        .all(|name| lookup.lookup(name).is_some()));
+    group.bench_function("shuffled_hits_10000", |b| {
+        b.iter(|| {
+            let mut found = 0usize;
+            for name in &shuffled_hits {
+                if lookup.lookup(name).is_some() {
+                    found += 1;
+                }
+            }
+            std::hint::black_box(found);
+        });
+    });
+
+    assert_eq!(
+        mixed_queries
+            .iter()
+            .filter(|name| lookup.lookup(name).is_some())
+            .count(),
+        LOOKUP_CHUNKS / 2
+    );
+    assert!(mixed_queries.iter().any(|name| name < &names[0]));
+    assert!(mixed_queries
+        .iter()
+        .any(|name| name > names.last().expect("lookup names are non-empty")));
+    group.bench_function("shuffled_mixed_hits_boundary_misses_10000", |b| {
+        b.iter(|| {
+            let mut found = 0usize;
+            for name in &mixed_queries {
+                if lookup.lookup(name).is_some() {
                     found += 1;
                 }
             }
