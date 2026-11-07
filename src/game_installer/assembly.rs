@@ -185,6 +185,70 @@ pub fn assemble_file(
     skip_md5_check: bool,
     verify_mode: super::VerifyMode,
 ) -> SophonResult<()> {
+    assemble_file_with_shared_mmap_advice(
+        all_files,
+        file_idx,
+        game_dir,
+        chunks_dir,
+        temp_dir,
+        chunk_lookup,
+        chunk_refcounts,
+        verify_cache,
+        skip_md5_check,
+        verify_mode,
+        super::assembly_opt::SharedMmapAdvice::PopulateRead,
+    )
+}
+
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_file_with_benchmark_mmap_advice(
+    all_files: &CompactManifest,
+    file_idx: usize,
+    game_dir: &Path,
+    chunks_dir: &Path,
+    temp_dir: &Path,
+    chunk_lookup: &ChunkNameLookup,
+    chunk_refcounts: &[AtomicU32],
+    verify_cache: &DashMap<String, VerificationEntry>,
+    skip_md5_check: bool,
+    verify_mode: super::VerifyMode,
+    demand_sequential: bool,
+) -> SophonResult<()> {
+    assemble_file_with_shared_mmap_advice(
+        all_files,
+        file_idx,
+        game_dir,
+        chunks_dir,
+        temp_dir,
+        chunk_lookup,
+        chunk_refcounts,
+        verify_cache,
+        skip_md5_check,
+        verify_mode,
+        if demand_sequential {
+            super::assembly_opt::SharedMmapAdvice::DemandSequential
+        } else {
+            super::assembly_opt::SharedMmapAdvice::PopulateRead
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_file_with_shared_mmap_advice(
+    all_files: &CompactManifest,
+    file_idx: usize,
+    game_dir: &Path,
+    chunks_dir: &Path,
+    temp_dir: &Path,
+    chunk_lookup: &ChunkNameLookup,
+    chunk_refcounts: &[AtomicU32],
+    verify_cache: &DashMap<String, VerificationEntry>,
+    skip_md5_check: bool,
+    verify_mode: super::VerifyMode,
+    shared_mmap_advice: super::assembly_opt::SharedMmapAdvice,
+) -> SophonResult<()> {
     let file_name = all_files.file_name(file_idx);
     let file_size = all_files.file_size(file_idx);
     let file_hash_md5 = all_files.file_hash_md5(file_idx);
@@ -408,7 +472,11 @@ pub fn assemble_file(
                     };
                     // MAP_SHARED read-only mmap sees concurrent pwrite_at updates
                     // to the page cache, eliminating per-chunk read_at syscalls.
-                    let map = match super::assembly_opt::mmap_shared_read_only(&file, map_len) {
+                    let map = match super::assembly_opt::mmap_shared_read_only(
+                        &file,
+                        map_len,
+                        shared_mmap_advice,
+                    ) {
                         Ok(m) => m,
                         Err(e) => {
                             *hasher_result.lock().unwrap() = Some(Err(SophonError::Io(e)));

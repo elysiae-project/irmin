@@ -238,7 +238,7 @@ use irmin_rs::bench_support::{
     uncovered_prefix_fixture_sizes,
 };
 use irmin_rs::game_installer::VerifyMode;
-use irmin_rs::game_installer::assembly::{assemble_file, chunk_filename};
+use irmin_rs::game_installer::assembly::chunk_filename;
 use irmin_rs::game_installer::cache::{VerificationCache, VerificationEntry};
 use irmin_rs::game_installer::compact_manifest::{CompactManifest, StringArena};
 use irmin_rs::game_installer::hdiffpatch::{HDiffSourceBackend, WindowStats};
@@ -290,6 +290,8 @@ struct Config {
     scenario: Scenario,
     size_mib: usize,
     chunks: usize,
+    assembly_verify_mode: VerifyMode,
+    assembly_demand_mmap: bool,
     asset_count: usize,
     preinstall_mode: PreinstallMode,
     diagnose_hdiff_phases: bool,
@@ -721,6 +723,8 @@ struct AssemblyContext {
     lookup: ChunkNameLookup,
     refcounts: Vec<AtomicU32>,
     cache: VerificationCache<String, VerificationEntry>,
+    verify_mode: VerifyMode,
+    demand_mmap: bool,
 }
 
 struct InstallContext {
@@ -1034,6 +1038,16 @@ fn child_command_args(
         } else {
             "standard".to_owned()
         },
+        match config.assembly_verify_mode {
+            VerifyMode::Full => "full".to_owned(),
+            VerifyMode::Deferred => "deferred".to_owned(),
+            VerifyMode::None => "none".to_owned(),
+        },
+        if config.assembly_demand_mmap {
+            "demand".to_owned()
+        } else {
+            "populate".to_owned()
+        },
     ]
 }
 
@@ -1211,6 +1225,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut scenario = None;
     let mut size_mib = 64;
     let mut chunks = 8;
+    let mut assembly_verify_mode = VerifyMode::Full;
+    let mut assembly_demand_mmap = false;
     let mut asset_count = 1;
     let mut preinstall_mode = PreinstallMode::Patch;
     let mut diagnose_hdiff_phases = false;
@@ -1243,6 +1259,19 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 index += 1;
                 chunks = parse_positive(value_at(args, index, option)?, option)?;
             }
+            "--assembly-verify-mode" => {
+                index += 1;
+                assembly_verify_mode = match value_at(args, index, option)? {
+                    "full" => VerifyMode::Full,
+                    "deferred" => VerifyMode::Deferred,
+                    value => {
+                        return Err(format!(
+                            "unknown assembly verification mode '{value}'; expected full or deferred"
+                        ));
+                    }
+                };
+            }
+            "--assembly-demand-mmap" => assembly_demand_mmap = true,
             "--asset-count" => {
                 index += 1;
                 asset_count = parse_positive(value_at(args, index, option)?, option)?;
@@ -1328,6 +1357,25 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     if preinstall_mode != PreinstallMode::Patch && scenario != Scenario::PreinstallApply {
         return Err("--preinstall-mode is only supported for preinstall-apply".to_owned());
     }
+    if (assembly_verify_mode != VerifyMode::Full || assembly_demand_mmap)
+        && scenario != Scenario::Assembly
+    {
+        return Err(
+            "--assembly-verify-mode and --assembly-demand-mmap require the assembly scenario"
+                .to_owned(),
+        );
+    }
+    if assembly_demand_mmap && assembly_verify_mode != VerifyMode::Deferred {
+        return Err("--assembly-demand-mmap requires --assembly-verify-mode deferred".to_owned());
+    }
+    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::None {
+        return Err(
+            "--assembly-verify-mode none is not supported by the assembly benchmark".to_owned(),
+        );
+    }
+    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::Deferred && chunks < 4 {
+        return Err("deferred assembly mmap diagnostics require at least four chunks".to_owned());
+    }
     if preinstall_mode == PreinstallMode::CopyOver && cover_pattern != CoverPattern::Sequential {
         return Err("copyover mode requires the sequential cover pattern".to_owned());
     }
@@ -1391,8 +1439,12 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     if scenario == Scenario::SophonInstall && (size_mib * 1024 * 1024) % chunks != 0 {
         return Err("sophon-install size-mib must divide evenly into chunks".to_owned());
     }
-    if fixture_backing == FixtureBacking::Disk && scenario != Scenario::PreinstallApply {
-        return Err("--fixture-backing disk is only supported for preinstall-apply".to_owned());
+    if fixture_backing == FixtureBacking::Disk
+        && !matches!(scenario, Scenario::PreinstallApply | Scenario::Assembly)
+    {
+        return Err(
+            "--fixture-backing disk is only supported for preinstall-apply and assembly".to_owned(),
+        );
     }
     if let Some(sizes) = &sweep_sizes_mib {
         if scenario != Scenario::PreinstallApply {
@@ -1451,6 +1503,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         scenario,
         size_mib,
         chunks,
+        assembly_verify_mode,
+        assembly_demand_mmap,
         asset_count,
         preinstall_mode,
         diagnose_hdiff_phases,
@@ -1498,12 +1552,12 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|preinstall-download-plan|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--diagnose-hdiff-phases] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|preinstall-download-plan|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--assembly-verify-mode full|deferred] [--assembly-demand-mmap] [--diagnose-hdiff-phases] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 13 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT PREINSTALL_MODE SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE DIAGNOSTIC_MODE".to_owned());
+    if args.len() != 15 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT PREINSTALL_MODE SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE DIAGNOSTIC_MODE ASSEMBLY_VERIFY_MODE ASSEMBLY_MMAP_ADVICE".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
@@ -1535,6 +1589,31 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "standard" => false,
         _ => return Err("invalid child diagnostic mode".to_owned()),
     };
+    let assembly_verify_mode = match args[13].as_str() {
+        "full" => VerifyMode::Full,
+        "deferred" => VerifyMode::Deferred,
+        "none" => VerifyMode::None,
+        _ => return Err("invalid child assembly verification mode".to_owned()),
+    };
+    let assembly_demand_mmap = match args[14].as_str() {
+        "populate" => false,
+        "demand" => true,
+        _ => return Err("invalid child assembly mmap advice".to_owned()),
+    };
+    if scenario != Scenario::Assembly
+        && (assembly_verify_mode != VerifyMode::Full || assembly_demand_mmap)
+    {
+        return Err("assembly diagnostics are only valid for assembly scenario".to_owned());
+    }
+    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::None {
+        return Err("assembly benchmark verification mode cannot be none".to_owned());
+    }
+    if assembly_demand_mmap && assembly_verify_mode != VerifyMode::Deferred {
+        return Err("demand mmap advice requires deferred assembly verification".to_owned());
+    }
+    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::Deferred && chunks < 4 {
+        return Err("deferred assembly mmap diagnostics require at least four chunks".to_owned());
+    }
     if cover_pattern == CoverPattern::UncoveredPrefix {
         uncovered_prefix_fixture_sizes(size_mib)?;
     }
@@ -1608,8 +1687,15 @@ fn run_child(args: &[String]) -> Result<(), String> {
         preinstall_mode,
         &args[6],
     )?;
-    if let ScenarioContext::PreinstallApply(context) = &mut context {
-        context.diagnose_hdiff_phases = diagnose_hdiff_phases;
+    match &mut context {
+        ScenarioContext::PreinstallApply(context) => {
+            context.diagnose_hdiff_phases = diagnose_hdiff_phases;
+        }
+        ScenarioContext::Assembly { context } => {
+            context.verify_mode = assembly_verify_mode;
+            context.demand_mmap = assembly_demand_mmap;
+        }
+        _ => {}
     }
     let cgroup_after_setup = if let Some((_, path, _, _, _)) = &cgroup_memory_before_setup {
         Some((
@@ -1810,6 +1896,26 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "hwm_reset": hwm_reset,
         "measurement": if hwm_reset { "operation_hwm" } else { "process_hwm_includes_setup" },
     });
+    result.as_object_mut().unwrap().insert(
+        "assembly_verify_mode".to_owned(),
+        serde_json::json!(
+            (scenario == Scenario::Assembly).then_some(match assembly_verify_mode {
+                VerifyMode::Full => "full",
+                VerifyMode::Deferred => "deferred",
+                VerifyMode::None => "none",
+            })
+        ),
+    );
+    result.as_object_mut().unwrap().insert(
+        "assembly_mmap_advice".to_owned(),
+        serde_json::json!(
+            (scenario == Scenario::Assembly).then_some(if assembly_demand_mmap {
+                "demand-sequential"
+            } else {
+                "populate-read-default"
+            })
+        ),
+    );
     #[cfg(feature = "bench-alloc-stats")]
     {
         if let Some(checkpoints) = asset_heap_live_growth_bytes {
@@ -2923,6 +3029,8 @@ fn prepare_assembly_context(
             lookup,
             refcounts,
             cache,
+            verify_mode: VerifyMode::Full,
+            demand_mmap: false,
         }),
     })
 }
@@ -3091,8 +3199,10 @@ fn run_operation(
                 lookup,
                 refcounts,
                 cache,
+                verify_mode,
+                demand_mmap,
             } = *context;
-            assemble_file(
+            irmin_rs::game_installer::assembly::assemble_file_with_benchmark_mmap_advice(
                 &manifest,
                 0,
                 &game_dir,
@@ -3102,7 +3212,8 @@ fn run_operation(
                 &refcounts,
                 &cache,
                 true,
-                VerifyMode::Full,
+                verify_mode,
+                demand_mmap,
             )
             .map_err(|error| format!("assembly failed: {error}"))?;
             Ok(Verification::Assembly {
@@ -3433,12 +3544,63 @@ mod tests {
         assert!(parse_args(&[]).is_err());
         assert!(parse_positive("0", "--repeat").is_err());
         assert!(parse_positive("abc", "--repeat").is_err());
+        let default_assembly = parse_args(&["--scenario".into(), "assembly".into()]).unwrap();
+        assert_eq!(default_assembly.assembly_verify_mode, VerifyMode::Full);
+        assert!(!default_assembly.assembly_demand_mmap);
+        let deferred_demand = parse_args(&[
+            "--scenario".into(),
+            "assembly".into(),
+            "--assembly-verify-mode".into(),
+            "deferred".into(),
+            "--assembly-demand-mmap".into(),
+            "--chunks".into(),
+            "4".into(),
+        ])
+        .unwrap();
+        assert_eq!(deferred_demand.assembly_verify_mode, VerifyMode::Deferred);
+        assert!(deferred_demand.assembly_demand_mmap);
         assert!(
             parse_args(&[
                 "--scenario".into(),
                 "assembly".into(),
+                "--assembly-demand-mmap".into(),
+            ])
+            .is_err()
+        );
+        let full_single_chunk = parse_args(&[
+            "--scenario".into(),
+            "assembly".into(),
+            "--chunks".into(),
+            "1".into(),
+        ])
+        .unwrap();
+        assert_eq!(full_single_chunk.assembly_verify_mode, VerifyMode::Full);
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "assembly".into(),
+                "--assembly-verify-mode".into(),
+                "none".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-apply".into(),
+                "--assembly-verify-mode".into(),
+                "deferred".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "assembly".into(),
+                "--assembly-verify-mode".into(),
+                "deferred".into(),
                 "--chunks".into(),
-                "0".into(),
+                "3".into(),
             ])
             .is_err()
         );
@@ -3696,6 +3858,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(disk.fixture_backing, FixtureBacking::Disk);
+        let disk_assembly = parse_args(&[
+            "--scenario".into(),
+            "assembly".into(),
+            "--fixture-backing".into(),
+            "disk".into(),
+        ])
+        .unwrap();
+        assert_eq!(disk_assembly.fixture_backing, FixtureBacking::Disk);
         assert!(
             parse_args(&[
                 "--scenario".into(),
@@ -3799,6 +3969,38 @@ mod tests {
         assert_eq!(
             size_run_order(&sizes, 2, true),
             [(16, 0), (32, 0), (64, 0), (32, 1), (64, 1), (16, 1)]
+        );
+    }
+
+    #[test]
+    fn child_protocol_preserves_assembly_diagnostic_settings() {
+        let config = parse_args(&[
+            "--scenario".into(),
+            "assembly".into(),
+            "--assembly-verify-mode".into(),
+            "deferred".into(),
+            "--assembly-demand-mmap".into(),
+            "--chunks".into(),
+            "4".into(),
+        ])
+        .unwrap();
+        let args = child_command_args(&config, Path::new("fixture"), None, 1, "", false);
+        assert_eq!(args.len(), 16);
+        assert_eq!(args[14], "deferred");
+        assert_eq!(args[15], "demand");
+        let mut invalid_mode = args[1..].to_vec();
+        invalid_mode[13] = "none".to_owned();
+        assert!(
+            run_child(&invalid_mode)
+                .unwrap_err()
+                .contains("cannot be none")
+        );
+        let mut demand_without_deferred = args[1..].to_vec();
+        demand_without_deferred[13] = "full".to_owned();
+        assert!(
+            run_child(&demand_without_deferred)
+                .unwrap_err()
+                .contains("requires deferred")
         );
     }
 
@@ -4476,6 +4678,26 @@ mod tests {
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn deferred_parallel_hash_matches_with_and_without_prefault() {
+        let mut outputs = Vec::new();
+        for demand_mmap in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            prepare_assembly_fixture(dir.path(), 1, 4).unwrap();
+            let context = prepare_assembly_context(dir.path(), 1, 4).unwrap();
+            let ScenarioContext::Assembly { mut context } = context else {
+                panic!("assembly fixture returned a different scenario");
+            };
+            context.verify_mode = VerifyMode::Deferred;
+            context.demand_mmap = demand_mmap;
+            let context = ScenarioContext::Assembly { context };
+            let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+            verify_output(verification).unwrap();
+            outputs.push(fs::read(dir.path().join("game/assembled.bin")).unwrap());
+        }
+        assert_eq!(outputs[0], outputs[1]);
     }
 
     #[test]

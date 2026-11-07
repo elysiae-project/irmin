@@ -254,8 +254,19 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
 
 /// MAP_SHARED read-only mapping: sees concurrent pwrite updates to the file's
 /// page cache. Used by the parallel hasher thread to hash assembling output
-/// without per-chunk read_at syscalls. `MADV_POPULATE_READ` pre-faults pages.
-pub(crate) fn mmap_shared_read_only(file: &File, len: usize) -> io::Result<MmapGuard> {
+/// without per-chunk read_at syscalls. Advice is best-effort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedMmapAdvice {
+    PopulateRead,
+    #[cfg(feature = "benchmark")]
+    DemandSequential,
+}
+
+pub(crate) fn mmap_shared_read_only(
+    file: &File,
+    len: usize,
+    advice: SharedMmapAdvice,
+) -> io::Result<MmapGuard> {
     if len == 0 {
         return Err(io::Error::other("empty file"));
     }
@@ -273,13 +284,17 @@ pub(crate) fn mmap_shared_read_only(file: &File, len: usize) -> io::Result<MmapG
         return Err(io::Error::last_os_error());
     }
     unsafe {
-        // Pre-fault pages so the hash loop doesn't pay per-page fault cost.
-        // Only for files ≤256 MiB; larger files use SEQUENTIAL for readahead
-        // without synchronous prefault.
-        if len <= 256 * 1024 * 1024 {
-            libc::madvise(ptr, len, libc::MADV_POPULATE_READ);
-        } else {
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+        match advice {
+            SharedMmapAdvice::PopulateRead if len <= 256 * 1024 * 1024 => {
+                libc::madvise(ptr, len, libc::MADV_POPULATE_READ);
+            }
+            SharedMmapAdvice::PopulateRead => {
+                libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+            }
+            #[cfg(feature = "benchmark")]
+            SharedMmapAdvice::DemandSequential => {
+                libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+            }
         }
         libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
     }
