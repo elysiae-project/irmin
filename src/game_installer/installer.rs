@@ -2369,7 +2369,6 @@ pub async fn install(
             total_files: total,
         });
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
         let checked_files = Arc::new(AtomicU64::new(0));
         let resume_bytes_offset_arc = Arc::new(AtomicU64::new(0));
         let pre_assembled_arc = Arc::new(AtomicU64::new(0));
@@ -2390,7 +2389,6 @@ pub async fn install(
 
         let calc_futures = (0..all_files.num_files()).map(|file_idx| {
             let all_files = Arc::clone(&all_files);
-            let permit = Arc::clone(&semaphore);
             let verify_cache = Arc::clone(&verify_cache);
             let game_dir = Arc::clone(&game_dir_arc);
             let checked_files = Arc::clone(&checked_files);
@@ -2404,8 +2402,6 @@ pub async fn install(
             let resume_bitmap = resume_bitmap.clone();
 
             async move {
-                let _permit = permit.acquire().await.ok()?;
-
                 let file_name = all_files.file_name(file_idx).to_string();
                 let file_size = all_files.file_size(file_idx);
                 let file_hash = all_files.file_hash_md5(file_idx).to_string();
@@ -2500,7 +2496,7 @@ pub async fn install(
 
         futures_util::stream::iter(calc_futures)
             .buffer_unordered(16)
-            .collect::<Vec<_>>()
+            .for_each(|_| futures_util::future::ready(()))
             .await;
 
         for path in files_to_delete.lock().unwrap().drain(..) {
