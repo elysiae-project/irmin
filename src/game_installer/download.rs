@@ -1374,6 +1374,24 @@ mod tests {
     }
 
     #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    fn fast_md5_matches_rfc_1321_vectors() {
+        assert_eq!(
+            hex::encode(fast_md5::digest(b"")),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+        assert_eq!(
+            hex::encode(fast_md5::digest(b"abc")),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        let million_a = vec![b'a'; 1_000_000];
+        assert_eq!(
+            hex::encode(fast_md5::digest(&million_a)),
+            "7707d6ae4e027c70eea2a935c2296f21"
+        );
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
     #[tokio::test]
     #[ignore = "diagnostic MD5 update granularity; run explicitly with --ignored"]
     async fn diagnose_md5_update_granularity() {
@@ -1404,10 +1422,13 @@ mod tests {
                 let digest = fast_md5::digest(black_box(&input));
                 let elapsed = start.elapsed();
                 assert_eq!(digest, expected);
-                elapsed
+                (
+                    elapsed,
+                    input.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0,
+                )
             })
             .collect::<Vec<_>>();
-        println!("md5_update_granularity one_shot_samples={one_shot_samples:?}");
+        println!("md5_update_granularity one_shot_samples=(duration, MB/s) {one_shot_samples:?}");
 
         for chunk_size in [
             1usize,
@@ -1440,11 +1461,14 @@ mod tests {
                     let digest = hasher.finalize();
                     let elapsed = start.elapsed();
                     assert_eq!(digest, expected);
-                    elapsed
+                    (
+                        elapsed,
+                        input.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0,
+                    )
                 })
                 .collect::<Vec<_>>();
             println!(
-                "md5_update_granularity bytes={} chunk_size={chunk_size} repeats={repeats} samples={samples:?}",
+                "md5_update_granularity bytes={} chunk_size={chunk_size} repeats={repeats} samples=(duration, MB/s) {samples:?}",
                 input.len()
             );
         }
