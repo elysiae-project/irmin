@@ -88,6 +88,26 @@
     }
 
     #[test]
+    fn snapshot_downloaded_chunks_preserves_names_values_and_last_duplicate() {
+        let lookup = ChunkNameLookup::from_arena(super::super::compact_manifest::StringArena::from(
+            &["shared", "idle", "shared", "other"][..],
+        ));
+        let downloaded_chunks = [
+            AtomicU32::new(11),
+            AtomicU32::new(0),
+            AtomicU32::new(29),
+            AtomicU32::new(7),
+        ];
+
+        let snapshot = snapshot_downloaded_chunks(&downloaded_chunks, &lookup);
+
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.get("shared"), Some(&29));
+        assert_eq!(snapshot.get("other"), Some(&7));
+        assert!(!snapshot.contains_key("idle"));
+    }
+
+    #[test]
     fn compute_totals_no_dupes() {
         let files = vec![
             make_file(

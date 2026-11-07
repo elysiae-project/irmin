@@ -118,9 +118,8 @@ struct InstallContext {
     chunks_since_save: Arc<AtomicU64>,
     last_save: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     state_saver: StateSaver,
-    /// Pre-built chunk name vec indexed by item_idx. Built once at init,
-    /// reused on every state save to avoid per-save String allocations.
-    save_chunk_names: Arc<OnceLock<Vec<String>>>,
+    /// Shares chunk names with the lookup used by assembly tasks.
+    save_chunk_names: Arc<OnceLock<Arc<ChunkNameLookup>>>,
     adaptive_assembly: Arc<AdaptiveAssembly>,
     profiler: Arc<super::profiling::PipelineProfiler>,
     /// Per-file completion bitset indexed by `file_idx`.
@@ -889,14 +888,7 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
     }
     let new_handle = tokio::task::spawn_blocking(move || {
         let map: HashMap<String, u64> = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
-            let mut m = HashMap::with_capacity(dc.len() / 2);
-            for (i, v) in dc.iter().enumerate() {
-                let val = v.load(Ordering::Relaxed);
-                if val > 0 {
-                    m.insert(names[i].clone(), val as u64);
-                }
-            }
-            m
+            snapshot_downloaded_chunks(dc, names)
         } else {
             HashMap::new()
         };
@@ -909,6 +901,21 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
         });
         *guard = Some(new_handle);
     }
+}
+
+fn snapshot_downloaded_chunks(
+    downloaded_chunks: &[AtomicU32],
+    chunk_names: &ChunkNameLookup,
+) -> HashMap<String, u64> {
+    debug_assert_eq!(downloaded_chunks.len(), chunk_names.sorted_indices.len());
+    let mut map = HashMap::with_capacity(downloaded_chunks.len() / 2);
+    for (i, value) in downloaded_chunks.iter().enumerate() {
+        let value = value.load(Ordering::Relaxed);
+        if value > 0 {
+            map.insert(chunk_names.get(i).to_owned(), value as u64);
+        }
+    }
+    map
 }
 
 #[allow(clippy::let_and_return)]
@@ -1885,14 +1892,7 @@ async fn finalize_install(
         let saver = Arc::clone(&ctx.state_saver);
         tokio::task::spawn_blocking(move || {
             let map = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
-                let mut m = HashMap::with_capacity(dc.len() / 2);
-                for (i, v) in dc.iter().enumerate() {
-                    let val = v.load(Ordering::Relaxed);
-                    if val > 0 {
-                        m.insert(names[i].clone(), val as u64);
-                    }
-                }
-                m
+                snapshot_downloaded_chunks(dc, names)
             } else {
                 HashMap::new()
             };
@@ -2623,14 +2623,7 @@ pub async fn install(
     let _ = ctx.chunk_refcounts.set(Arc::new(chunk_refcounts_vec));
     let _ = ctx.chunk_names.set(Arc::clone(&chunk_names_lookup));
 
-    // Pre-build chunk name strings for state saves. Built once here,
-    // reused on every save to avoid per-save arena lookups + allocations.
-    {
-        let names: Vec<String> = (0..download_items.len())
-            .map(|i| chunk_names_lookup.get(i).to_owned())
-            .collect();
-        let _ = ctx.save_chunk_names.set(names);
-    }
+    let _ = ctx.save_chunk_names.set(Arc::clone(&chunk_names_lookup));
 
     {
         let downloaded_chunks_vec: Vec<AtomicU32> = (0..download_items.len())
