@@ -429,3 +429,34 @@ fn check_file_md5_cached_hit_despite_mtime_change_same_size() {
     let result = check_file_md5_cached(&path, size, &md5, &game_dir, &cache).unwrap();
     assert!(!result, "cache should detect mtime change and re-verify");
 }
+
+#[test]
+fn file_md5_digest_buffer_capacities_match_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("capacity.bin");
+    let capacities = [1, 63, 64, 257, 4097];
+    let lengths = [0, 1, 63, 64, 65, 256, 257, 4096, 4097, 8193];
+
+    for length in lengths {
+        let data = (0..length)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        fs::write(&path, &data).unwrap();
+        let expected = fast_md5::digest(&data);
+        assert_eq!(file_md5_digest(&path).unwrap(), expected);
+        for capacity in capacities {
+            assert_eq!(
+                file_md5_digest_with_options(&path, capacity, false).unwrap(),
+                expected,
+                "length={length}, capacity={capacity}"
+            );
+        }
+    }
+
+    assert_eq!(
+        file_md5_digest_with_options(&path, 0, false)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}

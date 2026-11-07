@@ -436,6 +436,41 @@ fn bench_verify_file_md5(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "bench-internals")]
+fn bench_file_md5_buffer_capacity(c: &mut Criterion) {
+    use irmin_rs::game_installer::cache::benchmark::file_md5_digest_with_options;
+
+    const FILE_MIB: usize = 50;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("md5-buffer-sweep.bin");
+    fill_file_prng(&path, FILE_MIB, 0xD1CE_BA5E);
+    let expected = fast_md5::digest(&fs::read(&path).expect("read fixture"));
+    let bytes = (FILE_MIB * 1024 * 1024) as u64;
+
+    let mut group = c.benchmark_group("file_md5_buffer_capacity");
+    group.throughput(Throughput::Bytes(bytes));
+    for advise_page_cache in [false, true] {
+        let advice_label = if advise_page_cache {
+            "with_fadvise"
+        } else {
+            "no_fadvise"
+        };
+        for capacity in [64, 128, 256, 512, 1024, 4096].map(|kib| kib * 1024) {
+            let digest = file_md5_digest_with_options(&path, capacity, advise_page_cache)
+                .expect("validate digest capacity");
+            assert_eq!(digest, expected, "capacity={capacity}");
+            group.bench_function(BenchmarkId::new(advice_label, capacity / 1024), |b| {
+                b.iter(|| {
+                    let digest = file_md5_digest_with_options(&path, capacity, advise_page_cache)
+                        .expect("hash with selected reader capacity");
+                    std::hint::black_box(digest);
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 const HASH_MIB: u64 = 128;
 
 /// XXH64 throughput on a 128 MiB file via pread. This is the compressed-chunk
@@ -1802,6 +1837,13 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_file_md5_buffer_capacity_optional(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    bench_file_md5_buffer_capacity(c);
+    #[cfg(not(feature = "bench-internals"))]
+    let _ = c;
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -1822,6 +1864,7 @@ criterion_group!(
     bench_v20_step_buffer_stress,
     bench_v13_large_uncovered_prefix,
     bench_eager_decompress,
+    bench_file_md5_buffer_capacity_optional,
 );
 criterion_main!(benches);
 

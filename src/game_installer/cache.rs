@@ -10,6 +10,7 @@ use dashmap::DashMap;
 pub use dashmap::DashMap as VerificationCache;
 
 pub(crate) const VERIFICATION_CACHE_MAX_ENTRIES: usize = 5_000;
+const MD5_READ_BUFFER_SIZE: usize = 256 * 1024;
 
 #[cfg(test)]
 use fast_md5;
@@ -225,6 +226,20 @@ pub fn check_file_md5_with_cache_key_and_size(
 /// Compute the raw 16-byte MD5 digest of a file using buffered sequential reads.
 /// Returns an I/O error if opening or reading the file fails.
 pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
+    file_md5_digest_with_options(path, MD5_READ_BUFFER_SIZE, true)
+}
+
+fn file_md5_digest_with_options(
+    path: &Path,
+    buffer_capacity: usize,
+    advise_page_cache: bool,
+) -> io::Result<[u8; 16]> {
+    if buffer_capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MD5 read buffer capacity must be nonzero",
+        ));
+    }
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     if len == 0 {
@@ -235,11 +250,13 @@ pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     }
 
     let fd = file.as_raw_fd();
-    super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_SEQUENTIAL);
+    if advise_page_cache {
+        super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_SEQUENTIAL);
+    }
 
     let mut hasher =
         super::assembly_opt::take_md5().map_err(|e| io::Error::other(e.to_string()))?;
-    let mut reader = io::BufReader::with_capacity(256 * 1024, file);
+    let mut reader = io::BufReader::with_capacity(buffer_capacity, file);
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
@@ -251,7 +268,9 @@ pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
         let n = buf.len();
         reader.consume(n);
     }
-    super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_DONTNEED);
+    if advise_page_cache {
+        super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_DONTNEED);
+    }
 
     let digest = hasher
         .finish()
@@ -260,6 +279,20 @@ pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     Ok(digest)
 }
 
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod benchmark {
+    use std::io;
+    use std::path::Path;
+
+    pub fn file_md5_digest_with_options(
+        path: &Path,
+        capacity: usize,
+        advise_page_cache: bool,
+    ) -> io::Result<[u8; 16]> {
+        super::file_md5_digest_with_options(path, capacity, advise_page_cache)
+    }
+}
 
 #[cfg(test)]
 #[path = "cache_tests.rs"]

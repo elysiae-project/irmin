@@ -65,6 +65,7 @@ sophon-profiling = [
     "tikv-jemalloc-ctl/stats",
 ]
 benchmark = []
+bench-internals = ["benchmark"]
 bench-diagnostics = ["benchmark"]
 benchmark-jemalloc = [
     "benchmark",
