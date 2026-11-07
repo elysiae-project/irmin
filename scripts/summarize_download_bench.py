@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate Criterion throughput estimates and load samples for download runs."""
+"""Summarize Criterion throughput estimates and load samples for download runs."""
 
 import json
 import math
@@ -11,8 +11,6 @@ import sys
 def summarize(
     root: pathlib.Path,
     repeat_count: int,
-    spread_limit: float,
-    load_limit: float | None,
 ) -> dict:
     runs = []
     report_errors = []
@@ -35,9 +33,6 @@ def summarize(
                         pass
         load_before = load_values.get("load_before")
         load_after = load_values.get("load_after")
-        load_ok = load_before is not None and load_after is not None
-        if load_ok and load_limit is not None:
-            load_ok = load_before <= load_limit and load_after <= load_limit
 
         report_root = root / f"run-{number:02d}-criterion"
         measurements = {}
@@ -95,7 +90,7 @@ def summarize(
                 "run": number,
                 "load_before": load_values.get("load_before"),
                 "load_after": load_values.get("load_after"),
-                "load_ok": load_ok,
+                "load_recorded": load_before is not None and load_after is not None,
                 "throughput_Bps": measurements,
             }
         )
@@ -103,7 +98,6 @@ def summarize(
     benchmark_ids = sorted({name for run in runs for name in run["throughput_Bps"]})
     benchmarks = {}
     missing_benchmark_runs = {}
-    all_benchmarks_quiet = bool(benchmark_ids)
     for name in benchmark_ids:
         missing_runs = [run["run"] for run in runs if name not in run["throughput_Bps"]]
         if missing_runs:
@@ -111,40 +105,24 @@ def summarize(
         values = [
             run["throughput_Bps"][name]
             for run in runs
-            if run["load_ok"] and name in run["throughput_Bps"]
+            if name in run["throughput_Bps"]
         ]
         if not values:
-            benchmarks[name] = {"valid_runs": 0, "verdict": "insufficient"}
-            all_benchmarks_quiet = False
+            benchmarks[name] = {"valid_runs": 0}
             continue
 
         median = statistics.median(values)
         spread = (max(values) - min(values)) / median if median > 0 else math.inf
-        quiet = len(values) >= 5 and not missing_runs and spread <= spread_limit
-        all_benchmarks_quiet &= quiet
         benchmarks[name] = {
             "valid_runs": len(values),
             "min_Bps": min(values),
             "median_Bps": median,
             "max_Bps": max(values),
             "spread_fraction": spread,
-            "verdict": "quiet" if quiet else ("noisy" if len(values) >= 5 else "insufficient"),
         }
 
-    if report_errors or missing_benchmark_runs:
-        verdict = "insufficient"
-    elif all_benchmarks_quiet:
-        verdict = "quiet"
-    elif not benchmark_ids or any(item["valid_runs"] < 5 for item in benchmarks.values()):
-        verdict = "insufficient"
-    else:
-        verdict = "noisy"
     return {
         "repeats": repeat_count,
-        "minimum_valid_repeats": 5,
-        "max_spread_fraction": spread_limit,
-        "load_threshold": load_limit,
-        "verdict": verdict,
         "report_errors": report_errors,
         "missing_benchmark_runs": missing_benchmark_runs,
         "benchmarks": benchmarks,
@@ -153,20 +131,16 @@ def summarize(
 
 
 def main() -> None:
-    if len(sys.argv) != 5:
-        raise SystemExit("usage: summarize_download_bench.py OUTPUT_DIR REPEATS MAX_SPREAD LOAD_LIMIT")
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: summarize_download_bench.py OUTPUT_DIR REPEATS")
     root = pathlib.Path(sys.argv[1])
     try:
         repeat_count = int(sys.argv[2])
-        spread_limit = float(sys.argv[3])
-        load_limit = float(sys.argv[4]) if sys.argv[4] else None
     except ValueError as error:
         raise SystemExit(f"invalid numeric aggregation argument: {error}") from error
-    if repeat_count < 1 or not math.isfinite(spread_limit) or not 0 <= spread_limit < 1:
-        raise SystemExit("REPEATS must be positive and MAX_SPREAD must be in [0, 1)")
-    if load_limit is not None and (not math.isfinite(load_limit) or load_limit < 0):
-        raise SystemExit("LOAD_LIMIT must be finite and nonnegative")
-    result = summarize(root, repeat_count, spread_limit, load_limit)
+    if repeat_count < 1:
+        raise SystemExit("REPEATS must be positive")
+    result = summarize(root, repeat_count)
     (root / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
 
 

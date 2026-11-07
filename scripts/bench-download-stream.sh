@@ -3,13 +3,11 @@ set -euo pipefail
 umask 077
 
 usage() {
-    printf 'Usage: %s [OUTPUT_DIR] [REPEATS] [--test] [--wait-quiet SECONDS]\n' "$0"
+    printf 'Usage: %s [OUTPUT_DIR] [REPEATS] [--test]\n' "$0"
     printf 'Runs the opt-in in-memory download write/hash Criterion benchmark repeatedly.\n'
     printf 'Default output: /tmp/opencode/irmin-download-stream-<UTC timestamp>\n'
     printf 'Environment probes use Linux /proc and /sys when available; unavailable probes are recorded.\n'
-    printf 'Optional DOWNLOAD_BENCH_MAX_LOAD marks samples provisional when 1-minute load exceeds the value.\n'
-    printf 'Optional DOWNLOAD_BENCH_MAX_SPREAD sets the maximum acceptable relative throughput spread (default: 0.05).\n'
-    printf '%s\n' '--wait-quiet SECONDS waits up to a positive timeout for DOWNLOAD_BENCH_MAX_LOAD; it never changes system settings.'
+    printf 'Load averages are recorded as context only.\n'
     printf 'Requires Bash 4.4 or newer.\n'
 }
 
@@ -26,7 +24,6 @@ fi
 output_dir=
 repeats=
 test_mode=false
-wait_quiet_seconds=0
 positionals=()
 while (( $# )); do
     arg=$1
@@ -43,14 +40,6 @@ while (( $# )); do
             exit 2
         fi
         test_mode=true
-    elif [[ $arg == --wait-quiet ]]; then
-        if (( $# == 0 )) || [[ $1 == -* ]]; then
-            printf '%s\n' '--wait-quiet requires a following timeout in seconds' >&2
-            exit 2
-        fi
-        wait_quiet_seconds=$1
-        wait_quiet_set=true
-        shift
     elif [[ $arg == -* ]]; then
         usage >&2
         exit 2
@@ -71,40 +60,6 @@ if [[ ! $repeats =~ ^[1-9][0-9]*$ ]] || (( ${#repeats} > 2 )) || (( 10#$repeats 
     printf 'REPEATS must be an integer from 1 to 50\n' >&2
     exit 2
 fi
-if [[ -n ${DOWNLOAD_BENCH_MAX_LOAD:-} ]] && [[ ! $DOWNLOAD_BENCH_MAX_LOAD =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-    printf 'DOWNLOAD_BENCH_MAX_LOAD must be a nonnegative decimal number\n' >&2
-    exit 2
-fi
-if [[ ! $wait_quiet_seconds =~ ^([0-9]+)$ ]]; then
-    printf 'WAIT_QUIET timeout must be a positive integer from 1 to 86400 seconds\n' >&2
-    exit 2
-fi
-if [[ ${wait_quiet_set:-false} == true ]]; then
-    normalized_wait=$wait_quiet_seconds
-    while [[ ${#normalized_wait} -gt 1 && $normalized_wait == 0* ]]; do
-        normalized_wait=${normalized_wait#0}
-    done
-    normalized_wait=${normalized_wait:-0}
-    if (( ${#normalized_wait} > 5 )); then
-        printf 'WAIT_QUIET timeout must be a positive integer from 1 to 86400 seconds\n' >&2
-        exit 2
-    fi
-    normalized_wait_value=$((10#$normalized_wait))
-    if (( normalized_wait_value == 0 || normalized_wait_value > 86400 )); then
-        printf 'WAIT_QUIET timeout must be a positive integer from 1 to 86400 seconds\n' >&2
-        exit 2
-    fi
-    wait_quiet_seconds=$normalized_wait_value
-fi
-if [[ ${wait_quiet_set:-false} == true && -z ${DOWNLOAD_BENCH_MAX_LOAD:-} ]]; then
-    printf '%s\n' '--wait-quiet requires DOWNLOAD_BENCH_MAX_LOAD' >&2
-    exit 2
-fi
-max_spread=${DOWNLOAD_BENCH_MAX_SPREAD:-0.05}
-if [[ ! $max_spread =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || ! LC_ALL=C awk -v value="$max_spread" 'BEGIN { exit !(value >= 0 && value < 1) }'; then
-    printf 'DOWNLOAD_BENCH_MAX_SPREAD must be a decimal in [0, 1)\n' >&2
-    exit 2
-fi
 if [[ $test_mode != true ]] && ! command -v python3 >/dev/null 2>&1; then
     printf 'python3 is required to aggregate Criterion reports\n' >&2
     exit 2
@@ -118,36 +73,6 @@ if ! mkdir -- "$output_dir"; then
 fi
 
 loadavg_file=${DOWNLOAD_BENCH_LOADAVG_FILE:-/proc/loadavg}
-wait_log="$output_dir/quiet-wait.log"
-quiet_found=false
-if (( wait_quiet_seconds > 0 )); then
-    wait_start=$(python3 -c 'import time; print(time.monotonic())')
-    wait_deadline=$(python3 -c 'import sys; print(float(sys.argv[1]) + int(sys.argv[2]))' "$wait_start" "$wait_quiet_seconds")
-    : >"$wait_log"
-    while :; do
-        load_now=$(awk '{print $1}' "$loadavg_file" 2>/dev/null || true)
-        observed_at=$(python3 -c 'import time; print(time.monotonic())')
-        if [[ $load_now =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] && \
-            LC_ALL=C awk -v current="$load_now" -v max="$DOWNLOAD_BENCH_MAX_LOAD" 'BEGIN { exit !(current <= max) }'; then
-            printf 'quiet load observed: %s at monotonic=%s UTC=' "$load_now" "$observed_at" >>"$wait_log"
-            date -u >>"$wait_log" || true
-            quiet_found=true
-            break
-        fi
-        printf 'waiting, load=%s at monotonic=%s UTC=' "${load_now:-unavailable}" "$observed_at" >>"$wait_log"
-        date -u >>"$wait_log" || true
-        if LC_ALL=C awk -v now="$observed_at" -v deadline="$wait_deadline" 'BEGIN { exit !(now < deadline) }'; then
-            sleep 1
-        else
-            break
-        fi
-    done
-    if [[ $quiet_found != true ]]; then
-        printf 'Timed out waiting for load <= %s; see %s\n' "$DOWNLOAD_BENCH_MAX_LOAD" "$wait_log" >&2
-        exit 3
-    fi
-fi
-
 environment_file="$output_dir/environment.txt"
 {
     date -u || printf 'date unavailable\n'
@@ -195,10 +120,7 @@ environment_file="$output_dir/environment.txt"
         printf 'worktree_dirty=unavailable\n'
     fi
     printf '\nRun configuration:\nrepeats=%s\n' "$repeats"
-    printf 'wait_quiet_seconds=%s\n' "$wait_quiet_seconds"
     printf 'baseline_prefix=%s\n' "$baseline_prefix"
-    printf 'DOWNLOAD_BENCH_MAX_LOAD=%s\n' "${DOWNLOAD_BENCH_MAX_LOAD:-<unset>}"
-    printf 'DOWNLOAD_BENCH_MAX_SPREAD=%s\n' "$max_spread"
     if [[ ${CARGO_TARGET_DIR+x} ]]; then
         printf 'target_dir_set=true\n'
     else
@@ -275,17 +197,7 @@ for ((run = 1; run <= repeats; run++)); do
         printf '\nload_after='
         load_after=$(awk '{print $1}' "$loadavg_file" 2>/dev/null || true)
         printf '%s\n' "${load_after:-unavailable}"
-        numeric='^([0-9]+([.][0-9]*)?|[.][0-9]+)$'
-        if [[ -n ${DOWNLOAD_BENCH_MAX_LOAD:-} && ${load_before:-} =~ $numeric && ${load_after:-} =~ $numeric ]]; then
-            if LC_ALL=C awk -v before="$load_before" -v after="$load_after" -v max="$DOWNLOAD_BENCH_MAX_LOAD" \
-                'BEGIN { exit !(before <= max && after <= max) }'; then
-                printf 'load_verdict=below_user_threshold\n'
-            else
-                printf 'load_verdict=above_user_threshold; treat timing as provisional\n'
-            fi
-        else
-            printf 'load_verdict=not_scored\n'
-        fi
+        printf 'load_note=recorded_for_context_only\n'
     } >>"$log_file"
     if [[ $test_mode != true ]]; then
         report_root="${CARGO_TARGET_DIR:-$repo_root/target}/criterion"
@@ -322,10 +234,9 @@ for ((run = 1; run <= repeats; run++)); do
 done
 
 if [[ $test_mode == true ]]; then
-    printf '{"verdict":"test-only","repeats":%s}\n' "$repeats" >"$output_dir/summary.json"
+    printf '{"repeats":%s,"test_only":true}\n' "$repeats" >"$output_dir/summary.json"
 else
-    python3 "$repo_root/scripts/summarize_download_bench.py" \
-        "$output_dir" "$repeats" "$max_spread" "${DOWNLOAD_BENCH_MAX_LOAD:-}"
+    python3 "$repo_root/scripts/summarize_download_bench.py" "$output_dir" "$repeats"
 fi
 
 printf 'Results saved under %s\n' "$output_dir"
