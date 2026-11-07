@@ -24,6 +24,25 @@ pub(crate) trait ChunkHasher {
     fn update_chunk(&mut self, bytes: &[u8]) -> std::io::Result<()>;
 }
 
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DownloadPhaseTimings {
+    /// Time spent inside the streaming loop, including waiting for response data.
+    pub total: std::time::Duration,
+    /// Time awaiting each next response body chunk.
+    pub stream_wait: std::time::Duration,
+    /// Time writing response chunks through the buffered file writer.
+    pub write: std::time::Duration,
+    /// Time updating the selected chunk hash.
+    pub hash: std::time::Duration,
+    /// Time spent flushing and advising the kernel after integrity checks.
+    pub final_flush_and_evict: std::time::Duration,
+    /// Total response body bytes consumed by the stream.
+    pub bytes: u64,
+    /// Number of response body chunks consumed by the stream.
+    pub stream_chunks: u64,
+}
+
 impl ChunkHasher for PooledMd5 {
     fn update_chunk(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.get_mut().update(bytes)
@@ -201,9 +220,7 @@ fn get_available_space(path: &Path) -> Option<u64> {
     let hit = SPACE_CACHE.with(|cell| {
         let b = cell.borrow();
         match b.as_ref() {
-            Some((ts, space, cs))
-                if ts.elapsed() < CACHE_TTL && cs.as_bytes() == path_bytes =>
-            {
+            Some((ts, space, cs)) if ts.elapsed() < CACHE_TTL && cs.as_bytes() == path_bytes => {
                 Some(*space)
             }
             _ => None,
@@ -546,7 +563,8 @@ async fn do_download_chunk(
                 })
                 .unwrap_or(false);
             if range_header_valid {
-                return download_with_resume(resp, chunk, dest, existing_size, handle, skip_hash).await;
+                return download_with_resume(resp, chunk, dest, existing_size, handle, skip_hash)
+                    .await;
             }
             let _ = tokio::fs::remove_file(dest).await;
         } else {
@@ -557,7 +575,32 @@ async fn do_download_chunk(
     // Fresh download
     let resp = client.get(url).send().await?;
     let resp = resp.error_for_status()?;
-    download_full_file_with_response(resp, chunk, dest, handle, skip_hash).await
+    download_full_file_with_response(
+        resp,
+        chunk,
+        dest,
+        handle,
+        skip_hash,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "bench-diagnostics")]
+pub async fn benchmark_download_chunk_with_timings(
+    client: &Client,
+    url: &str,
+    chunk: ChunkRef<'_>,
+    dest: &Path,
+) -> SophonResult<DownloadPhaseTimings> {
+    if !super::assembly::validate_chunk_name(chunk.chunk_name) {
+        return Err(SophonError::PathTraversal(chunk.chunk_name.into()));
+    }
+    let resp = client.get(url).send().await?.error_for_status()?;
+    let mut timings = DownloadPhaseTimings::default();
+    download_full_file_with_response(resp, chunk, dest, None, false, Some(&mut timings)).await?;
+    Ok(timings)
 }
 
 /// Shared streaming loop: reads bytes from a response stream, writes to an
@@ -575,11 +618,16 @@ async fn stream_and_verify(
     compressed_hash: &str,
     dest: &Path,
     handle: Option<&DownloadHandle>,
+    #[cfg(feature = "bench-diagnostics")] mut timings: Option<&mut DownloadPhaseTimings>,
 ) -> SophonResult<()> {
+    #[cfg(feature = "bench-diagnostics")]
+    let total_started = std::time::Instant::now();
     let mut stream = resp.bytes_stream();
     let mut total_len = starting_len;
 
     loop {
+        #[cfg(feature = "bench-diagnostics")]
+        let wait_started = std::time::Instant::now();
         let next_chunk = stream.next();
         let result = if let Some(handle) = handle {
             tokio::select! {
@@ -593,9 +641,18 @@ async fn stream_and_verify(
         } else {
             next_chunk.await
         };
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.stream_wait += wait_started.elapsed();
+        }
 
         match result {
             Some(Ok(bytes)) => {
+                #[cfg(feature = "bench-diagnostics")]
+                if let Some(timings) = timings.as_deref_mut() {
+                    timings.stream_chunks += 1;
+                    timings.bytes += bytes.len() as u64;
+                }
                 let next_total_len =
                     match check_download_chunk_size(&bytes, expected_total, total_len) {
                         Ok(total_len) => total_len,
@@ -615,13 +672,26 @@ async fn stream_and_verify(
                             });
                         }
                     };
-                if let Err(error) = file.write_all(&bytes).await {
+                #[cfg(feature = "bench-diagnostics")]
+                let write_started = std::time::Instant::now();
+                let write_result = file.write_all(&bytes).await;
+                #[cfg(feature = "bench-diagnostics")]
+                if let Some(timings) = timings.as_deref_mut() {
+                    timings.write += write_started.elapsed();
+                }
+                if let Err(error) = write_result {
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::Io(error));
                 }
-                if let Err(error) =
-                    update_download_hashes(&bytes, hasher.as_mut(), xxh64_hasher.as_mut())
-                {
+                #[cfg(feature = "bench-diagnostics")]
+                let hash_started = std::time::Instant::now();
+                let hash_result =
+                    update_download_hashes(&bytes, hasher.as_mut(), xxh64_hasher.as_mut());
+                #[cfg(feature = "bench-diagnostics")]
+                if let Some(timings) = timings.as_deref_mut() {
+                    timings.hash += hash_started.elapsed();
+                }
+                if let Err(error) = hash_result {
                     return Err(SophonError::Io(error));
                 }
                 total_len = next_total_len;
@@ -634,6 +704,8 @@ async fn stream_and_verify(
         }
     }
 
+    #[cfg(feature = "bench-diagnostics")]
+    let final_flush_started = std::time::Instant::now();
     if let Err(err) = file.flush().await {
         let _ = tokio::fs::remove_file(dest).await;
         return Err(SophonError::Io(err));
@@ -695,9 +767,17 @@ async fn stream_and_verify(
     }
 
     file.flush_and_evict_all().await.ok();
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.final_flush_and_evict += final_flush_started.elapsed();
+    }
     hasher.take();
     if let Some(h) = xxh64_hasher.take() {
         super::assembly_opt::return_xxh64(h);
+    }
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.total = total_started.elapsed();
     }
     Ok(())
 }
@@ -709,6 +789,7 @@ async fn download_full_file_with_response(
     dest: &Path,
     handle: Option<&DownloadHandle>,
     skip_hash: bool,
+    #[cfg(feature = "bench-diagnostics")] timings: Option<&mut DownloadPhaseTimings>,
 ) -> SophonResult<()> {
     let content_length = resp.content_length();
     if let Some(len) = content_length
@@ -745,9 +826,15 @@ async fn download_full_file_with_response(
         chunk.chunk_size,
         0,
         chunk.chunk_name,
-        if skip_hash { "" } else { chunk.chunk_compressed_hash_md5 },
+        if skip_hash {
+            ""
+        } else {
+            chunk.chunk_compressed_hash_md5
+        },
         dest,
         handle,
+        #[cfg(feature = "bench-diagnostics")]
+        timings,
     )
     .await
 }
@@ -830,9 +917,15 @@ async fn download_with_resume(
         expected_total,
         existing_size,
         chunk.chunk_name,
-        if skip_hash { "" } else { chunk.chunk_compressed_hash_md5 },
+        if skip_hash {
+            ""
+        } else {
+            chunk.chunk_compressed_hash_md5
+        },
         dest,
         handle,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
     )
     .await
 }
@@ -965,6 +1058,77 @@ mod tests {
             "5eb63bbbe01eeed093cb22bb8f5acdc3"
         );
         return_md5(reused);
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[tokio::test]
+    #[ignore = "diagnostic loopback download timing; run explicitly with --ignored"]
+    async fn diagnose_loopback_download_phases() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SIZE: usize = 16 * 1024 * 1024;
+        let body: Vec<u8> = (0..SIZE)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let expected_hash = fast_md5::digest(&body);
+        let expected_hash = md5_to_hex(&expected_hash);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/payload"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let chunk = ChunkRef {
+            chunk_name: "payload",
+            chunk_decompressed_hash_md5: "",
+            chunk_size: SIZE as u64,
+            chunk_size_decompressed: SIZE as u64,
+            chunk_compressed_hash_md5: &expected_hash,
+            chunk_old_offset: -1,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload");
+        let url = format!("{}/payload", server.uri());
+        let timings = benchmark_download_chunk_with_timings(&Client::new(), &url, chunk, &dest)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(timings.bytes, SIZE as u64);
+        assert!(timings.stream_chunks > 0);
+        assert!(timings.total >= timings.stream_wait);
+        assert!(timings.total >= timings.write);
+        assert!(timings.total >= timings.hash);
+        println!("download phase timings: {timings:#?}");
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[tokio::test]
+    async fn diagnostic_download_rejects_invalid_chunk_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload");
+        let chunk = ChunkRef {
+            chunk_name: "../payload",
+            chunk_decompressed_hash_md5: "",
+            chunk_size: 0,
+            chunk_size_decompressed: 0,
+            chunk_compressed_hash_md5: "",
+            chunk_old_offset: -1,
+        };
+
+        assert!(matches!(
+            benchmark_download_chunk_with_timings(
+                &Client::new(),
+                "http://127.0.0.1:1",
+                chunk,
+                &dest
+            )
+            .await,
+            Err(SophonError::PathTraversal(_))
+        ));
+        assert!(!dest.exists());
     }
 
     #[test]

@@ -16,6 +16,9 @@ mod download;
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub use download::benchmark as download_benchmark;
+#[cfg(feature = "bench-diagnostics")]
+#[doc(hidden)]
+pub use download::{DownloadPhaseTimings, benchmark_download_chunk_with_timings};
 /// Streaming decompression directly into output file ranges.
 pub mod eager_decompress;
 mod error;
