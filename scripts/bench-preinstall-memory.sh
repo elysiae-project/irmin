@@ -64,10 +64,23 @@ fi
     printf 'profile=release (--release)\n'
     printf 'provenance_scope=script command and repository-local/CARGO_HOME Cargo and toolchain config; ancestor Cargo config may also affect the effective build\n'
     printf 'CARGO_BUILD_TARGET=%s\n' "${CARGO_BUILD_TARGET:-<host default or cargo config>}"
-    for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTC RUSTC_WRAPPER; do
+    for name in \
+        RUSTFLAGS \
+        CARGO_ENCODED_RUSTFLAGS \
+        CARGO_BUILD_RUSTFLAGS \
+        RUSTC \
+        RUSTC_WRAPPER \
+        RUSTC_WORKSPACE_WRAPPER \
+        MALLOC_ARENA_MAX \
+        MALLOC_CONF \
+        _RJEM_MALLOC_CONF \
+        GLIBC_TUNABLES \
+        LD_PRELOAD; do
         value=${!name:-}
         if [[ ${!name+x} ]]; then
-            hash=$(printf '%s' "$value" | hash_stdin || printf 'unavailable')
+            if ! hash=$(printf '%s' "$value" | hash_stdin); then
+                hash=unavailable
+            fi
             printf '%s_set=true sha256=%s\n' "$name" "$hash"
         else
             printf '%s_set=false\n' "$name"
@@ -89,6 +102,32 @@ fi
         fi
     done
 } >>"$environment_file"
+{
+    printf '\nTransparent huge pages:\n'
+    for setting in enabled defrag; do
+        path="/sys/kernel/mm/transparent_hugepage/$setting"
+        if value=$(cat -- "$path" 2>/dev/null); then
+            printf '%s=%s\n' "$setting" "$value"
+        else
+            printf '%s=unavailable\n' "$setting"
+        fi
+    done
+    old_nullglob=$(shopt -p nullglob || true)
+    shopt -s nullglob
+    hugepage_settings=(/sys/kernel/mm/transparent_hugepage/hugepages-*kB/enabled)
+    eval "$old_nullglob"
+    if (( ${#hugepage_settings[@]} == 0 )); then
+        printf 'per_size_enabled=unavailable\n'
+    else
+        for path in "${hugepage_settings[@]}"; do
+            if value=$(cat -- "$path" 2>/dev/null); then
+                printf '%s=%s\n' "${path%/enabled}" "$value"
+            else
+                printf '%s=unavailable\n' "${path%/enabled}"
+            fi
+        done
+    fi
+} >>"$environment_file" 2>&1
 {
     printf '\nFilesystem:\n'
     if ! df -T "$repo_root" "$output_dir" /tmp; then
