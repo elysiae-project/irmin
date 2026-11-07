@@ -20,6 +20,86 @@ struct PooledMd5 {
     hasher: Option<Md5>,
 }
 
+pub(crate) trait ChunkHasher {
+    fn update_chunk(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+impl ChunkHasher for PooledMd5 {
+    fn update_chunk(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.get_mut().update(bytes)
+    }
+}
+
+impl ChunkHasher for fast_md5::Md5 {
+    fn update_chunk(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.update(bytes);
+        Ok(())
+    }
+}
+
+fn update_download_hashes<H: ChunkHasher>(
+    bytes: &[u8],
+    hasher: Option<&mut H>,
+    xxh64_hasher: Option<&mut xxhash_rust::xxh64::Xxh64>,
+) -> std::io::Result<()> {
+    if let Some(hasher) = hasher {
+        hasher.update_chunk(bytes)?;
+    }
+    if let Some(hasher) = xxh64_hasher {
+        hasher.update(bytes);
+    }
+    Ok(())
+}
+
+fn check_download_chunk_size(
+    bytes: &[u8],
+    expected_total: u64,
+    total_len: u64,
+) -> Result<u64, StreamConsumeError> {
+    if bytes.is_empty() && total_len < expected_total {
+        return Err(StreamConsumeError::EmptyChunk);
+    }
+    let total_len = total_len
+        .checked_add(bytes.len() as u64)
+        .ok_or(StreamConsumeError::TooLarge(u64::MAX))?;
+    if total_len > expected_total {
+        return Err(StreamConsumeError::TooLarge(total_len));
+    }
+    Ok(total_len)
+}
+
+#[derive(Debug)]
+enum StreamConsumeError {
+    EmptyChunk,
+    TooLarge(u64),
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod benchmark {
+    #[allow(dead_code)]
+    pub fn check_chunk_size(bytes: &[u8], expected: u64, total: u64) -> Result<u64, bool> {
+        super::check_download_chunk_size(bytes, expected, total).map_err(|error| match error {
+            super::StreamConsumeError::EmptyChunk => false,
+            super::StreamConsumeError::TooLarge(_) => true,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn update_md5(hasher: &mut fast_md5::Md5, bytes: &[u8]) -> std::io::Result<()> {
+        super::update_download_hashes::<fast_md5::Md5>(bytes, Some(hasher), None)
+    }
+
+    #[allow(dead_code)]
+    pub fn update_xxh64(
+        hasher: &mut xxhash_rust::xxh64::Xxh64,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let mut md5 = None::<fast_md5::Md5>;
+        super::update_download_hashes::<fast_md5::Md5>(bytes, md5.as_mut(), Some(hasher))
+    }
+}
+
 impl PooledMd5 {
     fn new(hasher: Md5) -> Self {
         Self {
@@ -516,36 +596,39 @@ async fn stream_and_verify(
 
         match result {
             Some(Ok(bytes)) => {
-                if bytes.is_empty() && total_len < expected_total {
+                let next_total_len =
+                    match check_download_chunk_size(&bytes, expected_total, total_len) {
+                        Ok(total_len) => total_len,
+                        Err(StreamConsumeError::EmptyChunk) => {
+                            let _ = tokio::fs::remove_file(dest).await;
+                            return Err(SophonError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "corrupted compressed data: empty chunk while data remaining",
+                            )));
+                        }
+                        Err(StreamConsumeError::TooLarge(actual)) => {
+                            let _ = tokio::fs::remove_file(dest).await;
+                            return Err(SophonError::SizeMismatch {
+                                item: chunk_name.to_string(),
+                                expected: expected_total,
+                                actual,
+                            });
+                        }
+                    };
+                if let Err(error) = file.write_all(&bytes).await {
                     let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "corrupted compressed data: empty chunk while data remaining",
-                    )));
+                    return Err(SophonError::Io(error));
                 }
-                total_len += bytes.len() as u64;
-                if total_len > expected_total {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::SizeMismatch {
-                        item: chunk_name.to_string(),
-                        expected: expected_total,
-                        actual: total_len,
-                    });
+                if let Err(error) =
+                    update_download_hashes(&bytes, hasher.as_mut(), xxh64_hasher.as_mut())
+                {
+                    return Err(SophonError::Io(error));
                 }
-                if let Err(err) = file.write_all(&bytes).await {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(SophonError::Io(err));
-                }
-                if let Some(h) = hasher.as_mut() {
-                    h.get_mut().update(&bytes)?;
-                }
-                if let Some(h) = xxh64_hasher.as_mut() {
-                    h.update(&bytes);
-                }
+                total_len = next_total_len;
             }
-            Some(Err(e)) => {
+            Some(Err(error)) => {
                 let _ = tokio::fs::remove_file(dest).await;
-                return Err(e.into());
+                return Err(error.into());
             }
             None => break,
         }
@@ -757,6 +840,64 @@ async fn download_with_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_hash_helpers_match_one_shot_digests_across_chunks() {
+        let chunks = [b"alpha".as_slice(), b" beta", b" gamma"];
+        let expected = b"alpha beta gamma";
+        let mut md5 = fast_md5::Md5::new();
+        let mut xxh64 = Some(xxhash_rust::xxh64::Xxh64::new(0));
+        let mut total = 0;
+
+        for bytes in chunks {
+            total = check_download_chunk_size(bytes, expected.len() as u64, total).unwrap();
+            update_download_hashes(bytes, Some(&mut md5), xxh64.as_mut()).unwrap();
+        }
+
+        let mut expected_md5 = fast_md5::Md5::new();
+        expected_md5.update(expected);
+        assert_eq!(md5.finalize(), expected_md5.finalize());
+        let mut expected_xxh64 = xxhash_rust::xxh64::Xxh64::new(0);
+        expected_xxh64.update(expected);
+        assert_eq!(xxh64.unwrap().digest(), expected_xxh64.digest());
+        assert_eq!(total, expected.len() as u64);
+    }
+
+    #[test]
+    fn download_hash_helpers_support_md5_and_xxh64_together() {
+        let bytes = b"combined hash input";
+        let mut md5 = fast_md5::Md5::new();
+        let mut xxh64 = Some(xxhash_rust::xxh64::Xxh64::new(0));
+
+        update_download_hashes(bytes, Some(&mut md5), xxh64.as_mut()).unwrap();
+
+        let mut expected_md5 = fast_md5::Md5::new();
+        expected_md5.update(bytes);
+        assert_eq!(md5.finalize(), expected_md5.finalize());
+        let mut expected_xxh64 = xxhash_rust::xxh64::Xxh64::new(0);
+        expected_xxh64.update(bytes);
+        assert_eq!(xxh64.unwrap().digest(), expected_xxh64.digest());
+    }
+
+    #[test]
+    fn download_hash_helpers_accept_empty_and_reject_bad_stream_sizes() {
+        assert_eq!(check_download_chunk_size(b"", 0, 0).unwrap(), 0);
+        assert!(matches!(
+            check_download_chunk_size(b"", 1, 0),
+            Err(StreamConsumeError::EmptyChunk)
+        ));
+        assert!(matches!(
+            check_download_chunk_size(b"ab", 1, 0),
+            Err(StreamConsumeError::TooLarge(2))
+        ));
+        assert!(matches!(
+            check_download_chunk_size(b"x", u64::MAX, u64::MAX),
+            Err(StreamConsumeError::TooLarge(u64::MAX))
+        ));
+
+        let mut md5 = None::<fast_md5::Md5>;
+        update_download_hashes::<fast_md5::Md5>(b"ignored", md5.as_mut(), None).unwrap();
+    }
 
     #[tokio::test]
     async fn create_preallocated_file_truncates_and_keeps_logical_length() {

@@ -13,6 +13,9 @@ pub mod chunk_bitmap;
 /// Memory-compact columnar manifest representation.
 pub mod compact_manifest;
 mod download;
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub use download::benchmark as download_benchmark;
 /// Streaming decompression directly into output file ranges.
 pub mod eager_decompress;
 mod error;
