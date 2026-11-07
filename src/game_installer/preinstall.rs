@@ -751,6 +751,17 @@ fn validate_patch_asset_fields(asset: &SophonPatchAssetProperty) -> bool {
     true
 }
 
+fn insert_unique_chunk_name(
+    seen_chunk_names: &mut rustc_hash::FxHashSet<String>,
+    chunk_name: &str,
+) -> bool {
+    if seen_chunk_names.contains(chunk_name) {
+        false
+    } else {
+        seen_chunk_names.insert(chunk_name.to_owned())
+    }
+}
+
 fn select_preinstall_build(
     target_tag: &str,
     exact_build: SophonResult<SophonBuildData>,
@@ -981,7 +992,7 @@ async fn build_preinstall_plan_from_builds(
                             )
                         };
 
-                    if seen_chunk_names.insert(chunk.patch_name.clone()) {
+                    if insert_unique_chunk_name(&mut seen_chunk_names, &chunk.patch_name) {
                         unique_chunks.push(PatchChunkInfo {
                             patch_name: chunk.patch_name.clone(),
                             patch_size: chunk.patch_size as u64,

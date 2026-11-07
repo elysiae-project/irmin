@@ -1,6 +1,17 @@
 use super::*;
 use fast_md5;
 
+#[test]
+fn insert_unique_chunk_name_skips_duplicate_owned_key() {
+    let mut seen = rustc_hash::FxHashSet::default();
+    assert!(insert_unique_chunk_name(&mut seen, "chunk-a"));
+    assert!(insert_unique_chunk_name(&mut seen, "chunk-b"));
+    assert!(!insert_unique_chunk_name(&mut seen, "chunk-a"));
+    assert_eq!(seen.len(), 2);
+    assert!(seen.contains("chunk-a"));
+    assert!(seen.contains("chunk-b"));
+}
+
 #[tokio::test]
 async fn first_stream_error_drains_all_results_and_returns_first_error() {
     let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
