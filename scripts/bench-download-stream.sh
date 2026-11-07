@@ -185,7 +185,7 @@ for ((run = 1; run <= repeats; run++)); do
         numeric='^([0-9]+([.][0-9]*)?|[.][0-9]+)$'
         if [[ -n ${DOWNLOAD_BENCH_MAX_LOAD:-} && ${load_before:-} =~ $numeric && ${load_after:-} =~ $numeric ]]; then
             if LC_ALL=C awk -v before="$load_before" -v after="$load_after" -v max="$DOWNLOAD_BENCH_MAX_LOAD" \
-                'BEGIN { exit !((before + after) / 2 <= max) }'; then
+                'BEGIN { exit !(before <= max && after <= max) }'; then
                 printf 'load_verdict=below_user_threshold\n'
             else
                 printf 'load_verdict=above_user_threshold; treat timing as provisional\n'
