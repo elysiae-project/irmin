@@ -146,12 +146,74 @@ pub(crate) struct InstallerData {
     pub matching_field: String,
 }
 
+#[derive(Clone, Copy)]
 struct DownloadItem {
     file_idx: u32,
     chunk_idx: u32,
     installer_idx: u32,
     is_pre_downloaded: bool,
     use_eager: bool,
+}
+
+impl DownloadItem {
+    fn claim_index(next_index: &AtomicUsize, item_count: usize) -> Option<usize> {
+        next_index
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
+                (index < item_count).then_some(index + 1)
+            })
+            .ok()
+    }
+}
+
+#[inline]
+fn next_download_worker_count(spawned: usize, target: usize, unclaimed: usize) -> usize {
+    spawned.saturating_add(unclaimed).min(target)
+}
+
+fn record_download_cancellation(cancelled: &AtomicU8) {
+    cancelled.store(1, Ordering::Relaxed);
+}
+
+fn record_download_cancelled_result(
+    cancelled: &AtomicU8,
+    first_error: &Mutex<Option<SophonError>>,
+    handle: &DownloadHandle,
+) {
+    if handle.is_cancelled() {
+        record_download_cancellation(cancelled);
+    } else {
+        record_download_worker_error(
+            first_error,
+            SophonError::Io(std::io::Error::other(
+                "download worker cancelled without a user cancellation request",
+            )),
+        );
+    }
+}
+
+fn download_was_cancelled(recorded: &AtomicU8, handle: &DownloadHandle) -> bool {
+    recorded.load(Ordering::Relaxed) != 0 || handle.is_cancelled()
+}
+
+fn record_download_worker_error(first_error: &Mutex<Option<SophonError>>, error: SophonError) {
+    let mut guard = first_error.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(error);
+    }
+}
+
+fn download_work_finished(remaining: &AtomicUsize) -> bool {
+    remaining.load(Ordering::Acquire) == 0
+}
+
+fn download_work_abandoned(remaining: &AtomicUsize, handle: &DownloadHandle) -> bool {
+    !handle.is_cancelled() && !download_work_finished(remaining)
+}
+
+async fn wait_for_download_cancellation(handle: &DownloadHandle) {
+    if !handle.is_cancelled() {
+        handle.cancelled_future().await;
+    }
 }
 
 type FileEntry = (u32, u32, u32);
@@ -1733,8 +1795,8 @@ async fn run_downloads(
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let total: usize = download_items.len();
-    let queue: Arc<Mutex<VecDeque<(usize, DownloadItem)>>> =
-        Arc::new(Mutex::new(download_items.into_iter().enumerate().collect()));
+    let download_items = Arc::new(download_items);
+    let next_index = Arc::new(AtomicUsize::new(0));
     let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(total));
     let reclaim_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     let mut workers = tokio::task::JoinSet::new();
@@ -1743,7 +1805,8 @@ async fn run_downloads(
 
     // Spawn a worker closure factory to avoid repeating the body.
     let spawn_worker = |workers: &mut tokio::task::JoinSet<()>| {
-        let queue = Arc::clone(&queue);
+        let download_items = Arc::clone(&download_items);
+        let next_index = Arc::clone(&next_index);
         let ctx = Arc::clone(&ctx);
         let chunk_entries = Arc::clone(&chunk_entries);
         let chunk_entry_offsets = Arc::clone(&chunk_entry_offsets);
@@ -1761,13 +1824,10 @@ async fn run_downloads(
                     return;
                 }
                 let idle_start = std::time::Instant::now();
-                let (item_idx, item) = {
-                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-                    match q.pop_front() {
-                        Some(v) => v,
-                        None => break,
-                    }
+                let Some(item_idx) = DownloadItem::claim_index(&next_index, total) else {
+                    break;
                 };
+                let item = download_items[item_idx];
                 {
                     let idle_ns = idle_start.elapsed().as_nanos() as u64;
                     ctx.profiler.record_idle(idle_ns);
@@ -1785,7 +1845,8 @@ async fn run_downloads(
                 .await;
                 if let Err(err) = result {
                     if matches!(err, SophonError::Cancelled) {
-                        cancelled.store(1, Ordering::Relaxed);
+                        record_download_cancelled_result(&cancelled, &first_error, &handle);
+                        break;
                     } else if let Ok(mut guard) = first_error.lock()
                         && guard.is_none()
                     {
@@ -1812,11 +1873,26 @@ async fn run_downloads(
     // Adaptive scaling: periodically measure throughput and spawn more workers.
     let mut spawned = initial;
     loop {
+        if handle.is_cancelled() {
+            record_download_cancellation(&cancelled);
+            break;
+        }
         tokio::select! {
             biased;
+            _ = wait_for_download_cancellation(&handle) => {
+                record_download_cancellation(&cancelled);
+                break;
+            }
             result = workers.join_next() => {
-                if result.is_none() {
-                    break;
+                match result {
+                    Some(Ok(())) => {}
+                    Some(Err(err)) => {
+                        record_download_worker_error(
+                            &first_error,
+                            SophonError::JoinError(err),
+                        );
+                    }
+                    None => break,
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
@@ -1825,9 +1901,12 @@ async fn run_downloads(
                 adaptive.measure(db);
 
                 let target = adaptive.current_target();
-                let queue_len = queue.lock().unwrap_or_else(|e| e.into_inner()).len();
-                // Spawn up to target, but only if queue has work.
-                while spawned < target && queue_len > spawned {
+                // Keep the adaptive target staffed while unclaimed work remains.
+                while spawned < next_download_worker_count(
+                    spawned,
+                    target,
+                    total.saturating_sub(next_index.load(Ordering::Relaxed)),
+                ) {
                     spawn_worker(&mut workers);
                     spawned += 1;
                 }
@@ -1839,10 +1918,22 @@ async fn run_downloads(
         }
     }
 
-    while workers.join_next().await.is_some() {}
+    while let Some(result) = workers.join_next().await {
+        if let Err(err) = result {
+            record_download_worker_error(&first_error, SophonError::JoinError(err));
+        }
+    }
+    if download_work_abandoned(&remaining, &handle) {
+        record_download_worker_error(
+            &first_error,
+            SophonError::Io(std::io::Error::other(
+                "download workers exited before processing all claimed items",
+            )),
+        );
+    }
 
     DownloadSummary {
-        cancelled: cancelled.load(Ordering::Relaxed) != 0,
+        cancelled: download_was_cancelled(&cancelled, &handle),
         first_error: first_error.lock().unwrap_or_else(|e| e.into_inner()).take(),
     }
 }
@@ -1851,6 +1942,7 @@ async fn run_downloads(
 async fn finalize_install(
     ctx: &InstallContext,
     summary: DownloadSummary,
+    handle: &DownloadHandle,
     deleted_files: Vec<String>,
     tag: &str,
     is_preinstall: bool,
@@ -1859,7 +1951,7 @@ async fn finalize_install(
     game_code: &str,
     vo_langs: &[String],
 ) -> SophonResult<()> {
-    if summary.cancelled {
+    if summary.cancelled || handle.is_cancelled() {
         assembly_cancel_token.cancel(); // stop assembly before deleting chunks
         let _ = assembly_task.await; // drain before cleanup
         let cd = Arc::clone(&ctx.chunks_dir);
@@ -1877,6 +1969,8 @@ async fn finalize_install(
     }
 
     if let Some(err) = summary.first_error {
+        assembly_cancel_token.cancel();
+        let _ = assembly_task.await;
         return Err(err);
     }
     assembly_task.await??;
@@ -2674,7 +2768,7 @@ pub async fn install(
         chunk_entry_offsets,
         pending_counts,
         &assemble_tx,
-        options.handle,
+        options.handle.clone(),
     )
     .await;
 
@@ -2720,6 +2814,7 @@ pub async fn install(
     let result = finalize_install(
         &ctx,
         results,
+        &options.handle,
         deleted_files,
         tag,
         options.is_preinstall,

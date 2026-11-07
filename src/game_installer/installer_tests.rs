@@ -121,6 +121,137 @@
     }
 
     #[test]
+    fn download_item_claims_are_unique_and_stop_at_item_count() {
+        for item_count in [0, 1, 3, 1000] {
+            let next_index = Arc::new(AtomicUsize::new(0));
+            let claims = Arc::new(Mutex::new(Vec::new()));
+            std::thread::scope(|scope| {
+                for _ in 0..16 {
+                    let next_index = Arc::clone(&next_index);
+                    let claims = Arc::clone(&claims);
+                    scope.spawn(move || {
+                        while let Some(index) = DownloadItem::claim_index(&next_index, item_count) {
+                            claims.lock().unwrap().push(index);
+                        }
+                    });
+                }
+            });
+
+            let mut claims = Arc::try_unwrap(claims).unwrap().into_inner().unwrap();
+            claims.sort_unstable();
+            assert_eq!(claims, (0..item_count).collect::<Vec<_>>());
+            assert_eq!(next_index.load(Ordering::Relaxed), item_count);
+        }
+    }
+
+    #[test]
+    fn adaptive_download_scaling_checks_for_unclaimed_items() {
+        assert_eq!(next_download_worker_count(4, 16, 2), 6);
+        assert_eq!(next_download_worker_count(4, 16, 20), 16);
+        assert_eq!(next_download_worker_count(4, 4, 20), 4);
+    }
+
+    #[test]
+    fn download_cancellation_is_recorded_for_finalization() {
+        let cancelled = AtomicU8::new(0);
+
+        record_download_cancellation(&cancelled);
+
+        assert_eq!(cancelled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cancelled_worker_result_requires_user_cancellation() {
+        let cancelled = AtomicU8::new(0);
+        let first_error = Mutex::new(None);
+        let handle = DownloadHandle::new();
+
+        record_download_cancelled_result(&cancelled, &first_error, &handle);
+
+        assert_eq!(cancelled.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            first_error.into_inner().unwrap(),
+            Some(SophonError::Io(_))
+        ));
+
+        let cancelled = AtomicU8::new(0);
+        let first_error = Mutex::new(None);
+        let handle = DownloadHandle::new();
+        handle.cancel();
+
+        record_download_cancelled_result(&cancelled, &first_error, &handle);
+
+        assert_eq!(cancelled.load(Ordering::Relaxed), 1);
+        assert!(first_error.into_inner().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduler_cancellation_wait_handles_current_and_new_cancellation() {
+        let handle = DownloadHandle::new();
+        let waiting_handle = handle.clone();
+        let waiting = tokio::spawn(async move {
+            wait_for_download_cancellation(&waiting_handle).await;
+        });
+        tokio::task::yield_now().await;
+        handle.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+
+        wait_for_download_cancellation(&handle).await;
+    }
+
+    #[test]
+    fn download_summary_observes_recorded_and_handle_cancellation() {
+        let recorded = AtomicU8::new(0);
+        let handle = DownloadHandle::new();
+        assert!(!download_was_cancelled(&recorded, &handle));
+
+        record_download_cancellation(&recorded);
+        assert!(download_was_cancelled(&recorded, &handle));
+
+        let recorded = AtomicU8::new(0);
+        let handle = DownloadHandle::new();
+        handle.cancel();
+        assert!(download_was_cancelled(&recorded, &handle));
+    }
+
+    #[test]
+    fn download_worker_error_keeps_first_error() {
+        let first_error = Mutex::new(None);
+
+        record_download_worker_error(&first_error, SophonError::Cancelled);
+        record_download_worker_error(
+            &first_error,
+            SophonError::Io(std::io::Error::other("later error")),
+        );
+
+        assert!(matches!(
+            first_error.into_inner().unwrap(),
+            Some(SophonError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn download_work_completion_requires_zero_remaining_items() {
+        let remaining = AtomicUsize::new(1);
+        assert!(!download_work_finished(&remaining));
+        remaining.store(0, Ordering::Release);
+        assert!(download_work_finished(&remaining));
+    }
+
+    #[test]
+    fn cancelled_downloads_are_not_reported_as_abandoned_work() {
+        let remaining = AtomicUsize::new(1);
+        let handle = DownloadHandle::new();
+        assert!(download_work_abandoned(&remaining, &handle));
+
+        handle.cancel();
+        assert!(!download_work_abandoned(&remaining, &handle));
+    }
+
+    #[test]
     fn compute_totals_no_dupes() {
         let files = vec![
             make_file(
