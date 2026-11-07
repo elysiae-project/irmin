@@ -160,20 +160,7 @@ fn patch_loop(
     while cover_count > 0 {
         let buf_cover_size_raw = diff.read_long_7bit()?;
         let buf_rle_size_raw = diff.read_long_7bit()?;
-        if buf_cover_size_raw < 0 || buf_rle_size_raw < 0 {
-            return Err(std::io::Error::other("negative step size in patch"));
-        }
-        let buf_cover_size = buf_cover_size_raw as usize;
-        let buf_rle_size = buf_rle_size_raw as usize;
-        let step_end = buf_cover_size
-            .checked_add(buf_rle_size)
-            .ok_or_else(|| std::io::Error::other("step size overflow"))?;
-
-        if step_end > MAX_HDIFF20_STEP_SIZE {
-            return Err(std::io::Error::other(
-                "patch step size exceeds maximum allowed",
-            ));
-        }
+        let (buf_cover_size, step_end) = validate_step_sizes(buf_cover_size_raw, buf_rle_size_raw)?;
         prepare_step_buffer(step_buf, step_end);
         #[cfg(feature = "bench-alloc-stats")]
         {
@@ -275,6 +262,26 @@ fn patch_loop(
 
 fn prepare_step_buffer(step_buf: &mut Vec<u8>, step_end: usize) {
     step_buf.resize(step_end, 0);
+}
+
+fn validate_step_sizes(cover_size: i64, rle_size: i64) -> std::io::Result<(usize, usize)> {
+    let invalid_size = || {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid patch step size")
+    };
+    if cover_size < 0 || rle_size < 0 {
+        return Err(invalid_size());
+    }
+    let step_size = (cover_size as u64)
+        .checked_add(rle_size as u64)
+        .ok_or_else(invalid_size)?;
+    if step_size > MAX_HDIFF20_STEP_SIZE as u64 {
+        return Err(std::io::Error::other(
+            "patch step size exceeds maximum allowed",
+        ));
+    }
+    let cover_size = usize::try_from(cover_size).map_err(|_| invalid_size())?;
+    let step_size = usize::try_from(step_size).map_err(|_| invalid_size())?;
+    Ok((cover_size, step_size))
 }
 
 #[cfg(all(test, feature = "bench-alloc-stats"))]
@@ -941,22 +948,12 @@ mod tests {
         );
     }
 
-    /// When buf_cover_size or buf_rle_size is negative, patch_loop should
-    /// return an error.
     #[test]
-    fn patch_sf_negative_step_sizes_fails() {
+    fn patch_sf_truncated_step_size_varint_fails() {
         let dir = tempfile::tempdir().unwrap();
         let patch_path = dir.path().join("patch.hdiff");
 
-        // Encoding a negative value in varint is not possible (varints are
-        // unsigned), but we test the check by preparing a minimal diff where
-        // the varint parsing produces unexpectedly large values that don't
-        // lead to negative. Since varints can't be negative, the
-        // buf_cover_size_raw < 0 check is a safety net. We verify it exists
-        // by checking cover_count=1 with valid but insufficient diff data
-        // still triggers an error (truncated read during step).
-        // Instead, test that the negative check path is present by verifying
-        // the function returns error when diff data is insufficient.
+        // The first varint is missing after this continuation marker.
         std::fs::write(&patch_path, b"\x00").unwrap();
 
         let header = HeaderInfo {
@@ -978,8 +975,41 @@ mod tests {
         let mut input = Cursor::new(Vec::new());
         let mut output = Cursor::new(Vec::new());
         let result = patcher.patch(&mut input, &mut output, patch_path.to_str().unwrap(), None);
-        // Should fail because diff data is too short to read both varints
-        assert!(result.is_err(), "should fail with insufficient diff data");
+        let error = result.expect_err("truncated step-size varint must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn validate_step_sizes_accepts_inclusive_limit() {
+        assert_eq!(
+            validate_step_sizes(MAX_HDIFF20_STEP_SIZE as i64, 0).unwrap(),
+            (MAX_HDIFF20_STEP_SIZE, MAX_HDIFF20_STEP_SIZE)
+        );
+        assert_eq!(
+            validate_step_sizes(0, MAX_HDIFF20_STEP_SIZE as i64).unwrap(),
+            (0, MAX_HDIFF20_STEP_SIZE)
+        );
+    }
+
+    #[test]
+    fn validate_step_sizes_rejects_values_that_do_not_fit_usize() {
+        for (cover_size, rle_size) in [(i64::MIN, 0), (0, i64::MIN)] {
+            let error = validate_step_sizes(cover_size, rle_size).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn validate_step_sizes_rejects_totals_above_limit() {
+        for (cover_size, rle_size) in [
+            (i64::MAX, 0),
+            (i64::MAX, i64::MAX),
+            (MAX_HDIFF20_STEP_SIZE as i64, 1),
+        ] {
+            let error = validate_step_sizes(cover_size, rle_size).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(error.to_string().contains("exceeds maximum"));
+        }
     }
 
     /// When step_end exceeds both MAX_HDIFF20_STEP_SIZE and step_buf capacity,
