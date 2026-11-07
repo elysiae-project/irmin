@@ -219,18 +219,24 @@ fn repair_download_stream<I, F, Fut>(
     limit: usize,
     stopped: Arc<AtomicBool>,
     make_future: F,
-) -> impl futures_util::Stream<Item = Fut::Output>
+) -> SophonResult<impl futures_util::Stream<Item = Fut::Output>>
 where
     I: 'static,
     F: FnMut(I) -> Fut,
     Fut: std::future::Future,
 {
-    futures_util::stream::iter(items)
+    if limit == 0 {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repair download concurrency limit must be positive",
+        )));
+    }
+    Ok(futures_util::stream::iter(items)
         .take_while(move |_| {
             futures_util::future::ready(!stopped.load(Ordering::Acquire))
         })
         .map(make_future)
-        .buffer_unordered(limit)
+        .buffer_unordered(limit))
 }
 
 async fn wait_for_download_cancellation(handle: &DownloadHandle) {
@@ -3238,7 +3244,7 @@ async fn repair_assets(
                     result
                 }
             },
-        );
+        )?;
         while let Some(result) = dl_stream.next().await {
             if let Err(err) = result {
                 stopped.store(true, Ordering::Release);

@@ -297,7 +297,8 @@
                     }
                 }
             }
-        });
+        })
+        .unwrap();
 
         let mut first_error = None;
         while let Some(result) = stream.next().await {
@@ -326,13 +327,26 @@
                     Ok::<_, SophonError>(())
                 }
             }
-        });
+        })
+        .unwrap();
 
         while let Some(result) = stream.next().await {
             result.unwrap();
         }
 
         assert_eq!(started.load(Ordering::Relaxed), 37);
+    }
+
+    #[test]
+    fn repair_download_stream_rejects_zero_concurrency() {
+        let result = repair_download_stream(
+            Vec::<usize>::new(),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            |_| async { Ok::<_, SophonError>(()) },
+        );
+
+        assert!(matches!(result, Err(SophonError::Io(_))));
     }
 
     #[test]
