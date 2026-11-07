@@ -214,6 +214,25 @@ fn insert_new_chunk_name<'a>(seen_chunks: &mut rustc_hash::FxHashSet<&'a str>, n
     seen_chunks.insert(name)
 }
 
+fn repair_download_stream<I, F, Fut>(
+    items: Vec<I>,
+    limit: usize,
+    stopped: Arc<AtomicBool>,
+    make_future: F,
+) -> impl futures_util::Stream<Item = Fut::Output>
+where
+    I: 'static,
+    F: FnMut(I) -> Fut,
+    Fut: std::future::Future,
+{
+    futures_util::stream::iter(items)
+        .take_while(move |_| {
+            futures_util::future::ready(!stopped.load(Ordering::Acquire))
+        })
+        .map(make_future)
+        .buffer_unordered(limit)
+}
+
 async fn wait_for_download_cancellation(handle: &DownloadHandle) {
     if !handle.is_cancelled() {
         handle.cancelled_future().await;
@@ -3167,45 +3186,59 @@ async fn repair_assets(
             eta_seconds: 0.0,
         });
 
-        let dl_semaphore = Arc::new(tokio::sync::Semaphore::new(super::DOWNLOAD_CONCURRENCY));
-        let mut dl_stream = FuturesUnordered::new();
-        for (chunk, dl_info) in redownload_items {
-            let permit = Arc::clone(&dl_semaphore);
-            let chunks_dir = chunks_dir.clone();
-            let client = client.clone();
-            let dl_completed = Arc::clone(&dl_completed);
-            let dl_bytes = Arc::clone(&dl_bytes);
-            let stopped = Arc::clone(&stopped);
-            dl_stream.push(async move {
-                let _permit = permit.acquire().await.map_err(|_| SophonError::Cancelled)?;
-                if stopped.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
-                chunk_path.set_extension("zstd");
-                if let Some(parent) = chunk_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let result = download_chunk_with_retry_policy(
-                    (&chunk).into(),
-                    &client,
-                    &dl_info,
-                    &chunk_path,
-                    None,
-                    &DownloadHandle::new(),
-                    false,
-                    &|_| {},
-                )
-                .await;
-                if result.is_ok() {
-                    dl_completed.fetch_add(1, Ordering::Relaxed);
-                    dl_bytes.fetch_add(chunk.chunk_size, Ordering::Relaxed);
-                }
-                result
-            });
-        }
-
         let mut download_error = None;
+        let stopped_for_stream = Arc::clone(&stopped);
+        let chunks_dir_for_stream = chunks_dir.clone();
+        let client_for_stream = client.clone();
+        let dl_completed_for_stream = Arc::clone(&dl_completed);
+        let dl_bytes_for_stream = Arc::clone(&dl_bytes);
+        let stream_stopped = Arc::clone(&stopped_for_stream);
+        let mut dl_stream = repair_download_stream(
+            redownload_items,
+            super::DOWNLOAD_CONCURRENCY,
+            stream_stopped,
+            move |(chunk, dl_info)| {
+                let chunks_dir = chunks_dir_for_stream.clone();
+                let client = client_for_stream.clone();
+                let dl_completed = Arc::clone(&dl_completed_for_stream);
+                let dl_bytes = Arc::clone(&dl_bytes_for_stream);
+                let stopped = Arc::clone(&stopped_for_stream);
+                async move {
+                    let result = async {
+                        if stopped.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
+                        chunk_path.set_extension("zstd");
+                        if let Some(parent) = chunk_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        download_chunk_with_retry_policy(
+                            (&chunk).into(),
+                            &client,
+                            &dl_info,
+                            &chunk_path,
+                            None,
+                            &DownloadHandle::new(),
+                            false,
+                            &|_| {},
+                        )
+                        .await?;
+                        Ok(Some(chunk.chunk_size))
+                    }
+                    .await;
+                    match &result {
+                        Ok(Some(chunk_size)) => {
+                            dl_completed.fetch_add(1, Ordering::Relaxed);
+                            dl_bytes.fetch_add(*chunk_size, Ordering::Relaxed);
+                        }
+                        Ok(None) => {}
+                        Err(_) => stopped.store(true, Ordering::Release),
+                    }
+                    result
+                }
+            },
+        );
         while let Some(result) = dl_stream.next().await {
             if let Err(err) = result {
                 stopped.store(true, Ordering::Release);
