@@ -1373,6 +1373,83 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bench-diagnostics")]
+    #[tokio::test]
+    #[ignore = "diagnostic MD5 update granularity; run explicitly with --ignored"]
+    async fn diagnose_md5_update_granularity() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const LARGE_SIZE: usize = 64 * 1024 * 1024;
+        const SMALL_SIZE: usize = 1024 * 1024;
+        const REPEATS: usize = 10;
+        let make_input = |size: usize| {
+            (0..size)
+                .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+                .collect::<Vec<_>>()
+        };
+        let small_input = make_input(SMALL_SIZE);
+        let small_expected = fast_md5::digest(&small_input);
+        let input = make_input(LARGE_SIZE);
+        let expected = fast_md5::digest(&input);
+        let one_shot_warmup = fast_md5::digest(black_box(&input));
+        assert_eq!(one_shot_warmup, expected);
+        println!(
+            "md5_update_granularity one_shot bytes={} repeats={REPEATS}",
+            input.len()
+        );
+        let one_shot_samples = (0..REPEATS)
+            .map(|_| {
+                let start = Instant::now();
+                let digest = fast_md5::digest(black_box(&input));
+                let elapsed = start.elapsed();
+                assert_eq!(digest, expected);
+                elapsed
+            })
+            .collect::<Vec<_>>();
+        println!("md5_update_granularity one_shot_samples={one_shot_samples:?}");
+
+        for chunk_size in [
+            1usize,
+            63,
+            64,
+            65,
+            4 * 1024 - 1,
+            4 * 1024 + 1,
+            16 * 1024,
+            64 * 1024,
+            256 * 1024,
+        ] {
+            let (input, expected, repeats) = if chunk_size <= 65 {
+                (&small_input, small_expected, 3)
+            } else {
+                (&input, expected, REPEATS)
+            };
+            let mut warm = fast_md5::Md5::new();
+            for bytes in input.chunks(chunk_size) {
+                warm.update(bytes);
+            }
+            assert_eq!(warm.finalize(), expected);
+            let samples = (0..repeats)
+                .map(|_| {
+                    let start = Instant::now();
+                    let mut hasher = fast_md5::Md5::new();
+                    for bytes in input.chunks(chunk_size) {
+                        hasher.update(black_box(bytes));
+                    }
+                    let digest = hasher.finalize();
+                    let elapsed = start.elapsed();
+                    assert_eq!(digest, expected);
+                    elapsed
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "md5_update_granularity bytes={} chunk_size={chunk_size} repeats={repeats} samples={samples:?}",
+                input.len()
+            );
+        }
+    }
+
     #[test]
     fn pooled_md5_returns_context_on_drop() {
         {
