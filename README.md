@@ -1,117 +1,116 @@
 # Irmin
 
-A Rust library that downloads Chinese anime games. Manifest-based chunk downloads with zstd compression.
-
-## What it does
-
-- Downloads a fresh game build from a manifest of zstd-compressed chunks
-- Updates an existing install by diffing the installed tag against the remote tag
-- Pre-downloads upcoming versions as a patch package you apply on release
-- Verifies file integrity, installs plugins and channel SDKs, applies HDiff patches
-- Reports progress through a callback you provide
+Irmin is a Rust library for installing and updating supported anime games on Linux. It downloads manifest-based chunks, assembles game files, and reports progress to your application.
 
 ## Requirements
 
-- Rust >= 1.92. We recommend the use of [rustup](https://rustup.rs) instead of installing rust directly
+- Linux
+- Rust 1.92 or later
 
-Irmin targets Linux.
+## Add Irmin
 
-## Use Irmin
-
-First, add the crates:
+Add the crate to `Cargo.toml`:
 
 ```toml
-irmin = { version = "1.0.0", package = "irmin_rs" }
+[dependencies]
+irmin = { package = "irmin_rs", version = "1.1" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-next, create the Sophon download handler:
+## Download a game
+
+Create one `Sophon` for each game install. The game code identifies the game, and the second argument is the directory Irmin will create or update.
 
 ```rust
-use irmin::{Sophon, DownloadHandle, SophonProgress, VerifyMode};
+use irmin::{DownloadHandle, Sophon, SophonProgress};
 
-let handle = DownloadHandle::new();
-let sophon = Sophon::builder("hk4e", "/path/to/game")
-    .vo_lang("en-us")
-    .verify_mode(VerifyMode::Full)
-    .build();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let sophon = Sophon::builder("hk4e", "/games/example")
+        .vo_lang("en-us")
+        .build();
+    let handle = DownloadHandle::new();
 
-sophon
-    .download(&handle, |p: SophonProgress| {
-        println!("{p:?}");
-    })
-    .await?;
+    sophon
+        .download(&handle, |event: SophonProgress| {
+            match event {
+                SophonProgress::Downloading {
+                    downloaded_bytes,
+                    total_bytes,
+                    speed_bps,
+                    ..
+                } => println!("{downloaded_bytes}/{total_bytes} bytes ({speed_bps:.0} B/s)"),
+                SophonProgress::Finished => println!("Operation ended"),
+                other => println!("{other:?}"),
+            }
+        })
+        .await?;
+
+    Ok(())
+}
 ```
 
-`Sophon` owns the manifest-fetch client, the game identity, the install path, the resume-state directory, and the verify mode. Build it once and call any of `download`, `update`, `preinstall`, `apply_preinstall`, `check_update`, or `verify_integrity`. The builder defaults the client to a tuned HTTP/1.1 connection pool, `vo_lang` to `en-US`, `state_dir` to the install dir, and `verify_mode` to `Full`. Override any of them with `.client(...)`, `.vo_lang(...)`, `.state_dir(...)`, or `.verify_mode(...)`. Pass a `DownloadHandle` to any download operation. Clone the handle before the call and you can `handle.pause()`, `handle.resume()`, or `handle.cancel()` the in-flight operation from another task. No global registry tracks active downloads.
+The callback runs on worker tasks, so keep it thread-safe and avoid blocking work. It receives `SophonProgress` events such as `FetchingManifest`, `Downloading`, `Assembling`, and `Warning`. Treat the awaited result as the success signal: the method returns `Ok(())` on success or a `SophonError` on failure. `Finished` marks the end of the operation's progress events.
 
-Each download, update, and preinstall writes a per-game state file into `state_dir`. irmin reuses the on-disk chunks when the remote manifest hash matches, and starts a fresh download when the hash or any identity field differs. irmin removes the state file on success. To inspect that state without a `Sophon`, call `irmin::load_download_state` or `irmin::state_file_path`.
+## Choose an operation
 
-For lower-level control, the `game_installer` module exposes `build_installers`, `install`, `preinstall_download`, `apply_preinstall`, `check_update`, and `verify_integrity`.
+| Call | Use it for |
+| --- | --- |
+| `download(&handle, callback)` | Install a fresh copy. |
+| `update(&handle, callback)` | Update an existing install. Returns `NoInstalledVersion` if none exists. |
+| `check_update()` | Check for update or preinstall availability and sizes. |
+| `preinstall(&handle, callback)` | Download an available version's preinstall package. |
+| `apply_preinstall(tag, &handle, callback)` | Apply a downloaded package after release. |
+| `verify_integrity(callback)` | Check installed files and repair missing or damaged files. |
 
-### Verification modes
+Use `update` for routine upgrades. Use `preinstall` and `apply_preinstall` only when your app offers a pre-download workflow. Applying a completed package can still download payload chunks from the CDN.
 
-The `VerifyMode` parameter sets how much integrity checking irmin performs during download:
+## Configure the installer
 
-| Mode | Behavior | Crash-resume | CPU cost |
-|------|----------|-------------|----------|
-| `Full` | Hash every chunk during download and assembly. Full crash-resume via bitmap. | Yes | ~6.8 s/GiB |
-| `Deferred` | Skip per-chunk hashing. Verify only the final assembled file. All-eager pipeline (no intermediate .zstd files). No crash-resume. | No | ~3.4 s/GiB |
-| `None` | Size-only checks. No hashing. No crash-resume. | No | ~3.0 s/GiB |
+The builder requires a game identifier and install directory. These options are available:
 
-Interrupt a `Deferred` or `None` download and irmin re-downloads the incomplete files from scratch on the next run. `Full` mode resumes from where it left off.
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `.vo_lang(locale)` | `en-US` | Select the voice-over locale. |
+| `.verify_mode(mode)` | `VerifyMode::Full` | Choose download integrity checks. |
+| `.state_dir(path)` | Install directory | Store resume state separately, such as in app data. |
+| `.client(client)` | Tuned HTTP client | Override the client used for manifest requests. |
 
-Supported game identifiers:
+Supported game codes: `hk4e`, `hkrpg`, `nap`, `bh3`. Supported voice locales: `en-us`, `zh-cn`, `zh-tw`, `ko-kr`, `ja-jp`.
 
-- `hk4e`
-- `hkrpg`
-- `nap`
-- `bh3`
+`VerifyMode::Full` hashes chunks and supports crash resume. `Deferred` checks completed files and restarts incomplete files from scratch after interruption. `None` checks sizes without hashing and also restarts incomplete files from scratch. Keep `Full` unless your application has a specific reason to trade integrity checks or resume support for lower CPU use.
 
-Supported voice pack locales:
+## Pause, resume, and cancel
 
-- `en-us`
-- `zh-cn`
-- `zh-tw`
-- `ko-kr`
-- `ja-jp`
+Clone the handle before starting an operation, then use the clone from your UI or another task:
 
-`SophonProgress` is a serde-serializable enum. Each variant reports the relevant counters; `Finished` signals a clean end. Errors come back as `SophonError` from the pipeline.
+```rust
+let download_control = handle.clone();
+tokio::spawn(async move {
+    // Choose the control action your application needs:
+    download_control.pause();
+    download_control.resume();
+    download_control.cancel();
+});
+```
 
-### Manual integrity repair
+Pause takes effect at a worker checkpoint. Cancellation is permanent for that handle; create a new `DownloadHandle` for a later attempt. With `Full` verification, Irmin can reuse completed chunks after a process restart when the game, locale, install path, and manifest still match. It removes the resume state after success.
 
-`verify_integrity` hashes installed files rather than trusting persisted size/mtime cache hits, regardless of the builder's download verification mode. It repairs missing or damaged files, respects the selected voice language and the game's removed-resource filters, and regenerates launcher-owned metadata. Repair errors and worker failures return `Err`; `Finished` is emitted only after repair and metadata generation succeed. Plugins and SDKs are outside this operation's scope.
+## Next steps
 
-### Applying preinstalls after release
+- Read the [`Sophon` API documentation](https://docs.rs/irmin_rs) for method signatures and error types.
+- Use `irmin::load_download_state` or `irmin::state_file_path` to inspect persisted resume state.
+- Use the lower-level `game_installer` module if you need direct control beyond `Sophon`.
 
-Completed preinstalls now save the exact target manifests and each manifest's chunk-download information in their package state. Applying these packages does not need the pre-download branch, build metadata, or manifest endpoints to remain available, and cannot silently switch to a newer pre-download target.
+## Development
 
-This is **metadata independence, not fully offline installation**. New files and patch-repair fallbacks can still need payload chunks from the CDN. An interrupted, incomplete preinstall still needs upstream metadata to rebuild its download plan after restart.
-
-Older package states remain readable. Irmin tries to recover their exact saved target and manifest IDs before changing game files; if that metadata is gone, apply returns an actionable error and preserves the downloaded package. Legacy packages retain their recorded voice scope: omitted voice packs generate a warning and need a subsequent normal update/repair. Legacy deletion lists lack scope information, so obsolete files are conservatively retained rather than risking deletion of an omitted voice pack; they may require separate cleanup.
-
-Successful apply removes that package's metadata and marker. Shared patch/chunk payloads are retained because other completed or interrupted packages may still need them. Failed or cancelled applies retain metadata for retry.
-
-## How the pipeline works
-
-A download starts by fetching a manifest from the game's delivery API. The manifest lists every file, its size, and the chunks that compose it. Irmin checks what is already on disk, decides which chunks it still needs, and pulls them in parallel. In `Full` mode, chunks arrive zstd-compressed and irmin writes them to temp files. The assembler stitches them into final files, runs integrity checks, and installs any plugins or SDKs the manifest requests. In `Deferred`/`None` modes, irmin decompresses chunks inline into their final positions (the "eager" path), skipping intermediate IO.
-
-Updates skip unchanged files by comparing the installed version tag against the remote tag. Preinstall downloads the next version's patch before release. When the server switches to that version, apply the patch and the game runs.
-
-## Benchmarks
+Run the test suite with:
 
 ```sh
-cargo bench --features benchmark
+cargo test
 ```
 
-`benches/sophon_bench.rs` measures the hot paths: manifest parsing, chunk scheduling, assembly, and HDiff patching. `src/bin/bench_memory.rs` samples peak RSS during installs. Enable the `sophon-profiling` cargo feature for jemalloc allocator stats.
-
-### Preinstall memory diagnostics
-
-Run `scripts/bench-preinstall-memory.sh [OUTPUT_DIR]` on Linux to capture the synthetic 4/64/256 MiB HDiff phase and full-preinstall cases, plus a cgroup-limited run. It writes `environment.txt`, six phase/standard JSON results, and one cgroup-limited JSON result. By default it creates a timestamped directory under `/tmp/opencode` when available, otherwise under `/tmp`; a supplied output directory must be absent or empty. The script records the kernel, CPU, filesystem, cgroup, swap, Git revision, worktree cleanliness, and lockfile checksum, but does not collect environment variables or real game data. It uses disk-backed fixtures; the cgroup case also requires a usable cgroup v2 hierarchy and `systemd-run --user --scope` access. Set `CGROUP_MEMORY_MAX_MIB` to change the cgroup run's limit.
-
-These fixtures are diagnostic, not representative. Interpret `allocator_net_live_growth_peak_bytes` as requested heap growth, not RSS. `sampled_max_rss_anon_kib` and `sampled_max_rss_file_kib` split process RSS; sampled PSS and private/shared `smaps_rollup` fields are collected sequentially at RSS high-water samples, not atomically. Under a cgroup limit, `memory.current`, `memory.peak`, and `memory.stat` describe the whole cgroup; `memory.peak` is a cgroup-lifetime high-water, while `memory.stat` fields are boundary gauges/counters and their deltas can include setup or cleanup. File-backed RSS or cgroup charge is not by itself proof of an application heap leak, and reclaim pressure/PSI should be considered before calling it harmless.
-
-To investigate a reported preinstall peak, record what the “700 MB” metric means and which tool produced it, then rerun with the real or size-equivalent asset and capture the target kernel, filesystem, cgroup memory/swap limits, asset sizes and patch methods, concurrency, cache state, `memory.events`, PSI pressure, and whether the issue is OOM, latency, or only a dashboard reading. Without pressure and outcome data, the run cannot establish whether reclaim is harming the workload. Avoid changing mmap or page-cache policy from synthetic results alone.
+Run benchmarks with `cargo bench --features benchmark`. The benchmark and memory diagnostic scripts are intended for library development, not application integration.
 
 ## License
 
