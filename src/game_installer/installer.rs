@@ -210,6 +210,10 @@ fn download_work_abandoned(remaining: &AtomicUsize, handle: &DownloadHandle) -> 
     !handle.is_cancelled() && !download_work_finished(remaining)
 }
 
+fn insert_new_chunk_name<'a>(seen_chunks: &mut rustc_hash::FxHashSet<&'a str>, name: &'a str) -> bool {
+    seen_chunks.insert(name)
+}
+
 async fn wait_for_download_cancellation(handle: &DownloadHandle) {
     if !handle.is_cancelled() {
         handle.cancelled_future().await;
@@ -3112,19 +3116,17 @@ async fn repair_assets(
         .map(|(a, _, _)| a.asset_chunks.len())
         .sum();
     fs::create_dir_all(&chunks_dir)?;
-    let mut redownload_items: Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)> =
-        Vec::with_capacity(total_chunks_upper);
-    let mut seen_chunks: rustc_hash::FxHashSet<String> =
+    let mut redownload_items: Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)> = Vec::new();
+    let mut seen_chunks: rustc_hash::FxHashSet<&str> =
         rustc_hash::FxHashSet::with_capacity_and_hasher(
             total_chunks_upper,
             rustc_hash::FxBuildHasher,
         );
     for (asset, chunk_download, _) in &failed_verifications {
         for chunk in &asset.asset_chunks {
-            if seen_chunks.contains(&chunk.chunk_name) {
+            if !insert_new_chunk_name(&mut seen_chunks, chunk.chunk_name.as_str()) {
                 continue;
             }
-            seen_chunks.insert(chunk.chunk_name.clone());
             let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
             chunk_path.set_extension("zstd");
             let needs_download = !chunk_path.exists()

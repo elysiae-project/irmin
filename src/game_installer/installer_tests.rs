@@ -252,6 +252,17 @@
     }
 
     #[test]
+    fn repair_chunk_name_dedup_borrows_names() {
+        let names = [String::from("shared"), String::from("unique")];
+        let mut seen = rustc_hash::FxHashSet::default();
+
+        assert!(insert_new_chunk_name(&mut seen, &names[0]));
+        assert!(!insert_new_chunk_name(&mut seen, &names[0]));
+        assert!(insert_new_chunk_name(&mut seen, &names[1]));
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
     fn compute_totals_no_dupes() {
         let files = vec![
             make_file(
