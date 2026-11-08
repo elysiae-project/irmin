@@ -815,6 +815,34 @@ mod tests {
     }
 
     #[test]
+    fn deduplicated_empty_strings_share_index_but_regular_intern_appends() {
+        let mut arena = StringArena::default();
+        let first = arena.intern_dedup("");
+        assert_eq!(arena.intern_dedup(""), first);
+        assert_eq!(checked_intern(&mut arena, "", true).unwrap(), first);
+        assert_eq!(arena.len(), 1);
+
+        let appended = arena.intern("");
+        assert_ne!(appended, first);
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.get(first), "");
+        assert_eq!(arena.get(appended), "");
+    }
+
+    #[test]
+    fn clearing_dedup_map_allows_empty_string_to_be_interned_again() {
+        let mut arena = StringArena::default();
+        let first = arena.intern_dedup("");
+        assert_eq!(arena.len(), 1);
+        arena.clear_dedup();
+        let second = arena.intern_dedup("");
+        assert_ne!(first, second);
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.get(first), "");
+        assert_eq!(arena.get(second), "");
+    }
+
+    #[test]
     fn string_arena_initial_capacities_are_bounded_hints() {
         let arena = StringArena::with_capacity(usize::MAX, usize::MAX);
         assert!(arena.offsets.capacity() <= INITIAL_STRING_INDEX_CAPACITY + 1);
