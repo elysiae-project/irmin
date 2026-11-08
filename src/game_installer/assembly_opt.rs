@@ -213,11 +213,27 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // MADV_DONTNEED on MAP_SHARED dirty pages triggers writeback implicitly.
-        // msync(MS_ASYNC) is redundant on Linux >= 2.6.17 for shared mappings.
+        // Drop this mapping's page-table entries; the page cache remains authoritative.
         unsafe {
             libc::madvise(self.map_base, self.map_len, libc::MADV_DONTNEED);
         }
+    }
+
+    pub(crate) fn evict_prefix(&self, start: usize, end: usize) -> usize {
+        let page = page_size();
+        let aligned_start = start.min(self.len).div_ceil(page) * page;
+        let aligned_end = end.min(self.len) / page * page;
+        if aligned_end <= aligned_start {
+            return start;
+        }
+        let _ = unsafe {
+            libc::madvise(
+                (self.map_base as *mut u8).add(aligned_start).cast(),
+                aligned_end - aligned_start,
+                libc::MADV_DONTNEED,
+            )
+        };
+        aligned_end
     }
 }
 
@@ -265,7 +281,6 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SharedMmapAdvice {
     PopulateRead,
-    #[cfg(feature = "benchmark")]
     DemandSequential,
 }
 
@@ -298,7 +313,6 @@ pub(crate) fn mmap_shared_read_only(
             SharedMmapAdvice::PopulateRead => {
                 libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
             }
-            #[cfg(feature = "benchmark")]
             SharedMmapAdvice::DemandSequential => {
                 libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
             }

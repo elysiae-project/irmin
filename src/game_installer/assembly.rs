@@ -185,7 +185,7 @@ pub fn assemble_file(
     skip_md5_check: bool,
     verify_mode: super::VerifyMode,
 ) -> SophonResult<()> {
-    assemble_file_with_shared_mmap_advice(
+    assemble_file_with_options(
         all_files,
         file_idx,
         game_dir,
@@ -197,7 +197,66 @@ pub fn assemble_file(
         skip_md5_check,
         verify_mode,
         super::assembly_opt::SharedMmapAdvice::PopulateRead,
+        false,
     )
+    .map(|_| ())
+}
+
+pub(crate) struct AssembleOutcome {
+    pub(crate) file_hash_verified: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_file_for_download_over(
+    all_files: &CompactManifest,
+    file_idx: usize,
+    game_dir: &Path,
+    chunks_dir: &Path,
+    temp_dir: &Path,
+    chunk_lookup: &ChunkNameLookup,
+    chunk_refcounts: &[AtomicU32],
+    verify_cache: &DashMap<String, VerificationEntry>,
+) -> SophonResult<AssembleOutcome> {
+    assemble_file_with_options(
+        all_files,
+        file_idx,
+        game_dir,
+        chunks_dir,
+        temp_dir,
+        chunk_lookup,
+        chunk_refcounts,
+        verify_cache,
+        false,
+        super::VerifyMode::Full,
+        super::assembly_opt::SharedMmapAdvice::DemandSequential,
+        true,
+    )
+}
+
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_file_with_benchmark_file_hash(
+    all_files: &CompactManifest,
+    file_idx: usize,
+    game_dir: &Path,
+    chunks_dir: &Path,
+    temp_dir: &Path,
+    chunk_lookup: &ChunkNameLookup,
+    chunk_refcounts: &[AtomicU32],
+    verify_cache: &DashMap<String, VerificationEntry>,
+) -> SophonResult<bool> {
+    assemble_file_for_download_over(
+        all_files,
+        file_idx,
+        game_dir,
+        chunks_dir,
+        temp_dir,
+        chunk_lookup,
+        chunk_refcounts,
+        verify_cache,
+    )
+    .map(|outcome| outcome.file_hash_verified)
 }
 
 #[cfg(feature = "benchmark")]
@@ -216,7 +275,7 @@ pub fn assemble_file_with_benchmark_mmap_advice(
     verify_mode: super::VerifyMode,
     demand_sequential: bool,
 ) -> SophonResult<()> {
-    assemble_file_with_shared_mmap_advice(
+    assemble_file_with_options(
         all_files,
         file_idx,
         game_dir,
@@ -232,11 +291,13 @@ pub fn assemble_file_with_benchmark_mmap_advice(
         } else {
             super::assembly_opt::SharedMmapAdvice::PopulateRead
         },
+        false,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assemble_file_with_shared_mmap_advice(
+fn assemble_file_with_options(
     all_files: &CompactManifest,
     file_idx: usize,
     game_dir: &Path,
@@ -248,7 +309,8 @@ fn assemble_file_with_shared_mmap_advice(
     skip_md5_check: bool,
     verify_mode: super::VerifyMode,
     shared_mmap_advice: super::assembly_opt::SharedMmapAdvice,
-) -> SophonResult<()> {
+    force_file_hash: bool,
+) -> SophonResult<AssembleOutcome> {
     let file_name = all_files.file_name(file_idx);
     let file_size = all_files.file_size(file_idx);
     let file_hash_md5 = all_files.file_hash_md5(file_idx);
@@ -257,7 +319,9 @@ fn assemble_file_with_shared_mmap_advice(
 
     validate_asset_name(file_name)?;
     if is_dir {
-        return Ok(());
+        return Ok(AssembleOutcome {
+            file_hash_verified: false,
+        });
     }
     let target_path = game_dir.join(file_name);
     #[allow(clippy::needless_range_loop)]
@@ -298,7 +362,9 @@ fn assemble_file_with_shared_mmap_advice(
                     chunks_dir,
                 );
             }
-            return Ok(());
+            return Ok(AssembleOutcome {
+                file_hash_verified: true,
+            });
         }
         log::warn!(
             "assemble_file: file '{name}' exists but MD5 mismatch, re-assembling",
@@ -377,6 +443,11 @@ fn assemble_file_with_shared_mmap_advice(
 
     let parallelize =
         num_workers > 1 && total_chunks >= 4 && (all_chunks_have_hashes || has_file_hash);
+    let parallel_hashed_file = parallelize
+        && has_file_hash
+        && (force_file_hash
+            || !all_chunks_have_hashes
+            || verify_mode == super::VerifyMode::Deferred);
     let mut file_hasher = if verify_mode == super::VerifyMode::None || file_hash_md5.is_empty() {
         if !is_dir && file_hash_md5.is_empty() {
             log::warn!(
@@ -385,19 +456,17 @@ fn assemble_file_with_shared_mmap_advice(
             );
         }
         None
+    } else if parallel_hashed_file {
+        None
     } else if verify_mode == super::VerifyMode::Deferred {
-        // Deferred: always do file-level hash (it's the only verification).
-        // In parallel mode, use the mmap hasher thread instead of this sequential hasher.
-        if parallelize { None } else { Some(take_md5()?) }
-    } else if all_chunks_have_hashes || parallelize {
+        Some(take_md5()?)
+    } else if !force_file_hash && (all_chunks_have_hashes || parallelize) {
         None
     } else {
         Some(take_md5()?)
     };
 
-    // In Deferred mode with parallelize, enable the mmap hasher thread.
-    let parallel_hashed_file = parallelize && has_file_hash
-        && (!all_chunks_have_hashes || verify_mode == super::VerifyMode::Deferred);
+    let sequential_file_hash = file_hasher.is_some();
     let hasher_result: Mutex<Option<SophonResult<[u8; 16]>>> = Mutex::new(None);
 
     // In non-Full mode, skip per-chunk decompressed hash verification.
@@ -470,6 +539,7 @@ fn assemble_file_with_shared_mmap_advice(
                             return;
                         }
                     };
+                    let mut last_evicted = 0usize;
                     // MAP_SHARED read-only mmap sees concurrent pwrite_at updates
                     // to the page cache, eliminating per-chunk read_at syscalls.
                     let map = match super::assembly_opt::mmap_shared_read_only(
@@ -499,7 +569,11 @@ fn assemble_file_with_shared_mmap_advice(
                             *hasher_result.lock().unwrap() = Some(Err(SophonError::Io(e)));
                             return;
                         }
+                        if end.saturating_sub(last_evicted) >= 32 * 1024 * 1024 {
+                            last_evicted = map.evict_prefix(last_evicted, end);
+                        }
                     }
+                    let _ = map.evict_prefix(last_evicted, map_len);
                     match hasher.finish() {
                         Ok(digest) => {
                             *hasher_result.lock().unwrap() = Some(Ok(digest));
@@ -771,10 +845,12 @@ fn assemble_file_with_shared_mmap_advice(
         }
     }
 
+    let file_hash_verified = has_file_hash && (sequential_file_hash || parallel_hashed_file);
+
     transfer_buffer.clear();
     TRANSFER_BUF.with(|cell| cell.replace(transfer_buffer));
 
-    Ok(())
+    Ok(AssembleOutcome { file_hash_verified })
 }
 
 fn write_decompressed_chunk_at(

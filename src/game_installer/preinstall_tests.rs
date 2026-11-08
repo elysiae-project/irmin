@@ -1204,8 +1204,13 @@ fn apply_hdiff_patch_original_hash_mismatch_returns_error() {
         matching_field: "game".to_owned(),
     };
 
-    let error = apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &FilterCache::new(dir.path()))
-        .unwrap_err();
+    let error = apply_hdiff_patch(
+        dir.path(),
+        &chunks_dir,
+        &asset,
+        &FilterCache::new(dir.path()),
+    )
+    .unwrap_err();
     assert!(matches!(error, SophonError::OriginalFileMissing(_)));
 }
 

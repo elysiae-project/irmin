@@ -1600,6 +1600,13 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "demand" => true,
         _ => return Err("invalid child assembly mmap advice".to_owned()),
     };
+    let download_over_hash_strategy = if scenario == Scenario::Assembly {
+        std::env::var("IRMIN_BENCH_DOWNLOAD_OVER_HASH")
+            .ok()
+            .filter(|strategy| matches!(strategy.as_str(), "current" | "fused"))
+    } else {
+        None
+    };
     if scenario != Scenario::Assembly
         && (assembly_verify_mode != VerifyMode::Full || assembly_demand_mmap)
     {
@@ -1844,10 +1851,12 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let mut result = serde_json::json!({
         "scenario": scenario.name(),
         "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
-        "operation_mode": if diagnose_hdiff_phases {
-            "single_asset_hdiff_phase_diagnostics"
+        "operation_mode": if let Some(strategy) = &download_over_hash_strategy {
+            format!("download_over_{strategy}")
+        } else if diagnose_hdiff_phases {
+            "single_asset_hdiff_phase_diagnostics".to_owned()
         } else {
-            "standard_scenario"
+            "standard_scenario".to_owned()
         },
         "representative": false,
         "asset_count": (scenario == Scenario::PreinstallApply).then_some(asset_count),
@@ -1915,6 +1924,10 @@ fn run_child(args: &[String]) -> Result<(), String> {
                 "populate-read-default"
             })
         ),
+    );
+    result.as_object_mut().unwrap().insert(
+        "download_over_hash_strategy".to_owned(),
+        serde_json::json!(download_over_hash_strategy),
     );
     #[cfg(feature = "bench-alloc-stats")]
     {
@@ -2632,7 +2645,10 @@ mod cgroup_memory_stat_tests {
         assert_eq!(snapshot.stat.anon_bytes, None);
         assert_eq!(snapshot.stat.file_bytes, None);
         fs::write(dir.path().join("memory.current"), "123\n").unwrap();
-        assert_eq!(read_cgroup_memory_snapshot(dir.path()).current_bytes, Some(123));
+        assert_eq!(
+            read_cgroup_memory_snapshot(dir.path()).current_bytes,
+            Some(123)
+        );
     }
 }
 
@@ -3202,20 +3218,64 @@ fn run_operation(
                 verify_mode,
                 demand_mmap,
             } = *context;
-            irmin_rs::game_installer::assembly::assemble_file_with_benchmark_mmap_advice(
-                &manifest,
-                0,
-                &game_dir,
-                &chunks_dir,
-                &tmp_dir,
-                &lookup,
-                &refcounts,
-                &cache,
-                true,
-                verify_mode,
-                demand_mmap,
-            )
-            .map_err(|error| format!("assembly failed: {error}"))?;
+            match std::env::var("IRMIN_BENCH_DOWNLOAD_OVER_HASH").as_deref() {
+                Ok("fused") => {
+                    let verified =
+                        irmin_rs::game_installer::assembly::assemble_file_with_benchmark_file_hash(
+                            &manifest,
+                            0,
+                            &game_dir,
+                            &chunks_dir,
+                            &tmp_dir,
+                            &lookup,
+                            &refcounts,
+                            &cache,
+                        )
+                        .map_err(|error| format!("fused assembly failed: {error}"))?;
+                    if !verified {
+                        return Err("fused assembly did not verify the file hash".to_owned());
+                    }
+                }
+                Ok("current") => {
+                    irmin_rs::game_installer::assembly::assemble_file_with_benchmark_mmap_advice(
+                        &manifest,
+                        0,
+                        &game_dir,
+                        &chunks_dir,
+                        &tmp_dir,
+                        &lookup,
+                        &refcounts,
+                        &cache,
+                        true,
+                        verify_mode,
+                        demand_mmap,
+                    )
+                    .map_err(|error| format!("assembly failed: {error}"))?;
+                    let actual = irmin_rs::game_installer::cache::file_md5_digest(
+                        &game_dir.join("assembled.bin"),
+                    )
+                    .map_err(|error| format!("DownloadOver output hash failed: {error}"))?;
+                    if !hex::encode(actual).eq_ignore_ascii_case(manifest.file_hash_md5(0)) {
+                        return Err("DownloadOver output hash mismatch".to_owned());
+                    }
+                }
+                _ => {
+                    irmin_rs::game_installer::assembly::assemble_file_with_benchmark_mmap_advice(
+                        &manifest,
+                        0,
+                        &game_dir,
+                        &chunks_dir,
+                        &tmp_dir,
+                        &lookup,
+                        &refcounts,
+                        &cache,
+                        true,
+                        verify_mode,
+                        demand_mmap,
+                    )
+                    .map_err(|error| format!("assembly failed: {error}"))?;
+                }
+            }
             Ok(Verification::Assembly {
                 expected: expected_path,
                 actual: game_dir.join("assembled.bin"),

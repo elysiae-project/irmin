@@ -403,6 +403,95 @@ fn bench_assembly_e2e(c: &mut Criterion) {
             });
         },
     );
+
+    let expected_hash = hex::encode(fast_md5::digest(&raw_ch));
+    cache.clear();
+    let _ = fs::remove_file(game_dir2.join("assembled.bin"));
+    let fused_warmup = irmin_rs::game_installer::assembly::assemble_file_with_benchmark_file_hash(
+        &manifest_ch,
+        0,
+        &game_dir2,
+        &chunks_dir,
+        &tmp_dir2,
+        &lookup,
+        &refcounts,
+        &cache,
+    )
+    .expect("warmup fused DownloadOver output");
+    assert!(fused_warmup);
+    assert_eq!(
+        hex::encode(
+            irmin_rs::game_installer::cache::file_md5_digest(&game_dir2.join("assembled.bin"))
+                .expect("verify warmup fused DownloadOver output")
+        ),
+        expected_hash
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "download_over_current_chunk_verify_plus_file_hash",
+            num_chunks,
+        ),
+        |b| {
+            let game_dir = game_dir2.clone();
+            let tmp_dir = tmp_dir2.clone();
+            b.iter_batched(
+                || {
+                    cache.clear();
+                    let _ = fs::remove_file(game_dir.join("assembled.bin"));
+                },
+                |_| {
+                    assemble_file(
+                        &manifest_ch,
+                        0,
+                        &game_dir,
+                        &chunks_dir,
+                        &tmp_dir,
+                        &lookup,
+                        &refcounts,
+                        &cache,
+                        true,
+                        VerifyMode::Full,
+                    )
+                    .expect("assemble DownloadOver output");
+                    let actual = irmin_rs::game_installer::cache::file_md5_digest(
+                        &game_dir.join("assembled.bin"),
+                    )
+                    .expect("verify assembled DownloadOver output");
+                    assert_eq!(hex::encode(actual), expected_hash);
+                },
+                BatchSize::PerIteration,
+            );
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("download_over_fused_chunk_and_file_hash", num_chunks),
+        |b| {
+            let game_dir = game_dir2.clone();
+            let tmp_dir = tmp_dir2.clone();
+            b.iter_batched(
+                || {
+                    cache.clear();
+                    let _ = fs::remove_file(game_dir.join("assembled.bin"));
+                },
+                |_| {
+                    let file_hash_verified =
+                        irmin_rs::game_installer::assembly::assemble_file_with_benchmark_file_hash(
+                            &manifest_ch,
+                            0,
+                            &game_dir,
+                            &chunks_dir,
+                            &tmp_dir,
+                            &lookup,
+                            &refcounts,
+                            &cache,
+                        )
+                        .expect("assemble fused DownloadOver output");
+                    assert!(file_hash_verified);
+                },
+                BatchSize::PerIteration,
+            );
+        },
+    );
     group.finish();
 }
 

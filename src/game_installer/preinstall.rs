@@ -3378,7 +3378,7 @@ async fn apply_download_over(
             let chunk_lookup = super::installer::ChunkNameLookup::from_arena(
                 super::compact_manifest::StringArena::with_capacity(0, 0),
             );
-            let result = super::assembly::assemble_file(
+            let result = super::assembly::assemble_file_for_download_over(
                 &manifest,
                 0,
                 &gd,
@@ -3387,18 +3387,25 @@ async fn apply_download_over(
                 &chunk_lookup,
                 &[],
                 &vc,
-                false,
-                super::VerifyMode::Full, // preinstall always uses full verification
-            );
+            )
+            .map_err(|error| match error {
+                SophonError::Md5Mismatch { .. } => SophonError::AssemblyFailed {
+                    file: manifest.file_name(0).into(),
+                    error: "DownloadOver output failed whole-file size/hash verification".into(),
+                },
+                other => other,
+            });
             if let Err(err) = fs::remove_dir_all(&tmp_dir) {
                 log::warn!(
                     "Failed to clean up temp directory {path}: {err}",
                     path = tmp_dir.display(),
                 );
             }
-            result?;
+            let outcome = result?;
             let path = gd.join(manifest.file_name(0));
-            if !is_file_already_patched(&path, manifest.file_size(0), manifest.file_hash_md5(0)) {
+            if !outcome.file_hash_verified
+                && !is_file_already_patched(&path, manifest.file_size(0), manifest.file_hash_md5(0))
+            {
                 return Err(SophonError::AssemblyFailed {
                     file: manifest.file_name(0).into(),
                     error: "DownloadOver output failed whole-file size/hash verification".into(),
