@@ -342,11 +342,46 @@ impl CompactManifest {
     pub fn try_from_properties(
         mut properties: Vec<SophonManifestAssetProperty>,
     ) -> Result<Self, CompactManifestLimitError> {
+        let mut builder = CompactManifestBuilder::for_properties(&properties)?;
+        for file in properties.drain(..) {
+            builder.push(&file)?;
+        }
+        builder.finish()
+    }
+
+    /// Builds a compact manifest containing one borrowed asset property.
+    pub(crate) fn try_from_property_ref(
+        property: &SophonManifestAssetProperty,
+    ) -> Result<Self, CompactManifestLimitError> {
+        let mut builder = CompactManifestBuilder::for_properties(std::slice::from_ref(property))?;
+        builder.push(property)?;
+        builder.finish()
+    }
+}
+
+struct CompactManifestBuilder {
+    arena: StringArena,
+    file_name_idx: Vec<u32>,
+    file_hash_idx: Vec<u32>,
+    file_type: Vec<u8>,
+    file_size: Vec<u64>,
+    file_chunk_start: Vec<u32>,
+    chunk_name_idx: Vec<u32>,
+    chunk_decomp_hash_idx: Vec<u32>,
+    chunk_comp_hash_idx: Vec<u32>,
+    chunk_size: Vec<u32>,
+    chunk_size_decompressed: Vec<u32>,
+    chunk_old_offset: Vec<i64>,
+}
+
+impl CompactManifestBuilder {
+    fn for_properties(
+        properties: &[SophonManifestAssetProperty],
+    ) -> Result<Self, CompactManifestLimitError> {
         let total_files = properties.len();
-        let (total_chunks, estimated_string_bytes) = manifest_storage_estimates(&properties)
-            .ok_or(CompactManifestLimitError(
-                "manifest size arithmetic overflow",
-            ))?;
+        let (total_chunks, estimated_string_bytes) = manifest_storage_estimates(properties).ok_or(
+            CompactManifestLimitError("manifest size arithmetic overflow"),
+        )?;
         let span_count = validate_limits(total_files, total_chunks)?;
         validate_allocation_sizes(
             total_files,
@@ -354,67 +389,90 @@ impl CompactManifest {
             span_count,
             estimated_string_bytes,
         )?;
-        let mut arena = StringArena::with_capacity(span_count, estimated_string_bytes);
-        let mut file_name_idx = Vec::with_capacity(total_files);
-        let mut file_hash_idx = Vec::with_capacity(total_files);
-        let mut file_type = Vec::with_capacity(total_files);
-        let mut file_size = Vec::with_capacity(total_files);
-        let mut file_chunk_start = Vec::with_capacity(total_files + 1);
+        Ok(Self::with_capacity(
+            total_files,
+            total_chunks,
+            span_count,
+            estimated_string_bytes,
+        ))
+    }
 
-        let mut chunk_name_idx = Vec::with_capacity(total_chunks);
-        let mut chunk_decomp_hash_idx = Vec::with_capacity(total_chunks);
-        let mut chunk_comp_hash_idx = Vec::with_capacity(total_chunks);
-        let mut chunk_size = Vec::with_capacity(total_chunks);
-        let mut chunk_size_decompressed = Vec::with_capacity(total_chunks);
-        let mut chunk_old_offset = Vec::with_capacity(total_chunks);
-
-        for file in properties.drain(..) {
-            file_name_idx.push(checked_intern(&mut arena, &file.asset_name, false)?);
-            file_hash_idx.push(checked_intern(&mut arena, &file.asset_hash_md5, true)?);
-            file_type.push(file.asset_type as u8);
-            file_size.push(file.asset_size);
-            file_chunk_start.push(
-                u32::try_from(chunk_name_idx.len())
-                    .map_err(|_| CompactManifestLimitError("chunk index count"))?,
-            );
-            for chunk in file.asset_chunks {
-                chunk_name_idx.push(checked_intern(&mut arena, &chunk.chunk_name, false)?);
-                chunk_decomp_hash_idx.push(checked_intern(
-                    &mut arena,
-                    &chunk.chunk_decompressed_hash_md5,
-                    true,
-                )?);
-                chunk_comp_hash_idx.push(checked_intern(
-                    &mut arena,
-                    &chunk.chunk_compressed_hash_md5,
-                    true,
-                )?);
-                chunk_size.push(chunk.chunk_size as u32);
-                chunk_size_decompressed.push(chunk.chunk_size_decompressed as u32);
-                chunk_old_offset.push(chunk.chunk_old_offset);
-            }
+    fn with_capacity(
+        total_files: usize,
+        total_chunks: usize,
+        span_count: usize,
+        estimated_string_bytes: usize,
+    ) -> Self {
+        Self {
+            arena: StringArena::with_capacity(span_count, estimated_string_bytes),
+            file_name_idx: Vec::with_capacity(total_files),
+            file_hash_idx: Vec::with_capacity(total_files),
+            file_type: Vec::with_capacity(total_files),
+            file_size: Vec::with_capacity(total_files),
+            file_chunk_start: Vec::with_capacity(total_files + 1),
+            chunk_name_idx: Vec::with_capacity(total_chunks),
+            chunk_decomp_hash_idx: Vec::with_capacity(total_chunks),
+            chunk_comp_hash_idx: Vec::with_capacity(total_chunks),
+            chunk_size: Vec::with_capacity(total_chunks),
+            chunk_size_decompressed: Vec::with_capacity(total_chunks),
+            chunk_old_offset: Vec::with_capacity(total_chunks),
         }
+    }
 
-        file_chunk_start.push(
-            u32::try_from(chunk_name_idx.len())
+    fn push(
+        &mut self,
+        file: &SophonManifestAssetProperty,
+    ) -> Result<(), CompactManifestLimitError> {
+        self.file_name_idx
+            .push(checked_intern(&mut self.arena, &file.asset_name, false)?);
+        self.file_hash_idx
+            .push(checked_intern(&mut self.arena, &file.asset_hash_md5, true)?);
+        self.file_type.push(file.asset_type as u8);
+        self.file_size.push(file.asset_size);
+        self.file_chunk_start.push(
+            u32::try_from(self.chunk_name_idx.len())
+                .map_err(|_| CompactManifestLimitError("chunk index count"))?,
+        );
+        for chunk in &file.asset_chunks {
+            self.chunk_name_idx
+                .push(checked_intern(&mut self.arena, &chunk.chunk_name, false)?);
+            self.chunk_decomp_hash_idx.push(checked_intern(
+                &mut self.arena,
+                &chunk.chunk_decompressed_hash_md5,
+                true,
+            )?);
+            self.chunk_comp_hash_idx.push(checked_intern(
+                &mut self.arena,
+                &chunk.chunk_compressed_hash_md5,
+                true,
+            )?);
+            self.chunk_size.push(chunk.chunk_size as u32);
+            self.chunk_size_decompressed
+                .push(chunk.chunk_size_decompressed as u32);
+            self.chunk_old_offset.push(chunk.chunk_old_offset);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<CompactManifest, CompactManifestLimitError> {
+        self.file_chunk_start.push(
+            u32::try_from(self.chunk_name_idx.len())
                 .map_err(|_| CompactManifestLimitError("chunk index sentinel"))?,
         );
-
-        arena.clear_dedup();
-
-        Ok(Self {
-            arena,
-            file_name_idx,
-            file_hash_idx,
-            file_type,
-            file_size,
-            file_chunk_start,
-            chunk_name_idx,
-            chunk_decomp_hash_idx,
-            chunk_comp_hash_idx,
-            chunk_size,
-            chunk_size_decompressed,
-            chunk_old_offset,
+        self.arena.clear_dedup();
+        Ok(CompactManifest {
+            arena: self.arena,
+            file_name_idx: self.file_name_idx,
+            file_hash_idx: self.file_hash_idx,
+            file_type: self.file_type,
+            file_size: self.file_size,
+            file_chunk_start: self.file_chunk_start,
+            chunk_name_idx: self.chunk_name_idx,
+            chunk_decomp_hash_idx: self.chunk_decomp_hash_idx,
+            chunk_comp_hash_idx: self.chunk_comp_hash_idx,
+            chunk_size: self.chunk_size,
+            chunk_size_decompressed: self.chunk_size_decompressed,
+            chunk_old_offset: self.chunk_old_offset,
         })
     }
 }
@@ -596,6 +654,72 @@ mod tests {
         assert_eq!(cm.file_size(0), 1024);
         assert!(!cm.is_directory(0));
         assert_eq!(cm.file_chunk_range(0), 0..0);
+    }
+
+    #[test]
+    fn borrowed_single_file_builder_matches_owned_builder() {
+        for chunk_count in [0usize, 1, 3, 50] {
+            let chunks = (0..chunk_count)
+                .map(|index| SophonManifestAssetChunk {
+                    chunk_name: if index % 2 == 0 {
+                        "shared-chunk-name".to_owned()
+                    } else {
+                        format!("chunk-{index}")
+                    },
+                    chunk_decompressed_hash_md5: format!("{:032x}", index % 3),
+                    chunk_on_file_offset: (index * 1024) as u64,
+                    chunk_size: 512 + index as u64,
+                    chunk_size_decompressed: 1024 + index as u64,
+                    chunk_compressed_hash_xxh: index as u64,
+                    chunk_compressed_hash_md5: format!("{:032x}", index % 2),
+                    chunk_old_offset: if index % 2 == 0 { -1 } else { index as i64 },
+                })
+                .collect();
+            let property = make_file(
+                "GameData/StreamingAssets/bundle.pak",
+                "duplicate-file-hash",
+                if chunk_count == 0 { 64 } else { 0 },
+                (chunk_count * 1024) as u64,
+                chunks,
+            );
+            let owned = CompactManifest::try_from_properties(vec![property.clone()]).unwrap();
+            let borrowed = CompactManifest::try_from_property_ref(&property).unwrap();
+
+            assert_eq!(borrowed.num_files(), owned.num_files());
+            assert_eq!(borrowed.num_chunks(), owned.num_chunks());
+            assert_eq!(borrowed.file_name(0), owned.file_name(0));
+            assert_eq!(borrowed.file_hash_md5(0), owned.file_hash_md5(0));
+            assert_eq!(borrowed.file_type(0), owned.file_type(0));
+            assert_eq!(borrowed.file_size(0), owned.file_size(0));
+            assert_eq!(borrowed.is_directory(0), owned.is_directory(0));
+            assert_eq!(borrowed.file_chunk_range(0), owned.file_chunk_range(0));
+            for chunk_index in 0..chunk_count {
+                let borrowed_chunk = borrowed.file_chunk(0, chunk_index);
+                let owned_chunk = owned.file_chunk(0, chunk_index);
+                assert_eq!(borrowed_chunk.chunk_name, owned_chunk.chunk_name);
+                assert_eq!(
+                    borrowed_chunk.chunk_decompressed_hash_md5,
+                    owned_chunk.chunk_decompressed_hash_md5
+                );
+                assert_eq!(
+                    borrowed_chunk.chunk_compressed_hash_md5,
+                    owned_chunk.chunk_compressed_hash_md5
+                );
+                assert_eq!(borrowed_chunk.chunk_size, owned_chunk.chunk_size);
+                assert_eq!(
+                    borrowed_chunk.chunk_size_decompressed,
+                    owned_chunk.chunk_size_decompressed
+                );
+                assert_eq!(
+                    borrowed_chunk.chunk_old_offset,
+                    owned_chunk.chunk_old_offset
+                );
+                assert_eq!(
+                    borrowed.chunk_file_offset(chunk_index),
+                    owned.chunk_file_offset(chunk_index)
+                );
+            }
+        }
     }
 
     #[test]

@@ -3178,7 +3178,7 @@ fn apply_hdiff_patch_from_files(
 
 #[derive(Debug)]
 struct DownloadOverContext {
-    manifests: rustc_hash::FxHashMap<String, (DownloadInfo, SophonManifestProto)>,
+    manifests: rustc_hash::FxHashMap<String, (DownloadInfo, Arc<SophonManifestProto>)>,
 }
 
 impl DownloadOverContext {
@@ -3192,7 +3192,7 @@ impl DownloadOverContext {
                     normalize_full_download_manifest(&mut manifest);
                     (
                         entry.matching_field.clone(),
-                        (entry.chunk_download.clone(), manifest),
+                        (entry.chunk_download.clone(), Arc::new(manifest)),
                     )
                 })
                 .collect(),
@@ -3341,14 +3341,15 @@ async fn apply_download_over(
         .get(&asset.matching_field)
         .ok_or_else(|| SophonError::NoVoiceManifest(asset.matching_field.clone()))?;
 
-    let file_entry = manifest
+    let file_index = manifest
         .assets
         .iter()
-        .find(|a| a.asset_name == asset.target_file_path)
+        .position(|a| a.asset_name == asset.target_file_path)
         .ok_or_else(|| SophonError::AssemblyFailed {
             file: asset.target_file_path.clone(),
             error: "File not found in main manifest for DownloadOver".to_string(),
         })?;
+    let file_entry = &manifest.assets[file_index];
 
     let chunks_dir = game_dir.join("chunks");
     {
@@ -3365,14 +3366,22 @@ async fn apply_download_over(
 
     {
         let gd = game_dir.to_path_buf();
-        let file_entry = file_entry.clone();
         let cd = chunks_dir.clone();
+        let target_manifest = Arc::clone(manifest);
+        let target_file_path = asset.target_file_path.clone();
         let vc = Arc::new(dashmap::DashMap::new());
         tokio::task::spawn_blocking(move || {
             let tmp_dir = gd.join("tmp-patch-downloadover");
             fs::create_dir_all(&tmp_dir)?;
+            let file_entry = target_manifest.assets.get(file_index).ok_or_else(|| {
+                SophonError::AssemblyFailed {
+                    file: target_file_path.clone(),
+                    error: "File index no longer exists in DownloadOver manifest".to_owned(),
+                }
+            })?;
+            debug_assert_eq!(file_entry.asset_name, target_file_path);
             let manifest =
-                super::compact_manifest::CompactManifest::try_from_properties(vec![file_entry])?;
+                super::compact_manifest::CompactManifest::try_from_property_ref(file_entry)?;
             // No deletion ownership: these are shared cached payloads. Keep
             // them on failure/cancellation and for other packages' fallback.
             let chunk_lookup = super::installer::ChunkNameLookup::from_arena(

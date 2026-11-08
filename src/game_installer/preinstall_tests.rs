@@ -168,7 +168,16 @@ fn benchmark_download_over_context_clone() {
     let retained = match clone_mode.as_str() {
         "deep" => {
             let clone = DownloadOverContext {
-                manifests: shared.manifests.clone(),
+                manifests: shared
+                    .manifests
+                    .iter()
+                    .map(|(key, (download, manifest))| {
+                        (
+                            key.clone(),
+                            (download.clone(), std::sync::Arc::new((**manifest).clone())),
+                        )
+                    })
+                    .collect(),
             };
             std::hint::black_box(&clone);
             CloneStorage::Deep(Box::new(clone))
@@ -3512,13 +3521,22 @@ async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output
 
     let target_hash = hex::encode(fast_md5::digest(&expected));
     let manifest = SophonManifestProto {
-        assets: vec![SophonManifestAssetProperty {
-            asset_name: "downloaded.bin".to_owned(),
-            asset_chunks: asset_chunks.clone(),
-            asset_type: 0,
-            asset_size: expected.len() as u64,
-            asset_hash_md5: target_hash.clone(),
-        }],
+        assets: vec![
+            SophonManifestAssetProperty {
+                asset_name: "unused.bin".to_owned(),
+                asset_chunks: Vec::new(),
+                asset_type: 0,
+                asset_size: 0,
+                asset_hash_md5: String::new(),
+            },
+            SophonManifestAssetProperty {
+                asset_name: "downloaded.bin".to_owned(),
+                asset_chunks: asset_chunks.clone(),
+                asset_type: 0,
+                asset_size: expected.len() as u64,
+                asset_hash_md5: target_hash.clone(),
+            },
+        ],
     };
     let download_info = DownloadInfo {
         url_prefix: server.uri(),
@@ -3526,9 +3544,12 @@ async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output
         ..make_download_info()
     };
     let context = DownloadOverContext {
-        manifests: [("game".to_owned(), (download_info.clone(), manifest))]
-            .into_iter()
-            .collect(),
+        manifests: [(
+            "game".to_owned(),
+            (download_info.clone(), Arc::new(manifest)),
+        )]
+        .into_iter()
+        .collect(),
     };
     let asset = PatchAssetInfo {
         target_file_path: "downloaded.bin".to_owned(),
