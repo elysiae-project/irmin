@@ -921,6 +921,7 @@ dependencies = [
  "fast-md5",
  "flate2",
  "futures-util",
+ "hashbrown 0.17.1",
  "hex",
  "http-body-util",
  "hyper",

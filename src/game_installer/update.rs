@@ -1,6 +1,8 @@
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use reqwest::Client;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use super::api::{fetch_build, is_known_vo_locale, vo_lang_matches};
@@ -9,6 +11,90 @@ use super::read_installed_tag;
 
 use crate::api_scrape::PackageBranch;
 use crate::api_scrape::SophonManifestMeta;
+
+struct CompactChunkNameSet {
+    bytes: Vec<u8>,
+    entries: Vec<CompactChunkNameEntry>,
+    table: hashbrown::HashTable<usize>,
+}
+
+struct CompactChunkNameEntry {
+    hash: u64,
+    range: std::ops::Range<usize>,
+}
+
+impl CompactChunkNameSet {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            entries: Vec::new(),
+            table: hashbrown::HashTable::new(),
+        }
+    }
+
+    fn insert(&mut self, name: &str) -> std::io::Result<bool> {
+        let mut hasher = FxHasher::default();
+        name.hash(&mut hasher);
+        self.insert_hashed(name, hasher.finish())
+    }
+
+    #[cfg(test)]
+    fn insert_with_hash(&mut self, name: &str, hash: u64) -> std::io::Result<bool> {
+        self.insert_hashed(name, hash)
+    }
+
+    fn insert_hashed(&mut self, name: &str, hash: u64) -> std::io::Result<bool> {
+        if self
+            .table
+            .find(hash, |&index| {
+                let entry = &self.entries[index];
+                self.bytes[entry.range.clone()] == *name.as_bytes()
+            })
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        self.table
+            .try_reserve(1, |&index| self.entries[index].hash)
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to reserve compact chunk-name hash table: {error}"
+                ))
+            })?;
+        self.bytes
+            .try_reserve(name.len())
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to reserve compact chunk-name arena: {error}"
+                ))
+            })?;
+        self.entries.try_reserve(1).map_err(|error| {
+            std::io::Error::other(format!(
+                "failed to reserve compact chunk-name index: {error}"
+            ))
+        })?;
+        let start = self.bytes.len();
+        let end = start
+            .checked_add(name.len())
+            .ok_or_else(|| std::io::Error::other("chunk-name arena length overflow"))?;
+        self.bytes.extend_from_slice(name.as_bytes());
+        self.entries.push(CompactChunkNameEntry {
+            hash,
+            range: start..end,
+        });
+        let index = self.entries.len() - 1;
+        // Rehashing uses stored hashes, while `find` resolves collisions by comparing bytes.
+        self.table
+            .insert_unique(hash, index, |&entry_index| self.entries[entry_index].hash);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Availability and byte-size summary for update and preinstall operations.
@@ -209,7 +295,7 @@ pub async fn fetch_diff_sizes(
     }
     let mut cs = 0u64;
     let mut ds = 0u64;
-    let mut seen_chunks: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    let mut seen_chunks = CompactChunkNameSet::new();
 
     let old_map: rustc_hash::FxHashMap<String, &SophonManifestMeta> = old_build
         .manifests
@@ -264,30 +350,51 @@ pub async fn fetch_diff_sizes(
             .map(|chunk| chunk.chunk_decompressed_hash_md5.as_str())
             .collect();
 
-        for file in &new_manifest.assets {
-            if file.is_directory() {
-                continue;
-            }
-            let needs_download = match old_files_md5.get(file.asset_name.as_str()) {
-                Some(old_md5) => *old_md5 != file.asset_hash_md5,
-                None => true,
-            };
-            if needs_download {
-                for chunk in &file.asset_chunks {
-                    // Skip chunks whose decompressed content already exists in an old file
-                    if old_chunks.contains(chunk.chunk_decompressed_hash_md5.as_str()) {
-                        continue;
-                    }
-                    if seen_chunks.insert(chunk.chunk_name.clone()) {
-                        cs += chunk.chunk_size;
-                        ds += chunk.chunk_size_decompressed;
-                    }
+        accumulate_diff_manifest_sizes(
+            &old_files_md5,
+            &old_chunks,
+            &new_manifest,
+            &mut seen_chunks,
+            &mut cs,
+            &mut ds,
+        )?;
+    }
+
+    Ok((cs, ds))
+}
+
+fn accumulate_diff_manifest_sizes(
+    old_files_md5: &rustc_hash::FxHashMap<&str, &str>,
+    old_chunks: &rustc_hash::FxHashSet<&str>,
+    new_manifest: &crate::proto_parse::SophonManifestProto,
+    seen_chunks: &mut CompactChunkNameSet,
+    compressed: &mut u64,
+    decompressed: &mut u64,
+) -> SophonResult<()> {
+    for file in &new_manifest.assets {
+        if file.is_directory() {
+            continue;
+        }
+        let needs_download = match old_files_md5.get(file.asset_name.as_str()) {
+            Some(old_md5) => *old_md5 != file.asset_hash_md5,
+            None => true,
+        };
+        if needs_download {
+            for chunk in &file.asset_chunks {
+                if old_chunks.contains(chunk.chunk_decompressed_hash_md5.as_str()) {
+                    continue;
+                }
+                if seen_chunks
+                    .insert(&chunk.chunk_name)
+                    .map_err(SophonError::Io)?
+                {
+                    *compressed += chunk.chunk_size;
+                    *decompressed += chunk.chunk_size_decompressed;
                 }
             }
         }
     }
-
-    Ok((cs, ds))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -507,6 +614,132 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_chunk_name_set_is_exact_under_hash_collisions() {
+        let mut names = CompactChunkNameSet::new();
+        assert!(names.insert_with_hash("", 7).unwrap());
+        assert!(names.insert_with_hash("alpha", 7).unwrap());
+        assert!(names.insert_with_hash("βeta", 7).unwrap());
+        assert!(!names.insert_with_hash("alpha", 7).unwrap());
+        assert!(!names.insert_with_hash("", 7).unwrap());
+        for index in 0..128 {
+            assert!(
+                names
+                    .insert_with_hash(&format!("collision-{index}"), 7)
+                    .unwrap()
+            );
+        }
+        for index in 0..128 {
+            assert!(
+                !names
+                    .insert_with_hash(&format!("collision-{index}"), 7)
+                    .unwrap()
+            );
+        }
+        assert_eq!(names.len(), 131);
+    }
+
+    #[test]
+    fn compact_chunk_name_set_matches_owned_set_across_growth() {
+        let mut compact = CompactChunkNameSet::new();
+        let mut owned = rustc_hash::FxHashSet::default();
+        for index in 0..10_000usize {
+            let name = match index % 5 {
+                0 => format!("chunk-{index:06}"),
+                1 => format!("shared-{:04}", index % 97),
+                2 => String::new(),
+                3 => format!("音声/{:04}", index % 211),
+                _ => format!("GameData/Persistent/{:08x}.chunk", index / 3),
+            };
+            assert_eq!(
+                compact.insert(&name).unwrap(),
+                owned.insert(name),
+                "insert result differs at {index}"
+            );
+        }
+        assert_eq!(compact.len(), owned.len());
+    }
+
+    #[test]
+    fn diff_size_accumulation_deduplicates_names_across_manifests() {
+        use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
+
+        let chunk = |name: &str, hash: &str, size: u64| SophonManifestAssetChunk {
+            chunk_name: name.to_owned(),
+            chunk_decompressed_hash_md5: hash.to_owned(),
+            chunk_on_file_offset: 0,
+            chunk_size: size,
+            chunk_size_decompressed: size * 2,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: String::new(),
+            chunk_old_offset: -1,
+        };
+        let file = |name: &str, hash: &str, chunks| SophonManifestAssetProperty {
+            asset_name: name.to_owned(),
+            asset_chunks: chunks,
+            asset_type: 0,
+            asset_size: 0,
+            asset_hash_md5: hash.to_owned(),
+        };
+        let first = crate::proto_parse::SophonManifestProto {
+            assets: vec![file(
+                "changed-a",
+                "new-a",
+                vec![
+                    chunk("shared-name", "new-content-a", 10),
+                    chunk("new-name", "new-content-b", 20),
+                ],
+            )],
+        };
+        let second = crate::proto_parse::SophonManifestProto {
+            assets: vec![
+                file(
+                    "changed-b",
+                    "new-b",
+                    vec![chunk("shared-name", "new-content-c", 99)],
+                ),
+                file(
+                    "unchanged",
+                    "old-unchanged",
+                    vec![chunk("ignored", "new-content-d", 77)],
+                ),
+                file(
+                    "changed-c",
+                    "new-c",
+                    vec![chunk("reused", "old-content", 88)],
+                ),
+            ],
+        };
+        let mut old_files = rustc_hash::FxHashMap::default();
+        old_files.insert("unchanged", "old-unchanged");
+        old_files.insert("changed-a", "old-a");
+        let mut old_chunks = rustc_hash::FxHashSet::default();
+        old_chunks.insert("old-content");
+        let mut seen = CompactChunkNameSet::new();
+        let mut compressed = 0;
+        let mut decompressed = 0;
+        accumulate_diff_manifest_sizes(
+            &old_files,
+            &old_chunks,
+            &first,
+            &mut seen,
+            &mut compressed,
+            &mut decompressed,
+        )
+        .unwrap();
+        accumulate_diff_manifest_sizes(
+            &old_files,
+            &old_chunks,
+            &second,
+            &mut seen,
+            &mut compressed,
+            &mut decompressed,
+        )
+        .unwrap();
+        assert_eq!((compressed, decompressed), (30, 60));
+        assert_eq!(seen.len(), 2);
+    }
+
     #[cfg(feature = "bench-diagnostics")]
     #[test]
     #[ignore = "measures update diff-size planning time"]
@@ -567,6 +800,116 @@ mod tests {
                 owned_elapsed.as_micros(),
                 borrowed_elapsed.as_micros(),
                 owned_result.unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    #[ignore = "compares owned and compact cross-manifest name dedup in update planning"]
+    fn benchmark_diff_size_seen_chunk_set() {
+        use std::time::{Duration, Instant};
+
+        fn calculate_owned(
+            old_files: &rustc_hash::FxHashMap<&str, &str>,
+            old_chunks: &rustc_hash::FxHashSet<&str>,
+            manifests: &[crate::proto_parse::SophonManifestProto],
+        ) -> ((u64, u64), usize) {
+            let mut owned = rustc_hash::FxHashSet::<String>::default();
+            let mut compressed = 0u64;
+            let mut decompressed = 0u64;
+            for new in manifests {
+                for file in &new.assets {
+                    if file.is_directory() {
+                        continue;
+                    }
+                    let changed = match old_files.get(file.asset_name.as_str()) {
+                        Some(old_hash) => *old_hash != file.asset_hash_md5,
+                        None => true,
+                    };
+                    if changed {
+                        for chunk in &file.asset_chunks {
+                            if !old_chunks.contains(chunk.chunk_decompressed_hash_md5.as_str())
+                                && owned.insert(chunk.chunk_name.clone())
+                            {
+                                compressed += chunk.chunk_size;
+                                decompressed += chunk.chunk_size_decompressed;
+                            }
+                        }
+                    }
+                }
+            }
+            ((compressed, decompressed), owned.len())
+        }
+
+        fn calculate_compact(
+            old_files: &rustc_hash::FxHashMap<&str, &str>,
+            old_chunks: &rustc_hash::FxHashSet<&str>,
+            manifests: &[crate::proto_parse::SophonManifestProto],
+        ) -> ((u64, u64), usize) {
+            let mut seen = CompactChunkNameSet::new();
+            let mut compressed = 0u64;
+            let mut decompressed = 0u64;
+            for new in manifests {
+                accumulate_diff_manifest_sizes(
+                    old_files,
+                    old_chunks,
+                    new,
+                    &mut seen,
+                    &mut compressed,
+                    &mut decompressed,
+                )
+                .unwrap();
+            }
+            ((compressed, decompressed), seen.len())
+        }
+
+        for (changed_percent, reused_hash_percent) in [(10usize, 0usize), (50, 50), (100, 90)] {
+            let (old, new) =
+                make_diff_size_benchmark_manifests(5_000, 50, changed_percent, reused_hash_percent);
+            let (old_files, old_chunks) = borrowed_diff_indexes_collect(&old);
+            let mut first_assets = Vec::new();
+            let mut second_assets = Vec::new();
+            for (index, asset) in new.assets.into_iter().enumerate() {
+                if index % 2 == 0 {
+                    first_assets.push(asset);
+                } else {
+                    second_assets.push(asset);
+                }
+            }
+            let manifests = [
+                crate::proto_parse::SophonManifestProto {
+                    assets: first_assets,
+                },
+                crate::proto_parse::SophonManifestProto {
+                    assets: second_assets,
+                },
+            ];
+            let expected = calculate_owned(&old_files, &old_chunks, &manifests);
+            assert_eq!(
+                expected,
+                calculate_compact(&old_files, &old_chunks, &manifests)
+            );
+            let mut elapsed = [Duration::ZERO; 2];
+            let samples_per_policy = 20;
+            for round in 0..samples_per_policy * 2 {
+                for variant in (0..2).cycle().skip(round % 2).take(2) {
+                    let started = Instant::now();
+                    let result = if variant == 0 {
+                        calculate_owned(&old_files, &old_chunks, &manifests)
+                    } else {
+                        calculate_compact(&old_files, &old_chunks, &manifests)
+                    };
+                    elapsed[variant] += started.elapsed();
+                    assert_eq!(result, expected);
+                    std::hint::black_box(result);
+                }
+            }
+            println!(
+                "diff_size_seen_set files=5000 chunks_per_file=50 changed_percent={changed_percent} reused_hash_percent={reused_hash_percent} samples_per_policy={samples_per_policy} owned_ms={:.3} compact_ms={:.3} unique_names={}",
+                elapsed[0].as_secs_f64() * 1000.0,
+                elapsed[1].as_secs_f64() * 1000.0,
+                expected.1,
             );
         }
     }
