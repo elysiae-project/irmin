@@ -136,7 +136,41 @@ impl ChunkBitmap {
 
     /// Checks if all chunks in [start..end) are complete.
     pub fn all_complete_for_range(&self, start: usize, end: usize) -> bool {
-        (start..end).all(|i| self.is_complete(i))
+        if start >= end {
+            return true;
+        }
+        if end > self.total_chunks {
+            return false;
+        }
+
+        let first_word = start / 64;
+        let last_word = (end - 1) / 64;
+        if first_word == last_word {
+            let first_bit = start % 64;
+            let bit_count = end - start;
+            let mask = (u64::MAX >> (64 - bit_count)) << first_bit;
+            return self.bits[first_word].load(Ordering::Acquire) & mask == mask;
+        }
+
+        let first_bit = start % 64;
+        let first_mask = u64::MAX << first_bit;
+        if self.bits[first_word].load(Ordering::Acquire) & first_mask != first_mask {
+            return false;
+        }
+
+        for word_idx in first_word + 1..last_word {
+            if self.bits[word_idx].load(Ordering::Acquire) != u64::MAX {
+                return false;
+            }
+        }
+
+        let last_bit_count = end % 64;
+        if last_bit_count == 0 {
+            self.bits[last_word].load(Ordering::Acquire) == u64::MAX
+        } else {
+            let last_mask = u64::MAX >> (64 - last_bit_count);
+            self.bits[last_word].load(Ordering::Acquire) & last_mask == last_mask
+        }
     }
 
     /// Clears all bits for chunks in `[start..end)`. Each affected word is
@@ -253,6 +287,51 @@ mod tests {
         assert!(bm.all_complete_for_range(3, 7));
         assert!(!bm.all_complete_for_range(2, 7));
         assert!(!bm.all_complete_for_range(3, 8));
+    }
+
+    #[test]
+    fn all_complete_for_range_matches_bitwise_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        for (case_idx, total) in [0usize, 1, 63, 64, 65, 127, 128, 129, 1025]
+            .into_iter()
+            .enumerate()
+        {
+            let bitmap =
+                ChunkBitmap::create(&dir.path().join(format!("range-{case_idx}.bitmap")), total)
+                    .unwrap();
+            for index in 0..total {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if state & 1 != 0 {
+                    bitmap.mark_complete(index);
+                }
+            }
+
+            for _ in 0..500 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let start = state as usize % (total + 3);
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let end = state as usize % (total + 3);
+                let expected = (start..end).all(|index| bitmap.is_complete(index));
+                assert_eq!(bitmap.all_complete_for_range(start, end), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn all_complete_for_range_preserves_empty_reversed_and_out_of_bounds_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap = ChunkBitmap::create(&dir.path().join("range-boundaries.bitmap"), 65).unwrap();
+        assert!(bitmap.all_complete_for_range(0, 0));
+        assert!(bitmap.all_complete_for_range(64, 63));
+        assert!(!bitmap.all_complete_for_range(64, 66));
+        assert!(!bitmap.all_complete_for_range(65, 66));
     }
 
     #[test]
@@ -643,5 +722,70 @@ mod tests {
             ));
         }
         println!("bitmap_clear_range={rows:?}");
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    #[ignore = "measures bitmap range-completion checks"]
+    fn benchmark_all_complete_for_range() {
+        use std::time::Instant;
+
+        fn reference(bitmap: &ChunkBitmap, start: usize, end: usize) -> bool {
+            (start..end).all(|index| bitmap.is_complete(index))
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (1usize, 0usize, 1usize),
+            (63, 0, 63),
+            (64, 0, 64),
+            (65, 1, 65),
+            (1_024, 0, 1_024),
+            (1_024, 1, 1_023),
+            (1_000_000, 0, 1_000_000),
+            (1_000_000, 1, 1_000_000),
+        ];
+        for (case_idx, (total, start, end)) in cases.into_iter().enumerate() {
+            for missing in [None, Some(start), Some(end.saturating_sub(1))] {
+                let bitmap = ChunkBitmap::create(
+                    &dir.path().join(format!("{case_idx}-{missing:?}.bitmap")),
+                    total,
+                )
+                .unwrap();
+                for word in &bitmap.bits {
+                    word.store(u64::MAX, Ordering::Relaxed);
+                }
+                if let Some(index) = missing.filter(|index| *index < total) {
+                    bitmap.bits[index / 64].fetch_and(!(1 << (index % 64)), Ordering::Relaxed);
+                }
+                let expected = reference(&bitmap, start, end);
+                assert_eq!(bitmap.all_complete_for_range(start, end), expected);
+                let repetitions = if total >= 1_000_000 { 5_000 } else { 50_000 };
+                let mut baseline_ns = 0u128;
+                let mut candidate_ns = 0u128;
+                for round in 0..repetitions {
+                    if round % 2 == 0 {
+                        let started = Instant::now();
+                        std::hint::black_box(reference(&bitmap, start, end));
+                        baseline_ns += started.elapsed().as_nanos();
+                        let started = Instant::now();
+                        std::hint::black_box(bitmap.all_complete_for_range(start, end));
+                        candidate_ns += started.elapsed().as_nanos();
+                    } else {
+                        let started = Instant::now();
+                        std::hint::black_box(bitmap.all_complete_for_range(start, end));
+                        candidate_ns += started.elapsed().as_nanos();
+                        let started = Instant::now();
+                        std::hint::black_box(reference(&bitmap, start, end));
+                        baseline_ns += started.elapsed().as_nanos();
+                    }
+                }
+                println!(
+                    "bitmap_range_complete total={total} range={start}..{end} missing={missing:?} repetitions={repetitions} baseline_ns={} candidate_ns={}",
+                    baseline_ns / repetitions as u128,
+                    candidate_ns / repetitions as u128,
+                );
+            }
+        }
     }
 }
