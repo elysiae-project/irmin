@@ -2246,5 +2246,76 @@ fn bench_eager_decompress(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("8m_streaming_full_verify", |b| {
+        b.iter(|| {
+            let out_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&out_path)
+                .unwrap();
+            out_file.set_len(data_size as u64).unwrap();
+            irmin_rs::game_installer::eager_decompress::stream_decompress_to_file(
+                HashingRead::new(&compressed, &comp_hash),
+                &out_file,
+                0,
+                data_size as u64,
+                &decomp_hash,
+            )
+            .unwrap();
+        });
+    });
+
     group.finish();
+}
+
+struct HashingRead<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    hasher: Option<fast_md5::Md5>,
+    expected: &'a str,
+    verified: bool,
+}
+
+impl<'a> HashingRead<'a> {
+    fn new(bytes: &'a [u8], expected: &'a str) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            hasher: Some(fast_md5::Md5::new()),
+            expected,
+            verified: false,
+        }
+    }
+}
+
+impl std::io::Read for HashingRead<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let count = output.len().min(self.bytes.len() - self.offset);
+        output[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+        self.hasher
+            .as_mut()
+            .expect("hash context is available before EOF")
+            .update(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        if count == 0 && !self.verified {
+            self.verified = true;
+            let digest = self
+                .hasher
+                .take()
+                .expect("hash context is available at EOF")
+                .finalize();
+            if hex::encode(digest) != self.expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "compressed MD5 mismatch",
+                ));
+            }
+        }
+        Ok(count)
+    }
 }

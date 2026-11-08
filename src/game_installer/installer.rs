@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1395,6 +1396,224 @@ async fn process_eager_item(
     pending_counts: &[AtomicU32],
     handle: &DownloadHandle,
 ) -> SophonResult<()> {
+    if ctx.verify_mode == super::VerifyMode::Full
+        && !chunk.chunk_compressed_hash_md5.is_empty()
+        && !matches!(chunk.chunk_compressed_hash_md5.len(), 16 | 32)
+    {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported compressed chunk hash length",
+        )));
+    }
+    if chunk.chunk_size < EAGER_STREAM_THRESHOLD {
+        return process_eager_item_oneshot(
+            item,
+            item_idx,
+            chunk,
+            ctx,
+            chunk_entries,
+            chunk_entry_offsets,
+            pending_counts,
+            handle,
+        )
+        .await;
+    }
+    process_eager_item_streaming(
+        item,
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        handle,
+    )
+    .await
+}
+
+const EAGER_STREAM_THRESHOLD: u64 = 16 * 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item_oneshot(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    handle: &DownloadHandle,
+) -> SophonResult<()> {
+    let global_chunk_idx = {
+        let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
+        range.start as usize + item.chunk_idx as usize
+    };
+    if ctx.chunk_bitmap.is_complete(global_chunk_idx) {
+        ctx.downloaded_bytes
+            .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+        if let Some(dc) = ctx.downloaded_chunks.get() {
+            dc[item_idx].store(chunk.chunk_size as u32, Ordering::Relaxed);
+        }
+        notify_eager_file_complete(
+            item_idx,
+            chunk_entries,
+            chunk_entry_offsets,
+            pending_counts,
+            ctx,
+        );
+        return Ok(());
+    }
+
+    let file_idx = item.file_idx as usize;
+    if ctx.output_allocator.get_handle(file_idx).is_none() {
+        let file_name = ctx.all_files.file_name(file_idx);
+        validate_asset_name(file_name)?;
+        ctx.output_allocator.preallocate_file(
+            file_idx,
+            file_name,
+            ctx.all_files.file_size(file_idx),
+        )?;
+    }
+    let client = &ctx.installer_clients[item.installer_idx as usize];
+    let download_info = &ctx.installer_downloads[item.installer_idx as usize];
+    let mut url = String::with_capacity(256);
+    download_info.url_for_into(chunk.chunk_name, &mut url);
+    let mut attempts = 0;
+    let compressed_data = loop {
+        if handle.is_cancelled() {
+            return Err(SophonError::Cancelled);
+        }
+        let response = tokio::select! {
+            biased;
+            _ = handle.cancelled_future() => return Err(SophonError::Cancelled),
+            result = client.get(&url).send() => result,
+        }?
+        .error_for_status()?;
+        if let Some(length) = response.content_length()
+            && length != chunk.chunk_size
+        {
+            return Err(SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_owned(),
+                expected: chunk.chunk_size,
+                actual: length,
+            });
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() as u64 != chunk.chunk_size {
+            let error = SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_owned(),
+                expected: chunk.chunk_size,
+                actual: bytes.len() as u64,
+            };
+            attempts += 1;
+            if attempts >= MAX_RETRIES {
+                return Err(SophonError::DownloadFailed {
+                    chunk: chunk.chunk_name.to_owned(),
+                    attempts: MAX_RETRIES,
+                    error: error.to_string(),
+                });
+            }
+            if cancelable_sleep(handle, retry_delay(attempts))
+                .await
+                .is_err()
+            {
+                return Err(SophonError::Cancelled);
+            }
+            continue;
+        }
+        break bytes;
+    };
+
+    let out_file = ctx
+        .output_allocator
+        .get_handle(file_idx)
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
+    let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
+    let compressed_hash = if skip_hash {
+        ""
+    } else {
+        chunk.chunk_compressed_hash_md5
+    };
+    let decompressed_hash = if skip_hash {
+        ""
+    } else {
+        chunk.chunk_decompressed_hash_md5
+    };
+    let compressed_hash = compressed_hash.to_owned();
+    let decompressed_hash = decompressed_hash.to_owned();
+    let mut attempts = 0;
+    loop {
+        let result = tokio::task::spawn_blocking({
+            let out = Arc::clone(&out_file);
+            let compressed_data = compressed_data.clone();
+            let compressed_hash = compressed_hash.clone();
+            let decompressed_hash = decompressed_hash.clone();
+            let chunk_offset = item.output_offset;
+            let expected_size = chunk.chunk_size_decompressed;
+            move || {
+                super::eager_decompress::eager_decompress_chunk(
+                    &compressed_data,
+                    &out,
+                    chunk_offset,
+                    expected_size,
+                    &compressed_hash,
+                    &decompressed_hash,
+                )
+            }
+        })
+        .await
+        .map_err(SophonError::JoinError)?;
+        match result {
+            Ok(_) => break,
+            Err(error) if error.is_retryable() => {
+                attempts += 1;
+                if attempts >= MAX_HASH_RETRIES {
+                    clear_eager_range(
+                        &out_file,
+                        item.output_offset,
+                        chunk.chunk_size_decompressed,
+                    )?;
+                    return Err(SophonError::DownloadFailed {
+                        chunk: chunk.chunk_name.to_owned(),
+                        attempts,
+                        error: error.to_string(),
+                    });
+                }
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                if cancelable_sleep(handle, retry_delay(attempts))
+                    .await
+                    .is_err()
+                {
+                    return Err(SophonError::Cancelled);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    finish_eager_item(
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        global_chunk_idx,
+        &out_file,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item_streaming(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    handle: &DownloadHandle,
+) -> SophonResult<()> {
     // Check bitmap for resume.
     let global_chunk_idx = {
         let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
@@ -1427,102 +1646,272 @@ async fn process_eager_item(
             .preallocate_file(file_idx, file_name, file_size)?;
     }
 
-    // Download compressed chunk into memory (with retries).
+    // Download and decompress each attempt without retaining the full chunk.
     let client = &ctx.installer_clients[item.installer_idx as usize];
     let download_info = &ctx.installer_downloads[item.installer_idx as usize];
     let mut url = String::with_capacity(256);
     download_info.url_for_into(chunk.chunk_name, &mut url);
-
-    let compressed_data = {
-        let mut attempts: u32 = 0;
-        loop {
-            if handle.is_cancelled() {
-                return Err(SophonError::Cancelled);
-            }
-            let result: SophonResult<_> = async {
-                let resp = client.get(&url).send().await?;
-                if !resp.status().is_success() {
-                    return Err(SophonError::Io(std::io::Error::other(format!(
-                        "HTTP {} for chunk {}",
-                        resp.status(),
-                        chunk.chunk_name
-                    ))));
-                }
-                resp.bytes().await.map_err(SophonError::Http)
-            }
-            .await;
-            match result {
-                Ok(data) => break data,
-                Err(err) => {
-                    if !err.is_retryable() {
-                        return Err(err);
-                    }
-                    attempts += 1;
-                    if attempts >= MAX_RETRIES {
-                        return Err(SophonError::DownloadFailed {
-                            chunk: chunk.chunk_name.to_string(),
-                            attempts: MAX_RETRIES,
-                            error: err.to_string(),
-                        });
-                    }
-                    log::warn!(
-                        "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}): {err}",
-                        chunk.chunk_name,
-                    );
-                    if cancelable_sleep(handle, retry_delay(attempts))
-                        .await
-                        .is_err()
-                    {
-                        return Err(SophonError::Cancelled);
-                    }
-                }
-            }
-        }
-    };
-
-    if handle.is_cancelled() {
-        return Err(SophonError::Cancelled);
-    }
-
-    // Decompress and write to output file.
     let out_file = ctx
         .output_allocator
         .get_handle(file_idx)
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
+    let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
+    let compressed_hash = if skip_hash {
+        ""
+    } else {
+        chunk.chunk_compressed_hash_md5
+    };
+    let decompressed_hash = if skip_hash {
+        ""
+    } else {
+        chunk.chunk_decompressed_hash_md5
+    };
 
-    let _decompressed_bytes = tokio::task::spawn_blocking({
+    if !compressed_hash.is_empty() && !matches!(compressed_hash.len(), 16 | 32) {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported compressed chunk hash length",
+        )));
+    }
+    let mut attempts = 0;
+    loop {
+        if handle.is_cancelled() {
+            return Err(SophonError::Cancelled);
+        }
+        let response = tokio::select! {
+            biased;
+            _ = handle.cancelled_future() => return Err(SophonError::Cancelled),
+            result = client.get(&url).send() => result,
+        }?;
+        let response = response.error_for_status()?;
+        let content_length = response.content_length();
+        if content_length.is_some_and(|length| length > chunk.chunk_size) {
+            clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+            return Err(SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_string(),
+                expected: chunk.chunk_size,
+                actual: content_length.unwrap(),
+            });
+        }
+
+        let mut stream = response.bytes_stream();
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<StreamMessage, std::io::Error>>(8);
         let out = Arc::clone(&out_file);
-        let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
-        let decomp_hash = if skip_hash {
-            String::new()
-        } else {
-            chunk.chunk_decompressed_hash_md5.to_string()
-        };
-        let comp_hash = if skip_hash {
-            String::new()
-        } else {
-            chunk.chunk_compressed_hash_md5.to_string()
-        };
-        let expected_size = chunk.chunk_size_decompressed;
+        let expected_decompressed_size = chunk.chunk_size_decompressed;
         let chunk_offset = item.output_offset;
-        move || {
-            super::eager_decompress::eager_decompress_chunk(
-                &compressed_data,
+        let decompressed_hash = decompressed_hash.to_owned();
+        let decode_task = tokio::task::spawn_blocking(move || {
+            let reader = std::io::BufReader::with_capacity(
+                256 * 1024,
+                ChunkStreamReader {
+                    receiver,
+                    current: None,
+                    offset: 0,
+                    complete: false,
+                },
+            );
+            super::eager_decompress::stream_decompress_to_file(
+                reader,
                 &out,
                 chunk_offset,
-                expected_size,
-                &comp_hash,
-                &decomp_hash,
+                expected_decompressed_size,
+                &decompressed_hash,
             )
-        }
-    })
-    .await
-    .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
+        });
 
-    // Mark chunk in bitmap. Durability is batched: sync_data runs every
-    // CHUNK_STATE_SAVE_INTERVAL chunks (not per-chunk) to amortize the
-    // fdatasync cost across many writes. The per-file sync in
-    // notify_eager_file_complete covers final durability.
+        let mut bytes_received = 0u64;
+        let mut compressed_md5 = (compressed_hash.len() == 32).then(fast_md5::Md5::new);
+        let mut compressed_xxh64 =
+            (compressed_hash.len() == 16).then(super::assembly_opt::take_xxh64);
+        let mut stream_error = None;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = handle.cancelled_future() => {
+                    let _ = sender
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "download cancelled",
+                        )))
+                        .await;
+                    stream_error = Some(SophonError::Cancelled);
+                    break;
+                }
+                item = stream.next() => item,
+            };
+            let Some(result) = next else { break };
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = sender
+                        .send(Err(std::io::Error::other(error.to_string())))
+                        .await;
+                    stream_error = Some(SophonError::Http(error));
+                    break;
+                }
+            };
+            bytes_received = match bytes_received.checked_add(bytes.len() as u64) {
+                Some(total) if total <= chunk.chunk_size => total,
+                Some(total) => {
+                    let _ = sender
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "compressed response exceeds declared size",
+                        )))
+                        .await;
+                    stream_error = Some(SophonError::SizeMismatch {
+                        item: chunk.chunk_name.to_string(),
+                        expected: chunk.chunk_size,
+                        actual: total,
+                    });
+                    break;
+                }
+                None => {
+                    let _ = sender
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "compressed response size overflow",
+                        )))
+                        .await;
+                    stream_error = Some(SophonError::SizeMismatch {
+                        item: chunk.chunk_name.to_string(),
+                        expected: chunk.chunk_size,
+                        actual: u64::MAX,
+                    });
+                    break;
+                }
+            };
+            if let Some(hasher) = compressed_md5.as_mut() {
+                hasher.update(&bytes);
+            }
+            if let Some(hasher) = compressed_xxh64.as_mut() {
+                hasher.update(&bytes);
+            }
+            if sender.send(Ok(StreamMessage::Data(bytes))).await.is_err() {
+                stream_error = Some(SophonError::Io(std::io::Error::other(
+                    "eager decompressor stopped reading response",
+                )));
+                break;
+            }
+        }
+        if stream_error.is_none() && bytes_received != chunk.chunk_size {
+            stream_error = Some(SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_string(),
+                expected: chunk.chunk_size,
+                actual: bytes_received,
+            });
+        }
+        let compressed_hash_mismatch = if stream_error.is_none() {
+            if let Some(hasher) = compressed_md5.take() {
+                let digest = hasher.finalize();
+                !super::assembly_opt::md5_hex_eq(&digest, compressed_hash)
+            } else if let Some(hasher) = compressed_xxh64.take() {
+                let digest = hasher.digest();
+                !super::assembly_opt::xxh64_hex_eq(digest, compressed_hash)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if compressed_hash_mismatch {
+            stream_error = Some(SophonError::Md5Mismatch {
+                item: chunk.chunk_name.to_string(),
+                expected: compressed_hash.to_owned(),
+                actual: String::from("streamed compressed hash mismatch"),
+            });
+        }
+        if stream_error.is_none() {
+            let _ = sender.send(Ok(StreamMessage::Complete)).await;
+        }
+        drop(sender);
+        if let Some(error) = stream_error {
+            drop(stream);
+            drop(decode_task.abort_handle());
+            let _ = decode_task.await;
+            if matches!(error, SophonError::Cancelled) {
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                return Err(error);
+            }
+            if !error.is_retryable() {
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                return Err(error);
+            }
+            attempts += 1;
+            if attempts >= MAX_RETRIES {
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                return Err(SophonError::DownloadFailed {
+                    chunk: chunk.chunk_name.to_string(),
+                    attempts: MAX_RETRIES,
+                    error: error.to_string(),
+                });
+            }
+        } else {
+            match decode_task.await.map_err(SophonError::JoinError)? {
+                Ok(_) => break,
+                Err(error) => {
+                    if !error.is_retryable() {
+                        clear_eager_range(
+                            &out_file,
+                            item.output_offset,
+                            chunk.chunk_size_decompressed,
+                        )?;
+                        return Err(error);
+                    }
+                    attempts += 1;
+                    if attempts >= MAX_RETRIES {
+                        clear_eager_range(
+                            &out_file,
+                            item.output_offset,
+                            chunk.chunk_size_decompressed,
+                        )?;
+                        return Err(SophonError::DownloadFailed {
+                            chunk: chunk.chunk_name.to_string(),
+                            attempts: MAX_RETRIES,
+                            error: error.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        log::warn!(
+            "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}), re-downloading",
+            chunk.chunk_name,
+        );
+        if cancelable_sleep(handle, retry_delay(attempts))
+            .await
+            .is_err()
+        {
+            clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+            return Err(SophonError::Cancelled);
+        }
+    }
+
+    finish_eager_item(
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        global_chunk_idx,
+        &out_file,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_eager_item(
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    global_chunk_idx: usize,
+    out_file: &std::fs::File,
+) -> SophonResult<()> {
     if ctx.verify_mode == super::VerifyMode::Full {
         ctx.chunk_bitmap.mark_complete(global_chunk_idx);
         // Record in `downloaded_chunks` so the periodic state save tracks
@@ -1559,6 +1948,67 @@ async fn process_eager_item(
     );
 
     Ok(())
+}
+
+fn clear_eager_range(file: &std::fs::File, offset: u64, length: u64) -> SophonResult<()> {
+    let zeros = [0u8; 64 * 1024];
+    let mut written = 0u64;
+    while written < length {
+        let count = (length - written).min(zeros.len() as u64) as usize;
+        file.write_all_at(&zeros[..count], offset + written)
+            .map_err(SophonError::Io)?;
+        written += count as u64;
+    }
+    Ok(())
+}
+
+enum StreamMessage {
+    Data(bytes::Bytes),
+    Complete,
+}
+
+struct ChunkStreamReader {
+    receiver: tokio::sync::mpsc::Receiver<Result<StreamMessage, std::io::Error>>,
+    current: Option<bytes::Bytes>,
+    offset: usize,
+    complete: bool,
+}
+
+impl std::io::Read for ChunkStreamReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(current) = self.current.as_ref() {
+                if self.offset < current.len() {
+                    let count = output.len().min(current.len() - self.offset);
+                    output[..count].copy_from_slice(&current[self.offset..self.offset + count]);
+                    self.offset += count;
+                    return Ok(count);
+                }
+                self.current = None;
+                self.offset = 0;
+            }
+            if self.complete {
+                return Ok(0);
+            }
+            match self.receiver.blocking_recv() {
+                Some(Ok(StreamMessage::Data(bytes))) => self.current = Some(bytes),
+                Some(Ok(StreamMessage::Complete)) => {
+                    self.complete = true;
+                    return Ok(0);
+                }
+                Some(Err(error)) => return Err(error),
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "compressed stream ended before validation completed",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// When all eager chunks for a file complete, mark the file done directly
@@ -3486,3 +3936,7 @@ mod tests;
 #[cfg(test)]
 #[path = "repair_tests.rs"]
 mod repair_tests;
+
+#[cfg(test)]
+#[path = "eager_stream_tests.rs"]
+mod eager_stream_tests;

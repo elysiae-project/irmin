@@ -10,7 +10,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 
 use super::assembly_opt::{
-    self, chunk_hash_required, md5_hex_eq, md5_to_hex, return_md5, take_md5, xxh64_hex_eq, Md5,
+    self, Md5, chunk_hash_required, md5_hex_eq, md5_to_hex, return_md5, take_md5, xxh64_hex_eq,
 };
 use super::error::{SophonError, SophonResult};
 
@@ -127,16 +127,16 @@ pub fn eager_decompress_chunk(
     Ok(written as u64)
 }
 
-/// Streaming variant: decompresses from a sync `Read` source directly to the
-/// output file. Avoids buffering the entire compressed chunk in memory.
-/// Used in non-Full verify modes where no compressed hash is needed.
-/// Stream a compressed chunk into a file range, avoiding a full decompressed heap buffer.
+/// Stream a compressed chunk into a file range while checking optional hashes.
 pub fn stream_decompress_to_file(
     reader: impl io::Read,
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
+    decompressed_hash: &str,
 ) -> SophonResult<u64> {
+    let mut reader = reader;
+
     let mut ctx = assembly_opt::take_dctx();
     ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
         .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
@@ -144,43 +144,142 @@ pub fn stream_decompress_to_file(
         assembly_opt::MAX_WINDOW_LOG,
     ))
     .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx WindowLogMax")))?;
-
-    let mut decoder =
-        zstd::Decoder::with_context(io::BufReader::with_capacity(65536, reader), &mut ctx);
-
-    let mut buf = assembly_opt::take_eager_buf();
-    let mut bytes_written: u64 = 0;
-    let mut write_offset = chunk_offset;
-
-    loop {
-        let n = decoder
-            .read(&mut buf)
-            .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
-        if n == 0 {
-            break;
-        }
-
-        out_file
-            .write_all_at(&buf[..n], write_offset)
-            .map_err(SophonError::Io)?;
-
-        write_offset += n as u64;
-        bytes_written += n as u64;
+    let need_decompressed_hash = chunk_hash_required(decompressed_hash);
+    if need_decompressed_hash {
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
     }
 
-    drop(decoder);
-    drop(ctx);
-    assembly_opt::return_eager_buf(buf);
+    let buf = assembly_opt::take_eager_buf();
+    let decompressed_hasher = if need_decompressed_hash {
+        Some(take_md5()?)
+    } else {
+        None
+    };
+    let mut ctx = DctxGuard(Some(ctx));
+    let mut buf = EagerBuffer(Some(buf));
+    let decompressed_hasher = PooledMd5Guard(decompressed_hasher);
+    let mut output = StreamOutput {
+        file: out_file,
+        chunk_offset,
+        expected_size: expected_decompressed_size,
+        write_offset: chunk_offset,
+        bytes_written: 0,
+        hasher: decompressed_hasher,
+    };
+    {
+        let mut decoder = zstd::Decoder::with_context(
+            io::BufReader::with_capacity(256 * 1024, &mut reader),
+            ctx.0.as_mut().expect("decoder context is present"),
+        )
+        .single_frame();
+        read_decompressed(
+            &mut decoder,
+            buf.0.as_mut().expect("eager buffer is present"),
+            &mut output,
+        )?;
+        decoder
+            .finish_frame()
+            .map_err(|error| SophonError::Io(io::Error::other(error.to_string())))?;
+        let _ = decoder.finish();
+    }
 
-    if bytes_written != expected_decompressed_size {
+    if output.bytes_written != expected_decompressed_size {
         return Err(SophonError::SizeMismatch {
             item: format!("stream chunk at offset {chunk_offset}"),
             expected: expected_decompressed_size,
-            actual: bytes_written,
+            actual: output.bytes_written,
         });
     }
 
-    Ok(bytes_written)
+    if let Some(mut hasher) = output.hasher.0.take() {
+        let digest = hasher.finish()?;
+        return_md5(hasher);
+        if !md5_hex_eq(&digest, decompressed_hash) {
+            return Err(SophonError::Md5Mismatch {
+                item: format!("stream chunk decompressed at offset {chunk_offset}"),
+                expected: decompressed_hash.to_string(),
+                actual: md5_to_hex(&digest),
+            });
+        }
+    }
+
+    Ok(output.bytes_written)
+}
+
+struct DctxGuard(Option<zstd::zstd_safe::DCtx<'static>>);
+
+impl Drop for DctxGuard {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.0.take() {
+            assembly_opt::return_dctx(ctx, assembly_opt::MAX_WINDOW_LOG);
+        }
+    }
+}
+
+struct EagerBuffer(Option<Vec<u8>>);
+
+impl Drop for EagerBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.0.take() {
+            assembly_opt::return_eager_buf(buffer);
+        }
+    }
+}
+
+struct PooledMd5Guard(Option<Md5>);
+
+impl Drop for PooledMd5Guard {
+    fn drop(&mut self) {
+        if let Some(hasher) = self.0.take() {
+            return_md5(hasher);
+        }
+    }
+}
+
+struct StreamOutput<'a> {
+    file: &'a File,
+    chunk_offset: u64,
+    expected_size: u64,
+    write_offset: u64,
+    bytes_written: u64,
+    hasher: PooledMd5Guard,
+}
+
+fn read_decompressed(
+    decoder: &mut impl io::Read,
+    buf: &mut [u8],
+    output: &mut StreamOutput<'_>,
+) -> SophonResult<()> {
+    loop {
+        let remaining = output.expected_size.saturating_sub(output.bytes_written);
+        let read_limit = remaining.saturating_add(1).min(buf.len() as u64) as usize;
+        let n = decoder
+            .read(&mut buf[..read_limit])
+            .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
+        if n == 0 {
+            return Ok(());
+        }
+        let next_bytes_written = output
+            .bytes_written
+            .checked_add(n as u64)
+            .ok_or_else(|| SophonError::Io(io::Error::other("decompressed size overflow")))?;
+        if next_bytes_written > output.expected_size {
+            return Err(SophonError::SizeMismatch {
+                item: format!("stream chunk at offset {}", output.chunk_offset),
+                expected: output.expected_size,
+                actual: next_bytes_written,
+            });
+        }
+        output
+            .file
+            .write_all_at(&buf[..n], output.write_offset)
+            .map_err(SophonError::Io)?;
+        if let Some(hasher) = output.hasher.0.as_mut() {
+            hasher.update(&buf[..n])?;
+        }
+        output.write_offset += n as u64;
+        output.bytes_written = next_bytes_written;
+    }
 }
 
 #[cfg(test)]
