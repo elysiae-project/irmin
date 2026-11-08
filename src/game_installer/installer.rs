@@ -650,16 +650,15 @@ async fn build_diff_installers(
 
         match old_by_field.get(new_meta.matching_field.as_str()) {
             Some(old_meta) => {
-                let old_result = super::api::fetch_manifest(
+                let old_manifest = super::api::fetch_manifest_proto(
                     client,
                     &old_meta.manifest_download,
                     &old_meta.manifest.id,
                 )
                 .await?;
 
-                deleted_files.extend(collect_deleted_files(&old_result.manifest, &new_names));
+                deleted_files.extend(collect_deleted_files(&old_manifest, &new_names));
 
-                let old_manifest = old_result.manifest;
                 let gd = game_dir.to_path_buf();
                 let (old_manifest, corrupted_indices) = tokio::task::spawn_blocking(move || {
                     let mut bad: Vec<usize> = Vec::new();
