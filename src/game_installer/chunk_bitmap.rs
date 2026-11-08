@@ -3,8 +3,8 @@
 //! Tracks which chunks have been decompressed and written to their output file.
 //! One bit per chunk index, stored as a file with an 8-byte header.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,31 +47,62 @@ impl ChunkBitmap {
 
     /// Loads an existing bitmap from disk.
     pub fn load(path: &Path) -> io::Result<Self> {
-        let data = fs::read(path)?;
-        if data.len() < 8 {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < 8 {
             return Err(io::Error::other("bitmap file too short"));
         }
 
-        let magic = u32::from_le_bytes(data[..4].try_into().unwrap());
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header).map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                io::Error::other("bitmap file too short")
+            } else {
+                error
+            }
+        })?;
+        let magic = u32::from_le_bytes(header[..4].try_into().unwrap());
         if magic != MAGIC {
             return Err(io::Error::other("invalid bitmap magic"));
         }
 
-        let total_chunks = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        let word_count = total_chunks.div_ceil(64);
-        let expected_len = 8 + word_count * 8;
+        let total_chunks = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let word_count_u64 = u64::from(total_chunks).div_ceil(64);
+        let expected_len = word_count_u64
+            .checked_mul(8)
+            .and_then(|body_len| body_len.checked_add(8))
+            .ok_or_else(|| io::Error::other("bitmap size overflow"))?;
 
-        if data.len() < expected_len {
+        if file_len < expected_len {
             return Err(io::Error::other("bitmap file truncated"));
         }
 
-        let bits: Vec<AtomicU64> = (0..word_count)
-            .map(|i| {
-                let offset = 8 + i * 8;
-                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                AtomicU64::new(word)
-            })
-            .collect();
+        let total_chunks = usize::try_from(total_chunks)
+            .map_err(|_| io::Error::other("bitmap chunk count does not fit memory"))?;
+        let word_count = usize::try_from(word_count_u64)
+            .map_err(|_| io::Error::other("bitmap word count does not fit memory"))?;
+        let mut bits = Vec::with_capacity(word_count);
+        let body_bytes = usize::try_from(word_count_u64 * 8)
+            .map_err(|_| io::Error::other("bitmap size does not fit memory"))?;
+        let mut buffer = vec![0u8; body_bytes.min(64 * 1024)];
+        let mut remaining_words = word_count;
+        while remaining_words > 0 {
+            let words = remaining_words.min(buffer.len() / 8);
+            let bytes = &mut buffer[..words * 8];
+            file.read_exact(bytes).map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    io::Error::other("bitmap file truncated")
+                } else {
+                    error
+                }
+            })?;
+            bits.extend(
+                bytes
+                    .chunks_exact(8)
+                    .map(|word| AtomicU64::new(u64::from_le_bytes(word.try_into().unwrap()))),
+            );
+            remaining_words -= words;
+        }
 
         Ok(Self {
             bits,
@@ -160,6 +191,8 @@ impl ChunkBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "bench-diagnostics")]
+    use std::fs;
 
     #[test]
     fn create_and_mark() {
@@ -300,6 +333,104 @@ mod tests {
         data[4..8].copy_from_slice(&100u32.to_le_bytes()); // claims 100 chunks
         std::fs::write(&path, &data).unwrap();
         assert!(ChunkBitmap::load(&path).is_err());
+
+        let mut huge_header = [0u8; 8];
+        huge_header[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        huge_header[4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, huge_header).unwrap();
+        assert!(ChunkBitmap::load(&path).is_err());
+    }
+
+    #[test]
+    fn load_accepts_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.bitmap");
+        let bitmap = ChunkBitmap::create(&path, 65).unwrap();
+        bitmap.mark_complete(64);
+        bitmap.sync().unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[1, 2, 3, 4]).unwrap();
+
+        let loaded = ChunkBitmap::load(&path).unwrap();
+        assert_eq!(loaded.total_chunks(), 65);
+        assert!(loaded.is_complete(64));
+    }
+
+    #[test]
+    fn load_empty_bitmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bitmap");
+        ChunkBitmap::create(&path, 0).unwrap();
+
+        let loaded = ChunkBitmap::load(&path).unwrap();
+        assert_eq!(loaded.total_chunks(), 0);
+        assert_eq!(loaded.count_complete(), 0);
+    }
+
+    #[test]
+    fn load_bitmap_across_multiple_read_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi-block.bitmap");
+        let bitmap = ChunkBitmap::create(&path, 64 * 10_000).unwrap();
+        for index in [0, 64 * 8191, 64 * 8192, 64 * 9999] {
+            bitmap.mark_complete(index);
+        }
+        bitmap.sync().unwrap();
+
+        let loaded = ChunkBitmap::load(&path).unwrap();
+        assert_eq!(loaded.total_chunks(), 64 * 10_000);
+        for index in [0, 64 * 8191, 64 * 8192, 64 * 9999] {
+            assert!(loaded.is_complete(index));
+        }
+        assert!(!loaded.is_complete(1));
+    }
+
+    #[test]
+    fn load_rejects_body_truncated_after_a_read_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated-multi-block.bitmap");
+        let total_chunks = 64 * 10_000;
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&MAGIC.to_le_bytes()).unwrap();
+        file.write_all(&(total_chunks as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&vec![0; 64 * 1024 + 8]).unwrap();
+
+        assert!(
+            ChunkBitmap::load(&path)
+                .is_err_and(|error| { error.to_string() == "bitmap file truncated" })
+        );
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    #[ignore = "measures bitmap load time and process VmHWM"]
+    fn benchmark_load_bitmap_fixture() {
+        use std::time::Instant;
+
+        fn vm_hwm_kib() -> Option<u64> {
+            let status = fs::read_to_string("/proc/self/status").ok()?;
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse().ok())
+            })
+        }
+
+        let path = std::env::var_os("IRMIN_BITMAP_BENCH_PATH")
+            .expect("IRMIN_BITMAP_BENCH_PATH must point to a prepared bitmap file");
+        let before_hwm = vm_hwm_kib();
+        let started = Instant::now();
+        let bitmap = ChunkBitmap::load(Path::new(&path)).unwrap();
+        let elapsed = started.elapsed();
+        let after_hwm = vm_hwm_kib();
+        println!(
+            "bitmap_load chunks={} bytes={} elapsed_ms={} hwm_before_kib={before_hwm:?} hwm_after_kib={after_hwm:?}",
+            bitmap.total_chunks(),
+            fs::metadata(&path).unwrap().len(),
+            elapsed.as_millis(),
+        );
+        std::hint::black_box(bitmap.count_complete());
     }
 
     #[test]
