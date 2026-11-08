@@ -609,13 +609,74 @@ fn bench_compact_manifest_build(c: &mut Criterion) {
 const LOOKUP_CHUNKS: usize = 10000;
 
 /// ChunkNameLookup binary search throughput (the actual chunk resolution path).
+fn write_eytzinger(sorted: &[u32], layout: &mut [u32], source: &mut usize, node: usize) {
+    if node >= layout.len() {
+        return;
+    }
+    write_eytzinger(sorted, layout, source, node * 2 + 1);
+    layout[node] = sorted[*source];
+    *source += 1;
+    write_eytzinger(sorted, layout, source, node * 2 + 2);
+}
+
+fn eytzinger_lookup_by<'a>(
+    layout: &[u32],
+    query: &str,
+    name_at: impl Fn(usize) -> &'a str,
+) -> Option<usize> {
+    let mut node = 0usize;
+    while node < layout.len() {
+        let index = layout[node] as usize;
+        match name_at(index).cmp(query) {
+            std::cmp::Ordering::Equal => return Some(index),
+            std::cmp::Ordering::Less => node = node * 2 + 2,
+            std::cmp::Ordering::Greater => node = node * 2 + 1,
+        }
+    }
+    None
+}
+
 fn bench_chunk_lookup(c: &mut Criterion) {
+    for count in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+        let owned: Vec<String> = (0..count)
+            .map(|index| format!("name_{:04}", (index / 2) * 4))
+            .collect();
+        let names: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let interior_miss = if count > 1 {
+            "name_0002".to_owned()
+        } else {
+            "name_9999".to_owned()
+        };
+        let mut indices: Vec<u32> = (0..count as u32).collect();
+        indices.sort_by(|&a, &b| names[a as usize].cmp(names[b as usize]));
+        let mut layout = vec![0u32; count];
+        let mut source = 0usize;
+        write_eytzinger(&indices, &mut layout, &mut source, 0);
+        for query in names
+            .iter()
+            .copied()
+            .chain(["", "name_9999", interior_miss.as_str()])
+        {
+            let expected = names.iter().position(|name| *name == query);
+            assert_eq!(
+                eytzinger_lookup_by(&layout, query, |index| names[index]).map(|index| names[index]),
+                expected.map(|index| names[index])
+            );
+        }
+    }
+
     let names: Vec<String> = (0..LOOKUP_CHUNKS)
         .map(|i| format!("chunk_{i:08}"))
         .collect();
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let arena = StringArena::from(name_refs.as_slice());
     let lookup = ChunkNameLookup::from_arena(arena);
+    let mut indices: Vec<u32> = (0..LOOKUP_CHUNKS as u32).collect();
+    indices.sort_by(|&a, &b| lookup.get(a as usize).cmp(lookup.get(b as usize)));
+    let mut eytzinger = vec![0u32; indices.len()];
+    let mut source = 0usize;
+    write_eytzinger(&indices, &mut eytzinger, &mut source, 0);
+
     let mut shuffled_indices: Vec<usize> = (0..LOOKUP_CHUNKS).collect();
     let mut state = 0x9e37_79b9u32;
     for i in (1..shuffled_indices.len()).rev() {
@@ -690,6 +751,51 @@ fn bench_chunk_lookup(c: &mut Criterion) {
             let mut found = 0usize;
             for name in &mixed_queries {
                 if lookup.lookup(name).is_some() {
+                    found += 1;
+                }
+            }
+            std::hint::black_box(found);
+        });
+    });
+
+    assert_eq!(
+        mixed_queries
+            .iter()
+            .filter(|name| {
+                eytzinger_lookup_by(&eytzinger, name, |index| lookup.get(index)).is_some()
+            })
+            .count(),
+        LOOKUP_CHUNKS / 2
+    );
+    assert_eq!(
+        shuffled_hits
+            .iter()
+            .filter(
+                |name| eytzinger_lookup_by(&eytzinger, name, |index| lookup.get(index)).is_some()
+            )
+            .count(),
+        LOOKUP_CHUNKS
+    );
+    assert!(shuffled_hits.iter().all(|name| {
+        eytzinger_lookup_by(&eytzinger, name, |index| lookup.get(index))
+            .is_some_and(|index| lookup.get(index) == *name)
+    }));
+    group.bench_function("eytzinger_shuffled_hits_10000", |b| {
+        b.iter(|| {
+            let mut found = 0usize;
+            for name in &shuffled_hits {
+                if eytzinger_lookup_by(&eytzinger, name, |index| lookup.get(index)).is_some() {
+                    found += 1;
+                }
+            }
+            std::hint::black_box(found);
+        });
+    });
+    group.bench_function("eytzinger_mixed_hits_boundary_misses_10000", |b| {
+        b.iter(|| {
+            let mut found = 0usize;
+            for name in &mixed_queries {
+                if eytzinger_lookup_by(&eytzinger, name, |index| lookup.get(index)).is_some() {
                     found += 1;
                 }
             }
