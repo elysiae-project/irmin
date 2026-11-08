@@ -536,6 +536,28 @@ fn atomic_write_serialized<T: serde::Serialize>(target: &Path, value: &T) {
     let temp_file = StateTempFile::new(tmp);
     let write_result = (|| -> std::io::Result<()> {
         let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+        // Resume state is machine-readable; compact JSON reduces checkpoint writes.
+        serde_json::to_writer(&mut writer, value).map_err(std::io::Error::other)?;
+        writer.flush()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        return;
+    }
+    let _ = temp_file.commit(target);
+}
+
+#[cfg(all(test, feature = "bench-diagnostics"))]
+fn atomic_write_pretty_serialized<T: serde::Serialize>(target: &Path, value: &T) {
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok((tmp, file)) = create_state_temp_file(target) else {
+        return;
+    };
+    let temp_file = StateTempFile::new(tmp);
+    let write_result = (|| -> std::io::Result<()> {
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
         serde_json::to_writer_pretty(&mut writer, value).map_err(std::io::Error::other)?;
         writer.flush()?;
         Ok(())
@@ -616,10 +638,20 @@ mod tests {
                     let owned = serde_json::to_vec_pretty(&state).unwrap();
                     let borrowed = serde_json::to_vec_pretty(&view).unwrap();
                     assert_eq!(owned, borrowed);
-                    let decoded: DownloadState = serde_json::from_slice(&borrowed).unwrap();
+                    let compact = serde_json::to_vec(&view).unwrap();
+                    assert!(!compact.contains(&b'\n'));
+                    let decoded: DownloadState = serde_json::from_slice(&compact).unwrap();
+                    assert_eq!(decoded.game_id, state.game_id);
+                    assert_eq!(decoded.vo_lang, state.vo_lang);
+                    assert_eq!(decoded.output_path, state.output_path);
                     assert_eq!(decoded.download_type, state.download_type);
                     assert_eq!(decoded.current_tag, state.current_tag);
+                    assert_eq!(decoded.manifest_hash, state.manifest_hash);
                     assert_eq!(decoded.downloaded_chunks, state.downloaded_chunks);
+                    assert_eq!(
+                        serde_json::to_value(decoded.completed_files).unwrap(),
+                        serde_json::json!([])
+                    );
                 }
             }
         }
@@ -719,10 +751,20 @@ mod tests {
             let expected_json = serde_json::to_vec_pretty(&state).unwrap();
             let view_json = serde_json::to_vec_pretty(&state_view).unwrap();
             assert_eq!(expected_json, view_json);
+            let compact_json = serde_json::to_vec(&state_view).unwrap();
+            let compact_state: DownloadState = serde_json::from_slice(&compact_json).unwrap();
+            assert_eq!(compact_state.downloaded_chunks, state.downloaded_chunks);
+            assert_eq!(compact_state.download_type, state.download_type);
+            assert_eq!(compact_state.current_tag, state.current_tag);
 
             if let Ok(mode) = std::env::var("IRMIN_STATE_BENCH_MODE") {
-                assert!(matches!(mode.as_str(), "baseline" | "stream"));
+                assert!(matches!(mode.as_str(), "baseline" | "pretty" | "compact"));
                 let before = vm_hwm_kib();
+                let mode_json_bytes = if mode == "compact" {
+                    compact_json.len()
+                } else {
+                    expected_json.len()
+                };
                 if mode == "baseline" {
                     let owned_state = DownloadState {
                         game_id: state.game_id.clone(),
@@ -736,13 +778,15 @@ mod tests {
                     };
                     let json = serde_json::to_vec_pretty(&owned_state).unwrap();
                     atomic_write(&path, &json);
+                } else if mode == "pretty" {
+                    atomic_write_pretty_serialized(&path, &state_view);
                 } else {
                     atomic_write_serialized(&path, &state_view);
                 }
                 let after = vm_hwm_kib();
                 println!(
                     "download_state_peak mode={mode} entries={entry_count} json_bytes={} hwm_before_kib={before:?} hwm_after_kib={after:?}",
-                    expected_json.len(),
+                    mode_json_bytes,
                 );
                 std::hint::black_box(std::fs::metadata(&path).unwrap().len());
                 continue;
@@ -750,39 +794,73 @@ mod tests {
 
             let mut baseline_elapsed = Vec::with_capacity(iterations);
             let mut streaming_elapsed = Vec::with_capacity(iterations);
+            let mut compact_elapsed = Vec::with_capacity(iterations);
             for round in 0..iterations {
-                for streaming in [round % 2 == 1, round % 2 == 0] {
+                let order = if round % 2 == 0 {
+                    [0usize, 1, 2]
+                } else {
+                    [2usize, 1, 0]
+                };
+                for variant in order {
                     let started = Instant::now();
-                    if streaming {
-                        atomic_write_serialized(&path, &state_view);
-                        streaming_elapsed.push(started.elapsed());
-                    } else {
-                        let owned_state = DownloadState {
-                            game_id: state.game_id.clone(),
-                            vo_lang: state.vo_lang.clone(),
-                            output_path: state.output_path.clone(),
-                            download_type: state.download_type.clone(),
-                            current_tag: state.current_tag.clone(),
-                            manifest_hash: state.manifest_hash.clone(),
-                            downloaded_chunks: state.downloaded_chunks.clone(),
-                            completed_files: CompletedFiles::default(),
-                        };
-                        let json = serde_json::to_vec_pretty(&owned_state).unwrap();
-                        atomic_write(&path, &json);
-                        baseline_elapsed.push(started.elapsed());
+                    match variant {
+                        0 => {
+                            let owned_state = DownloadState {
+                                game_id: state.game_id.clone(),
+                                vo_lang: state.vo_lang.clone(),
+                                output_path: state.output_path.clone(),
+                                download_type: state.download_type.clone(),
+                                current_tag: state.current_tag.clone(),
+                                manifest_hash: state.manifest_hash.clone(),
+                                downloaded_chunks: state.downloaded_chunks.clone(),
+                                completed_files: CompletedFiles::default(),
+                            };
+                            let json = serde_json::to_vec_pretty(&owned_state).unwrap();
+                            atomic_write(&path, &json);
+                            baseline_elapsed.push(started.elapsed());
+                        }
+                        1 => {
+                            atomic_write_pretty_serialized(&path, &state_view);
+                            streaming_elapsed.push(started.elapsed());
+                        }
+                        _ => {
+                            atomic_write_serialized(&path, &state_view);
+                            compact_elapsed.push(started.elapsed());
+                        }
                     }
                 }
             }
-            assert_eq!(std::fs::read(&path).unwrap(), expected_json);
+            let output: DownloadState =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(output.game_id, state.game_id);
+            assert_eq!(output.vo_lang, state.vo_lang);
+            assert_eq!(output.output_path, state.output_path);
+            assert_eq!(output.downloaded_chunks, state.downloaded_chunks);
+            assert_eq!(output.download_type, state.download_type);
+            assert_eq!(output.current_tag, state.current_tag);
+            assert_eq!(output.manifest_hash, state.manifest_hash);
+            assert_eq!(
+                serde_json::to_value(output.completed_files).unwrap(),
+                serde_json::json!([])
+            );
             let median = |samples: &mut [std::time::Duration]| {
                 samples.sort_unstable();
                 samples[samples.len() / 2]
             };
+            let p95 = |samples: &mut [std::time::Duration]| {
+                samples.sort_unstable();
+                samples[samples.len() * 95 / 100]
+            };
             println!(
-                "download_state_snapshot entries={entry_count} iterations={iterations} json_bytes={} baseline_median_ms={} streaming_median_ms={}",
+                "download_state_snapshot entries={entry_count} iterations={iterations} pretty_bytes={} compact_bytes={} baseline_median_ms={} streaming_median_ms={} compact_median_ms={} baseline_p95_ms={} stream_p95_ms={} compact_p95_ms={}",
                 expected_json.len(),
+                compact_json.len(),
                 median(&mut baseline_elapsed).as_micros() as f64 / 1000.0,
                 median(&mut streaming_elapsed).as_micros() as f64 / 1000.0,
+                median(&mut compact_elapsed).as_micros() as f64 / 1000.0,
+                p95(&mut baseline_elapsed).as_micros() as f64 / 1000.0,
+                p95(&mut streaming_elapsed).as_micros() as f64 / 1000.0,
+                p95(&mut compact_elapsed).as_micros() as f64 / 1000.0,
             );
         }
     }
