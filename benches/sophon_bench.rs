@@ -26,6 +26,7 @@ use irmin_rs::game_installer::{
     installer::ChunkNameLookup,
     sysio, VerifyMode,
 };
+use irmin_rs::manifest::compute_content_manifest_hash;
 use irmin_rs::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 
 /// Fill a file with `mib` MiB of byte `fill`.
@@ -1190,6 +1191,31 @@ fn bench_protobuf_decode(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_manifest_content_hash(c: &mut Criterion) {
+    let encoded = gen_protobuf_manifest(PROTO_FILES, PROTO_CHUNKS_PER_FILE);
+    let manifest = SophonManifestProto::decode(encoded.as_slice()).unwrap();
+    let mut group = c.benchmark_group("manifest_content_hash");
+    group.throughput(Throughput::Elements(
+        (PROTO_FILES * PROTO_CHUNKS_PER_FILE) as u64,
+    ));
+    group.bench_function("hash_5000x50", |b| {
+        b.iter(|| std::hint::black_box(compute_content_manifest_hash(&manifest)));
+    });
+    group.bench_function("decode_and_hash_5000x50", |b| {
+        b.iter(|| {
+            let decoded = SophonManifestProto::decode(encoded.as_slice()).unwrap();
+            std::hint::black_box(compute_content_manifest_hash(&decoded))
+        });
+    });
+    group.bench_function("decode_only_5000x50", |b| {
+        b.iter(|| {
+            let decoded = SophonManifestProto::decode(encoded.as_slice()).unwrap();
+            std::hint::black_box(decoded);
+        });
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Buffer pool benchmark
 // ---------------------------------------------------------------------------
@@ -2214,6 +2240,7 @@ criterion_group!(
     bench_varint_decode,
     bench_cover_stream_decode,
     bench_protobuf_decode,
+    bench_manifest_content_hash,
     bench_buffer_pool,
     bench_hdiffpatch_e2e,
     bench_v20_cover_shapes,

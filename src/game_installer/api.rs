@@ -91,6 +91,16 @@ pub async fn fetch_manifest(
     dl: &DownloadInfo,
     manifest_id: &str,
 ) -> SophonResult<ManifestWithHash> {
+    let manifest = fetch_manifest_proto(client, dl, manifest_id).await?;
+    let hash = compute_content_manifest_hash(&manifest);
+    Ok(ManifestWithHash { manifest, hash })
+}
+
+pub(crate) async fn fetch_manifest_proto(
+    client: &Client,
+    dl: &DownloadInfo,
+    manifest_id: &str,
+) -> SophonResult<SophonManifestProto> {
     let url = dl.url_for(manifest_id);
 
     let resp = tokio::time::timeout(Duration::from_secs(30), client.get(&url).send())
@@ -115,8 +125,93 @@ pub async fn fetch_manifest(
     } else {
         decode_manifest(&bytes).map_err(SophonError::ManifestDecode)?
     };
-    let hash = compute_content_manifest_hash(&manifest);
-    Ok(ManifestWithHash { manifest, hash })
+    Ok(manifest)
+}
+
+#[cfg(test)]
+mod manifest_fetch_tests {
+    use super::*;
+    use crate::api_scrape::Compression;
+    use crate::proto_parse::SophonManifestAssetProperty;
+    use prost::Message;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn proto_only_fetch_matches_hashed_fetch() {
+        let server = MockServer::start().await;
+        let manifest = SophonManifestProto {
+            assets: vec![SophonManifestAssetProperty {
+                asset_name: "data.bin".into(),
+                asset_chunks: vec![],
+                asset_type: 0,
+                asset_size: 12,
+                asset_hash_md5: "0123456789abcdef0123456789abcdef".into(),
+            }],
+        };
+        Mock::given(path("/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest.encode_to_vec()))
+            .mount(&server)
+            .await;
+        let download = DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: server.uri(),
+            url_suffix: String::new(),
+        };
+        let client = Client::new();
+
+        let proto = fetch_manifest_proto(&client, &download, "manifest")
+            .await
+            .unwrap();
+        let fetched = fetch_manifest(&client, &download, "manifest")
+            .await
+            .unwrap();
+
+        assert_eq!(proto.assets, manifest.assets);
+        assert_eq!(fetched.manifest.assets, manifest.assets);
+        assert_eq!(fetched.hash, compute_content_manifest_hash(&manifest));
+    }
+
+    #[tokio::test]
+    async fn proto_only_fetch_matches_hashed_fetch_for_zstd() {
+        let server = MockServer::start().await;
+        let manifest = SophonManifestProto {
+            assets: vec![SophonManifestAssetProperty {
+                asset_name: "data.bin".into(),
+                asset_chunks: vec![],
+                asset_type: 0,
+                asset_size: 12,
+                asset_hash_md5: "0123456789abcdef0123456789abcdef".into(),
+            }],
+        };
+        let encoded = manifest.encode_to_vec();
+        let compressed = zstd::stream::encode_all(encoded.as_slice(), 1).unwrap();
+        Mock::given(path("/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed))
+            .mount(&server)
+            .await;
+        let download = DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::Zstd,
+            url_prefix: server.uri(),
+            url_suffix: String::new(),
+        };
+        let client = Client::new();
+
+        let proto = fetch_manifest_proto(&client, &download, "manifest")
+            .await
+            .unwrap();
+        let fetched = fetch_manifest(&client, &download, "manifest")
+            .await
+            .unwrap();
+
+        assert_eq!(proto.assets, manifest.assets);
+        assert_eq!(fetched.manifest.assets, manifest.assets);
+        assert_eq!(fetched.hash, compute_content_manifest_hash(&manifest));
+    }
 }
 
 /// Fetch the current build or a specific tag from a package branch.

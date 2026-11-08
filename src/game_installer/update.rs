@@ -227,25 +227,27 @@ pub async fn fetch_diff_sizes(
 
         let matching_field = new_meta.matching_field.clone();
 
-        let (new_response, old_manifest) = tokio::try_join!(
-            super::api::fetch_manifest(client, &new_meta.manifest_download, &new_meta.manifest.id),
+        let (new_manifest, old_manifest) = tokio::try_join!(
+            super::api::fetch_manifest_proto(
+                client,
+                &new_meta.manifest_download,
+                &new_meta.manifest.id,
+            ),
             async {
                 match old_map.get(&matching_field) {
-                    Some(old_meta) => super::api::fetch_manifest(
+                    Some(old_meta) => super::api::fetch_manifest_proto(
                         client,
                         &old_meta.manifest_download,
                         &old_meta.manifest.id,
                     )
                     .await
-                    .map(|response| Some(response.manifest)),
+                    .map(Some),
                     None => {
                         Ok::<Option<crate::proto_parse::SophonManifestProto>, SophonError>(None)
                     }
                 }
             }
         )?;
-        let new_manifest = new_response.manifest;
-
         let old_files_md5: rustc_hash::FxHashMap<&str, &str> = old_manifest
             .as_ref()
             .into_iter()
