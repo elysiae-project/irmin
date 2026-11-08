@@ -2138,7 +2138,7 @@ where
         log::warn!("{message}");
         updater(SophonProgress::Warning { message });
     }
-    let download_over_context = DownloadOverContext::from_snapshot(snapshot);
+    let download_over_context = Arc::new(DownloadOverContext::from_snapshot(snapshot));
 
     let chunks_dir = patching_chunk_dir(game_dir);
     let total_files = state.patch_assets.len() as u64;
@@ -2151,7 +2151,7 @@ where
     filter_patch_assets_for_removed_features(&filter_cache, &mut state.patch_assets);
 
     let regenerate_pkg_version = if state.game_id == "hk4e" {
-        Some(download_over_context.clone())
+        Some(Arc::clone(&download_over_context))
     } else {
         None
     };
@@ -3176,7 +3176,7 @@ fn apply_hdiff_patch_from_files(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DownloadOverContext {
     manifests: rustc_hash::FxHashMap<String, (DownloadInfo, SophonManifestProto)>,
 }

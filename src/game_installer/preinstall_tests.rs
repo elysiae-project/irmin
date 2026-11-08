@@ -106,6 +106,134 @@ fn benchmark_original_hash_mismatch_validation() {
     );
 }
 
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures DownloadOver context clone cost and resident memory"]
+fn benchmark_download_over_context_clone() {
+    use std::time::Instant;
+
+    let asset_count = std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_ASSETS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50_000);
+    let chunks_per_asset = std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_CHUNKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
+    let mut assets = Vec::with_capacity(asset_count);
+    for asset_index in 0..asset_count {
+        let mut chunks = Vec::with_capacity(chunks_per_asset);
+        for chunk_index in 0..chunks_per_asset {
+            chunks.push(SophonManifestAssetChunk {
+                chunk_name: format!("chunk-{asset_index:06}-{chunk_index:02}"),
+                chunk_decompressed_hash_md5: format!("{asset_index:016x}{chunk_index:016x}"),
+                chunk_on_file_offset: (chunk_index * 1024 * 1024) as u64,
+                chunk_size: 256 * 1024,
+                chunk_size_decompressed: 1024 * 1024,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: format!("{chunk_index:032x}"),
+                chunk_old_offset: -1,
+            });
+        }
+        assets.push(SophonManifestAssetProperty {
+            asset_name: format!("GameData/StreamingAssets/Persistent/{asset_index:08}.bundle"),
+            asset_chunks: chunks,
+            asset_type: 0,
+            asset_size: (chunks_per_asset * 1024 * 1024) as u64,
+            asset_hash_md5: format!("{asset_index:032x}"),
+        });
+    }
+    let snapshot = TargetSnapshot {
+        version: 1,
+        game_id: "hk4e_global".to_owned(),
+        vo_lang: "en-us".to_owned(),
+        installed_tag: "source".to_owned(),
+        tag: "target".to_owned(),
+        build_id: "synthetic".to_owned(),
+        legacy_coverage: false,
+        manifests: vec![TargetManifest {
+            matching_field: "game".to_owned(),
+            manifest_id: "synthetic-manifest".to_owned(),
+            chunk_download: make_download_info(),
+            manifest: SophonManifestProto { assets },
+        }],
+        digest: String::new(),
+    };
+    let context = DownloadOverContext::from_snapshot(&snapshot);
+    let baseline_rss = read_process_rss();
+    let shared = std::sync::Arc::new(context);
+    let clone_mode = std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_CLONE")
+        .unwrap_or_else(|_| "deep".to_owned());
+    let started = Instant::now();
+    let retained = match clone_mode.as_str() {
+        "deep" => {
+            let clone = DownloadOverContext {
+                manifests: shared.manifests.clone(),
+            };
+            std::hint::black_box(&clone);
+            CloneStorage::Deep(Box::new(clone))
+        }
+        "arc" => {
+            let clone = std::sync::Arc::clone(&shared);
+            std::hint::black_box(&clone);
+            CloneStorage::Shared(clone)
+        }
+        other => panic!("unsupported clone mode: {other}"),
+    };
+    let elapsed = started.elapsed();
+    let clone_rss = read_process_rss();
+    assert_eq!(retained.manifest_count(), 1);
+    assert_eq!(
+        retained.asset_count(),
+        asset_count,
+        "clone must preserve all target assets"
+    );
+    println!(
+        "download_over_context_clone mode={clone_mode} assets={asset_count} chunks_per_asset={chunks_per_asset} baseline_rss_kib={baseline_rss} clone_ms={:.3} clone_rss_kib={clone_rss}",
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+#[cfg(feature = "bench-diagnostics")]
+enum CloneStorage {
+    Deep(Box<DownloadOverContext>),
+    Shared(std::sync::Arc<DownloadOverContext>),
+}
+
+#[cfg(feature = "bench-diagnostics")]
+impl CloneStorage {
+    fn manifest_count(&self) -> usize {
+        match self {
+            Self::Deep(context) => context.manifests.len(),
+            Self::Shared(context) => context.manifests.len(),
+        }
+    }
+
+    fn asset_count(&self) -> usize {
+        match self {
+            Self::Deep(context) => context.manifests["game"].1.assets.len(),
+            Self::Shared(context) => context.manifests["game"].1.assets.len(),
+        }
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn read_process_rss() -> u64 {
+    let mut status = String::new();
+    std::fs::File::open("/proc/self/status")
+        .unwrap()
+        .read_to_string(&mut status)
+        .unwrap();
+    status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or_default()
+}
+
 #[test]
 fn insert_unique_chunk_name_skips_duplicate_owned_key() {
     let mut seen = rustc_hash::FxHashSet::default();
