@@ -72,6 +72,18 @@ fn eager_stream_threshold_preserves_small_one_shot_path() {
     assert_eq!(super::EAGER_STREAM_THRESHOLD, 16 * 1024 * 1024);
     assert!(super::EAGER_STREAM_THRESHOLD > 8 * 1024 * 1024);
     assert!(super::EAGER_STREAM_THRESHOLD <= 64 * 1024 * 1024);
+    assert!(!super::should_stream_eager(
+        super::EAGER_STREAM_THRESHOLD - 1,
+        None
+    ));
+    assert!(super::should_stream_eager(
+        super::EAGER_STREAM_THRESHOLD,
+        None
+    ));
+    assert!(!super::should_stream_eager(
+        super::EAGER_STREAM_THRESHOLD,
+        Some(false)
+    ));
 }
 
 fn rss_high_water_kib() -> u64 {
@@ -158,6 +170,265 @@ async fn eager_streaming_download_verifies_hashes_and_marks_bitmap() {
     .unwrap();
     assert!(ctx.chunk_bitmap.is_complete(0));
     assert_eq!(fs::read(dir.path().join("eager.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+#[ignore = "measures actual loopback eager installer concurrency RSS"]
+async fn benchmark_eager_loopback_concurrent_rss() {
+    use futures_util::stream;
+    use http_body_util::StreamBody;
+    use hyper::body::{Frame, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use std::net::TcpListener as StdTcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let concurrency = std::env::var("IRMIN_EAGER_BENCH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4);
+    let size_mib = std::env::var("IRMIN_EAGER_BENCH_SIZE_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(32);
+    assert!((1..=16).contains(&concurrency));
+    assert!((17..=128).contains(&size_mib));
+    let mode = std::env::var("IRMIN_EAGER_BENCH_MODE").unwrap_or_else(|_| "stream".to_owned());
+    let force_streaming = match mode.as_str() {
+        "stream" => true,
+        "oneshot" => false,
+        _ => panic!("IRMIN_EAGER_BENCH_MODE must be stream or oneshot"),
+    };
+    let queue_capacity = std::env::var("IRMIN_EAGER_BENCH_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
+    assert!(queue_capacity > 0);
+
+    let mut state = 0xBAD5EEDu64;
+    let data = (0..size_mib * 1024 * 1024)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+        })
+        .collect::<Vec<_>>();
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.window_log(25).unwrap();
+    encoder.write_all(&data).unwrap();
+    let compressed = bytes::Bytes::from(encoder.finish().unwrap());
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let decompressed_hash = hex::encode(fast_md5::digest(&data));
+    drop(data);
+
+    let (address_tx, address_rx) = mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_body = compressed.clone();
+    let server = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            let mut shutdown = Box::pin(shutdown_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => break,
+                    accepted = listener.accept() => {
+                        let (socket, _) = accepted.unwrap();
+                        let body_bytes = server_body.clone();
+                        tokio::spawn(async move {
+                            let service = service_fn(move |request: Request<Incoming>| {
+                            let body_bytes = body_bytes.clone();
+                            async move {
+                                let start = request
+                                    .headers()
+                                    .get("x-start")
+                                    .and_then(|value| value.to_str().ok())
+                                    .and_then(|value| value.parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                let length = request
+                                    .headers()
+                                    .get("x-length")
+                                    .and_then(|value| value.to_str().ok())
+                                    .and_then(|value| value.parse::<usize>().ok())
+                                    .unwrap_or(body_bytes.len());
+                                let end = start.saturating_add(length).min(body_bytes.len());
+                                let frame_size = 64 * 1024;
+                                let stream = stream::unfold(
+                                    (start, end, body_bytes),
+                                    move |(offset, end, body)| async move {
+                                        if offset >= end {
+                                            return None;
+                                        }
+                                        let next = (offset + frame_size).min(end);
+                                        Some((
+                                            Ok::<_, Infallible>(Frame::data(body.slice(offset..next))),
+                                            (next, end, body),
+                                        ))
+                                    },
+                                );
+                                let mut response = Response::new(StreamBody::new(stream));
+                                response.headers_mut().insert(
+                                    hyper::header::CONTENT_LENGTH,
+                                    (end - start).to_string().parse().unwrap(),
+                                );
+                                Ok::<_, Infallible>(response)
+                            }
+                        });
+                            let _ = http1::Builder::new()
+                                .serve_connection(TokioIo::new(socket), service)
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+    });
+    let address = address_rx.recv().unwrap();
+    let url_prefix = format!("http://{address}/");
+    let download = Arc::new(DownloadInfo {
+        encryption: 0,
+        password: String::new(),
+        compression: Compression::None,
+        url_prefix,
+        url_suffix: "chunks".to_owned(),
+    });
+    let client = Arc::new(Client::new());
+    let dir = tempfile::tempdir().unwrap();
+    let allocator = Arc::new(super::output_allocator::OutputAllocator::new(dir.path()));
+    let bitmap = Arc::new(
+        super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("bitmap"), concurrency).unwrap(),
+    );
+    let assets = (0..concurrency)
+        .map(|index| {
+            let chunk = SophonManifestAssetChunk {
+                chunk_name: format!("chunk-{index}"),
+                chunk_decompressed_hash_md5: decompressed_hash.clone(),
+                chunk_on_file_offset: 0,
+                chunk_size: compressed.len() as u64,
+                chunk_size_decompressed: (size_mib * 1024 * 1024) as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: compressed_hash.clone(),
+                chunk_old_offset: -1,
+            };
+            SophonManifestAssetProperty {
+                asset_name: format!("chunk-{index}.bin"),
+                asset_chunks: vec![chunk],
+                asset_type: 0,
+                asset_size: (size_mib * 1024 * 1024) as u64,
+                asset_hash_md5: decompressed_hash.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let manifest = Arc::new(CompactManifest::from(assets));
+    for index in 0..concurrency {
+        allocator
+            .preallocate_file(
+                index,
+                &format!("chunk-{index}.bin"),
+                (size_mib * 1024 * 1024) as u64,
+            )
+            .unwrap();
+    }
+    let context = Arc::new(InstallContext {
+        installer_clients: Arc::new(vec![Arc::clone(&client)]),
+        installer_downloads: Arc::new(vec![Arc::clone(&download)]),
+        chunks_dir: Arc::new(dir.path().to_path_buf()),
+        game_dir: Arc::new(dir.path().to_path_buf()),
+        all_tmp_dirs: Arc::new(vec![]),
+        all_files: manifest,
+        downloaded_bytes: Arc::new(AtomicU64::new(0)),
+        assembled_files: Arc::new(AtomicU64::new(0)),
+        checked_files: Arc::new(AtomicU64::new(0)),
+        total_bytes: (compressed.len() * concurrency) as u64,
+        total_files: concurrency as u64,
+        resume_bytes_offset: Arc::new(AtomicU64::new(0)),
+        verify_cache: Arc::new(DashMap::new()),
+        chunk_refcounts: Arc::new(OnceLock::new()),
+        chunk_names: Arc::new(OnceLock::new()),
+        last_assembly_update: Arc::new(Mutex::new(Instant::now())),
+        last_update: Arc::new(AtomicU64::new(now_nanos())),
+        smooth_speed_bps: Arc::new(AtomicU64::new(0)),
+        eta_speed_history: Arc::new(Mutex::new(VecDeque::new())),
+        last_speed_bytes: Arc::new(AtomicU64::new(0)),
+        last_speed_time: Arc::new(AtomicU64::new(now_nanos())),
+        updater: Arc::new(|_| {}),
+        downloaded_chunks: Arc::new(OnceLock::new()),
+        chunks_since_save: Arc::new(AtomicU64::new(0)),
+        last_save: Arc::new(Mutex::new(None)),
+        state_saver: Arc::new(|_| {}),
+        save_chunk_names: Arc::new(OnceLock::new()),
+        adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
+        profiler: Arc::new(super::profiling::PipelineProfiler::new()),
+        completion_flags: Arc::from(
+            (0..concurrency)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        ),
+        output_allocator: Arc::clone(&allocator),
+        chunk_bitmap: Arc::clone(&bitmap),
+        verify_mode: VerifyMode::Full,
+    });
+    let pending = Arc::new(
+        (0..concurrency)
+            .map(|_| AtomicU32::new(1))
+            .collect::<Vec<_>>(),
+    );
+    let chunk_entries = Arc::new(
+        (0..concurrency)
+            .map(|index| (index as u32, 0, index as u32))
+            .collect::<Vec<_>>(),
+    );
+    let offsets = Arc::new((0..=concurrency as u32).collect::<Vec<_>>());
+    let peak_before = rss_high_water_kib();
+    let started = std::time::Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..concurrency {
+        let context = Arc::clone(&context);
+        let pending = Arc::clone(&pending);
+        let chunk_entries = Arc::clone(&chunk_entries);
+        let offsets = Arc::clone(&offsets);
+        let force_streaming = force_streaming;
+        tasks.spawn(async move {
+            let mut item = eager_item();
+            item.file_idx = index as u32;
+            process_eager_item_with_mode(
+                &item,
+                index,
+                context.all_files.file_chunk(index, 0),
+                &context,
+                chunk_entries.as_slice(),
+                offsets.as_slice(),
+                pending.as_slice(),
+                &DownloadHandle::new(),
+                Some(force_streaming),
+                Some(queue_capacity),
+            )
+            .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap().unwrap();
+    }
+    println!(
+        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} elapsed_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
+        started.elapsed().as_millis(),
+        rss_high_water_kib(),
+        compressed.len() as f64 * concurrency as f64 / (1024.0 * 1024.0),
+    );
+    let _ = shutdown_tx.send(());
+    server.join().unwrap();
 }
 
 #[tokio::test]

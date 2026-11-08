@@ -1396,6 +1396,40 @@ async fn process_eager_item(
     pending_counts: &[AtomicU32],
     handle: &DownloadHandle,
 ) -> SophonResult<()> {
+    process_eager_item_with_mode(
+        item,
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        handle,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item_with_mode(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    handle: &DownloadHandle,
+    force_streaming: Option<bool>,
+    stream_queue_capacity: Option<usize>,
+) -> SophonResult<()> {
+    if stream_queue_capacity == Some(0) {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "eager stream queue capacity must be positive",
+        )));
+    }
     if ctx.verify_mode == super::VerifyMode::Full
         && !chunk.chunk_compressed_hash_md5.is_empty()
         && !matches!(chunk.chunk_compressed_hash_md5.len(), 16 | 32)
@@ -1405,8 +1439,8 @@ async fn process_eager_item(
             "unsupported compressed chunk hash length",
         )));
     }
-    if chunk.chunk_size < EAGER_STREAM_THRESHOLD {
-        return process_eager_item_oneshot(
+    if should_stream_eager(chunk.chunk_size, force_streaming) {
+        return process_eager_item_streaming(
             item,
             item_idx,
             chunk,
@@ -1415,10 +1449,11 @@ async fn process_eager_item(
             chunk_entry_offsets,
             pending_counts,
             handle,
+            stream_queue_capacity.unwrap_or(EAGER_STREAM_QUEUE_CAPACITY),
         )
         .await;
     }
-    process_eager_item_streaming(
+    process_eager_item_oneshot(
         item,
         item_idx,
         chunk,
@@ -1432,6 +1467,11 @@ async fn process_eager_item(
 }
 
 const EAGER_STREAM_THRESHOLD: u64 = 16 * 1024 * 1024;
+const EAGER_STREAM_QUEUE_CAPACITY: usize = 8;
+
+fn should_stream_eager(compressed_size: u64, forced: Option<bool>) -> bool {
+    forced.unwrap_or(compressed_size >= EAGER_STREAM_THRESHOLD)
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn process_eager_item_oneshot(
@@ -1613,6 +1653,7 @@ async fn process_eager_item_streaming(
     chunk_entry_offsets: &[u32],
     pending_counts: &[AtomicU32],
     handle: &DownloadHandle,
+    stream_queue_capacity: usize,
 ) -> SophonResult<()> {
     // Check bitmap for resume.
     let global_chunk_idx = {
@@ -1695,8 +1736,9 @@ async fn process_eager_item_streaming(
         }
 
         let mut stream = response.bytes_stream();
-        let (sender, receiver) =
-            tokio::sync::mpsc::channel::<Result<StreamMessage, std::io::Error>>(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<StreamMessage, std::io::Error>>(
+            stream_queue_capacity,
+        );
         let out = Arc::clone(&out_file);
         let expected_decompressed_size = chunk.chunk_size_decompressed;
         let chunk_offset = item.output_offset;
