@@ -2957,28 +2957,22 @@ fn apply_hdiff_patch_impl(
         && original_path.exists()
         && !expected_md5.is_empty()
         && !verify_file_hash(&original_path, expected_md5)
-        && is_filtered_asset(cache, asset)
     {
-        log::warn!(
-            "Original file MD5 mismatch for filtered asset, skipping: {path}",
-            path = asset.target_file_path
-        );
-        return Ok(());
-    }
-    if let Some(ref expected_md5) = asset.original_file_hash
-        && diff_ref_guard.0.is_none()
-        && original_path.exists()
-        && !expected_md5.is_empty()
-        && !verify_file_hash(&original_path, expected_md5)
-        && !is_filtered_asset(cache, asset)
-    {
-        log::warn!(
-            "Original file MD5 mismatch for {path}, falling back to DownloadOver (keeping file for old-chunk reuse)",
-            path = original_path.display()
-        );
-        return Err(SophonError::OriginalFileMissing(
-            original_path.to_string_lossy().to_string(),
-        ));
+        if is_filtered_asset(cache, asset) {
+            log::warn!(
+                "Original file MD5 mismatch for filtered asset, skipping: {path}",
+                path = asset.target_file_path
+            );
+            return Ok(());
+        } else {
+            log::warn!(
+                "Original file MD5 mismatch for {path}, falling back to DownloadOver (keeping file for old-chunk reuse)",
+                path = original_path.display()
+            );
+            return Err(SophonError::OriginalFileMissing(
+                original_path.to_string_lossy().to_string(),
+            ));
+        }
     }
     #[cfg(feature = "bench-diagnostics")]
     if let Some(observer) = observer.as_deref_mut() {

@@ -1,6 +1,111 @@
 use super::*;
 use fast_md5;
 
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures repeated original-file validation on hash mismatch"]
+fn benchmark_original_hash_mismatch_validation() {
+    use std::time::{Duration, Instant};
+
+    let size = std::env::var("IRMIN_ORIGINAL_HASH_DIAG_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+        .saturating_mul(1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("original.bin");
+    let mut file = std::fs::File::create(&path).unwrap();
+    let block = vec![0x5a; 256 * 1024];
+    let mut remaining = size;
+    while remaining > 0 {
+        let write_len = remaining.min(block.len());
+        std::io::Write::write_all(&mut file, &block[..write_len]).unwrap();
+        remaining -= write_len;
+    }
+    drop(file);
+
+    let wrong_hash = "00000000000000000000000000000000";
+    assert!(!verify_file_hash(&path, wrong_hash));
+    let asset = PatchAssetInfo {
+        target_file_path: "original.bin".to_owned(),
+        target_file_size: size as u64,
+        target_file_hash: String::new(),
+        patch_method: PatchMethod::Patch,
+        patch_name: "patch.bin".to_owned(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 0,
+        patch_chunk_length: 0,
+        original_file_path: Some("original.bin".to_owned()),
+        original_file_hash: Some(wrong_hash.to_owned()),
+        original_file_size: Some(size as u64),
+        matching_field: "game".to_owned(),
+    };
+    let unfiltered_cache = FilterCache::new(dir.path());
+    let mut filtered_cache = FilterCache::new(dir.path());
+    filtered_cache.blacklist_entries = Some(vec!["original.bin".to_owned()]);
+
+    let verify_existing = |cache: &FilterCache, expected_hash: &str| {
+        let mismatch_for_filtered = !verify_file_hash(&path, expected_hash);
+        if mismatch_for_filtered && is_filtered_asset(cache, &asset) {
+            return Ok::<bool, ()>(true);
+        }
+        let mismatch_for_normal = !verify_file_hash(&path, expected_hash);
+        if mismatch_for_normal && !is_filtered_asset(cache, &asset) {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    let verify_single_hash = |cache: &FilterCache, expected_hash: &str| {
+        let mismatch = !verify_file_hash(&path, expected_hash);
+        if mismatch && is_filtered_asset(cache, &asset) {
+            return Ok::<bool, ()>(true);
+        }
+        if mismatch {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    let repetitions = 5;
+    let mut existing_elapsed = Duration::ZERO;
+    let mut single_hash_elapsed = Duration::ZERO;
+    for round in 0..repetitions * 2 {
+        for variant in (0..2).cycle().skip(round % 2).take(2) {
+            let started = Instant::now();
+            let outcome = if variant == 0 {
+                verify_existing(&unfiltered_cache, wrong_hash).unwrap()
+            } else {
+                verify_single_hash(&unfiltered_cache, wrong_hash).unwrap()
+            };
+            assert!(!outcome);
+            let elapsed = started.elapsed();
+            if variant == 0 {
+                existing_elapsed += elapsed;
+            } else {
+                single_hash_elapsed += elapsed;
+            }
+        }
+    }
+    assert_eq!(
+        verify_existing(&filtered_cache, wrong_hash).unwrap(),
+        verify_single_hash(&filtered_cache, wrong_hash).unwrap()
+    );
+    let actual_hash = hex::encode(super::super::cache::file_md5_digest(&path).unwrap());
+    assert_eq!(
+        verify_existing(&unfiltered_cache, &actual_hash).unwrap(),
+        verify_single_hash(&unfiltered_cache, &actual_hash).unwrap()
+    );
+    println!(
+        "original_hash_mismatch size_mib={} repetitions={} existing_total_ms={:.3} single_hash_total_ms={:.3}",
+        size / (1024 * 1024),
+        repetitions,
+        existing_elapsed.as_secs_f64() * 1000.0,
+        single_hash_elapsed.as_secs_f64() * 1000.0
+    );
+}
+
 #[test]
 fn insert_unique_chunk_name_skips_duplicate_owned_key() {
     let mut seen = rustc_hash::FxHashSet::default();
@@ -1072,6 +1177,66 @@ fn apply_hdiff_patch_size_mismatch_returns_error() {
         err_str.contains("999") && err_str.contains(&actual_size.to_string()),
         "Error should include expected and actual sizes: {err_str}"
     );
+}
+
+#[test]
+fn apply_hdiff_patch_original_hash_mismatch_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks_dir = dir.path().join("patching/chunk");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    let original_path = dir.path().join("original.bin");
+    fs::write(&original_path, b"original data").unwrap();
+    fs::write(chunks_dir.join("patch_chunk.bin"), b"dummy chunk data").unwrap();
+
+    let asset = PatchAssetInfo {
+        target_file_path: "original.bin".to_owned(),
+        target_file_size: 100,
+        target_file_hash: "target_hash".to_owned(),
+        patch_method: PatchMethod::Patch,
+        patch_name: "patch_chunk.bin".to_owned(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 20,
+        patch_chunk_length: 20,
+        original_file_path: Some("original.bin".to_owned()),
+        original_file_hash: Some("00000000000000000000000000000000".to_owned()),
+        original_file_size: Some(fs::metadata(&original_path).unwrap().len()),
+        matching_field: "game".to_owned(),
+    };
+
+    let error = apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &FilterCache::new(dir.path()))
+        .unwrap_err();
+    assert!(matches!(error, SophonError::OriginalFileMissing(_)));
+}
+
+#[test]
+fn apply_hdiff_patch_filtered_original_hash_mismatch_skips() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks_dir = dir.path().join("patching/chunk");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    let original_path = dir.path().join("original.bin");
+    fs::write(&original_path, b"original data").unwrap();
+    fs::write(chunks_dir.join("patch_chunk.bin"), b"dummy chunk data").unwrap();
+
+    let asset = PatchAssetInfo {
+        target_file_path: "original.bin".to_owned(),
+        target_file_size: 100,
+        target_file_hash: "target_hash".to_owned(),
+        patch_method: PatchMethod::Patch,
+        patch_name: "patch_chunk.bin".to_owned(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 20,
+        patch_chunk_length: 20,
+        original_file_path: Some("original.bin".to_owned()),
+        original_file_hash: Some("00000000000000000000000000000000".to_owned()),
+        original_file_size: Some(fs::metadata(&original_path).unwrap().len()),
+        matching_field: "game".to_owned(),
+    };
+    let mut cache = FilterCache::new(dir.path());
+    cache.blacklist_entries = Some(vec!["original.bin".to_owned()]);
+
+    apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &cache).unwrap();
 }
 
 #[test]
