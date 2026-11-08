@@ -1407,6 +1407,8 @@ async fn process_eager_item(
         handle,
         None,
         None,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
     )
     .await
 }
@@ -1423,6 +1425,9 @@ async fn process_eager_item_with_mode(
     handle: &DownloadHandle,
     force_streaming: Option<bool>,
     stream_queue_capacity: Option<usize>,
+    #[cfg(feature = "bench-diagnostics")] timings: Option<
+        Arc<super::eager_decompress::EagerStreamPhaseTimings>,
+    >,
 ) -> SophonResult<()> {
     if stream_queue_capacity == Some(0) {
         return Err(SophonError::Io(std::io::Error::new(
@@ -1450,6 +1455,8 @@ async fn process_eager_item_with_mode(
             pending_counts,
             handle,
             stream_queue_capacity.unwrap_or(EAGER_STREAM_QUEUE_CAPACITY),
+            #[cfg(feature = "bench-diagnostics")]
+            timings,
         )
         .await;
     }
@@ -1654,6 +1661,9 @@ async fn process_eager_item_streaming(
     pending_counts: &[AtomicU32],
     handle: &DownloadHandle,
     stream_queue_capacity: usize,
+    #[cfg(feature = "bench-diagnostics")] timings: Option<
+        Arc<super::eager_decompress::EagerStreamPhaseTimings>,
+    >,
 ) -> SophonResult<()> {
     // Check bitmap for resume.
     let global_chunk_idx = {
@@ -1743,6 +1753,8 @@ async fn process_eager_item_streaming(
         let expected_decompressed_size = chunk.chunk_size_decompressed;
         let chunk_offset = item.output_offset;
         let decompressed_hash = decompressed_hash.to_owned();
+        #[cfg(feature = "bench-diagnostics")]
+        let decoder_timings = timings.clone();
         let decode_task = tokio::task::spawn_blocking(move || {
             let reader = std::io::BufReader::with_capacity(
                 256 * 1024,
@@ -1751,8 +1763,21 @@ async fn process_eager_item_streaming(
                     current: None,
                     offset: 0,
                     complete: false,
+                    #[cfg(feature = "bench-diagnostics")]
+                    timings: decoder_timings.clone(),
                 },
             );
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = decoder_timings {
+                return super::eager_decompress::stream_decompress_to_file_with_timings(
+                    reader,
+                    &out,
+                    chunk_offset,
+                    expected_decompressed_size,
+                    &decompressed_hash,
+                    timings,
+                );
+            }
             super::eager_decompress::stream_decompress_to_file(
                 reader,
                 &out,
@@ -1768,6 +1793,8 @@ async fn process_eager_item_streaming(
             (compressed_hash.len() == 16).then(super::assembly_opt::take_xxh64);
         let mut stream_error = None;
         loop {
+            #[cfg(feature = "bench-diagnostics")]
+            let wait_started = std::time::Instant::now();
             let next = tokio::select! {
                 biased;
                 _ = handle.cancelled_future() => {
@@ -1782,6 +1809,12 @@ async fn process_eager_item_streaming(
                 }
                 item = stream.next() => item,
             };
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                timings
+                    .producer_wait_ns
+                    .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             let Some(result) = next else { break };
             let bytes = match result {
                 Ok(bytes) => bytes,
@@ -1824,13 +1857,30 @@ async fn process_eager_item_streaming(
                     break;
                 }
             };
+            #[cfg(feature = "bench-diagnostics")]
+            let hash_started = std::time::Instant::now();
             if let Some(hasher) = compressed_md5.as_mut() {
                 hasher.update(&bytes);
             }
             if let Some(hasher) = compressed_xxh64.as_mut() {
                 hasher.update(&bytes);
             }
-            if sender.send(Ok(StreamMessage::Data(bytes))).await.is_err() {
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                timings
+                    .compressed_hash_ns
+                    .fetch_add(hash_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            #[cfg(feature = "bench-diagnostics")]
+            let send_started = std::time::Instant::now();
+            let send_result = sender.send(Ok(StreamMessage::Data(bytes))).await;
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                timings
+                    .channel_send_ns
+                    .fetch_add(send_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            if send_result.is_err() {
                 stream_error = Some(SophonError::Io(std::io::Error::other(
                     "eager decompressor stopped reading response",
                 )));
@@ -2014,10 +2064,24 @@ struct ChunkStreamReader {
     current: Option<bytes::Bytes>,
     offset: usize,
     complete: bool,
+    #[cfg(feature = "bench-diagnostics")]
+    timings: Option<Arc<super::eager_decompress::EagerStreamPhaseTimings>>,
 }
 
 impl std::io::Read for ChunkStreamReader {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = self.timings.as_ref() {
+            timings.input_read_calls.fetch_add(1, Ordering::Relaxed);
+            timings
+                .input_read_requested_bytes
+                .fetch_add(output.len() as u64, Ordering::Relaxed);
+            if output.len() >= 256 * 1024 {
+                timings
+                    .input_read_bypass_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if output.is_empty() {
             return Ok(0);
         }
@@ -2035,7 +2099,16 @@ impl std::io::Read for ChunkStreamReader {
             if self.complete {
                 return Ok(0);
             }
-            match self.receiver.blocking_recv() {
+            #[cfg(feature = "bench-diagnostics")]
+            let wait_started = std::time::Instant::now();
+            let message = self.receiver.blocking_recv();
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = self.timings.as_ref() {
+                timings
+                    .consumer_wait_ns
+                    .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            match message {
                 Some(Ok(StreamMessage::Data(bytes))) => self.current = Some(bytes),
                 Some(Ok(StreamMessage::Complete)) => {
                     self.complete = true;

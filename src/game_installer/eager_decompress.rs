@@ -8,6 +8,8 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
+#[cfg(feature = "bench-diagnostics")]
+use std::sync::Arc;
 
 use super::assembly_opt::{
     self, Md5, chunk_hash_required, md5_hex_eq, md5_to_hex, return_md5, take_md5, xxh64_hex_eq,
@@ -17,6 +19,37 @@ use super::error::{SophonError, SophonResult};
 /// Buffer size for reading from the zstd decoder and writing to the output file.
 /// Buffer size used by eager streaming decompression.
 pub const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
+
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Default)]
+pub(crate) struct EagerStreamPhaseTimings {
+    pub(crate) producer_wait_ns: std::sync::atomic::AtomicU64,
+    pub(crate) compressed_hash_ns: std::sync::atomic::AtomicU64,
+    pub(crate) channel_send_ns: std::sync::atomic::AtomicU64,
+    pub(crate) consumer_wait_ns: std::sync::atomic::AtomicU64,
+    pub(crate) input_read_calls: std::sync::atomic::AtomicU64,
+    pub(crate) input_read_requested_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) input_read_bypass_calls: std::sync::atomic::AtomicU64,
+    pub(crate) decoder_read_ns: std::sync::atomic::AtomicU64,
+    pub(crate) decoder_read_count: std::sync::atomic::AtomicU64,
+    pub(crate) decoder_read_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) output_write_ns: std::sync::atomic::AtomicU64,
+    pub(crate) output_hash_ns: std::sync::atomic::AtomicU64,
+    pub(crate) decoder_thread_cpu_ns: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn thread_cpu_time_ns() -> u64 {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) };
+    if result != 0 {
+        return 0;
+    }
+    let time = unsafe { time.assume_init() };
+    (time.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(time.tv_nsec as u64)
+}
 
 /// Performs eager decompression: decompresses compressed data and writes
 /// decompressed output directly to `out_file` at `chunk_offset`.
@@ -135,6 +168,49 @@ pub fn stream_decompress_to_file(
     expected_decompressed_size: u64,
     decompressed_hash: &str,
 ) -> SophonResult<u64> {
+    stream_decompress_to_file_inner(
+        reader,
+        out_file,
+        chunk_offset,
+        expected_decompressed_size,
+        decompressed_hash,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
+        #[cfg(feature = "bench-diagnostics")]
+        false,
+    )
+}
+
+#[cfg(feature = "bench-diagnostics")]
+pub(crate) fn stream_decompress_to_file_with_timings(
+    reader: impl io::Read,
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+    decompressed_hash: &str,
+    timings: Arc<EagerStreamPhaseTimings>,
+) -> SophonResult<u64> {
+    stream_decompress_to_file_inner(
+        reader,
+        out_file,
+        chunk_offset,
+        expected_decompressed_size,
+        decompressed_hash,
+        Some(timings),
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_decompress_to_file_inner(
+    reader: impl io::Read,
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+    decompressed_hash: &str,
+    #[cfg(feature = "bench-diagnostics")] timings: Option<Arc<EagerStreamPhaseTimings>>,
+    #[cfg(feature = "bench-diagnostics")] drain_reader_to_eof: bool,
+) -> SophonResult<u64> {
     let mut reader = reader;
 
     let mut ctx = assembly_opt::take_dctx();
@@ -165,8 +241,12 @@ pub fn stream_decompress_to_file(
         write_offset: chunk_offset,
         bytes_written: 0,
         hasher: decompressed_hasher,
+        #[cfg(feature = "bench-diagnostics")]
+        timings,
     };
     {
+        #[cfg(feature = "bench-diagnostics")]
+        let decoder_thread_started = thread_cpu_time_ns();
         let mut decoder = zstd::Decoder::with_context(
             io::BufReader::with_capacity(256 * 1024, &mut reader),
             ctx.0.as_mut().expect("decoder context is present"),
@@ -180,7 +260,21 @@ pub fn stream_decompress_to_file(
         decoder
             .finish_frame()
             .map_err(|error| SophonError::Io(io::Error::other(error.to_string())))?;
+        #[cfg(feature = "bench-diagnostics")]
+        let mut reader = decoder.finish();
+        #[cfg(not(feature = "bench-diagnostics"))]
         let _ = decoder.finish();
+        #[cfg(feature = "bench-diagnostics")]
+        if drain_reader_to_eof {
+            io::copy(&mut reader, &mut io::sink()).map_err(SophonError::Io)?;
+        }
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = output.timings.as_ref() {
+            timings.decoder_thread_cpu_ns.fetch_add(
+                thread_cpu_time_ns().saturating_sub(decoder_thread_started),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     if output.bytes_written != expected_decompressed_size {
@@ -243,6 +337,8 @@ struct StreamOutput<'a> {
     write_offset: u64,
     bytes_written: u64,
     hasher: PooledMd5Guard,
+    #[cfg(feature = "bench-diagnostics")]
+    timings: Option<Arc<EagerStreamPhaseTimings>>,
 }
 
 fn read_decompressed(
@@ -253,9 +349,26 @@ fn read_decompressed(
     loop {
         let remaining = output.expected_size.saturating_sub(output.bytes_written);
         let read_limit = remaining.saturating_add(1).min(buf.len() as u64) as usize;
+        #[cfg(feature = "bench-diagnostics")]
+        let read_started = std::time::Instant::now();
         let n = decoder
             .read(&mut buf[..read_limit])
             .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = output.timings.as_ref() {
+            let elapsed = read_started.elapsed().as_nanos() as u64;
+            timings
+                .decoder_read_ns
+                .fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+            if n > 0 {
+                timings
+                    .decoder_read_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                timings
+                    .decoder_read_bytes
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if n == 0 {
             return Ok(());
         }
@@ -270,12 +383,32 @@ fn read_decompressed(
                 actual: next_bytes_written,
             });
         }
+        #[cfg(feature = "bench-diagnostics")]
+        let write_started = std::time::Instant::now();
         output
             .file
             .write_all_at(&buf[..n], output.write_offset)
             .map_err(SophonError::Io)?;
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = output.timings.as_ref() {
+            timings.output_write_ns.fetch_add(
+                write_started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        #[cfg(feature = "bench-diagnostics")]
+        let hash_started = std::time::Instant::now();
         if let Some(hasher) = output.hasher.0.as_mut() {
             hasher.update(&buf[..n])?;
+        }
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = output.timings.as_ref()
+            && output.hasher.0.is_some()
+        {
+            timings.output_hash_ns.fetch_add(
+                hash_started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         output.write_offset += n as u64;
         output.bytes_written = next_bytes_written;

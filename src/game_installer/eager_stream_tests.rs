@@ -98,6 +98,7 @@ fn rss_high_water_kib() -> u64 {
         .unwrap()
 }
 
+#[cfg(feature = "bench-diagnostics")]
 fn process_cpu_time_ms() -> u128 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -181,9 +182,37 @@ async fn eager_streaming_download_verifies_hashes_and_marks_bitmap() {
     assert_eq!(fs::read(dir.path().join("eager.bin")).unwrap(), data);
 }
 
-#[tokio::test]
+#[cfg(feature = "bench-diagnostics")]
+#[test]
 #[ignore = "measures actual loopback eager installer concurrency RSS"]
-async fn benchmark_eager_loopback_concurrent_rss() {
+fn benchmark_eager_loopback_concurrent_rss() {
+    let runtime_mode =
+        std::env::var("IRMIN_EAGER_BENCH_RUNTIME").unwrap_or_else(|_| "multi4".to_owned());
+    match runtime_mode.as_str() {
+        "current" => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(benchmark_eager_loopback_inner()),
+        "multi1" | "multi2" | "multi4" => {
+            let workers = match runtime_mode.as_str() {
+                "multi1" => 1,
+                "multi2" => 2,
+                _ => 4,
+            };
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(benchmark_eager_loopback_inner())
+        }
+        _ => panic!("IRMIN_EAGER_BENCH_RUNTIME must be current, multi1, multi2, or multi4"),
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+async fn benchmark_eager_loopback_inner() {
     use futures_util::stream;
     use http_body_util::StreamBody;
     use hyper::body::{Frame, Incoming};
@@ -493,6 +522,7 @@ async fn benchmark_eager_loopback_concurrent_rss() {
     let peak_before = rss_high_water_kib();
     let cpu_before = process_cpu_time_ms();
     let started = std::time::Instant::now();
+    let timings = Arc::new(super::super::eager_decompress::EagerStreamPhaseTimings::default());
     let mut tasks = tokio::task::JoinSet::new();
     for index in 0..concurrency {
         let context = Arc::clone(&context);
@@ -500,6 +530,7 @@ async fn benchmark_eager_loopback_concurrent_rss() {
         let chunk_entries = Arc::clone(&chunk_entries);
         let offsets = Arc::clone(&offsets);
         let force_streaming = force_streaming;
+        let timings = Arc::clone(&timings);
         tasks.spawn(async move {
             let mut item = eager_item();
             item.file_idx = index as u32;
@@ -514,6 +545,7 @@ async fn benchmark_eager_loopback_concurrent_rss() {
                 &DownloadHandle::new(),
                 force_streaming,
                 Some(queue_capacity),
+                Some(timings),
             )
             .await
         });
@@ -522,12 +554,25 @@ async fn benchmark_eager_loopback_concurrent_rss() {
         result.unwrap().unwrap();
     }
     println!(
-        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} frame_kib={} rtt_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} requests={} frames={} elapsed_ms={} cpu_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
+        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} frame_kib={} rtt_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} requests={} frames={} elapsed_ms={} cpu_ms={} producer_wait_ms={} compressed_hash_ms={} send_ms={} consumer_wait_ms={} decoder_read_including_wait_ms={} decoder_thread_cpu_ms={} decoder_read_calls={} decoder_read_mib={:.1} reader_calls={} reader_requested_mib={:.1} reader_bypass_calls={} output_write_ms={} decompressed_hash_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
         frame_size / 1024,
         response_count.load(Ordering::Relaxed),
         frame_count.load(Ordering::Relaxed),
         started.elapsed().as_millis(),
         process_cpu_time_ms().saturating_sub(cpu_before),
+        timings.producer_wait_ns.load(Ordering::Relaxed) / 1_000_000,
+        timings.compressed_hash_ns.load(Ordering::Relaxed) / 1_000_000,
+        timings.channel_send_ns.load(Ordering::Relaxed) / 1_000_000,
+        timings.consumer_wait_ns.load(Ordering::Relaxed) / 1_000_000,
+        timings.decoder_read_ns.load(Ordering::Relaxed) / 1_000_000,
+        timings.decoder_thread_cpu_ns.load(Ordering::Relaxed) / 1_000_000,
+        timings.decoder_read_count.load(Ordering::Relaxed),
+        timings.decoder_read_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+        timings.input_read_calls.load(Ordering::Relaxed),
+        timings.input_read_requested_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+        timings.input_read_bypass_calls.load(Ordering::Relaxed),
+        timings.output_write_ns.load(Ordering::Relaxed) / 1_000_000,
+        timings.output_hash_ns.load(Ordering::Relaxed) / 1_000_000,
         rss_high_water_kib(),
         compressed.len() as f64 * concurrency as f64 / (1024.0 * 1024.0),
     );
@@ -620,6 +665,8 @@ fn chunk_stream_reader_requires_verified_completion() {
         current: None,
         offset: 0,
         complete: false,
+        #[cfg(feature = "bench-diagnostics")]
+        timings: None,
     };
     let mut output = [0; 4];
     assert_eq!(std::io::Read::read(&mut reader, &mut output).unwrap(), 3);
