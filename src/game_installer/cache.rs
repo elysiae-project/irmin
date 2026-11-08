@@ -234,6 +234,7 @@ fn file_md5_digest_with_options(
     buffer_capacity: usize,
     advise_page_cache: bool,
 ) -> io::Result<[u8; 16]> {
+    // Preserve invalid-capacity precedence over file-open errors.
     if buffer_capacity == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -241,6 +242,21 @@ fn file_md5_digest_with_options(
         ));
     }
     let file = File::open(path)?;
+    file_md5_digest_with_file(file, buffer_capacity, advise_page_cache)
+}
+
+fn file_md5_digest_with_file(
+    file: File,
+    buffer_capacity: usize,
+    advise_page_cache: bool,
+) -> io::Result<[u8; 16]> {
+    // Validate independently because benchmark callers can pass a File directly.
+    if buffer_capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MD5 read buffer capacity must be nonzero",
+        ));
+    }
     let len = file.metadata()?.len();
     if len == 0 {
         return Ok([
@@ -282,6 +298,7 @@ fn file_md5_digest_with_options(
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod benchmark {
+    use std::fs::File;
     use std::io;
     use std::path::Path;
 
@@ -291,6 +308,15 @@ pub mod benchmark {
         advise_page_cache: bool,
     ) -> io::Result<[u8; 16]> {
         super::file_md5_digest_with_options(path, capacity, advise_page_cache)
+    }
+
+    pub fn file_md5_digest_with_file(
+        file: File,
+        capacity: usize,
+        advise_page_cache: bool,
+    ) -> io::Result<[u8; 16]> {
+        // The file-consuming benchmark helper hashes from the current cursor.
+        super::file_md5_digest_with_file(file, capacity, advise_page_cache)
     }
 }
 

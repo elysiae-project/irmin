@@ -545,6 +545,89 @@ fn bench_file_md5_buffer_capacity(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "bench-internals")]
+// The fixture is read during setup, so digest cases exercise warm page-cache data.
+fn bench_file_metadata_cost(c: &mut Criterion) {
+    use irmin_rs::game_installer::cache::benchmark::{
+        file_md5_digest_with_file, file_md5_digest_with_options,
+    };
+
+    const FILE_MIB: usize = 1;
+    const READ_BUFFER_BYTES: usize = 256 * 1024;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("metadata-cost.bin");
+    fill_file_prng(&path, FILE_MIB, 0xF11E_0F57);
+    let expected = fast_md5::digest(&fs::read(&path).expect("read fixture"));
+    let bytes = (FILE_MIB * 1024 * 1024) as u64;
+
+    assert_eq!(fs::metadata(&path).expect("path metadata").len(), bytes);
+    {
+        let file = fs::File::open(&path).expect("open fixture");
+        assert_eq!(file.metadata().expect("file metadata").len(), bytes);
+    }
+    assert_eq!(
+        file_md5_digest_with_options(&path, READ_BUFFER_BYTES, false).expect("path digest"),
+        expected
+    );
+    assert_eq!(
+        file_md5_digest_with_file(
+            fs::File::open(&path).expect("open digest fixture"),
+            READ_BUFFER_BYTES,
+            false,
+        )
+        .expect("open-file digest"),
+        expected
+    );
+    let file = fs::File::open(&path).expect("open metadata fixture");
+
+    let mut group = c.benchmark_group("file_metadata_cost");
+    group.sample_size(100);
+    group.bench_function("path_metadata", |b| {
+        b.iter(|| {
+            let metadata = fs::metadata(&path).expect("path metadata");
+            std::hint::black_box(metadata.len());
+        });
+    });
+    group.bench_function("open_then_file_metadata", |b| {
+        b.iter(|| {
+            let file = fs::File::open(&path).expect("open fixture");
+            let metadata = file.metadata().expect("file metadata");
+            std::hint::black_box(metadata.len());
+        });
+    });
+    group.bench_function("open_close", |b| {
+        b.iter(|| {
+            let file = fs::File::open(&path).expect("open fixture");
+            std::hint::black_box(file);
+        });
+    });
+    group.bench_function("already_open_file_metadata", |b| {
+        b.iter(|| {
+            let metadata = file.metadata().expect("file metadata");
+            std::hint::black_box(metadata.len());
+        });
+    });
+    group.bench_function("path_digest_1mib", |b| {
+        b.iter(|| {
+            let digest = file_md5_digest_with_options(&path, READ_BUFFER_BYTES, false)
+                .expect("path digest");
+            std::hint::black_box(digest);
+        });
+    });
+    group.bench_function("open_excluded_digest_1mib_close_timed", |b| {
+        b.iter_batched(
+            || fs::File::open(&path).expect("open digest fixture"),
+            |file| {
+                let digest = file_md5_digest_with_file(file, READ_BUFFER_BYTES, false)
+                    .expect("open-file digest");
+                std::hint::black_box(digest);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
 const HASH_MIB: u64 = 128;
 
 /// XXH64 throughput on a 128 MiB file via pread. This is the compressed-chunk
@@ -2089,6 +2172,13 @@ fn bench_file_md5_buffer_capacity_optional(c: &mut Criterion) {
     let _ = c;
 }
 
+fn bench_file_metadata_cost_optional(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    bench_file_metadata_cost(c);
+    #[cfg(not(feature = "bench-internals"))]
+    let _ = c;
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -2110,6 +2200,7 @@ criterion_group!(
     bench_v13_large_uncovered_prefix,
     bench_eager_decompress,
     bench_file_md5_buffer_capacity_optional,
+    bench_file_metadata_cost_optional,
 );
 criterion_main!(benches);
 
