@@ -2600,13 +2600,18 @@ fn contains_ignore_ascii_case(haystack: &str, pattern: &str) -> bool {
     if pattern.len() > haystack.len() {
         return false;
     }
+    if pattern.is_empty() {
+        return true;
+    }
     let h = haystack.as_bytes();
     let p = pattern.as_bytes();
+    let first = p[0].to_ascii_lowercase();
     for i in 0..=(h.len() - p.len()) {
-        if h[i..i + p.len()]
-            .iter()
-            .zip(p.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        if h[i].to_ascii_lowercase() == first
+            && h[i + 1..i + p.len()]
+                .iter()
+                .zip(p[1..].iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
         {
             return true;
         }

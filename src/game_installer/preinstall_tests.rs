@@ -1542,6 +1542,120 @@ fn is_filtered_asset_no_game_dir_markers() {
 }
 
 #[test]
+fn contains_ignore_ascii_case_matches_reference_for_edge_cases() {
+    fn reference(haystack: &str, pattern: &str) -> bool {
+        if pattern.len() > haystack.len() {
+            return false;
+        }
+        let haystack = haystack.as_bytes();
+        let pattern = pattern.as_bytes();
+        (0..=haystack.len() - pattern.len()).any(|start| {
+            haystack[start..start + pattern.len()]
+                .iter()
+                .zip(pattern)
+                .all(|(actual, expected)| actual.to_ascii_lowercase() == *expected)
+        })
+    }
+
+    let cases = [
+        ("", ""),
+        ("path/to/file", ""),
+        ("", "long"),
+        ("Audio/Japanese/Voice.Pak", "japanese/voice"),
+        ("DATA/OTHER/file.PAK", "data/other/"),
+        ("café/音声.PAK", "音声"),
+        ("café/音声.PAK", "É"),
+        ("prefix", "prefix-too-long"),
+    ];
+    for (haystack, pattern) in cases {
+        assert_eq!(
+            contains_ignore_ascii_case(haystack, pattern),
+            reference(haystack, pattern),
+            "haystack={haystack:?}, pattern={pattern:?}",
+        );
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures complete preinstall patch-asset filter pass"]
+fn benchmark_patch_asset_filter_pass() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for asset_count in [1_000usize, 10_000, 50_000] {
+        for pattern_count in [5usize, 32, 100] {
+            for hit_stride in [0usize, 2] {
+                let mut patterns = (0..pattern_count)
+                    .map(|index| match index % 4 {
+                        0 => format!("audio/korean/voice_{index:04}.pak"),
+                        1 => format!("persistent/resource_{index:04}.pak"),
+                        2 => format!("/japanese/voice_{index:04}/"),
+                        _ => format!("streamingassets/voice_{index:04}.pak"),
+                    })
+                    .collect::<Vec<_>>();
+                if hit_stride > 0 {
+                    *patterns.last_mut().unwrap() = "/audio/japanese/".to_owned();
+                }
+                let cache = FilterCache {
+                    kdel_tokens: None,
+                    blacklist_entries: Some(patterns),
+                    ignored_lang_patterns: None,
+                };
+                let assets = (0..asset_count)
+                    .map(|index| PatchAssetInfo {
+                        target_file_path: if hit_stride > 0 && index % hit_stride == 1 {
+                            format!("data/audio/japanese/voice_{index}.pak")
+                        } else {
+                            format!("data/other/voice_{index}.pak")
+                        },
+                        target_file_size: 1,
+                        target_file_hash: String::new(),
+                        patch_method: PatchMethod::Patch,
+                        patch_name: String::new(),
+                        patch_hash: String::new(),
+                        patch_offset: 0,
+                        patch_size: 0,
+                        patch_chunk_length: 0,
+                        original_file_path: None,
+                        original_file_hash: None,
+                        original_file_size: None,
+                        matching_field: "game".to_owned(),
+                    })
+                    .collect::<Vec<_>>();
+                let repetitions = if asset_count >= 50_000 { 10 } else { 50 };
+                let mut filter_time = std::time::Duration::ZERO;
+                let started = Instant::now();
+                let mut total_filtered = 0usize;
+                for _ in 0..repetitions {
+                    let mut batch = assets.clone();
+                    let filter_started = Instant::now();
+                    filter_patch_assets_for_removed_features(&cache, &mut batch);
+                    filter_time += filter_started.elapsed();
+                    let filtered = batch
+                        .iter()
+                        .filter(|asset| asset.patch_method == PatchMethod::Skip)
+                        .count();
+                    let expected_filtered = if hit_stride > 0 {
+                        asset_count / hit_stride
+                    } else {
+                        0
+                    };
+                    assert_eq!(filtered, expected_filtered);
+                    total_filtered += filtered;
+                }
+                println!(
+                    "patch_asset_filter_pass assets={asset_count} patterns={pattern_count} hit_stride={hit_stride} repetitions={repetitions} clone_and_filter_us={} filter_only_us={} filtered={}",
+                    started.elapsed().as_micros(),
+                    filter_time.as_micros(),
+                    black_box(total_filtered),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn patching_chunk_dir_path() {
     let dir = tempfile::tempdir().unwrap();
     let chunks = patching_chunk_dir(dir.path());
