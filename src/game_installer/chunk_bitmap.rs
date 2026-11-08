@@ -156,20 +156,24 @@ impl ChunkBitmap {
     /// Flushes the bitmap to disk. Serialized: concurrent callers block.
     pub fn sync(&self) -> io::Result<()> {
         let _guard = self.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let word_count = self.bits.len();
-        let mut buf = Vec::with_capacity(8 + word_count * 8);
-
-        buf.extend_from_slice(&MAGIC.to_le_bytes());
-        buf.extend_from_slice(&(self.total_chunks as u32).to_le_bytes());
-        for word in &self.bits {
-            buf.extend_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
-        }
-
         let mut f = OpenOptions::new()
             .write(true)
             .truncate(true)
             .open(&self.path)?;
-        f.write_all(&buf)?;
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        header[4..].copy_from_slice(&(self.total_chunks as u32).to_le_bytes());
+        f.write_all(&header)?;
+
+        let words_per_block = (64 * 1024) / 8;
+        let mut buffer = vec![0u8; words_per_block * 8];
+        for words in self.bits.chunks(words_per_block) {
+            let bytes = &mut buffer[..words.len() * 8];
+            for (word, output) in words.iter().zip(bytes.chunks_exact_mut(8)) {
+                output.copy_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
+            }
+            f.write_all(bytes)?;
+        }
         f.sync_data()?;
         Ok(())
     }
@@ -402,10 +406,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sync_streams_multiple_blocks_and_preserves_atomic_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-multi-block.bitmap");
+        let bitmap = ChunkBitmap::create(&path, 64 * 10_000).unwrap();
+        for index in [0, 64 * 8191, 64 * 8192, 64 * 9999] {
+            bitmap.mark_complete(index);
+        }
+        bitmap.sync().unwrap();
+
+        let loaded = ChunkBitmap::load(&path).unwrap();
+        assert_eq!(loaded.total_chunks(), 64 * 10_000);
+        for index in [0, 64 * 8191, 64 * 8192, 64 * 9999] {
+            assert!(loaded.is_complete(index));
+        }
+        assert!(!loaded.is_complete(1));
+    }
+
     #[cfg(feature = "bench-diagnostics")]
     #[test]
-    #[ignore = "measures bitmap load time and process VmHWM"]
-    fn benchmark_load_bitmap_fixture() {
+    #[ignore = "measures bitmap load/sync time and process VmHWM"]
+    fn benchmark_bitmap_io_fixture() {
         use std::time::Instant;
 
         fn vm_hwm_kib() -> Option<u64> {
@@ -419,13 +441,34 @@ mod tests {
 
         let path = std::env::var_os("IRMIN_BITMAP_BENCH_PATH")
             .expect("IRMIN_BITMAP_BENCH_PATH must point to a prepared bitmap file");
+        let path = PathBuf::from(path);
+        let operation = std::env::var("IRMIN_BITMAP_BENCH_OP").unwrap_or_else(|_| "load".into());
+        assert!(matches!(operation.as_str(), "load" | "sync"));
+        let bitmap = if operation == "sync" {
+            ChunkBitmap::load(&path).unwrap()
+        } else {
+            drop(ChunkBitmap::load(&path).unwrap());
+            let before_hwm = vm_hwm_kib();
+            let started = Instant::now();
+            let bitmap = ChunkBitmap::load(&path).unwrap();
+            let elapsed = started.elapsed();
+            let after_hwm = vm_hwm_kib();
+            println!(
+                "bitmap_load chunks={} bytes={} elapsed_ms={} hwm_before_kib={before_hwm:?} hwm_after_kib={after_hwm:?}",
+                bitmap.total_chunks(),
+                fs::metadata(&path).unwrap().len(),
+                elapsed.as_millis(),
+            );
+            std::hint::black_box(bitmap.count_complete());
+            return;
+        };
         let before_hwm = vm_hwm_kib();
         let started = Instant::now();
-        let bitmap = ChunkBitmap::load(Path::new(&path)).unwrap();
+        bitmap.sync().unwrap();
         let elapsed = started.elapsed();
         let after_hwm = vm_hwm_kib();
         println!(
-            "bitmap_load chunks={} bytes={} elapsed_ms={} hwm_before_kib={before_hwm:?} hwm_after_kib={after_hwm:?}",
+            "bitmap_sync chunks={} bytes={} elapsed_ms={} hwm_before_kib={before_hwm:?} hwm_after_kib={after_hwm:?}",
             bitmap.total_chunks(),
             fs::metadata(&path).unwrap().len(),
             elapsed.as_millis(),
