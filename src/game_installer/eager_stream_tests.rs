@@ -283,6 +283,7 @@ fn stream_decompressor_rejects_decompressed_hash_mismatch() {
 #[test]
 #[ignore = "reports single-worker eager decompression timing and VmHWM"]
 fn benchmark_eager_decompression_rss() {
+    use std::thread;
     use std::time::Instant;
 
     let size_mib = std::env::var("IRMIN_EAGER_BENCH_SIZE_MIB")
@@ -290,6 +291,11 @@ fn benchmark_eager_decompression_rss() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(64);
     assert!((1..=512).contains(&size_mib));
+    let concurrency = std::env::var("IRMIN_EAGER_BENCH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    assert!((1..=32).contains(&concurrency));
     let mut random_state = 0xA11C_E5EED_u64;
     let data = (0..size_mib * 1024 * 1024)
         .map(|_| {
@@ -303,40 +309,50 @@ fn benchmark_eager_decompression_rss() {
     let compressed_hash = hex::encode(fast_md5::digest(&compressed));
     let decompressed_hash = hex::encode(fast_md5::digest(&data));
     let dir = tempfile::tempdir().unwrap();
-    let output = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(dir.path().join("output.bin"))
-        .unwrap();
-    output.set_len(data.len() as u64).unwrap();
-
     let mode = std::env::var("IRMIN_EAGER_BENCH_MODE").unwrap_or_else(|_| "stream".to_owned());
     let before = rss_high_water_kib();
     let started = Instant::now();
-    match mode.as_str() {
-        "oneshot" => super::super::eager_decompress::eager_decompress_chunk(
-            &compressed,
-            &output,
-            0,
-            data.len() as u64,
-            &compressed_hash,
-            &decompressed_hash,
-        )
-        .unwrap(),
-        "stream" => super::super::eager_decompress::stream_decompress_to_file(
-            std::io::Cursor::new(&compressed),
-            &output,
-            0,
-            data.len() as u64,
-            &decompressed_hash,
-        )
-        .unwrap(),
-        _ => panic!("IRMIN_EAGER_BENCH_MODE must be oneshot or stream"),
-    };
+    thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(concurrency);
+        for index in 0..concurrency {
+            let output = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dir.path().join(format!("output-{index}.bin")))
+                .unwrap();
+            output.set_len(data.len() as u64).unwrap();
+            let compressed = &compressed;
+            let compressed_hash = &compressed_hash;
+            let decompressed_hash = &decompressed_hash;
+            let mode = mode.as_str();
+            let size = data.len() as u64;
+            workers.push(scope.spawn(move || match mode {
+                "oneshot" => super::super::eager_decompress::eager_decompress_chunk(
+                    compressed,
+                    &output,
+                    0,
+                    size,
+                    compressed_hash,
+                    decompressed_hash,
+                ),
+                "stream" => super::super::eager_decompress::stream_decompress_to_file(
+                    std::io::Cursor::new(compressed),
+                    &output,
+                    0,
+                    size,
+                    decompressed_hash,
+                ),
+                _ => panic!("IRMIN_EAGER_BENCH_MODE must be oneshot or stream"),
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+    });
     println!(
-        "mode={mode} size_mib={size_mib} compressed_mib={:.1} elapsed_ms={} before_kib={before} after_kib={}",
+        "mode={mode} size_mib={size_mib} concurrency={concurrency} compressed_mib={:.1} elapsed_ms={} before_kib={before} after_kib={}",
         compressed.len() as f64 / (1024.0 * 1024.0),
         started.elapsed().as_millis(),
         rss_high_water_kib(),
