@@ -108,6 +108,113 @@ fn process_cpu_time_ms() -> u128 {
         + (usage.ru_utime.tv_usec as u128 + usage.ru_stime.tv_usec as u128) / 1000
 }
 
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "reports per-thread compressed buffer capacity retention"]
+fn benchmark_compressed_buffer_retention() {
+    use std::sync::mpsc;
+
+    let worker_count = std::env::var("IRMIN_BUFFER_BENCH_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    let sizes =
+        std::env::var("IRMIN_BUFFER_BENCH_SIZES_MIB").unwrap_or_else(|_| "2,32,2".to_owned());
+    let sizes_mib = sizes
+        .split(',')
+        .map(|value| value.parse::<usize>().expect("valid MiB size"));
+    let sizes_mib = sizes_mib.collect::<Vec<_>>();
+    assert!(sizes_mib.iter().all(|size| *size > 0));
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixtures = Vec::with_capacity(sizes_mib.len());
+    for (index, size_mib) in sizes_mib.iter().copied().enumerate() {
+        let raw = (0..size_mib * 1024 * 1024)
+            .map(|byte| {
+                let value = (byte as u64)
+                    .wrapping_add(index as u64 * 0x9e37_79b9)
+                    .wrapping_mul(0xd6e8_feb8_6659_fd93);
+                (value ^ (value >> 29) ^ (value >> 47)) as u8
+            })
+            .collect::<Vec<_>>();
+        let expected_hash = fast_md5::digest(&raw);
+        let compressed = zstd::encode_all(std::io::Cursor::new(raw), 1).unwrap();
+        let path = dir.path().join(format!("chunk-{index}.zst"));
+        std::fs::write(&path, &compressed).unwrap();
+        let expected_size = (size_mib * 1024 * 1024) as u64;
+        fixtures.push((path, expected_size, compressed.len(), expected_hash));
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for worker_idx in 0..worker_count {
+        let fixtures = fixtures.clone();
+        let output_path = dir.path().join(format!("output-{worker_idx}.bin"));
+        let tx = tx.clone();
+        workers.push(std::thread::spawn(move || {
+            let output = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(output_path)
+                .unwrap();
+            let compressed_sizes = fixtures
+                .iter()
+                .map(|(_, _, size, _)| *size)
+                .collect::<Vec<_>>();
+            let mut decompression_time = std::time::Duration::ZERO;
+            for (chunk_path, decoded_size, _, expected_hash) in fixtures {
+                output.set_len(decoded_size).unwrap();
+                let started = std::time::Instant::now();
+                let written = super::super::assembly_opt::decompress_chunk_optimized(
+                    &chunk_path,
+                    &output,
+                    0,
+                    decoded_size,
+                    None,
+                    &hex::encode(expected_hash),
+                )
+                .unwrap();
+                decompression_time += started.elapsed();
+                assert_eq!(written, decoded_size);
+                let mut hasher = fast_md5::Md5::new();
+                let mut buffer = vec![0; 256 * 1024];
+                let mut offset = 0u64;
+                loop {
+                    let count =
+                        std::os::unix::fs::FileExt::read_at(&output, &mut buffer, offset).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                    offset += count as u64;
+                }
+                assert_eq!(hasher.finalize(), expected_hash);
+            }
+            let retained = super::super::assembly_opt::compressed_buffer_capacity();
+            super::super::assembly_opt::clear_compressed_buffer();
+            tx.send((retained, compressed_sizes, decompression_time.as_micros()))
+                .unwrap();
+        }));
+    }
+    drop(tx);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let capacities = rx.into_iter().collect::<Vec<_>>();
+    assert_eq!(capacities.len(), worker_count);
+    println!(
+        "compressed_buffer_retention fixture=high_entropy_worst_case workers={worker_count} sequence_mib={sizes_mib:?} capacities={capacities:?} process_hwm_kib={} retained_total_mib={:.1}",
+        rss_high_water_kib(),
+        capacities
+            .iter()
+            .map(|(capacity, _, _)| *capacity)
+            .sum::<usize>() as f64
+            / (1024.0 * 1024.0),
+    );
+}
+
 fn chunk_download(server: &wiremock::MockServer) -> Arc<DownloadInfo> {
     Arc::new(DownloadInfo {
         encryption: 0,
