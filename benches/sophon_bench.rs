@@ -148,6 +148,26 @@ fn bench_io_copy(c: &mut Criterion) {
 
 const MD5_MIB: u64 = 50;
 
+fn bench_md5_resident(c: &mut Criterion) {
+    const SIZE: usize = 64 * 1024 * 1024;
+    let data = gen_prng_data(0x5EED, SIZE);
+    let mut group = c.benchmark_group("md5_resident");
+    group.throughput(Throughput::Bytes(SIZE as u64));
+
+    for block_size in [64 * 1024, 256 * 1024, 1024 * 1024, SIZE] {
+        group.bench_function(BenchmarkId::from_parameter(block_size / 1024), |b| {
+            b.iter(|| {
+                let mut hasher = fast_md5::Md5::new();
+                for block in data.chunks(block_size) {
+                    hasher.update(block);
+                }
+                std::hint::black_box(hasher.finalize());
+            });
+        });
+    }
+    group.finish();
+}
+
 /// MD5 throughput of a 50 MiB file via the `md-5` crate (the verification hasher).
 fn bench_md5(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2183,6 +2203,7 @@ criterion_group!(
     benches,
     bench_io_copy,
     bench_md5,
+    bench_md5_resident,
     bench_zstd_decompress,
     bench_assembly_e2e,
     bench_verify_file_md5,
