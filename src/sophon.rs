@@ -2,7 +2,9 @@
 //! verify mode, and resume state, hiding the internal installer plumbing.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use rustc_hash::FxHashMap;
@@ -23,6 +25,7 @@ impl<T: Fn(SophonProgress) + Send + Sync + 'static> ProgressFn for T {}
 /// Per-game resume-state filename within `state_dir`.
 const STATE_FILE_PREFIX: &str = ".sophon_download_state_";
 const STATE_FILE_SUFFIX: &str = ".json";
+static STATE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Primary entry point. Owns its manifest-fetch HTTP client, game identity,
 /// install path, resume-state directory, and verify mode. Chunk downloads
@@ -390,19 +393,17 @@ impl Sophon {
         let output_path = self.game_dir.to_string_lossy().into_owned();
 
         let state_saver: StateSaver = Arc::new(move |map: &HashMap<String, u64>| {
-            let state = DownloadState {
-                game_id: game_id.clone(),
-                vo_lang: vo_lang.clone(),
-                output_path: output_path.clone(),
-                download_type: download_type.clone(),
-                current_tag: current_tag.clone(),
-                manifest_hash: manifest_hash.clone(),
-                downloaded_chunks: map.clone(),
-                completed_files: CompletedFiles::default(),
+            let state = DownloadStateRef {
+                game_id: &game_id,
+                vo_lang: &vo_lang,
+                output_path: &output_path,
+                download_type: &download_type,
+                current_tag: current_tag.as_deref(),
+                manifest_hash: &manifest_hash,
+                downloaded_chunks: map,
+                completed_files: &[],
             };
-            if let Ok(json) = serde_json::to_vec_pretty(&state) {
-                atomic_write(&state_file, &json);
-            }
+            atomic_write_serialized(&state_file, &state);
         });
 
         InstallCallbacks {
@@ -418,19 +419,17 @@ impl Sophon {
         let output_path = self.game_dir.to_string_lossy().into_owned();
 
         Arc::new(move |map: &HashMap<String, u64>| {
-            let state = DownloadState {
-                game_id: game_id.clone(),
-                vo_lang: vo_lang.clone(),
-                output_path: output_path.clone(),
-                download_type: DownloadType::Preinstall,
+            let state = DownloadStateRef {
+                game_id: &game_id,
+                vo_lang: &vo_lang,
+                output_path: &output_path,
+                download_type: &DownloadType::Preinstall,
                 current_tag: None,
-                manifest_hash: String::new(),
-                downloaded_chunks: map.clone(),
-                completed_files: CompletedFiles::default(),
+                manifest_hash: "",
+                downloaded_chunks: map,
+                completed_files: &[],
             };
-            if let Ok(json) = serde_json::to_vec_pretty(&state) {
-                atomic_write(&state_file, &json);
-            }
+            atomic_write_serialized(&state_file, &state);
         })
     }
 }
@@ -445,20 +444,106 @@ fn empty_resume() -> ResumeContext {
 
 /// Write `data` to `target` via a temp file then rename, so a crash mid-write
 /// leaves the previous state intact. Silently ignores IO errors.
+#[cfg(test)]
 fn atomic_write(target: &Path, data: &[u8]) {
     if let Some(parent) = target.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let pid = std::process::id();
-    let name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = target.with_file_name(format!(".{name}.{pid}.tmp"));
-    if std::fs::write(&tmp, data).is_err() {
+    let Ok((tmp, mut file)) = create_state_temp_file(target) else {
+        return;
+    };
+    let temp_file = StateTempFile::new(tmp);
+    if file.write_all(data).is_err() {
         return;
     }
-    let _ = std::fs::rename(&tmp, target);
+    drop(file);
+    let _ = temp_file.commit(target);
+}
+
+fn create_state_temp_file(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for _ in 0..16 {
+        let sequence = STATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path =
+            target.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "unable to create a unique state temp file",
+    ))
+}
+
+struct StateTempFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl StateTempFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self, target: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, target)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StateTempFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadStateRef<'a> {
+    game_id: &'a str,
+    vo_lang: &'a str,
+    output_path: &'a str,
+    download_type: &'a DownloadType,
+    current_tag: Option<&'a str>,
+    manifest_hash: &'a str,
+    downloaded_chunks: &'a HashMap<String, u64>,
+    completed_files: &'a [usize],
+}
+
+fn atomic_write_serialized<T: serde::Serialize>(target: &Path, value: &T) {
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok((tmp, file)) = create_state_temp_file(target) else {
+        return;
+    };
+    let temp_file = StateTempFile::new(tmp);
+    let write_result = (|| -> std::io::Result<()> {
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+        serde_json::to_writer_pretty(&mut writer, value).map_err(std::io::Error::other)?;
+        writer.flush()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        return;
+    }
+    let _ = temp_file.commit(target);
 }
 
 /// Per-game resume-state file path under `state_dir`.
@@ -491,6 +576,215 @@ mod tests {
     fn write_state(s: &Sophon, state: &DownloadState) {
         let json = serde_json::to_vec_pretty(state).unwrap();
         atomic_write(&s.state_file(), &json);
+    }
+
+    #[test]
+    fn borrowed_download_state_serialization_matches_owned_state() {
+        for download_type in [
+            DownloadType::Fresh,
+            DownloadType::Update,
+            DownloadType::Preinstall,
+        ] {
+            for current_tag in [None, Some("release-2.0")] {
+                for downloaded_chunks in [
+                    HashMap::new(),
+                    HashMap::from([
+                        ("unicode-雪.bin".to_owned(), 123),
+                        ("escaped\n\"chunk".to_owned(), 456),
+                    ]),
+                ] {
+                    let state = DownloadState {
+                        game_id: "nap".into(),
+                        vo_lang: "en-US".into(),
+                        output_path: "/games/test".into(),
+                        download_type: download_type.clone(),
+                        current_tag: current_tag.map(str::to_owned),
+                        manifest_hash: "a1b2c3".into(),
+                        downloaded_chunks,
+                        completed_files: CompletedFiles::default(),
+                    };
+                    let view = DownloadStateRef {
+                        game_id: &state.game_id,
+                        vo_lang: &state.vo_lang,
+                        output_path: &state.output_path,
+                        download_type: &state.download_type,
+                        current_tag: state.current_tag.as_deref(),
+                        manifest_hash: &state.manifest_hash,
+                        downloaded_chunks: &state.downloaded_chunks,
+                        completed_files: &[],
+                    };
+                    let owned = serde_json::to_vec_pretty(&state).unwrap();
+                    let borrowed = serde_json::to_vec_pretty(&view).unwrap();
+                    assert_eq!(owned, borrowed);
+                    let decoded: DownloadState = serde_json::from_slice(&borrowed).unwrap();
+                    assert_eq!(decoded.download_type, state.download_type);
+                    assert_eq!(decoded.current_tag, state.current_tag);
+                    assert_eq!(decoded.downloaded_chunks, state.downloaded_chunks);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_state_write_keeps_previous_file_on_serialize_error() {
+        struct FailingState;
+
+        impl serde::Serialize for FailingState {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("partial", &true)?;
+                Err(serde::ser::Error::custom("forced serialization failure"))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, b"previous state").unwrap();
+
+        atomic_write_serialized(&path, &FailingState);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous state");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_atomic_state_writes_use_distinct_temp_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let writers = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let payload = format!("state-{index}-{}", "x".repeat(128 * 1024));
+                    let expected = serde_json::to_string(&payload).unwrap();
+                    atomic_write_serialized(&path, &payload);
+                    expected
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+
+        let final_state = std::fs::read_to_string(&path).unwrap();
+        assert!(expected.contains(&final_state));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    #[ignore = "measures resume-state map clone and serialization cost"]
+    fn benchmark_download_state_snapshot_serialization() {
+        use std::time::Instant;
+
+        fn vm_hwm_kib() -> Option<u64> {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse().ok())
+            })
+        }
+
+        for entry_count in [10_000usize, 100_000, 1_000_000] {
+            let downloaded_chunks = (0..entry_count)
+                .map(|index| (format!("patch-chunk-{index:08}.bin"), 256 * 1024))
+                .collect::<HashMap<_, _>>();
+            let iterations = if entry_count == 1_000_000 { 5 } else { 20 };
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            let state = DownloadState {
+                game_id: "nap".into(),
+                vo_lang: "en-US".into(),
+                output_path: "/games/test".into(),
+                download_type: DownloadType::Preinstall,
+                current_tag: None,
+                manifest_hash: String::new(),
+                downloaded_chunks: downloaded_chunks.clone(),
+                completed_files: CompletedFiles::default(),
+            };
+            let state_view = DownloadStateRef {
+                game_id: &state.game_id,
+                vo_lang: &state.vo_lang,
+                output_path: &state.output_path,
+                download_type: &state.download_type,
+                current_tag: state.current_tag.as_deref(),
+                manifest_hash: &state.manifest_hash,
+                downloaded_chunks: &state.downloaded_chunks,
+                completed_files: &[],
+            };
+            let expected_json = serde_json::to_vec_pretty(&state).unwrap();
+            let view_json = serde_json::to_vec_pretty(&state_view).unwrap();
+            assert_eq!(expected_json, view_json);
+
+            if let Ok(mode) = std::env::var("IRMIN_STATE_BENCH_MODE") {
+                assert!(matches!(mode.as_str(), "baseline" | "stream"));
+                let before = vm_hwm_kib();
+                if mode == "baseline" {
+                    let owned_state = DownloadState {
+                        game_id: state.game_id.clone(),
+                        vo_lang: state.vo_lang.clone(),
+                        output_path: state.output_path.clone(),
+                        download_type: state.download_type.clone(),
+                        current_tag: state.current_tag.clone(),
+                        manifest_hash: state.manifest_hash.clone(),
+                        downloaded_chunks: state.downloaded_chunks.clone(),
+                        completed_files: CompletedFiles::default(),
+                    };
+                    let json = serde_json::to_vec_pretty(&owned_state).unwrap();
+                    atomic_write(&path, &json);
+                } else {
+                    atomic_write_serialized(&path, &state_view);
+                }
+                let after = vm_hwm_kib();
+                println!(
+                    "download_state_peak mode={mode} entries={entry_count} json_bytes={} hwm_before_kib={before:?} hwm_after_kib={after:?}",
+                    expected_json.len(),
+                );
+                std::hint::black_box(std::fs::metadata(&path).unwrap().len());
+                continue;
+            }
+
+            let mut baseline_elapsed = Vec::with_capacity(iterations);
+            let mut streaming_elapsed = Vec::with_capacity(iterations);
+            for round in 0..iterations {
+                for streaming in [round % 2 == 1, round % 2 == 0] {
+                    let started = Instant::now();
+                    if streaming {
+                        atomic_write_serialized(&path, &state_view);
+                        streaming_elapsed.push(started.elapsed());
+                    } else {
+                        let owned_state = DownloadState {
+                            game_id: state.game_id.clone(),
+                            vo_lang: state.vo_lang.clone(),
+                            output_path: state.output_path.clone(),
+                            download_type: state.download_type.clone(),
+                            current_tag: state.current_tag.clone(),
+                            manifest_hash: state.manifest_hash.clone(),
+                            downloaded_chunks: state.downloaded_chunks.clone(),
+                            completed_files: CompletedFiles::default(),
+                        };
+                        let json = serde_json::to_vec_pretty(&owned_state).unwrap();
+                        atomic_write(&path, &json);
+                        baseline_elapsed.push(started.elapsed());
+                    }
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), expected_json);
+            let median = |samples: &mut [std::time::Duration]| {
+                samples.sort_unstable();
+                samples[samples.len() / 2]
+            };
+            println!(
+                "download_state_snapshot entries={entry_count} iterations={iterations} json_bytes={} baseline_median_ms={} streaming_median_ms={}",
+                expected_json.len(),
+                median(&mut baseline_elapsed).as_micros() as f64 / 1000.0,
+                median(&mut streaming_elapsed).as_micros() as f64 / 1000.0,
+            );
+        }
     }
 
     fn sample_state(
