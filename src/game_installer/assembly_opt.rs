@@ -384,11 +384,6 @@ pub(crate) fn compressed_buffer_capacity() -> usize {
     COMPRESSED_BUF.with(|cell| cell.borrow().capacity())
 }
 
-#[cfg(all(feature = "bench-diagnostics", test))]
-pub(crate) fn clear_compressed_buffer() {
-    COMPRESSED_BUF.with(|cell| cell.borrow_mut().clear());
-}
-
 fn decompress_chunk_oneshot(
     chunk_path: &Path,
     out_file: &File,

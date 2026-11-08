@@ -145,12 +145,17 @@ fn benchmark_compressed_buffer_retention() {
         fixtures.push((path, expected_size, compressed.len(), expected_hash));
     }
     let (tx, rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
     let mut workers = Vec::with_capacity(worker_count);
+    let mut release_senders = Vec::with_capacity(worker_count);
 
     for worker_idx in 0..worker_count {
         let fixtures = fixtures.clone();
         let output_path = dir.path().join(format!("output-{worker_idx}.bin"));
         let tx = tx.clone();
+        let ready_tx = ready_tx.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+        release_senders.push(release_tx);
         workers.push(std::thread::spawn(move || {
             let output = std::fs::OpenOptions::new()
                 .read(true)
@@ -193,19 +198,44 @@ fn benchmark_compressed_buffer_retention() {
                 assert_eq!(hasher.finalize(), expected_hash);
             }
             let retained = super::super::assembly_opt::compressed_buffer_capacity();
-            super::super::assembly_opt::clear_compressed_buffer();
             tx.send((retained, compressed_sizes, decompression_time.as_micros()))
+                .unwrap();
+            drop(output);
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
                 .unwrap();
         }));
     }
     drop(tx);
-    for worker in workers {
-        worker.join().unwrap();
-    }
-    let capacities = rx.into_iter().collect::<Vec<_>>();
+    drop(ready_tx);
+    let capacities = (0..worker_count)
+        .map(|_| {
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("worker should report its retained buffer capacity")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(capacities.len(), worker_count);
+    drop(dir);
+    for _ in 0..worker_count {
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("all workers should hold their thread-local buffers");
+    }
+    let smaps = std::fs::read_to_string("/proc/self/smaps_rollup");
+    let smaps_available = smaps.is_ok();
+    let mut rss_anon_kib: Option<u64> = None;
+    let mut pss_kib: Option<u64> = None;
+    for line in smaps.as_deref().unwrap_or_default().lines() {
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("RssAnon:") => rss_anon_kib = fields.next().and_then(|value| value.parse().ok()),
+            Some("Pss:") => pss_kib = fields.next().and_then(|value| value.parse().ok()),
+            _ => {}
+        }
+    }
     println!(
-        "compressed_buffer_retention fixture=high_entropy_worst_case workers={worker_count} sequence_mib={sizes_mib:?} capacities={capacities:?} process_hwm_kib={} retained_total_mib={:.1}",
+        "compressed_buffer_retention fixture=high_entropy_worst_case policy=baseline workers={worker_count} sequence_mib={sizes_mib:?} capacities={capacities:?} smaps_available={smaps_available} rss_anon_kib={rss_anon_kib:?} pss_kib={pss_kib:?} process_hwm_kib={} retained_total_mib={:.1}",
         rss_high_water_kib(),
         capacities
             .iter()
@@ -213,6 +243,12 @@ fn benchmark_compressed_buffer_retention() {
             .sum::<usize>() as f64
             / (1024.0 * 1024.0),
     );
+    for release_tx in release_senders {
+        release_tx.send(()).unwrap();
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
 }
 
 fn chunk_download(server: &wiremock::MockServer) -> Arc<DownloadInfo> {
