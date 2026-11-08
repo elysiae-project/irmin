@@ -16,7 +16,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::AtomicU32;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use fast_md5;
 
 use irmin_rs::game_installer::{
@@ -405,11 +405,53 @@ fn bench_verify_file_md5(c: &mut Criterion) {
         b.iter(|| {
             cache.clear();
             evict_page_cache(&path);
-            let _ = irmin_rs::game_installer::cache::check_file_md5_cached(
+            let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
                 &path, bytes, &md5, &game_dir, &cache,
             )
             .unwrap();
+            assert!(valid);
+            assert!(cache.contains_key("verify.bin"));
         });
+    });
+
+    group.bench_function("warm_start_miss_setup_excluded", |b| {
+        let game_dir = game_dir.clone();
+        b.iter_batched(
+            || {
+                cache.clear();
+                let mut file = fs::File::open(&path).unwrap();
+                std::io::copy(&mut file, &mut std::io::sink()).unwrap();
+                cache.clear();
+            },
+            |_| {
+                let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
+                    &path, bytes, &md5, &game_dir, &cache,
+                )
+                .unwrap();
+                assert!(valid);
+                assert!(cache.contains_key("verify.bin"));
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("eviction_advised_miss_setup_excluded", |b| {
+        let game_dir = game_dir.clone();
+        b.iter_batched(
+            || {
+                cache.clear();
+                evict_page_cache(&path);
+            },
+            |_| {
+                let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
+                    &path, bytes, &md5, &game_dir, &cache,
+                )
+                .unwrap();
+                assert!(valid);
+                assert!(cache.contains_key("verify.bin"));
+            },
+            BatchSize::PerIteration,
+        );
     });
 
     // Populate cache for hit benchmark
@@ -434,6 +476,38 @@ fn bench_verify_file_md5(c: &mut Criterion) {
     });
 
     group.finish();
+
+    const SMALL_VERIFY_MIB: usize = 1;
+    let small_path = game_dir.join("verify-small.bin");
+    fill_file(&small_path, SMALL_VERIFY_MIB, 0x5A);
+    let small_md5 = hex::encode(fast_md5::digest(&fs::read(&small_path).unwrap()));
+    let small_bytes = (SMALL_VERIFY_MIB * 1024 * 1024) as u64;
+    let small_cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
+    let mut small_group = c.benchmark_group("verify_file_md5_small");
+    small_group.throughput(Throughput::Bytes(small_bytes));
+    small_group.bench_function("eviction_advised_miss_setup_excluded", |b| {
+        let game_dir = game_dir.clone();
+        b.iter_batched(
+            || {
+                small_cache.clear();
+                evict_page_cache(&small_path);
+            },
+            |_| {
+                let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
+                    &small_path,
+                    small_bytes,
+                    &small_md5,
+                    &game_dir,
+                    &small_cache,
+                )
+                .unwrap();
+                assert!(valid);
+                assert!(small_cache.contains_key("verify-small.bin"));
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    small_group.finish();
 }
 
 #[cfg(feature = "bench-internals")]
