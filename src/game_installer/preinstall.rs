@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::api::{
-    fetch_build, fetch_front_door, fetch_manifest, fetch_patch_build, fetch_patch_manifest,
+    fetch_build, fetch_front_door, fetch_manifest_proto, fetch_patch_build, fetch_patch_manifest,
     is_known_vo_locale, vo_lang_matches,
 };
 use super::assembly_opt::{md5_hex_eq, md5_to_hex, posix_advise};
@@ -1074,17 +1074,18 @@ async fn build_preinstall_plan_from_builds(
         .map(|(matching_field, meta)| {
             let field = matching_field.to_string();
             async move {
-                let result =
-                    fetch_manifest(client, &meta.manifest_download, &meta.manifest.id).await?;
-                Ok::<_, SophonError>((field, result))
+                let manifest =
+                    fetch_manifest_proto(client, &meta.manifest_download, &meta.manifest.id)
+                        .await?;
+                Ok::<_, SophonError>((field, manifest))
             }
         })
         .collect();
     let manifest_results = try_join_all(manifest_futures).await?;
 
     let mut target_manifests = Vec::with_capacity(manifest_results.len());
-    for (matching_field, manifest_result) in manifest_results {
-        for asset in &manifest_result.manifest.assets {
+    for (matching_field, manifest) in manifest_results {
+        for asset in &manifest.assets {
             if asset.is_directory() {
                 seen_patch_targets.insert(asset.asset_name.clone());
                 continue;
@@ -1114,7 +1115,7 @@ async fn build_preinstall_plan_from_builds(
             matching_field,
             manifest_id: meta.manifest.id.clone(),
             chunk_download: meta.chunk_download.clone(),
-            manifest: manifest_result.manifest,
+            manifest,
         });
     }
     let mut target_snapshot = TargetSnapshot {
@@ -3249,12 +3250,12 @@ where
                     .ok_or_else(|| {
                         invalid_state(format!("Saved target manifest {field}/{id} is unavailable"))
                     })?;
-                let result = fetch_manifest(client, &meta.manifest_download, id).await?;
+                let manifest = fetch_manifest_proto(client, &meta.manifest_download, id).await?;
                 manifests.push(TargetManifest {
                     matching_field: field.clone(),
                     manifest_id: id.clone(),
                     chunk_download: meta.chunk_download.clone(),
-                    manifest: result.manifest,
+                    manifest,
                 });
             }
             let mut snapshot = TargetSnapshot {
