@@ -196,14 +196,17 @@ async fn benchmark_eager_loopback_concurrent_rss() {
     use std::sync::mpsc;
     use std::thread;
 
-    let concurrency = std::env::var("IRMIN_EAGER_BENCH_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4);
-    let size_mib = std::env::var("IRMIN_EAGER_BENCH_SIZE_MIB")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(32);
+    let parse_env = |name: &str, default: u64| {
+        std::env::var(name)
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| panic!("{name} must be an unsigned integer"))
+            })
+            .unwrap_or(default)
+    };
+    let concurrency = usize::try_from(parse_env("IRMIN_EAGER_BENCH_CONCURRENCY", 4)).unwrap();
+    let size_mib = usize::try_from(parse_env("IRMIN_EAGER_BENCH_SIZE_MIB", 32)).unwrap();
     assert!((1..=16).contains(&concurrency));
     assert!((17..=128).contains(&size_mib));
     let mode = std::env::var("IRMIN_EAGER_BENCH_MODE").unwrap_or_else(|_| "stream".to_owned());
@@ -213,11 +216,24 @@ async fn benchmark_eager_loopback_concurrent_rss() {
         "threshold" => None,
         _ => panic!("IRMIN_EAGER_BENCH_MODE must be stream, oneshot, or threshold"),
     };
-    let queue_capacity = std::env::var("IRMIN_EAGER_BENCH_QUEUE_CAPACITY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(8);
+    let queue_capacity = usize::try_from(parse_env("IRMIN_EAGER_BENCH_QUEUE_CAPACITY", 8)).unwrap();
     assert!(queue_capacity > 0);
+    let response_delay_ms = parse_env("IRMIN_EAGER_BENCH_RTT_MS", 0);
+    assert!(response_delay_ms <= 60_000, "RTT delay must not exceed 60s");
+    let rate_mib_s = parse_env("IRMIN_EAGER_BENCH_RATE_MIB_S", 0);
+    let rate_bytes_s = rate_mib_s.checked_mul(1024 * 1024).expect("rate too large");
+    let frame_size = usize::try_from(parse_env("IRMIN_EAGER_BENCH_FRAME_KIB", 64))
+        .unwrap()
+        .checked_mul(1024)
+        .expect("frame size too large");
+    assert!((1..=4096 * 1024).contains(&frame_size));
+    if rate_bytes_s > 0 {
+        let interval_nanos = (frame_size as u128) * 1_000_000_000 / rate_bytes_s as u128;
+        assert!(
+            interval_nanos >= 500_000,
+            "frame pacing interval must be at least 500us"
+        );
+    }
 
     let mut state = 0xBAD5EEDu64;
     let data = (0..size_mib * 1024 * 1024)
@@ -238,7 +254,13 @@ async fn benchmark_eager_loopback_concurrent_rss() {
 
     let (address_tx, address_rx) = mpsc::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let pacing = Arc::new(Mutex::new(None::<Instant>));
+    let response_count = Arc::new(AtomicU64::new(0));
+    let frame_count = Arc::new(AtomicU64::new(0));
+    let server_response_count = Arc::clone(&response_count);
+    let server_frame_count = Arc::clone(&frame_count);
     let server_body = compressed.clone();
+    let server_pacing = Arc::clone(&pacing);
     let server = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -257,45 +279,94 @@ async fn benchmark_eager_loopback_concurrent_rss() {
                     accepted = listener.accept() => {
                         let (socket, _) = accepted.unwrap();
                         let body_bytes = server_body.clone();
+                        let pacing = Arc::clone(&server_pacing);
+                        let response_count = Arc::clone(&server_response_count);
+                        let frame_count = Arc::clone(&server_frame_count);
                         tokio::spawn(async move {
                             let service = service_fn(move |request: Request<Incoming>| {
-                            let body_bytes = body_bytes.clone();
-                            async move {
-                                let start = request
-                                    .headers()
-                                    .get("x-start")
-                                    .and_then(|value| value.to_str().ok())
-                                    .and_then(|value| value.parse::<usize>().ok())
-                                    .unwrap_or(0);
-                                let length = request
-                                    .headers()
-                                    .get("x-length")
-                                    .and_then(|value| value.to_str().ok())
-                                    .and_then(|value| value.parse::<usize>().ok())
-                                    .unwrap_or(body_bytes.len());
-                                let end = start.saturating_add(length).min(body_bytes.len());
-                                let frame_size = 64 * 1024;
-                                let stream = stream::unfold(
-                                    (start, end, body_bytes),
-                                    move |(offset, end, body)| async move {
-                                        if offset >= end {
-                                            return None;
-                                        }
-                                        let next = (offset + frame_size).min(end);
-                                        Some((
-                                            Ok::<_, Infallible>(Frame::data(body.slice(offset..next))),
-                                            (next, end, body),
+                                let body_bytes = body_bytes.clone();
+                                let pacing = Arc::clone(&pacing);
+                                let response_count = Arc::clone(&response_count);
+                                let frame_count = Arc::clone(&frame_count);
+                                async move {
+                                    response_count.fetch_add(1, Ordering::Relaxed);
+                                    if response_delay_ms > 0 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            response_delay_ms,
                                         ))
-                                    },
-                                );
-                                let mut response = Response::new(StreamBody::new(stream));
-                                response.headers_mut().insert(
-                                    hyper::header::CONTENT_LENGTH,
-                                    (end - start).to_string().parse().unwrap(),
-                                );
-                                Ok::<_, Infallible>(response)
-                            }
-                        });
+                                        .await;
+                                    }
+                                    let start = request
+                                        .headers()
+                                        .get("x-start")
+                                        .and_then(|value| value.to_str().ok())
+                                        .and_then(|value| value.parse::<usize>().ok())
+                                        .unwrap_or(0);
+                                    let length = request
+                                        .headers()
+                                        .get("x-length")
+                                        .and_then(|value| value.to_str().ok())
+                                        .and_then(|value| value.parse::<usize>().ok())
+                                        .unwrap_or(body_bytes.len());
+                                    let end = start.saturating_add(length).min(body_bytes.len());
+                                    let response_frame_size = frame_size;
+                                    let stream = stream::unfold(
+                                        (start, end, body_bytes),
+                                        move |(offset, end, body)| {
+                                            let pacing = Arc::clone(&pacing);
+                                            let frame_count = Arc::clone(&frame_count);
+                                            async move {
+                                                if offset >= end {
+                                                    return None;
+                                                }
+                                                let next = (offset + response_frame_size).min(end);
+                                                if rate_bytes_s > 0 {
+                                                    let frame_bytes = (next - offset) as u64;
+                                                    let scheduled_end = {
+                                                        let mut state = pacing
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
+                                                        let now = Instant::now();
+                                                        let start = state
+                                                            .map_or(now, |available| available.max(now));
+                                                        let duration_nanos = (frame_bytes as u128)
+                                                            .saturating_mul(1_000_000_000)
+                                                            .div_ceil(rate_bytes_s as u128)
+                                                            .min(u64::MAX as u128)
+                                                            as u64;
+                                                        let end = start
+                                                            + std::time::Duration::from_nanos(
+                                                                duration_nanos,
+                                                            );
+                                                        *state = Some(end);
+                                                        end
+                                                    };
+                                                    let now = Instant::now();
+                                                    if scheduled_end > now {
+                                                        tokio::time::sleep_until(
+                                                            scheduled_end.into(),
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                                frame_count.fetch_add(1, Ordering::Relaxed);
+                                                Some((
+                                                    Ok::<_, Infallible>(Frame::data(
+                                                        body.slice(offset..next),
+                                                    )),
+                                                    (next, end, body),
+                                                ))
+                                            }
+                                        },
+                                    );
+                                    let mut response = Response::new(StreamBody::new(stream));
+                                    response.headers_mut().insert(
+                                        hyper::header::CONTENT_LENGTH,
+                                        (end - start).to_string().parse().unwrap(),
+                                    );
+                                    Ok::<_, Infallible>(response)
+                                }
+                            });
                             let _ = http1::Builder::new()
                                 .serve_connection(TokioIo::new(socket), service)
                                 .await;
@@ -305,6 +376,24 @@ async fn benchmark_eager_loopback_concurrent_rss() {
             }
         });
     });
+    struct ServerGuard {
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let mut server_guard = ServerGuard {
+        shutdown: Some(shutdown_tx),
+        thread: Some(server),
+    };
     let address = address_rx.recv().unwrap();
     let url_prefix = format!("http://{address}/");
     let download = Arc::new(DownloadInfo {
@@ -433,14 +522,17 @@ async fn benchmark_eager_loopback_concurrent_rss() {
         result.unwrap().unwrap();
     }
     println!(
-        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} elapsed_ms={} cpu_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
+        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} frame_kib={} rtt_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} requests={} frames={} elapsed_ms={} cpu_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
+        frame_size / 1024,
+        response_count.load(Ordering::Relaxed),
+        frame_count.load(Ordering::Relaxed),
         started.elapsed().as_millis(),
         process_cpu_time_ms().saturating_sub(cpu_before),
         rss_high_water_kib(),
         compressed.len() as f64 * concurrency as f64 / (1024.0 * 1024.0),
     );
-    let _ = shutdown_tx.send(());
-    server.join().unwrap();
+    server_guard.shutdown.take().unwrap().send(()).unwrap();
+    server_guard.thread.take().unwrap().join().unwrap();
 }
 
 #[tokio::test]
