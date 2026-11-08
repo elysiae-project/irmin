@@ -1466,7 +1466,7 @@ async fn process_eager_item_with_mode(
     .await
 }
 
-const EAGER_STREAM_THRESHOLD: u64 = 16 * 1024 * 1024;
+const EAGER_STREAM_THRESHOLD: u64 = 64 * 1024 * 1024;
 const EAGER_STREAM_QUEUE_CAPACITY: usize = 8;
 
 fn should_stream_eager(compressed_size: u64, forced: Option<bool>) -> bool {

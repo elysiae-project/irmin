@@ -69,7 +69,7 @@ fn eager_item() -> DownloadItem {
 
 #[test]
 fn eager_stream_threshold_preserves_small_one_shot_path() {
-    assert_eq!(super::EAGER_STREAM_THRESHOLD, 16 * 1024 * 1024);
+    assert_eq!(super::EAGER_STREAM_THRESHOLD, 64 * 1024 * 1024);
     assert!(super::EAGER_STREAM_THRESHOLD > 8 * 1024 * 1024);
     assert!(super::EAGER_STREAM_THRESHOLD <= 64 * 1024 * 1024);
     assert!(!super::should_stream_eager(
@@ -96,6 +96,15 @@ fn rss_high_water_kib() -> u64 {
                 .and_then(|value| value.parse().ok())
         })
         .unwrap()
+}
+
+fn process_cpu_time_ms() -> u128 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    assert_eq!(result, 0);
+    let usage = unsafe { usage.assume_init() };
+    (usage.ru_utime.tv_sec as u128 + usage.ru_stime.tv_sec as u128) * 1000
+        + (usage.ru_utime.tv_usec as u128 + usage.ru_stime.tv_usec as u128) / 1000
 }
 
 fn chunk_download(server: &wiremock::MockServer) -> Arc<DownloadInfo> {
@@ -199,9 +208,10 @@ async fn benchmark_eager_loopback_concurrent_rss() {
     assert!((17..=128).contains(&size_mib));
     let mode = std::env::var("IRMIN_EAGER_BENCH_MODE").unwrap_or_else(|_| "stream".to_owned());
     let force_streaming = match mode.as_str() {
-        "stream" => true,
-        "oneshot" => false,
-        _ => panic!("IRMIN_EAGER_BENCH_MODE must be stream or oneshot"),
+        "stream" => Some(true),
+        "oneshot" => Some(false),
+        "threshold" => None,
+        _ => panic!("IRMIN_EAGER_BENCH_MODE must be stream, oneshot, or threshold"),
     };
     let queue_capacity = std::env::var("IRMIN_EAGER_BENCH_QUEUE_CAPACITY")
         .ok()
@@ -392,6 +402,7 @@ async fn benchmark_eager_loopback_concurrent_rss() {
     );
     let offsets = Arc::new((0..=concurrency as u32).collect::<Vec<_>>());
     let peak_before = rss_high_water_kib();
+    let cpu_before = process_cpu_time_ms();
     let started = std::time::Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
     for index in 0..concurrency {
@@ -412,7 +423,7 @@ async fn benchmark_eager_loopback_concurrent_rss() {
                 offsets.as_slice(),
                 pending.as_slice(),
                 &DownloadHandle::new(),
-                Some(force_streaming),
+                force_streaming,
                 Some(queue_capacity),
             )
             .await
@@ -422,8 +433,9 @@ async fn benchmark_eager_loopback_concurrent_rss() {
         result.unwrap().unwrap();
     }
     println!(
-        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} elapsed_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
+        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} elapsed_ms={} cpu_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
         started.elapsed().as_millis(),
+        process_cpu_time_ms().saturating_sub(cpu_before),
         rss_high_water_kib(),
         compressed.len() as f64 * concurrency as f64 / (1024.0 * 1024.0),
     );
