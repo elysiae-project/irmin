@@ -338,14 +338,19 @@ fn assemble_file_with_options(
     let tmp_name = std::str::from_utf8(&name_buf).unwrap();
     let tmp_path = temp_dir.join(tmp_name);
 
-    if !skip_md5_check && target_path.exists() {
-        let already_valid = super::cache::check_file_md5_cached(
-            &target_path,
-            file_size,
-            file_hash_md5,
-            game_dir,
-            verify_cache,
-        )?;
+    if !skip_md5_check {
+        let target_metadata = target_path.metadata().ok();
+        let already_valid = match target_metadata {
+            Some(metadata) => super::cache::check_file_md5_cached_with_metadata(
+                &target_path,
+                file_size,
+                file_hash_md5,
+                game_dir,
+                verify_cache,
+                metadata,
+            )?,
+            None => false,
+        };
 
         if already_valid {
             log::debug!(
@@ -637,15 +642,18 @@ fn assemble_file_with_options(
                                 chunk.chunk_size_decompressed,
                                 None,
                                 &mut transfer_buf,
-                                if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
+                                if skip_chunk_hash {
+                                    ""
+                                } else {
+                                    chunk.chunk_decompressed_hash_md5
+                                },
                             )
                         } else {
                             if !validate_chunk_name(chunk.chunk_name) {
                                 let mut guard = err.lock().unwrap();
                                 if guard.is_none() {
-                                    *guard = Some(SophonError::PathTraversal(
-                                        chunk.chunk_name.into(),
-                                    ));
+                                    *guard =
+                                        Some(SophonError::PathTraversal(chunk.chunk_name.into()));
                                 }
                                 err_flag.store(true, Ordering::Relaxed);
                                 break;
@@ -658,7 +666,11 @@ fn assemble_file_with_options(
                                 offset,
                                 chunk.chunk_size_decompressed,
                                 None,
-                                if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
+                                if skip_chunk_hash {
+                                    ""
+                                } else {
+                                    chunk.chunk_decompressed_hash_md5
+                                },
                             );
                             chunk_path.pop();
                             result
@@ -729,7 +741,11 @@ fn assemble_file_with_options(
                     chunk.chunk_size_decompressed,
                     file_hasher.as_mut(),
                     &mut transfer_buffer,
-                    if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
+                    if skip_chunk_hash {
+                        ""
+                    } else {
+                        chunk.chunk_decompressed_hash_md5
+                    },
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -750,7 +766,11 @@ fn assemble_file_with_options(
                     offset,
                     chunk.chunk_size_decompressed,
                     file_hasher.as_mut(),
-                    if skip_chunk_hash { "" } else { chunk.chunk_decompressed_hash_md5 },
+                    if skip_chunk_hash {
+                        ""
+                    } else {
+                        chunk.chunk_decompressed_hash_md5
+                    },
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -1205,7 +1225,6 @@ pub async fn spawn_assembly_task(
         .map_err(|_| SophonError::Io(std::io::Error::other("assembly task cancelled")))
         .and_then(|r| r)
 }
-
 
 #[cfg(test)]
 #[path = "assembly_tests.rs"]

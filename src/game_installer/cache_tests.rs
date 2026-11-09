@@ -116,6 +116,108 @@ fn check_file_md5_cached_hit() {
 }
 
 #[test]
+fn check_file_md5_cached_with_metadata_matches_regular_cache_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.dat");
+    fs::write(&file_path, b"hello world").unwrap();
+    let metadata = fs::metadata(&file_path).unwrap();
+    let mtime = metadata
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let md5 = hex::encode(fast_md5::digest(b"hello world"));
+    let cache = DashMap::new();
+    cache.insert(
+        "test.dat".to_owned(),
+        VerificationEntry {
+            size: 11,
+            md5: md5.clone(),
+            mtime_secs: mtime,
+        },
+    );
+
+    assert!(
+        check_file_md5_cached_with_metadata(&file_path, 11, &md5, dir.path(), &cache, metadata,)
+            .unwrap()
+    );
+    assert!(cache.contains_key("test.dat"));
+}
+
+#[test]
+fn check_file_md5_cached_with_metadata_removes_size_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.dat");
+    fs::write(&file_path, b"hello world").unwrap();
+    let metadata = fs::metadata(&file_path).unwrap();
+    let cache = DashMap::new();
+    cache.insert(
+        "test.dat".to_owned(),
+        VerificationEntry {
+            size: 11,
+            md5: hex::encode(fast_md5::digest(b"hello world")),
+            mtime_secs: metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        },
+    );
+
+    assert!(
+        !check_file_md5_cached_with_metadata(
+            &file_path,
+            12,
+            "unused-on-size-mismatch",
+            dir.path(),
+            &cache,
+            metadata,
+        )
+        .unwrap()
+    );
+    assert!(!cache.contains_key("test.dat"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_file_md5_cached_with_metadata_follows_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.dat");
+    let link = dir.path().join("link.dat");
+    fs::write(&target, b"hello world").unwrap();
+    symlink(&target, &link).unwrap();
+    let metadata = fs::metadata(&link).unwrap();
+    let md5 = hex::encode(fast_md5::digest(b"hello world"));
+    let cache = DashMap::new();
+    cache.insert(
+        "link.dat".to_owned(),
+        VerificationEntry {
+            size: 11,
+            md5: md5.clone(),
+            mtime_secs: metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        },
+    );
+    assert!(
+        check_file_md5_cached_with_metadata(&link, 11, &md5, dir.path(), &cache, metadata,)
+            .unwrap()
+    );
+
+    fs::remove_file(&link).unwrap();
+    symlink(dir.path().join("missing.dat"), &link).unwrap();
+    assert!(link.metadata().is_err());
+    assert!(!link.exists());
+}
+
+#[test]
 fn check_file_md5_cached_miss_size_changed() {
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("test.dat");

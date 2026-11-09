@@ -349,6 +349,123 @@ fn benchmark_repair_post_assembly_hash_reread() {
     );
 }
 
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures cached-target checks in the assembly fast path"]
+fn benchmark_cached_assembly_target_checks() {
+    use std::io::Read as _;
+    use std::time::Instant;
+
+    fn process_hwm_kib() -> u64 {
+        let mut status = String::new();
+        fs::File::open("/proc/self/status")
+            .unwrap()
+            .read_to_string(&mut status)
+            .unwrap();
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmHWM:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or_default()
+    }
+
+    let file_count = std::env::var("IRMIN_CACHE_HIT_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+    assert!(file_count > 0);
+    let temp_root = std::env::var_os("IRMIN_CACHE_HIT_TEMP_DIR");
+    let dir = if let Some(root) = temp_root {
+        tempfile::tempdir_in(root).unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+    let empty_hash = hex::encode(fast_md5::digest(b""));
+    let mut assets = Vec::with_capacity(file_count);
+    let cache = DashMap::new();
+    for index in 0..file_count {
+        let name = format!("asset-{index:08}.bin");
+        let path = game_dir.join(&name);
+        fs::File::create(&path).unwrap();
+        let mtime_secs = path
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        cache.insert(
+            name.clone(),
+            super::super::cache::VerificationEntry {
+                size: 0,
+                md5: empty_hash.clone(),
+                mtime_secs,
+            },
+        );
+        assets.push(SophonManifestAssetProperty {
+            asset_name: name,
+            asset_chunks: Vec::new(),
+            asset_type: 0,
+            asset_size: 0,
+            asset_hash_md5: empty_hash.clone(),
+        });
+    }
+    let manifest = CompactManifest::from(assets);
+    std::fs::write("/proc/self/clear_refs", b"5").unwrap();
+    let before_hwm = process_hwm_kib();
+    let run = |metadata_reuse: bool| {
+        let started = Instant::now();
+        for file_idx in 0..manifest.num_files() {
+            let path = game_dir.join(manifest.file_name(file_idx));
+            let already_valid = if metadata_reuse {
+                match path.metadata() {
+                    Ok(metadata) => super::super::cache::check_file_md5_cached_with_metadata(
+                        &path,
+                        manifest.file_size(file_idx),
+                        manifest.file_hash_md5(file_idx),
+                        &game_dir,
+                        &cache,
+                        metadata,
+                    )
+                    .unwrap(),
+                    Err(_) => false,
+                }
+            } else {
+                path.exists()
+                    && super::super::cache::check_file_md5_cached(
+                        &path,
+                        manifest.file_size(file_idx),
+                        manifest.file_hash_md5(file_idx),
+                        &game_dir,
+                        &cache,
+                    )
+                    .unwrap()
+            };
+            assert!(already_valid);
+        }
+        started.elapsed()
+    };
+    let metadata_reuse = std::env::var("IRMIN_CACHE_HIT_MODE").as_deref() == Ok("reuse");
+    let elapsed = run(metadata_reuse);
+    println!(
+        "cached_assembly_target_checks mode={} files={file_count} elapsed_ms={:.3} per_file_us={:.3} hwm_before_kib={before_hwm} hwm_after_kib={}",
+        if metadata_reuse { "reuse" } else { "baseline" },
+        elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1_000_000.0 / file_count as f64,
+        process_hwm_kib(),
+    );
+}
+
 fn make_chunk_names(names: &[&str]) -> Arc<ChunkNameLookup> {
     Arc::new(ChunkNameLookup::from_arena(StringArena::from(names)))
 }
@@ -623,6 +740,46 @@ fn assemble_file_skips_valid_existing() {
 
     let result = fs::read(&target).unwrap();
     assert_eq!(result, original_data);
+}
+
+#[test]
+fn assemble_file_skip_md5_check_does_not_verify_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+    let target = game_dir.join("target.bin");
+    fs::write(&target, b"stale target").unwrap();
+    let correct = b"replacement";
+    make_chunk_file(&chunks_dir, "replacement", correct);
+    let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
+        asset_name: "target.bin".to_owned(),
+        asset_chunks: vec![make_chunk("replacement", 0, correct.len() as u64)],
+        asset_type: 0,
+        asset_size: correct.len() as u64,
+        asset_hash_md5: compute_md5_hex(correct),
+    }]);
+    let lookup = make_chunk_names(&["replacement"]);
+    let refcounts = [AtomicU32::new(1)];
+
+    assemble_file(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &DashMap::new(),
+        true,
+        crate::game_installer::VerifyMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&target).unwrap(), correct);
 }
 
 #[test]

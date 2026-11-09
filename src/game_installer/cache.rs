@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -133,8 +133,7 @@ pub fn check_file_md5_cached(
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<bool> {
-    let relative = path.strip_prefix(game_dir).unwrap_or(path);
-    let cache_key = relative.to_string_lossy();
+    let cache_key = cache_key_for_path(path, game_dir);
     check_file_md5_with_cache_key(path, expected_size, expected_md5, &cache_key, cache)
 }
 
@@ -146,8 +145,7 @@ pub fn check_file_md5_cached_with_size(
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<(bool, Option<u64>)> {
-    let relative = path.strip_prefix(game_dir).unwrap_or(path);
-    let cache_key = relative.to_string_lossy();
+    let cache_key = cache_key_for_path(path, game_dir);
     check_file_md5_with_cache_key_and_size(path, expected_size, expected_md5, &cache_key, cache)
 }
 
@@ -179,6 +177,50 @@ pub fn check_file_md5_with_cache_key_and_size(
         }
         Err(err) => return Err(err),
     };
+    check_file_md5_with_metadata(
+        path,
+        expected_size,
+        expected_md5,
+        cache_key,
+        cache,
+        metadata,
+    )
+}
+
+pub(crate) fn check_file_md5_cached_with_metadata(
+    path: &Path,
+    expected_size: u64,
+    expected_md5: &str,
+    game_dir: &Path,
+    cache: &DashMap<String, VerificationEntry>,
+    metadata: Metadata,
+) -> io::Result<bool> {
+    let cache_key = cache_key_for_path(path, game_dir);
+    check_file_md5_with_metadata(
+        path,
+        expected_size,
+        expected_md5,
+        &cache_key,
+        cache,
+        metadata,
+    )
+    .map(|(ok, _)| ok)
+}
+
+fn cache_key_for_path<'a>(path: &'a Path, game_dir: &Path) -> std::borrow::Cow<'a, str> {
+    path.strip_prefix(game_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+}
+
+fn check_file_md5_with_metadata(
+    path: &Path,
+    expected_size: u64,
+    expected_md5: &str,
+    cache_key: &str,
+    cache: &DashMap<String, VerificationEntry>,
+    metadata: Metadata,
+) -> io::Result<(bool, Option<u64>)> {
     let actual_size = metadata.len();
 
     // Fast rejection: skip DashMap lookup if size doesn't match.
