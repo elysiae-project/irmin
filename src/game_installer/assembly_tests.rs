@@ -5,13 +5,36 @@ use crate::game_installer::compact_manifest::CompactManifest;
 use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 
 #[cfg(feature = "bench-diagnostics")]
+fn benchmark_download_over_fused_hash() -> bool {
+    parse_benchmark_fused_hash_flag(
+        std::env::var("IRMIN_DOWNLOAD_OVER_FUSED_HASH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn parse_benchmark_fused_hash_flag(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(all(test, feature = "bench-diagnostics"))]
+#[test]
+fn download_over_fused_hash_benchmark_flag_requires_one() {
+    assert!(!parse_benchmark_fused_hash_flag(None));
+    assert!(!parse_benchmark_fused_hash_flag(Some("0")));
+    assert!(!parse_benchmark_fused_hash_flag(Some("true")));
+    assert!(parse_benchmark_fused_hash_flag(Some("1")));
+}
+
+#[cfg(feature = "bench-diagnostics")]
 #[test]
 #[ignore = "reports DownloadOver-like assembly timing and RSS by hash strategy"]
 fn benchmark_download_over_assembly_hash_strategy() {
     use std::io::Read as _;
     use std::time::Instant;
 
-    let fused = std::env::var_os("IRMIN_DOWNLOAD_OVER_FUSED_HASH").is_some();
+    let fused = benchmark_download_over_fused_hash();
     let temp_root = std::env::var_os("IRMIN_DOWNLOAD_OVER_TEMP_DIR");
     let dir = if let Some(temp_root) = temp_root {
         tempfile::tempdir_in(temp_root).unwrap()
