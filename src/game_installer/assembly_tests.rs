@@ -164,6 +164,191 @@ fn benchmark_download_over_assembly_hash_strategy() {
     );
 }
 
+/// Measures Deferred assembly and the subsequent repair-style cache-miss hash read.
+/// The per-file cache hint is best effort; timings are diagnostic and warm-cache unless the
+/// filesystem actually drops the advised pages.
+#[cfg(all(feature = "bench-diagnostics", unix))]
+#[test]
+#[ignore = "measures repair-style post-assembly destination verification cost"]
+fn benchmark_repair_post_assembly_hash_reread() {
+    use std::io::Read as _;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Instant;
+
+    let total_mib = std::env::var("IRMIN_REPAIR_HASH_SIZE_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1);
+    assert!(total_mib <= 4096, "benchmark size exceeds 4 GiB");
+    let cold_hint = std::env::var("IRMIN_REPAIR_HASH_COLD_HINT").as_deref() == Ok("1");
+    let iterations = std::env::var("IRMIN_REPAIR_HASH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1);
+    assert!(iterations <= 100, "benchmark iteration count exceeds 100");
+    let temp_root = std::env::var_os("IRMIN_REPAIR_HASH_TEMP_DIR");
+    let dir = if let Some(temp_root) = temp_root {
+        tempfile::tempdir_in(temp_root).unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let total_bytes = total_mib.checked_mul(1024 * 1024).unwrap();
+    let chunk_size = total_bytes.div_ceil(8);
+    let mut file_hasher = fast_md5::Md5::new();
+    let mut chunks = Vec::with_capacity(8);
+    let mut names = Vec::with_capacity(8);
+    for index in 0..8 {
+        let start = index * chunk_size;
+        let len = (total_bytes - start).min(chunk_size);
+        let data: Vec<u8> = (0..len)
+            .map(|offset| (offset.wrapping_mul(31).wrapping_add(index * 17) % 251) as u8)
+            .collect();
+        let name = format!("repair-hash-{index}");
+        make_chunk_file(&chunks_dir, &name, &data);
+        file_hasher.update(&data);
+        let mut chunk = make_chunk(&name, start as u64, len as u64);
+        chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(&data));
+        names.push(name);
+        chunks.push(chunk);
+    }
+    let expected_hash = hex::encode(file_hasher.finalize());
+    let file = SophonManifestAssetProperty {
+        asset_name: "repair-asset.bin".to_owned(),
+        asset_chunks: chunks,
+        asset_type: 0,
+        asset_size: total_bytes as u64,
+        asset_hash_md5: expected_hash.clone(),
+    };
+    let manifest = CompactManifest::from(vec![file]);
+    let lookup = ChunkNameLookup::from_arena(StringArena::from(
+        names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+    ));
+    let remaining_uses = u32::try_from(iterations).unwrap() + 1;
+    let refcounts = (0..8)
+        .map(|_| AtomicU32::new(remaining_uses))
+        .collect::<Vec<_>>();
+    let verify_cache = DashMap::new();
+    let target = game_dir.join("repair-asset.bin");
+    let path_key = "repair-asset.bin";
+    let filesystem_magic = {
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+        assert_eq!(result, 0, "failed to query benchmark filesystem");
+        unsafe { stats.assume_init().f_type as u64 }
+    };
+
+    let mut assembly_times = Vec::with_capacity(iterations);
+    let mut reread_times = Vec::with_capacity(iterations);
+    let mut total_times = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        verify_cache.remove(path_key);
+        let started = Instant::now();
+        assemble_file(
+            &manifest,
+            0,
+            &game_dir,
+            &chunks_dir,
+            &temp_dir,
+            &lookup,
+            &refcounts,
+            &verify_cache,
+            true,
+            crate::game_installer::VerifyMode::Deferred,
+        )
+        .unwrap_or_else(|error| panic!("repair hash fixture assembly failed: {error}"));
+        let assembly_elapsed = started.elapsed();
+
+        let target_file = fs::File::open(&target).unwrap();
+        if cold_hint {
+            super::super::assembly_opt::posix_advise(
+                target_file.as_raw_fd(),
+                0,
+                total_bytes as u64,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        verify_cache.remove(path_key);
+        let verify_started = Instant::now();
+        assert!(
+            super::super::cache::check_file_md5_cached(
+                &target,
+                total_bytes as u64,
+                &expected_hash,
+                &game_dir,
+                &verify_cache,
+            )
+            .unwrap()
+        );
+        let reread_elapsed = verify_started.elapsed();
+        total_times.push(started.elapsed());
+        assembly_times.push(assembly_elapsed);
+        reread_times.push(reread_elapsed);
+        assert_eq!(
+            hex::encode(super::super::cache::file_md5_digest(&target).unwrap()),
+            expected_hash
+        );
+        let expected_mtime = target
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let entry = verify_cache.get(path_key).unwrap();
+            assert_eq!(entry.value().size, total_bytes as u64);
+            assert_eq!(entry.value().md5, expected_hash);
+            assert_eq!(entry.value().mtime_secs, expected_mtime);
+        }
+        verify_cache.remove(path_key);
+    }
+
+    let mut status = String::new();
+    fs::File::open("/proc/self/status")
+        .unwrap()
+        .read_to_string(&mut status)
+        .unwrap();
+    let hwm_kib = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmHWM:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or_default();
+    println!(
+        "repair_hash_baseline filesystem_magic=0x{filesystem_magic:x} size_mib={total_mib} iterations={iterations} cold_hint={cold_hint} assembly_ms={:?} reread_ms={:?} total_ms={:?} VmHWM_kib={hwm_kib}",
+        assembly_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>(),
+        reread_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>(),
+        total_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>(),
+    );
+}
+
 fn make_chunk_names(names: &[&str]) -> Arc<ChunkNameLookup> {
     Arc::new(ChunkNameLookup::from_arena(StringArena::from(names)))
 }
