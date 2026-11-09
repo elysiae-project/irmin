@@ -86,6 +86,7 @@ fn eager_stream_threshold_preserves_small_one_shot_path() {
     ));
 }
 
+#[cfg(feature = "bench-diagnostics")]
 fn rss_high_water_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .unwrap()
