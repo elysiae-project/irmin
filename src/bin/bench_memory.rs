@@ -250,6 +250,7 @@ use irmin_rs::proto_parse::{
     SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
 };
 use irmin_rs::types::CompletedFiles;
+use sha2::Digest as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scenario {
@@ -306,6 +307,7 @@ struct Config {
     sweep_sizes_mib: Option<Vec<usize>>,
     memory_max_mib: Option<u64>,
     interleave_sizes: bool,
+    resume_cache: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -732,6 +734,8 @@ struct InstallContext {
     game_dir: PathBuf,
     expected_path: PathBuf,
     size_mib: usize,
+    resume_cache: bool,
+    resume: ResumeContext,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -954,7 +958,10 @@ fn run_child_once(
             config.preinstall_mode,
         )?;
     }
-    let mut local_server = if !prepare_in_child && config.scenario == Scenario::SophonInstall {
+    let mut local_server = if !prepare_in_child
+        && config.scenario == Scenario::SophonInstall
+        && !config.resume_cache
+    {
         Some(LocalChunkServer::start(fixture_dir.clone())?)
     } else {
         None
@@ -1047,6 +1054,11 @@ fn child_command_args(
             "demand".to_owned()
         } else {
             "populate".to_owned()
+        },
+        if config.resume_cache {
+            "resume-cache".to_owned()
+        } else {
+            "fresh".to_owned()
         },
     ]
 }
@@ -1242,6 +1254,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut sweep_sizes_mib = None;
     let mut memory_max_mib = None;
     let mut interleave_sizes = false;
+    let mut resume_cache = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -1336,6 +1349,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                     Some(parse_positive(value_at(args, index, option)?, option)? as u64);
             }
             "--interleave-sizes" => interleave_sizes = true,
+            "--resume-cache" => resume_cache = true,
             "--help" | "-h" => return Err(usage().to_owned()),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
@@ -1343,6 +1357,12 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     }
 
     let scenario = scenario.ok_or_else(|| usage().to_owned())?;
+    if resume_cache && scenario != Scenario::SophonInstall {
+        return Err("--resume-cache is only supported for sophon-install".to_owned());
+    }
+    if resume_cache && !(2..=5_000).contains(&chunks) {
+        return Err("--resume-cache requires --chunks between 2 and 5000".to_owned());
+    }
     if scenario != Scenario::Hdiff && source_backend != SourceBackend::Mmap {
         return Err(
             "--source-backend overrides are only supported for the hdiff scenario".to_owned(),
@@ -1440,10 +1460,14 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err("sophon-install size-mib must divide evenly into chunks".to_owned());
     }
     if fixture_backing == FixtureBacking::Disk
-        && !matches!(scenario, Scenario::PreinstallApply | Scenario::Assembly)
+        && !matches!(
+            scenario,
+            Scenario::PreinstallApply | Scenario::Assembly | Scenario::SophonInstall
+        )
     {
         return Err(
-            "--fixture-backing disk is only supported for preinstall-apply and assembly".to_owned(),
+            "--fixture-backing disk is only supported for preinstall-apply, assembly, and sophon-install"
+                .to_owned(),
         );
     }
     if let Some(sizes) = &sweep_sizes_mib {
@@ -1519,6 +1543,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         sweep_sizes_mib,
         memory_max_mib,
         interleave_sizes,
+        resume_cache,
     })
 }
 
@@ -1552,12 +1577,12 @@ fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: bench_memory --scenario hdiff|preinstall-apply|preinstall-download-plan|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--assembly-verify-mode full|deferred] [--assembly-demand-mmap] [--diagnose-hdiff-phases] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
+    "Usage: bench_memory --scenario hdiff|preinstall-apply|preinstall-download-plan|assembly|sophon-install [--size-mib N] [--sweep-sizes-mib N,N,...] [--memory-max-mib N] [--chunks N] [--asset-count N] [--preinstall-mode patch|copyover] [--resume-cache] [--assembly-verify-mode full|deferred] [--assembly-demand-mmap] [--diagnose-hdiff-phases] [--repeat N] [--source-backend mmap|file|windowed] [--window-mib N|--window-kib N] [--cover-pattern sequential|reverse|thrash|uncovered-prefix|hdiff20-steps] [--fixture-backing tempfile|disk] [--budget-mib N] [--json] [--keep-workdir]"
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
-    if args.len() != 15 {
-        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT PREINSTALL_MODE SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE DIAGNOSTIC_MODE ASSEMBLY_VERIFY_MODE ASSEMBLY_MMAP_ADVICE".to_owned());
+    if args.len() != 16 {
+        return Err("child expects SCENARIO FIXTURE_DIR SIZE_MIB CHUNKS ASSET_COUNT PREINSTALL_MODE SERVER_URL COVER_PATTERN FIXTURE_BACKING FS_MAGIC SOURCE_BACKEND PREPARE_MODE DIAGNOSTIC_MODE ASSEMBLY_VERIFY_MODE ASSEMBLY_MMAP_ADVICE RESUME_MODE".to_owned());
     }
     let scenario = Scenario::parse(&args[0])?;
     let fixture_dir = PathBuf::from(&args[1]);
@@ -1600,6 +1625,14 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "demand" => true,
         _ => return Err("invalid child assembly mmap advice".to_owned()),
     };
+    let resume_cache = match args[15].as_str() {
+        "resume-cache" => true,
+        "fresh" => false,
+        _ => return Err("invalid child resume mode".to_owned()),
+    };
+    if resume_cache && scenario != Scenario::SophonInstall {
+        return Err("resume cache is only supported for SophonInstall".to_owned());
+    }
     let download_over_hash_strategy = if scenario == Scenario::Assembly {
         std::env::var("IRMIN_BENCH_DOWNLOAD_OVER_HASH")
             .ok()
@@ -1693,6 +1726,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         asset_count,
         preinstall_mode,
         &args[6],
+        resume_cache,
     )?;
     match &mut context {
         ScenarioContext::PreinstallApply(context) => {
@@ -1851,7 +1885,9 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let mut result = serde_json::json!({
         "scenario": scenario.name(),
         "fixture_kind": if scenario == Scenario::PreinstallApply { "synthetic-preinstall" } else { "synthetic" },
-        "operation_mode": if let Some(strategy) = &download_over_hash_strategy {
+        "operation_mode": if resume_cache {
+            "resume_cache".to_owned()
+        } else if let Some(strategy) = &download_over_hash_strategy {
             format!("download_over_{strategy}")
         } else if diagnose_hdiff_phases {
             "single_asset_hdiff_phase_diagnostics".to_owned()
@@ -1862,6 +1898,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         "asset_count": (scenario == Scenario::PreinstallApply).then_some(asset_count),
         "preinstall_mode": (scenario == Scenario::PreinstallApply)
             .then_some(preinstall_mode.name()),
+        "resume_cache": (scenario == Scenario::SophonInstall).then_some(resume_cache),
         "cover_pattern": cover_pattern.name(),
         "fixture_shape": fixture_shape,
         "fixture_backing": fixture_backing.name(),
@@ -2903,6 +2940,7 @@ fn prepare_install_fixture(dir: &Path, size_mib: usize, chunks: usize) -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_child_context(
     scenario: Scenario,
     dir: &Path,
@@ -2911,6 +2949,7 @@ fn prepare_child_context(
     asset_count: usize,
     preinstall_mode: PreinstallMode,
     server_url: &str,
+    resume_cache: bool,
 ) -> Result<ScenarioContext, String> {
     if asset_count == 0 || asset_count > 8 {
         return Err("asset_count must be between 1 and 8".to_owned());
@@ -2966,7 +3005,9 @@ fn prepare_child_context(
             )))
         }
         Scenario::Assembly => prepare_assembly_context(dir, size_mib, chunks),
-        Scenario::SophonInstall => prepare_install_context(dir, size_mib, chunks, server_url),
+        Scenario::SophonInstall => {
+            prepare_install_context(dir, size_mib, chunks, server_url, resume_cache)
+        }
     }
 }
 
@@ -3056,20 +3097,33 @@ fn prepare_install_context(
     size_mib: usize,
     chunks: usize,
     server_url: &str,
+    resume_cache: bool,
 ) -> Result<ScenarioContext, String> {
-    if server_url.is_empty() {
+    if server_url.is_empty() && !resume_cache {
         return Err("sophon-install requires a local fixture server".to_owned());
     }
+    if resume_cache && !(2..=5_000).contains(&chunks) {
+        return Err("resume-cache requires between 2 and 5000 chunks".to_owned());
+    }
+    let game_dir = dir.join("install-game");
+    let fixture_chunk_index = |index: usize| {
+        if resume_cache && index + 1 == chunks {
+            0
+        } else {
+            index
+        }
+    };
     let chunk_size = size_mib * 1024 * 1024 / chunks;
     let mut file_hasher = Md5::new();
     let chunk_rows = (0..chunks)
         .map(|index| {
-            let raw = deterministic_data(0xBEEF + index as u64, chunk_size);
+            let fixture_index = fixture_chunk_index(index);
+            let raw = deterministic_data(0xBEEF + fixture_index as u64, chunk_size);
             file_hasher.update(&raw);
-            let compressed_path = dir.join(format!("chunk-{index:04}"));
+            let compressed_path = dir.join(format!("chunk-{fixture_index:04}"));
             let compressed = fs::read(&compressed_path).map_err(|error| error.to_string())?;
             Ok(SophonManifestAssetChunk {
-                chunk_name: format!("chunk-{index:04}"),
+                chunk_name: format!("chunk-{fixture_index:04}"),
                 chunk_decompressed_hash_md5: hex::encode(fast_md5::digest(&raw)),
                 chunk_on_file_offset: (index * chunk_size) as u64,
                 chunk_size: compressed.len() as u64,
@@ -3083,8 +3137,9 @@ fn prepare_install_context(
     let expected_path = dir.join("expected-install.bin");
     let mut expected_file = File::create(&expected_path).map_err(|error| error.to_string())?;
     for index in 0..chunks {
+        let fixture_index = fixture_chunk_index(index);
         expected_file
-            .write_all(&deterministic_data(0xBEEF + index as u64, chunk_size))
+            .write_all(&deterministic_data(0xBEEF + fixture_index as u64, chunk_size))
             .map_err(|error| error.to_string())?;
     }
     let file_md5 = hex::encode(file_hasher.finalize());
@@ -3110,11 +3165,47 @@ fn prepare_install_context(
         matching_field: "bench".to_owned(),
         manifest_hash: "memory-bench-manifest".to_owned(),
     };
+    let mut resume = ResumeContext {
+        prev_manifest_hash: String::new(),
+        prev_downloaded_chunks: Default::default(),
+        resume_seed: CompletedFiles::default(),
+    };
+    if resume_cache {
+        let chunks_dir = game_dir.join("chunks");
+        fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
+        let cache = VerificationCache::new();
+        for chunk in installer.manifest.assets[0].asset_chunks[..chunks - 1].iter() {
+            let cached_path = chunks_dir.join(chunk_filename(&chunk.chunk_name));
+            fs::hard_link(dir.join(&chunk.chunk_name), &cached_path)
+                .map_err(|error| error.to_string())?;
+            let valid = irmin_rs::game_installer::cache::check_file_md5_cached_with_size(
+                &cached_path,
+                chunk.chunk_size,
+                &chunk.chunk_compressed_hash_md5,
+                &game_dir,
+                &cache,
+            )
+            .map_err(|error| error.to_string())?;
+            if !valid.0 {
+                return Err("failed to seed resume verification cache".to_owned());
+            }
+            resume
+                .prev_downloaded_chunks
+                .insert(chunk.chunk_name.clone(), chunk.chunk_size);
+        }
+        irmin_rs::game_installer::cache::save_verification_cache(&game_dir, &cache)
+            .map_err(|error| error.to_string())?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(installer.manifest_hash.as_bytes());
+        resume.prev_manifest_hash = hex::encode(&hasher.finalize()[..8]);
+    }
     Ok(ScenarioContext::SophonInstall(Box::new(InstallContext {
         installer,
-        game_dir: dir.join("install-game"),
+        game_dir,
         expected_path,
         size_mib,
+        resume_cache,
+        resume,
         runtime: tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -3288,6 +3379,8 @@ fn run_operation(
                 game_dir,
                 expected_path,
                 size_mib,
+                resume_cache,
+                resume,
                 runtime,
             } = *context;
             runtime
@@ -3296,14 +3389,10 @@ fn run_operation(
                     &game_dir,
                     Vec::new(),
                     "bench-tag",
-                    ResumeContext {
-                        prev_manifest_hash: String::new(),
-                        prev_downloaded_chunks: Default::default(),
-                        resume_seed: CompletedFiles::default(),
-                    },
+                    resume,
                     InstallOptions {
                         is_preinstall: false,
-                        is_resume: false,
+                        is_resume: resume_cache,
                         handle: DownloadHandle::new(),
                         verify_mode: VerifyMode::Full,
                     },
@@ -3926,6 +4015,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(disk_assembly.fixture_backing, FixtureBacking::Disk);
+        let disk_sophon_install = parse_args(&[
+            "--scenario".into(),
+            "sophon-install".into(),
+            "--fixture-backing".into(),
+            "disk".into(),
+        ])
+        .unwrap();
+        assert_eq!(disk_sophon_install.fixture_backing, FixtureBacking::Disk);
         assert!(
             parse_args(&[
                 "--scenario".into(),
@@ -4045,9 +4142,10 @@ mod tests {
         ])
         .unwrap();
         let args = child_command_args(&config, Path::new("fixture"), None, 1, "", false);
-        assert_eq!(args.len(), 16);
+        assert_eq!(args.len(), 17);
         assert_eq!(args[14], "deferred");
         assert_eq!(args[15], "demand");
+        assert_eq!(args[16], "fresh");
         let mut invalid_mode = args[1..].to_vec();
         invalid_mode[13] = "none".to_owned();
         assert!(
@@ -4417,6 +4515,7 @@ mod tests {
             1,
             PreinstallMode::Patch,
             "",
+            false,
         )
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
@@ -4435,6 +4534,7 @@ mod tests {
             1,
             PreinstallMode::Patch,
             "",
+            false,
         )
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
@@ -4453,6 +4553,7 @@ mod tests {
             1,
             PreinstallMode::Patch,
             "",
+            false,
         )
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
@@ -4472,6 +4573,7 @@ mod tests {
             2,
             PreinstallMode::Patch,
             "",
+            false,
         )
         .unwrap();
         let window = allocation_stats::AllocationWindow::start().unwrap();
@@ -4511,6 +4613,7 @@ mod tests {
             1,
             PreinstallMode::CopyOver,
             "",
+            false,
         )
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
@@ -4530,6 +4633,7 @@ mod tests {
                 1,
                 PreinstallMode::Patch,
                 "",
+                false,
             )
             .unwrap();
             let verification = run_operation(context, backend).unwrap();
@@ -4549,6 +4653,7 @@ mod tests {
             1,
             PreinstallMode::Patch,
             "",
+            false,
         )
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
@@ -4567,6 +4672,7 @@ mod tests {
             1,
             PreinstallMode::Patch,
             "",
+            false,
         )
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
@@ -4734,6 +4840,7 @@ mod tests {
             1,
             PreinstallMode::Patch,
             "",
+            false,
         )
         .unwrap();
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
@@ -4773,8 +4880,32 @@ mod tests {
             1,
             PreinstallMode::Patch,
             &server.base_url,
+            false,
         )
         .unwrap();
+        let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
+        verify_output(verification).unwrap();
+    }
+
+    #[test]
+    fn sophon_install_resumes_cached_assembly_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_install_fixture(dir.path(), 1, 4).unwrap();
+        let context = prepare_child_context(
+            Scenario::SophonInstall,
+            dir.path(),
+            1,
+            4,
+            1,
+            PreinstallMode::Patch,
+            "",
+            true,
+        )
+        .unwrap();
+        let cache = irmin_rs::game_installer::cache::load_verification_cache(
+            &dir.path().join("install-game"),
+        );
+        assert_eq!(cache.len(), 3);
         let verification = run_operation(context, HDiffSourceBackend::Mmap).unwrap();
         verify_output(verification).unwrap();
     }

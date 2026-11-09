@@ -1165,6 +1165,164 @@
         assert!(!needs.0);
     }
 
+    #[cfg(feature = "bench-diagnostics")]
+    #[tokio::test]
+    #[ignore = "measures item-budget scheduling for predownloaded chunk verification"]
+    async fn benchmark_resume_chunk_check_dispatch() {
+        use futures_util::stream::{self, StreamExt};
+        use std::time::Instant;
+
+        let entry_count = std::env::var("IRMIN_RESUME_CHECK_BENCH_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5_000);
+        let concurrency = std::env::var("IRMIN_RESUME_CHECK_BENCH_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(48);
+        let batch_size = std::env::var("IRMIN_RESUME_CHECK_BENCH_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        let cache_entries = std::env::var("IRMIN_RESUME_CHECK_BENCH_CACHE_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| entry_count.min(cache::VERIFICATION_CACHE_MAX_ENTRIES));
+        let mode = std::env::var("IRMIN_RESUME_CHECK_BENCH_MODE")
+            .unwrap_or_else(|_| "per-item".to_owned());
+        assert!((1..=100_000).contains(&entry_count));
+        assert!(cache_entries <= entry_count.min(cache::VERIFICATION_CACHE_MAX_ENTRIES));
+        assert!((1..=256).contains(&concurrency));
+        assert!((1..=256).contains(&batch_size));
+        assert!(concurrency.is_multiple_of(batch_size));
+        assert!(matches!(mode.as_str(), "per-item" | "batched"));
+
+        let dir = match std::env::var_os("IRMIN_RESUME_CHECK_BENCH_TEMP_DIR") {
+            Some(path) => tempfile::tempdir_in(path).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let data = [0x5au8; 4096];
+        let md5 = hex::encode(fast_md5::digest(&data));
+        let mut chunks = Vec::with_capacity(entry_count);
+        let cache: Arc<DashMap<String, VerificationEntry>> = Arc::new(DashMap::new());
+        let game_dir = Arc::new(dir.path().to_path_buf());
+        let source_count = entry_count.min(64);
+        for index in 0..entry_count {
+            let name = format!("resume-{index:08}.zstd");
+            let path = dir.path().join(&name);
+            if index < source_count {
+                std::fs::write(&path, data).unwrap();
+            } else {
+                let source = dir.path().join(format!("resume-{:08}.zstd", index % source_count));
+                std::fs::hard_link(source, &path).unwrap();
+            }
+            if index < cache_entries {
+                let mtime_secs = std::fs::metadata(&path)
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                cache.insert(
+                    name,
+                    VerificationEntry {
+                        size: data.len() as u64,
+                        md5: md5.clone(),
+                        mtime_secs,
+                    },
+                );
+            }
+            let mut chunk = make_chunk_with_hash(
+                &format!("resume-{index:08}"),
+                data.len() as u64,
+                &md5,
+                (index * data.len()) as u64,
+            );
+            chunk.chunk_compressed_hash_md5 = md5.clone();
+            chunks.push(chunk);
+        }
+        let manifest = Arc::new(CompactManifest::from(vec![make_file(
+            "resume.bin",
+            &md5,
+            chunks,
+        )]));
+        let started = Instant::now();
+        let verified = if mode == "per-item" {
+            stream::iter(0..entry_count)
+                .map(|chunk_idx| {
+                    let manifest = Arc::clone(&manifest);
+                    let game_dir = Arc::clone(&game_dir);
+                    let cache = Arc::clone(&cache);
+                    let path = dir.path().join(format!("resume-{chunk_idx:08}.zstd"));
+                    async move {
+                        let (needs_download, _) =
+                            check_needs_download(&path, manifest, 0, chunk_idx, game_dir, cache)
+                                .await
+                                .unwrap();
+                        !needs_download
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .fold(0usize, |verified, hit| async move {
+                    verified + usize::from(hit)
+                })
+                .await
+        } else {
+            let chunk_count = manifest.file_chunk_range(0).len();
+            let batches = (0..chunk_count)
+                .step_by(batch_size)
+                .map(|start| (start, (start + batch_size).min(chunk_count)))
+                .collect::<Vec<_>>();
+            stream::iter(batches)
+                .map(|(start, end)| {
+                    let manifest = Arc::clone(&manifest);
+                    let game_dir = Arc::clone(&game_dir);
+                    let cache = Arc::clone(&cache);
+                    let paths = (start..end)
+                        .map(|chunk_idx| dir.path().join(format!("resume-{chunk_idx:08}.zstd")))
+                        .collect::<Vec<_>>();
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let mut hits = 0;
+                            for (offset, path) in paths.into_iter().enumerate() {
+                                let chunk = manifest.file_chunk(0, start + offset);
+                                let (valid, _) = cache::check_file_md5_cached_with_size(
+                                    &path,
+                                    chunk.chunk_size,
+                                    chunk.chunk_compressed_hash_md5,
+                                    &game_dir,
+                                    &cache,
+                                )
+                                .unwrap_or((false, None));
+                                hits += usize::from(valid);
+                            }
+                            hits
+                        })
+                        .await
+                        .unwrap()
+                    }
+                })
+                .buffer_unordered(concurrency / batch_size)
+                .fold(0usize, |verified, batch_hits| async move {
+                    verified + batch_hits
+                })
+                .await
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(verified, entry_count);
+        let job_slots = if mode == "per-item" {
+            concurrency
+        } else {
+            concurrency / batch_size
+        };
+        println!(
+            "resume_chunk_check mode={mode} entries={entry_count} cache_entries={cache_entries} concurrency={concurrency} batch_size={batch_size} job_slots={job_slots} elapsed_us={} verified={verified} final_cache_entries={}",
+            elapsed.as_micros(),
+            cache.len(),
+        );
+    }
+
     #[tokio::test]
     async fn download_chunk_with_retries_success_on_first() {
         use crate::api_scrape::Compression;
