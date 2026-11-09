@@ -169,7 +169,7 @@
             &manifest,
             0,
             0,
-            &mut entries,
+            |item_idx, entry| push_nested_chunk_entry(&mut entries, item_idx, entry),
             &mut items,
             &mut index,
             &mut refcounts,
@@ -178,7 +178,8 @@
             &FxHashMap::default(),
             &mut tainted,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].chunk_idx, 0);
@@ -218,7 +219,7 @@
             &manifest,
             0,
             0,
-            &mut entries,
+            |item_idx, entry| push_nested_chunk_entry(&mut entries, item_idx, entry),
             &mut items,
             &mut index,
             &mut refcounts,
@@ -227,7 +228,8 @@
             &FxHashMap::default(),
             &mut tainted,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].output_offset, 0);
@@ -258,7 +260,7 @@
                 &manifest,
                 file_idx,
                 file_idx,
-                &mut entries,
+                |item_idx, entry| push_nested_chunk_entry(&mut entries, item_idx, entry),
                 &mut items,
                 &mut index,
                 &mut refcounts,
@@ -267,7 +269,8 @@
                 &FxHashMap::default(),
                 &mut tainted,
                 false,
-            );
+            )
+            .unwrap();
         }
 
         assert_eq!(items.len(), 1);
@@ -294,7 +297,7 @@
             &manifest,
             0,
             0,
-            &mut entries,
+            |item_idx, entry| push_nested_chunk_entry(&mut entries, item_idx, entry),
             &mut items,
             &mut index,
             &mut refcounts,
@@ -303,7 +306,8 @@
             &FxHashMap::default(),
             &mut tainted,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(items.len(), 1);
         assert!(tainted.contains(&0));
@@ -1333,6 +1337,359 @@
         assert_eq!(data[0].file_count, 1);
         assert_eq!(all_files.len(), 1);
         assert_eq!(all_files[0].asset_name, "a.pak");
+    }
+
+    #[test]
+    fn flat_chunk_entry_collector_preserves_group_and_entry_order() {
+        if usize::BITS == 64 {
+            assert_eq!(
+                std::mem::size_of::<(u32, FileEntry)>(),
+                std::mem::size_of::<u32>() * 4
+            );
+            assert!(
+                std::mem::size_of::<(u32, FileEntry)>() < std::mem::size_of::<(usize, FileEntry)>()
+            );
+        }
+        let mut collector = super::ChunkEntryCollector::with_capacity(5, 3).unwrap();
+        collector.push(1, (10, 2, 3)).unwrap();
+        collector.push(0, (20, 1, 4)).unwrap();
+        collector.push(1, (11, 2, 5)).unwrap();
+        collector.push(0, (21, 1, 6)).unwrap();
+        collector.push(2, (30, 3, 7)).unwrap();
+        assert_eq!(collector.counts, vec![2, 2, 1]);
+
+        let (flat, offsets) = collector.finish(3).unwrap();
+
+        assert_eq!(offsets, vec![0, 2, 4, 5]);
+        assert_eq!(
+            flat,
+            vec![(20, 1, 4), (21, 1, 6), (10, 2, 3), (11, 2, 5), (30, 3, 7)]
+        );
+    }
+
+    #[test]
+    fn flat_chunk_entry_collector_preserves_interleaved_groups() {
+        let mut collector = super::ChunkEntryCollector::with_capacity(5, 3).unwrap();
+        collector.push(2, (20, 2, 0)).unwrap();
+        collector.push(0, (0, 0, 0)).unwrap();
+        collector.push(2, (21, 2, 1)).unwrap();
+        collector.push(1, (10, 1, 0)).unwrap();
+        collector.push(0, (1, 0, 1)).unwrap();
+
+        let (flat, offsets) = collector.finish(3).unwrap();
+
+        assert_eq!(offsets, vec![0, 2, 3, 5]);
+        assert_eq!(
+            flat,
+            vec![(0, 0, 0), (1, 0, 1), (10, 1, 0), (20, 2, 0), (21, 2, 1)]
+        );
+    }
+
+    #[test]
+    fn chunk_entry_offsets_reject_u32_overflow_without_mutating_offsets() {
+        let mut offsets = vec![u32::MAX - 2];
+        push_chunk_entry_offset(&mut offsets, 2).unwrap();
+        assert_eq!(offsets, vec![u32::MAX - 2, u32::MAX]);
+
+        let error = push_chunk_entry_offset(&mut offsets, 1).unwrap_err();
+        assert!(error.to_string().contains("u32 index range"));
+        assert_eq!(offsets, vec![u32::MAX - 2, u32::MAX]);
+    }
+
+    #[test]
+    fn flat_chunk_entry_collector_keeps_empty_item_groups() {
+        let mut collector = super::ChunkEntryCollector::with_capacity(2, 5).unwrap();
+        collector.push(1, (10, 2, 3)).unwrap();
+        collector.push(3, (30, 4, 5)).unwrap();
+
+        let (flat, offsets) = collector.finish(5).unwrap();
+
+        assert_eq!(flat, vec![(10, 2, 3), (30, 4, 5)]);
+        assert_eq!(offsets, vec![0, 0, 1, 1, 2, 2]);
+
+        let mut extra_group = super::ChunkEntryCollector::with_capacity(1, 2).unwrap();
+        extra_group.push(1, (1, 1, 1)).unwrap();
+        assert!(extra_group.finish(1).is_err());
+
+        let empty = super::ChunkEntryCollector::with_capacity(0, 0)
+            .unwrap()
+            .finish(0)
+            .unwrap();
+        assert_eq!(empty, (Vec::new(), vec![0]));
+    }
+
+    #[test]
+    fn flat_registration_matches_nested_entries_for_deduplicated_and_independent_chunks() {
+        let mut old_chunk = make_chunk("old-source", 7);
+        old_chunk.chunk_old_offset = 12;
+        let manifest = CompactManifest::from(vec![
+            make_file("old-only.pak", "old-only-hash", vec![old_chunk.clone()]),
+            make_file("empty-before.pak", "empty-before-hash", vec![]),
+            make_file(
+                "first.pak",
+                "hash-a",
+                vec![
+                    make_chunk("shared", 11),
+                    make_chunk("first-only", 13),
+                    old_chunk,
+                ],
+            ),
+            make_file(
+                "second.pak",
+                "hash-b",
+                vec![make_chunk("shared", 17), make_chunk("second-only", 19)],
+            ),
+            make_file("empty.pak", "hash-empty", vec![]),
+        ]);
+
+        let run = |flat_output: bool, force_eager: bool| {
+            let total_chunks = manifest.num_chunks();
+            let mut nested_entries = Vec::with_capacity(total_chunks);
+            let mut flat_collector =
+                super::ChunkEntryCollector::with_capacity(total_chunks, total_chunks).unwrap();
+            let mut items = Vec::new();
+            let mut index = new_download_items_index(super::VerifyMode::Full, total_chunks);
+            let mut refcounts = Vec::new();
+            let mut pending = Vec::new();
+            let mut tainted = rustc_hash::FxHashSet::default();
+            let mut pre_downloaded = FxHashMap::default();
+            pre_downloaded.insert(3, 13);
+
+            for file_idx in 0..manifest.num_files() {
+                let mut add_entry = |item_idx, entry| {
+                    if flat_output {
+                        flat_collector.push(item_idx, entry)
+                    } else {
+                        push_nested_chunk_entry(&mut nested_entries, item_idx, entry)
+                    }
+                };
+                register_chunks_for_file(
+                    &manifest,
+                    file_idx,
+                    file_idx,
+                    &mut add_entry,
+                    &mut items,
+                    &mut index,
+                    &mut refcounts,
+                    &mut pending,
+                    file_idx,
+                    &pre_downloaded,
+                    &mut tainted,
+                    force_eager,
+                )
+                .unwrap();
+            }
+
+            let (flat_entries, offsets) = if flat_output {
+                flat_collector.finish(items.len()).unwrap()
+            } else {
+                let total_entries = nested_entries.iter().map(Vec::len).sum();
+                let mut offsets = Vec::with_capacity(nested_entries.len() + 1);
+                let mut entries = Vec::with_capacity(total_entries);
+                offsets.push(0);
+                for group in nested_entries {
+                    entries.extend(group);
+                    offsets.push(entries.len() as u32);
+                }
+                (entries, offsets)
+            };
+            let item_fields = items
+                .iter()
+                .map(|item| {
+                    (
+                        item.file_idx,
+                        item.chunk_idx,
+                        item.output_offset,
+                        item.installer_idx,
+                        item.is_pre_downloaded,
+                        item.use_eager,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let refcount_values = refcounts
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect::<Vec<_>>();
+            let pending_values = pending
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect::<Vec<_>>();
+            (
+                item_fields,
+                flat_entries,
+                offsets,
+                refcount_values,
+                pending_values,
+                tainted,
+            )
+        };
+
+        for force_eager in [false, true] {
+            assert_eq!(run(false, force_eager), run(true, force_eager));
+        }
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    #[ignore = "measures download-state registration and flatten allocations"]
+    fn benchmark_chunk_entry_flatten_baseline() {
+        use std::io::Read as _;
+        use std::time::Instant;
+
+        fn process_hwm_kib() -> u64 {
+            let mut status = String::new();
+            std::fs::File::open("/proc/self/status")
+                .unwrap()
+                .read_to_string(&mut status)
+                .unwrap();
+            status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("VmHWM:")
+                        .and_then(|value| value.split_whitespace().next())
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .unwrap_or_default()
+        }
+
+        let file_count = std::env::var("IRMIN_ENTRY_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_000);
+        let chunks_per_file = std::env::var("IRMIN_ENTRY_BENCH_CHUNKS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        let unique_chunk_count = std::env::var("IRMIN_ENTRY_BENCH_UNIQUE_CHUNKS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(file_count * chunks_per_file);
+        let mode = std::env::var("IRMIN_ENTRY_BENCH_MODE").unwrap_or_else(|_| "nested".to_owned());
+        assert!(file_count > 0 && chunks_per_file > 0 && unique_chunk_count > 0);
+        let total_chunk_occurrences = file_count
+            .checked_mul(chunks_per_file)
+            .expect("diagnostic occurrence count overflow");
+        let assets: Vec<SophonManifestAssetProperty> = (0..file_count)
+            .map(|file_index| {
+                let chunks = (0..chunks_per_file)
+                    .map(|chunk_index| {
+                        let occurrence = file_index * chunks_per_file + chunk_index;
+                        make_chunk(
+                            &format!("chunk-{:08}", occurrence % unique_chunk_count),
+                            1024,
+                        )
+                    })
+                    .collect();
+                make_file(
+                    &format!("asset-{file_index:08}.bundle"),
+                    "file-hash",
+                    chunks,
+                )
+            })
+            .collect();
+        let manifest = CompactManifest::from(assets);
+        let total_chunks = manifest.num_chunks();
+        let mut items = Vec::with_capacity(total_chunks);
+        let mut index = new_download_items_index(super::VerifyMode::Full, total_chunks);
+        let mut refcounts = Vec::with_capacity(total_chunks);
+        let mut pending = Vec::with_capacity(manifest.num_files());
+        let mut tainted = rustc_hash::FxHashSet::default();
+        let empty_pre_downloaded = FxHashMap::default();
+
+        std::fs::write("/proc/self/clear_refs", b"5").unwrap();
+        let before_hwm = process_hwm_kib();
+        let started = Instant::now();
+        let (
+            registration_elapsed,
+            flatten_elapsed,
+            unique_items,
+            association_count,
+            after_register_hwm,
+        ) = match mode.as_str() {
+            "nested" => {
+                let mut entries = Vec::with_capacity(total_chunks);
+                for file_index in 0..manifest.num_files() {
+                    register_chunks_for_file(
+                        &manifest,
+                        file_index,
+                        file_index % 4,
+                        |item_idx, entry| push_nested_chunk_entry(&mut entries, item_idx, entry),
+                        &mut items,
+                        &mut index,
+                        &mut refcounts,
+                        &mut pending,
+                        file_index % 4,
+                        &empty_pre_downloaded,
+                        &mut tainted,
+                        false,
+                    )
+                    .unwrap();
+                }
+                let registration_elapsed = started.elapsed();
+                let after_register_hwm = process_hwm_kib();
+                let total_flat_entries = entries.iter().map(Vec::len).sum::<usize>();
+                let flatten_started = Instant::now();
+                let mut offsets = Vec::with_capacity(entries.len() + 1);
+                let mut flat = Vec::with_capacity(total_flat_entries);
+                offsets.push(0);
+                for inner in entries.drain(..) {
+                    flat.extend(inner);
+                    offsets.push(flat.len() as u32);
+                }
+                assert_eq!(flat.len(), total_flat_entries);
+                assert_eq!(offsets.len(), items.len() + 1);
+                let flatten_elapsed = flatten_started.elapsed();
+                (
+                    registration_elapsed,
+                    flatten_elapsed,
+                    items.len(),
+                    total_flat_entries,
+                    after_register_hwm,
+                )
+            }
+            "flat" => {
+                let mut collector =
+                    super::ChunkEntryCollector::with_capacity(total_chunks, total_chunks).unwrap();
+                for file_index in 0..manifest.num_files() {
+                    register_chunks_for_file(
+                        &manifest,
+                        file_index,
+                        file_index % 4,
+                        |item_idx, entry| collector.push(item_idx, entry),
+                        &mut items,
+                        &mut index,
+                        &mut refcounts,
+                        &mut pending,
+                        file_index % 4,
+                        &empty_pre_downloaded,
+                        &mut tainted,
+                        false,
+                    )
+                    .unwrap();
+                }
+                let registration_elapsed = started.elapsed();
+                let after_register_hwm = process_hwm_kib();
+                let scatter_started = Instant::now();
+                let (_flat, offsets) = collector.finish(items.len()).unwrap();
+                let flatten_elapsed = scatter_started.elapsed();
+                assert_eq!(offsets.len(), items.len() + 1);
+                (
+                    registration_elapsed,
+                    flatten_elapsed,
+                    items.len(),
+                    total_chunk_occurrences,
+                    after_register_hwm,
+                )
+            }
+            other => panic!("unsupported entry benchmark mode: {other}"),
+        };
+        let after_flatten_hwm = process_hwm_kib();
+        assert_eq!(association_count, total_chunk_occurrences);
+        println!(
+            "chunk_entry_flatten mode={mode} files={file_count} chunks_per_file={chunks_per_file} occurrences={total_chunk_occurrences} unique_items={unique_items} associations={association_count} registration_ms={:.3} flatten_ms={:.3} before_hwm_kib={before_hwm} after_register_hwm_kib={after_register_hwm} after_flatten_hwm_kib={after_flatten_hwm}",
+            registration_elapsed.as_secs_f64() * 1000.0,
+            flatten_elapsed.as_secs_f64() * 1000.0,
+        );
     }
 
     #[test]

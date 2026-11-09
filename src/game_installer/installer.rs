@@ -219,6 +219,19 @@ fn insert_new_chunk_name<'a>(
     seen_chunks.insert(name)
 }
 
+#[cfg(test)]
+fn push_nested_chunk_entry(
+    chunk_entries: &mut Vec<Vec<FileEntry>>,
+    item_idx: usize,
+    entry: FileEntry,
+) -> SophonResult<()> {
+    if item_idx >= chunk_entries.len() {
+        chunk_entries.resize_with(item_idx + 1, Vec::new);
+    }
+    chunk_entries[item_idx].push(entry);
+    Ok(())
+}
+
 fn disable_eager_for_tainted_files(
     download_items: &mut [DownloadItem],
     eager_tainted_files: &rustc_hash::FxHashSet<u32>,
@@ -328,6 +341,175 @@ async fn wait_for_download_cancellation(handle: &DownloadHandle) {
 }
 
 type FileEntry = (u32, u32, u32);
+
+fn push_chunk_entry_offset(offsets: &mut Vec<u32>, count: usize) -> SophonResult<()> {
+    let current = offsets
+        .last()
+        .copied()
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("missing chunk-entry offset base")))?;
+    let next = (current as usize)
+        .checked_add(count)
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("chunk-entry offset overflow")))?;
+    offsets.push(u32::try_from(next).map_err(|_| {
+        SophonError::Io(std::io::Error::other(
+            "chunk-entry offset exceeds the u32 index range",
+        ))
+    })?);
+    Ok(())
+}
+
+struct ChunkEntryCollector {
+    tagged_entries: Vec<(u32, FileEntry)>,
+    counts: Vec<usize>,
+    max_items: usize,
+}
+
+impl ChunkEntryCollector {
+    fn with_capacity(total_occurrences: usize, expected_items: usize) -> SophonResult<Self> {
+        let mut tagged_entries = Vec::new();
+        tagged_entries
+            .try_reserve(total_occurrences)
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve flat chunk-entry records: {error}"
+                )))
+            })?;
+        Ok(Self {
+            tagged_entries,
+            counts: Vec::new(),
+            max_items: expected_items,
+        })
+    }
+
+    fn push(&mut self, item_idx: usize, entry: FileEntry) -> SophonResult<()> {
+        if item_idx >= self.max_items {
+            return Err(SophonError::Io(std::io::Error::other(
+                "chunk-entry item index exceeds expected groups",
+            )));
+        }
+        let tagged_item_idx = u32::try_from(item_idx).map_err(|_| {
+            SophonError::Io(std::io::Error::other("download item index exceeds u32"))
+        })?;
+        let required_len = item_idx.checked_add(1).ok_or_else(|| {
+            SophonError::Io(std::io::Error::other("download item count overflow"))
+        })?;
+        let additional_counts = required_len.saturating_sub(self.counts.len());
+        self.counts
+            .try_reserve(additional_counts)
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve chunk-entry group counts: {error}"
+                )))
+            })?;
+        self.tagged_entries.try_reserve(1).map_err(|error| {
+            SophonError::Io(std::io::Error::other(format!(
+                "failed to reserve flat chunk-entry records: {error}"
+            )))
+        })?;
+        let next_count = if item_idx < self.counts.len() {
+            self.counts[item_idx].checked_add(1).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other("chunk-entry count overflow"))
+            })?
+        } else {
+            1
+        };
+        if required_len > self.counts.len() {
+            self.counts.resize(required_len, 0);
+        }
+        self.counts[item_idx] = next_count;
+        self.tagged_entries.push((tagged_item_idx, entry));
+        Ok(())
+    }
+
+    fn finish(self, expected_items: usize) -> SophonResult<(Vec<FileEntry>, Vec<u32>)> {
+        if expected_items > self.max_items {
+            return Err(SophonError::Io(std::io::Error::other(
+                "download item count exceeds chunk-entry collector capacity",
+            )));
+        }
+        if self.counts.len() > expected_items {
+            return Err(SophonError::Io(std::io::Error::other(
+                "chunk-entry groups exceed download item count",
+            )));
+        }
+        let mut counts = self.counts;
+        counts
+            .try_reserve(expected_items - counts.len())
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve chunk-entry groups: {error}"
+                )))
+            })?;
+        counts.resize(expected_items, 0);
+        let offset_capacity = expected_items
+            .checked_add(1)
+            .ok_or_else(|| SophonError::Io(std::io::Error::other("offset capacity overflow")))?;
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(offset_capacity).map_err(|error| {
+            SophonError::Io(std::io::Error::other(format!(
+                "failed to reserve chunk-entry offsets: {error}"
+            )))
+        })?;
+        offsets.push(0u32);
+        for &count in &counts {
+            push_chunk_entry_offset(&mut offsets, count)?;
+        }
+
+        let mut cursors = Vec::new();
+        cursors
+            .try_reserve_exact(expected_items)
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve chunk-entry scatter cursors: {error}"
+                )))
+            })?;
+        cursors.extend(offsets[..expected_items].iter().map(|&offset| offset as usize));
+        // Every slot is assigned once by the stable scatter below.
+        let mut flat = Vec::new();
+        flat.try_reserve_exact(self.tagged_entries.len())
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve flat chunk-entry output: {error}"
+                )))
+            })?;
+        flat.resize(self.tagged_entries.len(), (0u32, 0u32, 0u32));
+        for (item_idx, entry) in self.tagged_entries {
+            let cursor = cursors.get_mut(item_idx as usize).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other(
+                    "chunk-entry item index is out of range",
+                ))
+            })?;
+            let slot = flat.get_mut(*cursor).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other(
+                    "chunk-entry target offset is out of range",
+                ))
+            })?;
+            *slot = entry;
+            *cursor = cursor.checked_add(1).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other("chunk-entry cursor overflow"))
+            })?;
+        }
+        for item_idx in 0..expected_items {
+            let expected_end = offsets[item_idx + 1] as usize;
+            if cursors[item_idx] != expected_end {
+                return Err(SophonError::Io(std::io::Error::other(format!(
+                    "chunk-entry scatter count mismatch at group {item_idx}: cursor={} end={expected_end}",
+                    cursors[item_idx]
+                ))));
+            }
+        }
+        if offsets.last().copied()
+            != Some(u32::try_from(flat.len()).map_err(|_| {
+                SophonError::Io(std::io::Error::other("flat chunk-entry count exceeds u32"))
+            })?)
+        {
+            return Err(SophonError::Io(std::io::Error::other(
+                "flat chunk-entry sentinel mismatch",
+            )));
+        }
+        Ok((flat, offsets))
+    }
+}
 
 #[inline]
 fn uses_chunk_deduplication(verify_mode: super::VerifyMode) -> bool {
@@ -800,7 +982,7 @@ fn register_chunks_for_file<'a>(
     all_files: &'a CompactManifest,
     file_idx: usize,
     tmp_dir_idx: usize,
-    chunk_entries: &mut Vec<Vec<FileEntry>>,
+    mut add_chunk_entry: impl FnMut(usize, FileEntry) -> SophonResult<()>,
     download_items: &mut Vec<DownloadItem>,
     download_items_index: &mut Option<FxHashMap<&'a str, u32>>,
     chunk_refcounts: &mut Vec<AtomicU32>,
@@ -809,7 +991,7 @@ fn register_chunks_for_file<'a>(
     pre_downloaded: &FxHashMap<u32, u64>,
     eager_tainted_files: &mut rustc_hash::FxHashSet<u32>,
     force_eager: bool,
-) {
+) -> SophonResult<()> {
     let range = all_files.file_chunk_range(file_idx);
 
     // A file qualifies for eager decompression when all its chunks are
@@ -874,10 +1056,10 @@ fn register_chunks_for_file<'a>(
             idx
         };
 
-        if item_idx as usize >= chunk_entries.len() {
-            chunk_entries.resize_with(item_idx as usize + 1, Vec::new);
-        }
-        chunk_entries[item_idx as usize].push((file_idx as u32, tmp_dir_idx as u32, pending_idx));
+        add_chunk_entry(
+            item_idx as usize,
+            (file_idx as u32, tmp_dir_idx as u32, pending_idx),
+        )?;
 
         if item_idx as usize >= chunk_refcounts.len() {
             chunk_refcounts.resize_with(item_idx as usize + 1, || AtomicU32::new(0));
@@ -888,6 +1070,7 @@ fn register_chunks_for_file<'a>(
     if pending_counts[pending_idx as usize].load(Ordering::Relaxed) == 0 {
         pending_counts.pop();
     }
+    Ok(())
 }
 
 async fn build_download_state(
@@ -910,7 +1093,8 @@ async fn build_download_state(
     let mut download_items: Vec<DownloadItem> = Vec::with_capacity(total_chunks);
     let force_eager = !uses_chunk_deduplication(ctx.verify_mode);
     let mut download_items_index = new_download_items_index(ctx.verify_mode, total_chunks);
-    let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::with_capacity(total_chunks);
+    // Each download item originates from a chunk occurrence, so total_chunks bounds item IDs.
+    let mut chunk_entries = ChunkEntryCollector::with_capacity(total_chunks, total_chunks)?;
     let mut chunk_refcounts: Vec<AtomicU32> = Vec::with_capacity(total_chunks);
     let mut pending_counts: Vec<AtomicU32> = Vec::with_capacity(total_files);
     let mut eager_tainted_files: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
@@ -940,7 +1124,7 @@ async fn build_download_state(
                 &ctx.all_files,
                 all_files_index,
                 tmp_dir_idx,
-                &mut chunk_entries,
+                |item_idx, entry| chunk_entries.push(item_idx, entry),
                 &mut download_items,
                 &mut download_items_index,
                 &mut chunk_refcounts,
@@ -949,7 +1133,7 @@ async fn build_download_state(
                 pre_downloaded,
                 &mut eager_tainted_files,
                 force_eager,
-            );
+            )?;
 
             if pending_counts.len() == pending_before {
                 let _ = assemble_tx.send((all_files_index, tmp_dir_idx));
@@ -968,17 +1152,10 @@ async fn build_download_state(
     log::info!(
         "build_download_state: {items} download items, {entries} chunk entries, all_files_index={all_files_index}",
         items = download_items.len(),
-        entries = chunk_entries.len(),
+        entries = download_items.len(),
     );
 
-    let total_flat_entries: usize = chunk_entries.iter().map(Vec::len).sum();
-    let mut chunk_entry_offsets: Vec<u32> = Vec::with_capacity(chunk_entries.len() + 1);
-    let mut flat_chunk_entries: Vec<FileEntry> = Vec::with_capacity(total_flat_entries);
-    chunk_entry_offsets.push(0);
-    for inner in chunk_entries.drain(..) {
-        flat_chunk_entries.extend(inner);
-        chunk_entry_offsets.push(flat_chunk_entries.len() as u32);
-    }
+    let (flat_chunk_entries, chunk_entry_offsets) = chunk_entries.finish(download_items.len())?;
 
     let total_name_bytes: usize = download_items
         .iter()
