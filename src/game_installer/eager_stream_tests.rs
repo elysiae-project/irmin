@@ -109,6 +109,15 @@ fn process_cpu_time_ms() -> u128 {
 }
 
 #[cfg(feature = "bench-diagnostics")]
+fn eager_benchmark_prefault_label(mode: &str, prefault: bool) -> &'static str {
+    if mode == "oneshot" {
+        if prefault { "true" } else { "false" }
+    } else {
+        "na"
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
 #[test]
 #[ignore = "reports per-thread compressed buffer capacity retention"]
 fn benchmark_compressed_buffer_retention() {
@@ -845,6 +854,97 @@ fn stream_decompressor_rejects_decompressed_hash_mismatch() {
     assert!(matches!(result, Err(SophonError::Md5Mismatch { .. })));
 }
 
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+fn eager_decompress_prefault_and_demand_paths_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = (0usize..256 * 1024)
+        .map(|index| (index.wrapping_mul(37) >> 3) as u8)
+        .collect::<Vec<_>>();
+    let compressed = zstd::encode_all(data.as_slice(), 3).unwrap();
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let decompressed_hash = hex::encode(fast_md5::digest(&data));
+
+    let mut outputs = Vec::new();
+    for (index, prefault) in [true, false].into_iter().enumerate() {
+        let path = dir.path().join(format!("output-{index}.bin"));
+        let output = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        output.set_len(data.len() as u64).unwrap();
+        let written = if prefault {
+            super::super::eager_decompress::benchmark_eager_decompress_chunk_with_prefault(
+                &compressed,
+                &output,
+                0,
+                data.len() as u64,
+                &compressed_hash,
+                &decompressed_hash,
+            )
+        } else {
+            super::super::eager_decompress::benchmark_eager_decompress_chunk_without_prefault(
+                &compressed,
+                &output,
+                0,
+                data.len() as u64,
+                &compressed_hash,
+                &decompressed_hash,
+            )
+        }
+        .unwrap();
+        assert_eq!(written, data.len() as u64);
+        outputs.push(std::fs::read(path).unwrap());
+    }
+    assert_eq!(outputs[0], data);
+    assert_eq!(outputs[1], data);
+    assert_eq!(outputs[0], outputs[1]);
+
+    let bad_output = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("bad-output.bin"))
+        .unwrap();
+    bad_output.set_len(data.len() as u64).unwrap();
+    for prefault in [true, false] {
+        let result = if prefault {
+            super::super::eager_decompress::benchmark_eager_decompress_chunk_with_prefault(
+                b"invalid zstd data",
+                &bad_output,
+                0,
+                data.len() as u64,
+                "",
+                "",
+            )
+        } else {
+            super::super::eager_decompress::benchmark_eager_decompress_chunk_without_prefault(
+                b"invalid zstd data",
+                &bad_output,
+                0,
+                data.len() as u64,
+                "",
+                "",
+            )
+        };
+        assert!(matches!(result, Err(SophonError::Io(_))));
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+fn eager_benchmark_prefault_label_matches_mode() {
+    assert_eq!(eager_benchmark_prefault_label("oneshot", true), "true");
+    assert_eq!(eager_benchmark_prefault_label("oneshot", false), "false");
+    assert_eq!(eager_benchmark_prefault_label("stream", true), "na");
+    assert_eq!(eager_benchmark_prefault_label("stream", false), "na");
+}
+
+#[cfg(feature = "bench-diagnostics")]
 #[test]
 #[ignore = "reports single-worker eager decompression timing and VmHWM"]
 fn benchmark_eager_decompression_rss() {
@@ -861,6 +961,9 @@ fn benchmark_eager_decompression_rss() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
     assert!((1..=32).contains(&concurrency));
+    let prefault = std::env::var("IRMIN_EAGER_BENCH_PREFAULT")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let mut random_state = 0xA11C_E5EED_u64;
     let data = (0..size_mib * 1024 * 1024)
         .map(|_| {
@@ -873,9 +976,13 @@ fn benchmark_eager_decompression_rss() {
     let compressed = zstd::encode_all(data.as_slice(), 3).unwrap();
     let compressed_hash = hex::encode(fast_md5::digest(&compressed));
     let decompressed_hash = hex::encode(fast_md5::digest(&data));
-    let dir = tempfile::tempdir().unwrap();
+    let dir = match std::env::var_os("IRMIN_EAGER_BENCH_TEMP_DIR") {
+        Some(path) => tempfile::tempdir_in(path).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
     let mode = std::env::var("IRMIN_EAGER_BENCH_MODE").unwrap_or_else(|_| "stream".to_owned());
     let before = rss_high_water_kib();
+    let cpu_before = process_cpu_time_ms();
     let started = Instant::now();
     thread::scope(|scope| {
         let mut workers = Vec::with_capacity(concurrency);
@@ -893,8 +1000,20 @@ fn benchmark_eager_decompression_rss() {
             let decompressed_hash = &decompressed_hash;
             let mode = mode.as_str();
             let size = data.len() as u64;
-            workers.push(scope.spawn(move || match mode {
-                "oneshot" => super::super::eager_decompress::eager_decompress_chunk(
+            workers.push(scope.spawn(move || {
+                match (mode, prefault) {
+                ("oneshot", true) => {
+                    super::super::eager_decompress::benchmark_eager_decompress_chunk_with_prefault(
+                        compressed,
+                        &output,
+                        0,
+                        size,
+                        compressed_hash,
+                        decompressed_hash,
+                    )
+                }
+                ("oneshot", false) => super::super::eager_decompress::
+                    benchmark_eager_decompress_chunk_without_prefault(
                     compressed,
                     &output,
                     0,
@@ -902,7 +1021,7 @@ fn benchmark_eager_decompression_rss() {
                     compressed_hash,
                     decompressed_hash,
                 ),
-                "stream" => super::super::eager_decompress::stream_decompress_to_file(
+                ("stream", _) => super::super::eager_decompress::stream_decompress_to_file(
                     std::io::Cursor::new(compressed),
                     &output,
                     0,
@@ -910,16 +1029,20 @@ fn benchmark_eager_decompression_rss() {
                     decompressed_hash,
                 ),
                 _ => panic!("IRMIN_EAGER_BENCH_MODE must be oneshot or stream"),
+            }
             }));
         }
         for worker in workers {
             worker.join().unwrap().unwrap();
         }
     });
+    let elapsed = started.elapsed();
+    let prefault_label = eager_benchmark_prefault_label(&mode, prefault);
     println!(
-        "mode={mode} size_mib={size_mib} concurrency={concurrency} compressed_mib={:.1} elapsed_ms={} before_kib={before} after_kib={}",
+        "mode={mode} prefault={prefault_label} size_mib={size_mib} concurrency={concurrency} compressed_mib={:.1} elapsed_us={} cpu_ms={} before_kib={before} after_kib={}",
         compressed.len() as f64 / (1024.0 * 1024.0),
-        started.elapsed().as_millis(),
+        elapsed.as_micros(),
+        process_cpu_time_ms().saturating_sub(cpu_before),
         rss_high_water_kib(),
     );
 }

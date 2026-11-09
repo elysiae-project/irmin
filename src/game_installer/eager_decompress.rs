@@ -64,6 +64,62 @@ pub fn eager_decompress_chunk(
     compressed_hash: &str,
     decompressed_hash: &str,
 ) -> SophonResult<u64> {
+    eager_decompress_chunk_inner::<true>(
+        compressed_data,
+        out_file,
+        chunk_offset,
+        expected_decompressed_size,
+        compressed_hash,
+        decompressed_hash,
+    )
+}
+
+#[cfg(feature = "bench-diagnostics")]
+pub(crate) fn benchmark_eager_decompress_chunk_with_prefault(
+    compressed_data: &[u8],
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+    compressed_hash: &str,
+    decompressed_hash: &str,
+) -> SophonResult<u64> {
+    eager_decompress_chunk_inner::<true>(
+        compressed_data,
+        out_file,
+        chunk_offset,
+        expected_decompressed_size,
+        compressed_hash,
+        decompressed_hash,
+    )
+}
+
+#[cfg(feature = "bench-diagnostics")]
+pub(crate) fn benchmark_eager_decompress_chunk_without_prefault(
+    compressed_data: &[u8],
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+    compressed_hash: &str,
+    decompressed_hash: &str,
+) -> SophonResult<u64> {
+    eager_decompress_chunk_inner::<false>(
+        compressed_data,
+        out_file,
+        chunk_offset,
+        expected_decompressed_size,
+        compressed_hash,
+        decompressed_hash,
+    )
+}
+
+fn eager_decompress_chunk_inner<const PREFAULT: bool>(
+    compressed_data: &[u8],
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+    compressed_hash: &str,
+    decompressed_hash: &str,
+) -> SophonResult<u64> {
     // Verify compressed hash first.
     if !compressed_hash.is_empty() {
         match compressed_hash.len() {
@@ -105,13 +161,14 @@ pub fn eager_decompress_chunk(
     let mut out_mmap = assembly_opt::mmap_read_write(out_file, chunk_offset, expected_usize)
         .map_err(SophonError::Io)?;
 
-    // Prefault output pages to avoid per-page faults during decompression.
-    unsafe {
-        libc::madvise(
-            out_mmap.map_base,
-            out_mmap.map_len,
-            libc::MADV_POPULATE_WRITE,
-        );
+    if PREFAULT {
+        unsafe {
+            libc::madvise(
+                out_mmap.map_base,
+                out_mmap.map_len,
+                libc::MADV_POPULATE_WRITE,
+            );
+        }
     }
 
     let output = out_mmap.as_mut_slice();
