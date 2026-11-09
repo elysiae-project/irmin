@@ -1274,7 +1274,12 @@ fn snapshot_downloaded_chunks(
     chunk_names: &ChunkNameLookup,
 ) -> HashMap<String, u64> {
     debug_assert_eq!(downloaded_chunks.len(), chunk_names.sorted_indices.len());
-    let mut map = HashMap::with_capacity(downloaded_chunks.len() / 2);
+    let completed_count = downloaded_chunks
+        .iter()
+        .filter(|value| value.load(Ordering::Relaxed) > 0)
+        .count();
+    // Concurrent updates can change the snapshot between passes; capacity is a hint.
+    let mut map = HashMap::with_capacity(completed_count);
     for (i, value) in downloaded_chunks.iter().enumerate() {
         let value = value.load(Ordering::Relaxed);
         if value > 0 {

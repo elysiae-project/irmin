@@ -108,6 +108,122 @@
     }
 
     #[test]
+    fn snapshot_downloaded_chunks_keeps_last_duplicate_with_exact_capacity() {
+        let lookup = ChunkNameLookup::from_arena(
+            super::super::compact_manifest::StringArena::from(
+                &["shared", "shared", "shared"][..],
+            ),
+        );
+        let downloaded_chunks = [AtomicU32::new(29), AtomicU32::new(11), AtomicU32::new(0)];
+
+        let snapshot = snapshot_downloaded_chunks(&downloaded_chunks, &lookup);
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.get("shared"), Some(&11));
+
+        let no_completed_duplicates = [AtomicU32::new(0), AtomicU32::new(0)];
+        let no_completed_lookup = ChunkNameLookup::from_arena(
+            super::super::compact_manifest::StringArena::from(&["shared", "shared"][..]),
+        );
+        assert!(
+            snapshot_downloaded_chunks(&no_completed_duplicates, &no_completed_lookup).is_empty()
+        );
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    #[ignore = "measures resume snapshot allocation strategies"]
+    fn benchmark_downloaded_chunk_snapshot_capacity() {
+        use std::io::Read as _;
+        use std::time::Instant;
+
+        fn process_hwm_kib() -> u64 {
+            let mut status = String::new();
+            std::fs::File::open("/proc/self/status")
+                .unwrap()
+                .read_to_string(&mut status)
+                .unwrap();
+            status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("VmHWM:")
+                        .and_then(|value| value.split_whitespace().next())
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .unwrap_or_default()
+        }
+
+        let item_count = std::env::var("IRMIN_SNAPSHOT_ITEMS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(500_000);
+        let completed = std::env::var("IRMIN_SNAPSHOT_COMPLETED")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(500)
+            .min(item_count);
+        let strategy = std::env::var("IRMIN_SNAPSHOT_STRATEGY")
+            .unwrap_or_else(|_| "production".to_owned());
+        let names = (0..item_count)
+            .map(|index| format!("chunk-{index:08}"))
+            .collect::<Vec<_>>();
+        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let lookup = ChunkNameLookup::from_arena(
+            super::super::compact_manifest::StringArena::from(name_refs.as_slice()),
+        );
+        let values = (0..item_count)
+            .map(|index| AtomicU32::new(if index < completed { 1 } else { 0 }))
+            .collect::<Vec<_>>();
+
+        std::fs::write("/proc/self/clear_refs", b"5").unwrap();
+        let before_hwm = process_hwm_kib();
+        let started = Instant::now();
+        let map = match strategy.as_str() {
+            "production" => snapshot_downloaded_chunks(&values, &lookup),
+            "empty" => {
+                let mut map = HashMap::new();
+                for (index, value) in values.iter().enumerate() {
+                    let value = value.load(Ordering::Relaxed);
+                    if value > 0 {
+                        map.insert(lookup.get(index).to_owned(), value as u64);
+                    }
+                }
+                map
+            }
+            "exact" => {
+                let count = values
+                    .iter()
+                    .filter(|value| value.load(Ordering::Relaxed) > 0)
+                    .count();
+                let mut map = HashMap::with_capacity(count);
+                for (index, value) in values.iter().enumerate() {
+                    let value = value.load(Ordering::Relaxed);
+                    if value > 0 {
+                        map.insert(lookup.get(index).to_owned(), value as u64);
+                    }
+                }
+                map
+            }
+            other => panic!("unknown snapshot strategy {other}"),
+        };
+        let snapshot_elapsed = started.elapsed();
+        assert_eq!(map.len(), completed);
+        let before_serialize_hwm = process_hwm_kib();
+        let serialize_started = Instant::now();
+        let serialized_len = serde_json::to_vec(&map).unwrap().len();
+        let serialize_elapsed = serialize_started.elapsed();
+        std::hint::black_box(&map);
+        std::hint::black_box(serialized_len);
+        let after_serialize_hwm = process_hwm_kib();
+        println!(
+            "snapshot_capacity strategy={strategy} items={item_count} completed={completed} snapshot_ms={:.3} serialize_ms={:.3} hwm_before_kib={before_hwm} hwm_before_serialize_kib={before_serialize_hwm} hwm_after_serialize_kib={after_serialize_hwm} output_bytes={serialized_len} capacity={}",
+            snapshot_elapsed.as_secs_f64() * 1000.0,
+            serialize_elapsed.as_secs_f64() * 1000.0,
+            map.capacity(),
+        );
+    }
+
+    #[test]
     fn download_item_index_is_absent_when_deduplication_is_disabled() {
         assert!(uses_chunk_deduplication(super::VerifyMode::Full));
         assert!(!uses_chunk_deduplication(super::VerifyMode::Deferred));
