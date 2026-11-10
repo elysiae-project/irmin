@@ -2647,6 +2647,65 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+/// Generate a v20 (PatchSF) patch with a full-file RLE XOR run (lenv > 0),
+/// exercising the `add_from_source` SIMD path. `run_kind` 2 adds a constant,
+/// 3 adds a per-byte delta — mirroring the v13 RLE generators.
+fn gen_hdiff_v20_rle_patch(old: &[u8], run_kind: u8) -> (Vec<u8>, Vec<u8>) {
+    let run_len = old.len();
+    let new = old
+        .iter()
+        .enumerate()
+        .map(|(index, &byte)| {
+            if run_kind == 2 {
+                byte.wrapping_add(0x37)
+            } else {
+                byte.wrapping_add((index as u8).wrapping_mul(13).wrapping_add(1))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut cover_data = Vec::new();
+    cover_data.extend_from_slice(&encode_tagged_1bit(0, 0));
+    cover_data.extend_from_slice(&encode_7bit_varint(0));
+    cover_data.extend_from_slice(&encode_7bit_varint(run_len as i64));
+
+    // The v20 RLE0 format stores actual XOR bytes in the RLE buffer, not a
+    // single repeated value. lenv = run_len means run_len bytes of XOR data.
+    let mut rle_data = Vec::new();
+    rle_data.extend_from_slice(&encode_7bit_varint(0));
+    rle_data.extend_from_slice(&encode_7bit_varint(run_len as i64));
+    if run_kind == 2 {
+        // Constant add: every byte is 0x37.
+        rle_data.resize(rle_data.len() + run_len, 0x37);
+    } else {
+        // Per-byte delta: XOR value for each position.
+        for i in 0..run_len {
+            rle_data.push((new[i]).wrapping_sub(old[i]));
+        }
+    }
+
+    let step_mem_size = (cover_data.len() + rle_data.len()) as i64;
+    let mut diff_stream = Vec::new();
+    diff_stream.extend_from_slice(&encode_7bit_varint(cover_data.len() as i64));
+    diff_stream.extend_from_slice(&encode_7bit_varint(rle_data.len() as i64));
+    diff_stream.extend_from_slice(&cover_data);
+    diff_stream.extend_from_slice(&rle_data);
+
+    let mut patch = b"HDIFF20&nocomp\0".to_vec();
+    for value in [
+        new.len() as i64,
+        old.len() as i64,
+        1i64,
+        step_mem_size,
+        diff_stream.len() as i64,
+        0,
+    ] {
+        patch.extend_from_slice(&encode_7bit_varint(value));
+    }
+    patch.extend_from_slice(&diff_stream);
+    (patch, new)
+}
+
 /// Focused RLE-only throughput at larger sizes to isolate the SIMD-accelerated
 /// wrapping-add loops from I/O and decompression overhead.
 fn bench_hdiffpatch_rle_throughput(c: &mut Criterion) {
@@ -2666,6 +2725,40 @@ fn bench_hdiffpatch_rle_throughput(c: &mut Criterion) {
         fs::write(&copy_path, &patch_rle_copy).unwrap();
 
         for (label, path) in [("rle_add", &add_path), ("rle_copy", &copy_path)] {
+            group.throughput(Throughput::Bytes(old.len() as u64));
+            group.bench_function(BenchmarkId::new(label, size_mib), |b| {
+                b.iter(|| {
+                    let mut hdiff = HDiff::new(
+                        old_path.to_string_lossy().to_string(),
+                        path.to_string_lossy().to_string(),
+                        out_path.to_string_lossy().to_string(),
+                    );
+                    assert!(hdiff.apply(None));
+                });
+            });
+        }
+    }
+    // v20 RLE0 format stores actual XOR bytes (no set-constant mode), so the
+    // patch size equals the data size. Use 8 MiB to stay under the 16 MiB
+    // single-step limit (MAX_HDIFF20_STEP_SIZE).
+    for &size_mib in &[8usize] {
+        let old = gen_prng_data(0xF00D + size_mib as u64, size_mib * 1024 * 1024);
+        let (patch_v20_rle_add, _) = gen_hdiff_v20_rle_patch(&old, 2);
+        let (patch_v20_rle_copy, _) = gen_hdiff_v20_rle_patch(&old, 3);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_path = dir.path().join("old.bin");
+        let v20_add_path = dir.path().join("v20_rle_add.hdiff");
+        let v20_copy_path = dir.path().join("v20_rle_copy.hdiff");
+        let out_path = dir.path().join("out.bin");
+        fs::write(&old_path, &old).unwrap();
+        fs::write(&v20_add_path, &patch_v20_rle_add).unwrap();
+        fs::write(&v20_copy_path, &patch_v20_rle_copy).unwrap();
+
+        for (label, path) in [
+            ("v20_rle_add", &v20_add_path),
+            ("v20_rle_copy", &v20_copy_path),
+        ] {
             group.throughput(Throughput::Bytes(old.len() as u64));
             group.bench_function(BenchmarkId::new(label, size_mib), |b| {
                 b.iter(|| {

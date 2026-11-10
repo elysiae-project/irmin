@@ -6,6 +6,7 @@ use std::io::{Read, SeekFrom, Write};
 use super::compression::get_clip_stream;
 use super::header::MAX_HDIFF20_STEP_SIZE;
 use super::parser::{BinaryExtensions, read_long_7bit_from_slice};
+use super::patch_core::{wrapping_add_slices, wrapping_add_two_into};
 use super::{BufferPool, HeaderInfo, SeekableRead};
 
 const IO_BUF_SIZE: usize = 256 * 1024;
@@ -407,10 +408,7 @@ impl<'a> Rle0Decoder<'a> {
                 let to_read = self.lenv.min(rem);
                 let src = &self.buf[self.pos..self.pos + to_read];
                 let dst = &mut data[dp..dp + to_read];
-                // Iter-zip form enables LLVM autovectorization (vpaddb).
-                for (d, s) in dst.iter_mut().zip(src.iter()) {
-                    *d = d.wrapping_add(*s);
-                }
+                wrapping_add_slices(dst, src);
                 self.pos += to_read;
                 self.lenv -= to_read;
                 dp += to_read;
@@ -463,10 +461,7 @@ impl<'a> Rle0Decoder<'a> {
                 let rle_src = &self.buf[self.pos..self.pos + to_read];
                 let old_src = &source[dp..dp + to_read];
                 let dst = &mut out[dp..dp + to_read];
-                // source[i] + rle[i] directly into output, no prior copy needed.
-                for ((d, o), r) in dst.iter_mut().zip(old_src.iter()).zip(rle_src.iter()) {
-                    *d = o.wrapping_add(*r);
-                }
+                wrapping_add_two_into(dst, old_src, rle_src);
                 self.pos += to_read;
                 self.lenv -= to_read;
                 dp += to_read;

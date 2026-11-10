@@ -619,7 +619,7 @@ fn tbytes_determine_rle_type(
 /// Element-wise wrapping add of `src` into `dst` (`dst[i] += src[i]`).
 /// Uses AVX2 when available at runtime, falling back to a generic loop.
 #[inline]
-fn wrapping_add_slices(dst: &mut [u8], src: &[u8]) {
+pub(super) fn wrapping_add_slices(dst: &mut [u8], src: &[u8]) {
     // Hard check (not debug_assert): the AVX2 path relies on src.len() >= n.
     let n = dst.len();
     let src = &src[..n];
@@ -632,6 +632,24 @@ fn wrapping_add_slices(dst: &mut [u8], src: &[u8]) {
         return unsafe { wrapping_add_slices_avx2(dst, src) };
     }
     wrapping_add_slices_generic(dst, src);
+}
+
+/// Element-wise wrapping add of two source slices into `dst` (`dst[i] = a[i] + b[i]`).
+/// Uses AVX2 when available at runtime, falling back to a generic loop.
+#[inline]
+pub(super) fn wrapping_add_two_into(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let n = dst.len();
+    let a = &a[..n];
+    let b = &b[..n];
+    if n == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support checked above; a.len() >= n and b.len() >= n.
+        return unsafe { wrapping_add_two_into_avx2(dst, a, b) };
+    }
+    wrapping_add_two_into_generic(dst, a, b);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -677,6 +695,54 @@ unsafe fn wrapping_add_slices_avx2(dst: &mut [u8], src: &[u8]) {
 fn wrapping_add_slices_generic(dst: &mut [u8], src: &[u8]) {
     for (d, s) in dst.iter_mut().zip(src) {
         *d = d.wrapping_add(*s);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// # Safety
+/// Requires AVX2 CPU support at runtime, `a.len() >= dst.len()`, and
+/// `b.len() >= dst.len()`.
+#[target_feature(enable = "avx2")]
+unsafe fn wrapping_add_two_into_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    use std::arch::x86_64::*;
+    let n = dst.len();
+    let dst_ptr = dst.as_mut_ptr();
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: i + 32 <= n.
+        unsafe {
+            let av = _mm256_loadu_si256(a_ptr.add(i) as *const __m256i);
+            let bv = _mm256_loadu_si256(b_ptr.add(i) as *const __m256i);
+            let r = _mm256_add_epi8(av, bv);
+            _mm256_storeu_si256(dst_ptr.add(i) as *mut __m256i, r);
+        }
+        i += 32;
+    }
+    if i + 16 <= n {
+        // SAFETY: i + 16 <= n.
+        unsafe {
+            let av = _mm_loadu_si128(a_ptr.add(i) as *const __m128i);
+            let bv = _mm_loadu_si128(b_ptr.add(i) as *const __m128i);
+            let r = _mm_add_epi8(av, bv);
+            _mm_storeu_si128(dst_ptr.add(i) as *mut __m128i, r);
+        }
+        i += 16;
+    }
+    while i < n {
+        // SAFETY: i < n.
+        unsafe {
+            *dst_ptr.add(i) = (*a_ptr.add(i)).wrapping_add(*b_ptr.add(i));
+        }
+        i += 1;
+    }
+}
+
+#[inline(always)]
+fn wrapping_add_two_into_generic(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    for ((d, &x), &y) in dst.iter_mut().zip(a.iter()).zip(b.iter()) {
+        *d = x.wrapping_add(y);
     }
 }
 
@@ -1863,5 +1929,43 @@ mod tests {
         let mut dst = vec![0u8; 64];
         let src = vec![0u8; 32];
         super::wrapping_add_slices(&mut dst, &src);
+    }
+
+    fn wrapping_add_two_into_ref(dst: &mut [u8], a: &[u8], b: &[u8]) {
+        for ((d, &x), &y) in dst.iter_mut().zip(a.iter()).zip(b.iter()) {
+            *d = x.wrapping_add(y);
+        }
+    }
+
+    #[test]
+    fn wrapping_add_two_into_matches_generic_across_lengths() {
+        let mut rng_state = 0xFACEFEEDu64;
+        let mut next_byte = || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng_state >> 32) as u8
+        };
+        for &len in &[
+            0usize, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 127, 128, 1024, 4096,
+        ] {
+            let a: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            let b: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            let mut dst_simd = vec![0u8; len];
+            let mut dst_ref = vec![0u8; len];
+            super::wrapping_add_two_into(&mut dst_simd, &a, &b);
+            wrapping_add_two_into_ref(&mut dst_ref, &a, &b);
+            assert_eq!(
+                dst_simd, dst_ref,
+                "wrapping_add_two_into mismatch at len {len}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range for slice")]
+    fn wrapping_add_two_into_panics_on_short_a() {
+        let mut dst = vec![0u8; 64];
+        let a = vec![0u8; 32];
+        let b = vec![0u8; 64];
+        super::wrapping_add_two_into(&mut dst, &a, &b);
     }
 }
