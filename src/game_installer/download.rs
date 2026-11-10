@@ -1,4 +1,4 @@
-use std::io::BufRead;
+use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -358,19 +358,19 @@ fn pread_hash_slice(
     if max_bytes == 0 {
         return Ok(());
     }
-    let file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(path)?;
     let fd = file.as_raw_fd();
     posix_advise(fd, 0, max_bytes, libc::POSIX_FADV_SEQUENTIAL);
-    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+    let cap = (max_bytes as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
+    let mut buffer = super::assembly_opt::HashReadBuffer::take(cap);
     let mut remaining = max_bytes;
     while remaining > 0 {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
+        let n = file.read(buffer.as_mut_slice())?;
+        if n == 0 {
             break;
         }
-        let take = std::cmp::min(buf.len(), remaining as usize);
-        f(&buf[..take])?;
-        reader.consume(take);
+        let take = n.min(remaining as usize);
+        f(buffer.filled(take))?;
         remaining -= take as u64;
     }
     posix_advise(fd, 0, max_bytes, libc::POSIX_FADV_DONTNEED);
@@ -378,7 +378,7 @@ fn pread_hash_slice(
 }
 
 fn pread_hash_md5_digest(path: &Path, known_size: Option<u64>) -> SophonResult<[u8; 16]> {
-    let file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(path)?;
     let len = match known_size {
         Some(s) => s,
         None => file.metadata()?.len(),
@@ -390,15 +390,14 @@ fn pread_hash_md5_digest(path: &Path, known_size: Option<u64>) -> SophonResult<[
         hasher.finish().map_err(SophonError::Io)
     } else {
         posix_advise(fd, 0, len, libc::POSIX_FADV_SEQUENTIAL);
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+        let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
+        let mut buffer = super::assembly_opt::HashReadBuffer::take(cap);
         loop {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
+            let n = file.read(buffer.as_mut_slice())?;
+            if n == 0 {
                 break;
             }
-            hasher.update(buf)?;
-            let n = buf.len();
-            reader.consume(n);
+            hasher.update(buffer.filled(n))?;
         }
         hasher.finish().map_err(SophonError::Io)
     };
@@ -408,7 +407,7 @@ fn pread_hash_md5_digest(path: &Path, known_size: Option<u64>) -> SophonResult<[
 }
 
 fn pread_hash_xxh64_digest(path: &Path, known_size: Option<u64>) -> SophonResult<u64> {
-    let file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(path)?;
     let len = match known_size {
         Some(s) => s,
         None => file.metadata()?.len(),
@@ -422,16 +421,15 @@ fn pread_hash_xxh64_digest(path: &Path, known_size: Option<u64>) -> SophonResult
         Ok(digest)
     } else {
         posix_advise(fd, 0, len, libc::POSIX_FADV_SEQUENTIAL);
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+        let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
+        let mut buffer = super::assembly_opt::HashReadBuffer::take(cap);
         let mut hasher = super::assembly_opt::take_xxh64();
         loop {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
+            let n = file.read(buffer.as_mut_slice())?;
+            if n == 0 {
                 break;
             }
-            hasher.update(buf);
-            let n = buf.len();
-            reader.consume(n);
+            hasher.update(buffer.filled(n));
         }
         let digest = hasher.digest();
         super::assembly_opt::return_xxh64(hasher);

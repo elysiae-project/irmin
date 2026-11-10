@@ -82,6 +82,68 @@ pub(crate) fn take_xxh64() -> xxhash_rust::xxh64::Xxh64 {
 
 pub(crate) fn return_xxh64(_hasher: xxhash_rust::xxh64::Xxh64) {}
 
+/// Upper bound on the per-thread read buffer retained for hashing.
+pub(crate) const HASH_READ_BUFFER_SIZE: usize = 256 * 1024;
+
+thread_local! {
+    static HASH_READ_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Thread-local read buffer reused across file-hash calls.
+///
+/// Retains at most [`HASH_READ_BUFFER_SIZE`] bytes per thread; larger requested
+/// capacities use a local allocation so they cannot evict the retained buffer.
+pub(crate) struct HashReadBuffer {
+    buffer: Vec<u8>,
+    /// Length handed to each `read`, bounded by the caller's request.
+    read_len: usize,
+    /// Whether `buffer` came from the thread-local pool and should return to it.
+    pooled: bool,
+}
+
+impl HashReadBuffer {
+    pub(crate) fn take(capacity: usize) -> Self {
+        if capacity > HASH_READ_BUFFER_SIZE {
+            return Self {
+                buffer: vec![0; capacity],
+                read_len: capacity,
+                pooled: false,
+            };
+        }
+        debug_assert!(capacity > 0, "hash read buffer capacity must be nonzero");
+        let mut buffer = HASH_READ_BUF
+            .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+            .unwrap_or_default();
+        if buffer.len() < capacity {
+            // `resize` grows amortized and can overshoot the retention cap.
+            buffer.reserve_exact(capacity - buffer.len());
+            buffer.resize(capacity, 0);
+        }
+        Self {
+            buffer,
+            read_len: capacity,
+            pooled: true,
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer[..self.read_len]
+    }
+
+    pub(crate) fn filled(&self, len: usize) -> &[u8] {
+        &self.buffer[..len]
+    }
+}
+
+impl Drop for HashReadBuffer {
+    fn drop(&mut self) {
+        if self.pooled && self.buffer.capacity() <= HASH_READ_BUFFER_SIZE {
+            let buffer = std::mem::take(&mut self.buffer);
+            let _ = HASH_READ_BUF.try_with(|cell| *cell.borrow_mut() = buffer);
+        }
+    }
+}
+
 /// Compare an MD5 digest against an expected lowercase hex string without
 /// allocating. Returns false on length mismatch.
 #[inline]
