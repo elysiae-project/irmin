@@ -450,11 +450,15 @@ fn take_compressed_buf(len: usize) -> Vec<u8> {
     })
 }
 
-/// Return the compressed buffer to the thread-local pool. Keeps the
-/// buffer's length so `take_compressed_buf`'s `resize` is a no-op when the
-/// next requested size matches.
+/// Return the compressed buffer to the thread-local pool. Shrinks oversized
+/// buffers to avoid retaining large allocations between chunks.
 #[inline]
-fn return_compressed_buf(buf: Vec<u8>) {
+fn return_compressed_buf(mut buf: Vec<u8>) {
+    // Cap retained capacity to avoid holding large buffers indefinitely.
+    const MAX_RETAINED_COMPRESSED_BUF: usize = 8 * 1024 * 1024;
+    if buf.capacity() > MAX_RETAINED_COMPRESSED_BUF {
+        buf = Vec::with_capacity(MAX_RETAINED_COMPRESSED_BUF);
+    }
     COMPRESSED_BUF.with(|cell| {
         *cell.borrow_mut() = buf;
     });
