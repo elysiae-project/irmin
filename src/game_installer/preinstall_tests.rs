@@ -162,8 +162,8 @@ fn benchmark_download_over_context_clone() {
     let context = DownloadOverContext::from_snapshot(&snapshot);
     let baseline_rss = read_process_rss();
     let shared = std::sync::Arc::new(context);
-    let clone_mode = std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_CLONE")
-        .unwrap_or_else(|_| "deep".to_owned());
+    let clone_mode =
+        std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_CLONE").unwrap_or_else(|_| "deep".to_owned());
     let started = Instant::now();
     let retained = match clone_mode.as_str() {
         "deep" => {

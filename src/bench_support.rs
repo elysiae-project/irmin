@@ -205,8 +205,7 @@ pub fn hdiff20_step_stress_shape(size_mib: usize) -> Result<Hdiff20StepFixtureSh
         .checked_mul(1024 * 1024)
         .ok_or_else(|| "HDIFF20 step-stress fixture size is too large".to_owned())?;
     let cover_count = output_bytes - 1;
-    let max_covers_per_step =
-        MAX_HDIFF20_STEP_SIZE / HDIFF20_STEP_STRESS_BYTES_PER_COVER;
+    let max_covers_per_step = MAX_HDIFF20_STEP_SIZE / HDIFF20_STEP_STRESS_BYTES_PER_COVER;
     let mut remaining_covers = cover_count;
     let mut step_cover_counts = Vec::new();
 

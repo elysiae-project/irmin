@@ -62,13 +62,11 @@ impl CompactChunkNameSet {
                     "failed to reserve compact chunk-name hash table: {error}"
                 ))
             })?;
-        self.bytes
-            .try_reserve(name.len())
-            .map_err(|error| {
-                std::io::Error::other(format!(
-                    "failed to reserve compact chunk-name arena: {error}"
-                ))
-            })?;
+        self.bytes.try_reserve(name.len()).map_err(|error| {
+            std::io::Error::other(format!(
+                "failed to reserve compact chunk-name arena: {error}"
+            ))
+        })?;
         self.entries.try_reserve(1).map_err(|error| {
             std::io::Error::other(format!(
                 "failed to reserve compact chunk-name index: {error}"

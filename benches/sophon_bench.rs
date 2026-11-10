@@ -16,15 +16,16 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::AtomicU32;
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fast_md5;
 
 use irmin_rs::game_installer::{
+    VerifyMode,
     assembly::{assemble_file, chunk_filename},
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
     installer::ChunkNameLookup,
-    sysio, VerifyMode,
+    sysio,
 };
 use irmin_rs::manifest::compute_content_manifest_hash;
 use irmin_rs::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
@@ -588,7 +589,11 @@ fn bench_assembly_old_chunk_reuse(c: &mut Criterion) {
     };
     let verify_output = |target: &Path| {
         let output = fs::read(target).expect("read assembled file");
-        assert_eq!(output.len(), expected_output.len(), "reused output size mismatch");
+        assert_eq!(
+            output.len(),
+            expected_output.len(),
+            "reused output size mismatch"
+        );
         for (index, chunk) in output.chunks(chunk_mib * 1024 * 1024).enumerate() {
             let manifest_chunk = reuse_manifest.chunk(index);
             let source_start = manifest_chunk.chunk_old_offset as usize;
@@ -652,10 +657,9 @@ fn bench_assembly_old_chunk_reuse(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("kernel_copy_no_hash", num_chunks), |b| {
         bench_reuse(b, &run_unhashed_assembly);
     });
-    group.bench_function(
-        BenchmarkId::new("file_hash_end_to_end", num_chunks),
-        |b| bench_reuse(b, &run_hashed_assembly),
-    );
+    group.bench_function(BenchmarkId::new("file_hash_end_to_end", num_chunks), |b| {
+        bench_reuse(b, &run_hashed_assembly)
+    });
     group.finish();
 }
 
@@ -930,8 +934,8 @@ fn bench_file_metadata_cost(c: &mut Criterion) {
     });
     group.bench_function("path_digest_1mib", |b| {
         b.iter(|| {
-            let digest = file_md5_digest_with_options(&path, READ_BUFFER_BYTES, false)
-                .expect("path digest");
+            let digest =
+                file_md5_digest_with_options(&path, READ_BUFFER_BYTES, false).expect("path digest");
             std::hint::black_box(digest);
         });
     });
@@ -1198,9 +1202,11 @@ fn bench_chunk_lookup(c: &mut Criterion) {
         });
     });
 
-    assert!(shuffled_hits
-        .iter()
-        .all(|name| lookup.lookup(name).is_some()));
+    assert!(
+        shuffled_hits
+            .iter()
+            .all(|name| lookup.lookup(name).is_some())
+    );
     group.bench_function("shuffled_hits_10000", |b| {
         b.iter(|| {
             let mut found = 0usize;
@@ -1221,9 +1227,11 @@ fn bench_chunk_lookup(c: &mut Criterion) {
         LOOKUP_CHUNKS / 2
     );
     assert!(mixed_queries.iter().any(|name| name < &names[0]));
-    assert!(mixed_queries
-        .iter()
-        .any(|name| name > names.last().expect("lookup names are non-empty")));
+    assert!(
+        mixed_queries
+            .iter()
+            .any(|name| name > names.last().expect("lookup names are non-empty"))
+    );
     group.bench_function("shuffled_mixed_hits_boundary_misses_10000", |b| {
         b.iter(|| {
             let mut found = 0usize;
@@ -1521,7 +1529,7 @@ fn bench_manifest_content_hash(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 use irmin_rs::game_installer::hdiffpatch::HDiffPublic as HDiff;
-use irmin_rs::game_installer::hdiffpatch::{BufferPool, BENCH_MAX_ARRAY_POOL_LEN};
+use irmin_rs::game_installer::hdiffpatch::{BENCH_MAX_ARRAY_POOL_LEN, BufferPool};
 
 const POOL_OPS: u64 = 1000;
 
@@ -1702,7 +1710,7 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch.extend_from_slice(&encode_7bit_varint(step_mem_size));
     patch.extend_from_slice(&encode_7bit_varint(uncompressed_size));
     patch.extend_from_slice(&encode_7bit_varint(0)); // compressed_size = 0 (nocomp)
-                                                     // Diff data
+    // Diff data
     patch.extend_from_slice(&diff_stream);
 
     patch

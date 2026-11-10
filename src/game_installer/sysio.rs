@@ -266,7 +266,11 @@ mod tests {
                 .read_exact_at(&mut output_chunk, output_start as u64)
                 .unwrap();
             assert_eq!(fast_md5::digest(&output_chunk), source_hashes[source_index]);
-            assert!(output_chunk.iter().all(|&byte| byte == (source_index + 1) as u8));
+            assert!(
+                output_chunk
+                    .iter()
+                    .all(|&byte| byte == (source_index + 1) as u8)
+            );
         }
         assert_eq!(
             dst.metadata().unwrap().len(),

@@ -445,25 +445,29 @@ impl ChunkEntryCollector {
             .checked_add(1)
             .ok_or_else(|| SophonError::Io(std::io::Error::other("offset capacity overflow")))?;
         let mut offsets = Vec::new();
-        offsets.try_reserve_exact(offset_capacity).map_err(|error| {
-            SophonError::Io(std::io::Error::other(format!(
-                "failed to reserve chunk-entry offsets: {error}"
-            )))
-        })?;
+        offsets
+            .try_reserve_exact(offset_capacity)
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve chunk-entry offsets: {error}"
+                )))
+            })?;
         offsets.push(0u32);
         for &count in &counts {
             push_chunk_entry_offset(&mut offsets, count)?;
         }
 
         let mut cursors = Vec::new();
-        cursors
-            .try_reserve_exact(expected_items)
-            .map_err(|error| {
-                SophonError::Io(std::io::Error::other(format!(
-                    "failed to reserve chunk-entry scatter cursors: {error}"
-                )))
-            })?;
-        cursors.extend(offsets[..expected_items].iter().map(|&offset| offset as usize));
+        cursors.try_reserve_exact(expected_items).map_err(|error| {
+            SophonError::Io(std::io::Error::other(format!(
+                "failed to reserve chunk-entry scatter cursors: {error}"
+            )))
+        })?;
+        cursors.extend(
+            offsets[..expected_items]
+                .iter()
+                .map(|&offset| offset as usize),
+        );
         // Every slot is assigned once by the stable scatter below.
         let mut flat = Vec::new();
         flat.try_reserve_exact(self.tagged_entries.len())

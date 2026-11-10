@@ -265,9 +265,8 @@ fn prepare_step_buffer(step_buf: &mut Vec<u8>, step_end: usize) {
 }
 
 fn validate_step_sizes(cover_size: i64, rle_size: i64) -> std::io::Result<(usize, usize)> {
-    let invalid_size = || {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid patch step size")
-    };
+    let invalid_size =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid patch step size");
     if cover_size < 0 || rle_size < 0 {
         return Err(invalid_size());
     }

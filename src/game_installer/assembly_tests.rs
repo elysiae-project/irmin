@@ -1678,7 +1678,9 @@ fn assemble_file_reuses_chunks_from_permuted_old_offsets() {
         .map(|index| vec![u8::try_from(index + 1).unwrap(); CHUNK_SIZE])
         .collect();
     let old_data: Vec<u8> = source_chunks.iter().flatten().copied().collect();
-    let permutation: Vec<usize> = (0..CHUNK_COUNT).map(|index| (index * 3) % CHUNK_COUNT).collect();
+    let permutation: Vec<usize> = (0..CHUNK_COUNT)
+        .map(|index| (index * 3) % CHUNK_COUNT)
+        .collect();
     let expected: Vec<u8> = permutation
         .iter()
         .flat_map(|&source_index| source_chunks[source_index].iter().copied())
@@ -1739,8 +1741,15 @@ fn assemble_file_copies_permuted_old_chunks_without_hashing() {
     fs::create_dir_all(&chunks_dir).unwrap();
     fs::create_dir_all(&temp_dir).unwrap();
 
-    let source_chunks = [b"first chunk".as_slice(), b"second chunk with tail".as_slice(), b"third".as_slice()];
-    let old_data: Vec<u8> = source_chunks.iter().flat_map(|chunk| chunk.iter().copied()).collect();
+    let source_chunks = [
+        b"first chunk".as_slice(),
+        b"second chunk with tail".as_slice(),
+        b"third".as_slice(),
+    ];
+    let old_data: Vec<u8> = source_chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
     let permutation = [2usize, 0, 1];
     let expected: Vec<u8> = permutation
         .iter()
@@ -1887,9 +1896,11 @@ fn assemble_file_reuses_large_chunks_from_permuted_old_offsets() {
                     (index * CHUNK_SIZE + block_start) as u64,
                 )
                 .unwrap();
-            assert!(output_chunk[..block_len]
-                .iter()
-                .all(|&byte| byte == expected_byte));
+            assert!(
+                output_chunk[..block_len]
+                    .iter()
+                    .all(|&byte| byte == expected_byte)
+            );
             output_hasher.update(&output_chunk[..block_len]);
         }
     }

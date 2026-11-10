@@ -519,7 +519,10 @@ impl CgroupMemorySnapshot {
                 before.stat.file_mapped_bytes,
                 after.stat.file_mapped_bytes,
             ),
-            file_dirty_bytes: signed_delta(before.stat.file_dirty_bytes, after.stat.file_dirty_bytes),
+            file_dirty_bytes: signed_delta(
+                before.stat.file_dirty_bytes,
+                after.stat.file_dirty_bytes,
+            ),
             file_writeback_bytes: signed_delta(
                 before.stat.file_writeback_bytes,
                 after.stat.file_writeback_bytes,
@@ -527,7 +530,10 @@ impl CgroupMemorySnapshot {
             shmem_bytes: signed_delta(before.stat.shmem_bytes, after.stat.shmem_bytes),
             kernel_bytes: signed_delta(before.stat.kernel_bytes, after.stat.kernel_bytes),
             slab_bytes: signed_delta(before.stat.slab_bytes, after.stat.slab_bytes),
-            pagetables_bytes: signed_delta(before.stat.pagetables_bytes, after.stat.pagetables_bytes),
+            pagetables_bytes: signed_delta(
+                before.stat.pagetables_bytes,
+                after.stat.pagetables_bytes,
+            ),
             pgmajfault: signed_delta(before.stat.pgmajfault, after.stat.pgmajfault),
             workingset_refault_file: signed_delta(
                 before.stat.workingset_refault_file,
@@ -1393,7 +1399,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--assembly-verify-mode none is not supported by the assembly benchmark".to_owned(),
         );
     }
-    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::Deferred && chunks < 4 {
+    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::Deferred && chunks < 4
+    {
         return Err("deferred assembly mmap diagnostics require at least four chunks".to_owned());
     }
     if preinstall_mode == PreinstallMode::CopyOver && cover_pattern != CoverPattern::Sequential {
@@ -1651,7 +1658,8 @@ fn run_child(args: &[String]) -> Result<(), String> {
     if assembly_demand_mmap && assembly_verify_mode != VerifyMode::Deferred {
         return Err("demand mmap advice requires deferred assembly verification".to_owned());
     }
-    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::Deferred && chunks < 4 {
+    if scenario == Scenario::Assembly && assembly_verify_mode == VerifyMode::Deferred && chunks < 4
+    {
         return Err("deferred assembly mmap diagnostics require at least four chunks".to_owned());
     }
     if cover_pattern == CoverPattern::UncoveredPrefix {
@@ -1813,21 +1821,15 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let cgroup_memory_setup_delta = cgroup_memory_before_setup
         .as_ref()
         .zip(cgroup_after_setup.as_ref())
-        .map(|((_, _, _, _, before), (_, _, after))| {
-            CgroupMemorySnapshot::delta(before, after)
-        });
+        .map(|((_, _, _, _, before), (_, _, after))| CgroupMemorySnapshot::delta(before, after));
     let cgroup_memory_operation_delta = cgroup_after_setup
         .as_ref()
         .zip(cgroup_after_operation.as_ref())
-        .map(|((_, _, before), (_, _, after))| {
-            CgroupMemorySnapshot::delta(before, after)
-        });
+        .map(|((_, _, before), (_, _, after))| CgroupMemorySnapshot::delta(before, after));
     let cgroup_memory_total_delta = cgroup_memory_before_setup
         .as_ref()
         .zip(cgroup_after_operation.as_ref())
-        .map(|((_, _, _, _, before), (_, _, after))| {
-            CgroupMemorySnapshot::delta(before, after)
-        });
+        .map(|((_, _, _, _, before), (_, _, after))| CgroupMemorySnapshot::delta(before, after));
     let sampled_peak = sampler.finish();
     #[cfg(all(
         unix,
@@ -2072,7 +2074,9 @@ fn run_child(args: &[String]) -> Result<(), String> {
     );
     result.as_object_mut().unwrap().insert(
         "smaps_rollup_sampling_note".to_owned(),
-        serde_json::json!("/proc/self/status and /proc/self/smaps_rollup are read sequentially, not atomically."),
+        serde_json::json!(
+            "/proc/self/status and /proc/self/smaps_rollup are read sequentially, not atomically."
+        ),
     );
     #[cfg(feature = "bench-diagnostics")]
     if let Some(timings) = phase_timings {
@@ -2159,8 +2163,12 @@ fn run_child(args: &[String]) -> Result<(), String> {
     );
     result.insert(
         "cgroup_memory_snapshot_after_operation".to_owned(),
-        serde_json::to_value(cgroup_after_operation.as_ref().map(|(_, _, snapshot)| snapshot))
-            .unwrap_or_default(),
+        serde_json::to_value(
+            cgroup_after_operation
+                .as_ref()
+                .map(|(_, _, snapshot)| snapshot),
+        )
+        .unwrap_or_default(),
     );
     result.insert(
         "cgroup_memory_stat_delta_setup".to_owned(),
@@ -3139,7 +3147,10 @@ fn prepare_install_context(
     for index in 0..chunks {
         let fixture_index = fixture_chunk_index(index);
         expected_file
-            .write_all(&deterministic_data(0xBEEF + fixture_index as u64, chunk_size))
+            .write_all(&deterministic_data(
+                0xBEEF + fixture_index as u64,
+                chunk_size,
+            ))
             .map_err(|error| error.to_string())?;
     }
     let file_md5 = hex::encode(file_hasher.finalize());
@@ -4080,20 +4091,24 @@ mod tests {
 
     #[test]
     fn download_plan_rejects_cgroup_memory_limit_configuration() {
-        assert!(parse_args(&[
-            "--scenario".into(),
-            "preinstall-download-plan".into(),
-            "--memory-max-mib".into(),
-            "64".into(),
-        ])
-        .is_err());
-        assert!(parse_args(&[
-            "--scenario".into(),
-            "preinstall-download-plan".into(),
-            "--sweep-sizes-mib".into(),
-            "4,8".into(),
-        ])
-        .is_err());
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-download-plan".into(),
+                "--memory-max-mib".into(),
+                "64".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "--scenario".into(),
+                "preinstall-download-plan".into(),
+                "--sweep-sizes-mib".into(),
+                "4,8".into(),
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -130,7 +130,7 @@ pub fn read_long_7bit_from_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_long_7bit_from_slice, BinaryExtensions};
+    use super::{BinaryExtensions, read_long_7bit_from_slice};
     use std::io::Cursor;
 
     fn src(data: &[u8]) -> Cursor<Vec<u8>> {
