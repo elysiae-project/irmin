@@ -38,19 +38,10 @@ struct VerificationCacheSerializable {
 pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationEntry> {
     let cache_path = game_dir.join(VERIFICATION_CACHE_FILE);
 
-    // Clean up leftover .tmp files from a previous crash.
-    if let Some(parent) = cache_path.parent()
-        && let Ok(entries) = parent.read_dir()
-    {
-        let cache_stem = cache_path.file_stem();
-        for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|ext| ext == "tmp")
-                && cache_stem == entry.path().file_stem()
-            {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
+    // Clean up the temp file a crashed save may have left behind. The save path
+    // uses one fixed name, so remove it directly instead of scanning the whole
+    // game directory.
+    let _ = fs::remove_file(cache_path.with_extension("tmp"));
 
     let serializable: VerificationCacheSerializable = match File::open(&cache_path) {
         Ok(f) => serde_json::from_reader(std::io::BufReader::new(f)).unwrap_or_else(|_| {

@@ -318,6 +318,24 @@ fn check_file_md5_cached_populates_on_match() {
 }
 
 #[test]
+fn load_removes_leftover_tmp_from_crashed_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::write(
+        game_dir.join(format!("{VERIFICATION_CACHE_FILE}.tmp")),
+        b"junk",
+    )
+    .unwrap();
+    let _ = load_verification_cache(&game_dir);
+    assert!(
+        !game_dir
+            .join(format!("{VERIFICATION_CACHE_FILE}.tmp"))
+            .exists()
+    );
+}
+
+#[test]
 fn save_verification_cache_atomic_write() {
     let dir = tempfile::tempdir().unwrap();
     let game_dir = dir.path().join("game");
@@ -599,5 +617,74 @@ fn file_md5_digest_reuses_buffer_across_mixed_sizes() {
     assert_eq!(
         file_md5_digest(&large).unwrap(),
         fast_md5::digest(&large_data)
+    );
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures verification-cache load startup cost in a large game dir"]
+fn benchmark_load_verification_cache_startup() {
+    use std::time::Instant;
+
+    let files = std::env::var("IRMIN_CACHE_LOAD_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50_000);
+    let rounds = std::env::var("IRMIN_CACHE_LOAD_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(15);
+    assert!(files > 0 && rounds > 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    fs::create_dir_all(&game_dir).unwrap();
+    for index in 0..files {
+        fs::write(game_dir.join(format!("asset-{index:06}.pak")), b"x").unwrap();
+    }
+    // Realistic cache payload: a few thousand entries.
+    let cache = DashMap::new();
+    for index in 0..2000 {
+        cache.insert(
+            format!("asset-{index:06}.pak"),
+            VerificationEntry {
+                size: 1,
+                md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                mtime_secs: index as u64,
+            },
+        );
+    }
+    save_verification_cache(&game_dir, &cache).unwrap();
+    // Leave a crashed temp file behind so load exercises its cleanup path.
+    fs::write(
+        game_dir.join(format!("{VERIFICATION_CACHE_FILE}.tmp")),
+        b"junk",
+    )
+    .unwrap();
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        // Recreate the crash leftover each round.
+        fs::write(
+            game_dir.join(format!("{VERIFICATION_CACHE_FILE}.tmp")),
+            b"junk",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let loaded = load_verification_cache(&game_dir);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(loaded.len(), 2000);
+        assert!(
+            !game_dir
+                .join(format!("{VERIFICATION_CACHE_FILE}.tmp"))
+                .exists()
+        );
+    }
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "load_verification_cache files={files} cache_entries=2000 rounds={rounds} median_ms={:.3} range_ms={:.3}-{:.3}",
+        samples[samples.len() / 2],
+        samples[0],
+        samples[samples.len() - 1],
     );
 }
