@@ -337,7 +337,7 @@ pub async fn fetch_diff_sizes(
             .into_iter()
             .flat_map(|manifest| manifest.assets.iter())
             .filter(|file| !file.is_directory())
-            .map(|file| (file.asset_name.as_str(), file.asset_hash_md5.as_str()))
+            .map(|file| (file.asset_name_str(), file.asset_hash_md5_str()))
             .collect();
         let old_chunks: rustc_hash::FxHashSet<&str> = old_manifest
             .as_ref()
@@ -345,7 +345,7 @@ pub async fn fetch_diff_sizes(
             .flat_map(|manifest| manifest.assets.iter())
             .filter(|file| !file.is_directory())
             .flat_map(|file| file.asset_chunks.iter())
-            .map(|chunk| chunk.chunk_decompressed_hash_md5.as_str())
+            .map(|chunk| chunk.chunk_decompressed_hash_md5_str())
             .collect();
 
         accumulate_diff_manifest_sizes(
@@ -373,17 +373,17 @@ fn accumulate_diff_manifest_sizes(
         if file.is_directory() {
             continue;
         }
-        let needs_download = match old_files_md5.get(file.asset_name.as_str()) {
+        let needs_download = match old_files_md5.get(file.asset_name_str()) {
             Some(old_md5) => *old_md5 != file.asset_hash_md5,
             None => true,
         };
         if needs_download {
             for chunk in &file.asset_chunks {
-                if old_chunks.contains(chunk.chunk_decompressed_hash_md5.as_str()) {
+                if old_chunks.contains(chunk.chunk_decompressed_hash_md5_str()) {
                     continue;
                 }
                 if seen_chunks
-                    .insert(&chunk.chunk_name)
+                    .insert(chunk.chunk_name_str())
                     .map_err(SophonError::Io)?
                 {
                     *compressed += chunk.chunk_size;
@@ -414,14 +414,14 @@ where
         if file.is_directory() {
             continue;
         }
-        let needs_download = match old_files_md5.get(file.asset_name.as_str()) {
+        let needs_download = match old_files_md5.get(file.asset_name_str()) {
             Some(old_md5) => old_md5.as_ref() != file.asset_hash_md5,
             None => true,
         };
         if needs_download {
             for chunk in &file.asset_chunks {
-                if !old_chunks.contains(chunk.chunk_decompressed_hash_md5.as_str())
-                    && seen_chunks.insert(chunk.chunk_name.clone())
+                if !old_chunks.contains(chunk.chunk_decompressed_hash_md5_str())
+                    && seen_chunks.insert(chunk.chunk_name_str().to_string())
                 {
                     compressed += chunk.chunk_size;
                     decompressed += chunk.chunk_size_decompressed;
@@ -443,14 +443,14 @@ fn borrowed_diff_indexes_collect<'a>(
         .assets
         .iter()
         .filter(|file| !file.is_directory())
-        .map(|file| (file.asset_name.as_str(), file.asset_hash_md5.as_str()))
+        .map(|file| (file.asset_name_str(), file.asset_hash_md5_str()))
         .collect();
     let old_chunks = old_manifest
         .assets
         .iter()
         .filter(|file| !file.is_directory())
         .flat_map(|file| file.asset_chunks.iter())
-        .map(|chunk| chunk.chunk_decompressed_hash_md5.as_str())
+        .map(|chunk| chunk.chunk_decompressed_hash_md5_str())
         .collect();
     (old_files_md5, old_chunks)
 }
@@ -466,14 +466,19 @@ fn owned_diff_indexes(
         .assets
         .iter()
         .filter(|file| !file.is_directory())
-        .map(|file| (file.asset_name.clone(), file.asset_hash_md5.clone()))
+        .map(|file| {
+            (
+                file.asset_name_str().to_string(),
+                file.asset_hash_md5_str().to_string(),
+            )
+        })
         .collect::<rustc_hash::FxHashMap<String, String>>();
     let old_chunks = old_manifest
         .assets
         .iter()
         .filter(|file| !file.is_directory())
         .flat_map(|file| file.asset_chunks.iter())
-        .map(|chunk| chunk.chunk_decompressed_hash_md5.clone())
+        .map(|chunk| chunk.chunk_decompressed_hash_md5_str().to_string())
         .collect::<rustc_hash::FxHashSet<String>>();
     (old_files_md5, old_chunks)
 }
@@ -501,26 +506,26 @@ fn make_diff_size_benchmark_manifests(
                     format!("new-hash-{file_idx:06}-{chunk_idx:04}")
                 };
                 SophonManifestAssetChunk {
-                    chunk_name: format!("chunk-{:06}-{chunk_idx:04}", file_idx % 100),
-                    chunk_decompressed_hash_md5: hash,
+                    chunk_name: format!("chunk-{:06}-{chunk_idx:04}", file_idx % 100).into(),
+                    chunk_decompressed_hash_md5: hash.into(),
                     chunk_on_file_offset: (chunk_idx * 1024 * 1024) as u64,
                     chunk_size: 256 * 1024,
                     chunk_size_decompressed: 1024 * 1024,
                     chunk_compressed_hash_xxh: 0,
-                    chunk_compressed_hash_md5: String::new(),
+                    chunk_compressed_hash_md5: bytes::Bytes::new(),
                     chunk_old_offset: -1,
                 }
             })
             .collect();
         SophonManifestAssetProperty {
-            asset_name: format!("asset-{file_idx:06}.pak"),
+            asset_name: format!("asset-{file_idx:06}.pak").into(),
             asset_chunks,
             asset_type: 0,
             asset_size: (chunks_per_file * 1024 * 1024) as u64,
             asset_hash_md5: if changed {
-                format!("new-file-hash-{file_idx:06}")
+                format!("new-file-hash-{file_idx:06}").into()
             } else {
-                format!("old-file-hash-{file_idx:06}")
+                format!("old-file-hash-{file_idx:06}").into()
             },
         }
     };
@@ -663,21 +668,21 @@ mod tests {
         use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
 
         let chunk = |name: &str, hash: &str, size: u64| SophonManifestAssetChunk {
-            chunk_name: name.to_owned(),
-            chunk_decompressed_hash_md5: hash.to_owned(),
+            chunk_name: name.to_string().into(),
+            chunk_decompressed_hash_md5: hash.to_owned().into(),
             chunk_on_file_offset: 0,
             chunk_size: size,
             chunk_size_decompressed: size * 2,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: -1,
         };
         let file = |name: &str, hash: &str, chunks| SophonManifestAssetProperty {
-            asset_name: name.to_owned(),
+            asset_name: name.to_string().into(),
             asset_chunks: chunks,
             asset_type: 0,
             asset_size: 0,
-            asset_hash_md5: hash.to_owned(),
+            asset_hash_md5: hash.to_owned().into(),
         };
         let first = crate::proto_parse::SophonManifestProto {
             assets: vec![file(
@@ -821,13 +826,13 @@ mod tests {
                     if file.is_directory() {
                         continue;
                     }
-                    let changed = match old_files.get(file.asset_name.as_str()) {
+                    let changed = match old_files.get(file.asset_name_str()) {
                         Some(old_hash) => *old_hash != file.asset_hash_md5,
                         None => true,
                     };
                     if changed {
                         for chunk in &file.asset_chunks {
-                            if !old_chunks.contains(chunk.chunk_decompressed_hash_md5.as_str())
+                            if !old_chunks.contains(chunk.chunk_decompressed_hash_md5_str())
                                 && owned.insert(chunk.chunk_name.clone())
                             {
                                 compressed += chunk.chunk_size;

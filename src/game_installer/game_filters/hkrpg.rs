@@ -60,11 +60,10 @@ pub fn filter_hkrpg_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestA
 
     let original_len = assets.len();
     assets.retain(|asset| {
-        let asset_lower = asset.asset_name.to_ascii_lowercase();
+        let asset_lower = asset.asset_name_str().to_ascii_lowercase();
         for entry in &blacklist_lower {
             if asset_lower.contains(entry) {
-                let name = &asset.asset_name;
-                log::warn!("Filtered blacklisted asset: {name}");
+                log::warn!("Filtered blacklisted asset: {}", &asset.asset_name_str());
                 return false;
             }
         }
@@ -398,11 +397,11 @@ mod tests {
         // No blacklist file.
 
         let mut assets = vec![SophonManifestAssetProperty {
-            asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice.pck"),
+            asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice.pck").into(),
             asset_chunks: vec![],
             asset_type: 0,
             asset_size: 100,
-            asset_hash_md5: "abc".into(),
+            asset_hash_md5: bytes::Bytes::from("abc"),
         }];
 
         filter_hkrpg_asset_list(dir.path(), &mut assets);
@@ -424,18 +423,18 @@ mod tests {
 
         let mut assets = vec![
             SophonManifestAssetProperty {
-                asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice_good.pck"),
+                asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice_good.pck").into(),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice_bad.pck"),
+                asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice_bad.pck").into(),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 200,
-                asset_hash_md5: "def".into(),
+                asset_hash_md5: bytes::Bytes::from("def"),
             },
         ];
 
@@ -463,11 +462,11 @@ mod tests {
         .unwrap();
 
         let mut assets = vec![SophonManifestAssetProperty {
-            asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice.pck"),
+            asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice.pck").into(),
             asset_chunks: vec![],
             asset_type: 0,
             asset_size: 100,
-            asset_hash_md5: "abc".into(),
+            asset_hash_md5: bytes::Bytes::from("abc"),
         }];
 
         filter_hkrpg_asset_list(dir.path(), &mut assets);
@@ -482,11 +481,11 @@ mod tests {
         fs::write(blacklist_dir.join("DownloadBlacklist.json"), "").unwrap();
 
         let mut assets = vec![SophonManifestAssetProperty {
-            asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice.pck"),
+            asset_name: format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice.pck").into(),
             asset_chunks: vec![],
             asset_type: 0,
             asset_size: 100,
-            asset_hash_md5: "abc".into(),
+            asset_hash_md5: bytes::Bytes::from("abc"),
         }];
 
         filter_hkrpg_asset_list(dir.path(), &mut assets);
@@ -506,18 +505,18 @@ mod tests {
 
         let mut assets = vec![
             SophonManifestAssetProperty {
-                asset_name: "audio/bad.pck".into(),
+                asset_name: bytes::Bytes::from("audio/bad.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "audio/good.pck".into(),
+                asset_name: bytes::Bytes::from("audio/good.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 200,
-                asset_hash_md5: "def".into(),
+                asset_hash_md5: bytes::Bytes::from("def"),
             },
         ];
 

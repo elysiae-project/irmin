@@ -261,51 +261,48 @@ impl TargetSnapshot {
                 return Err(invalid_state("Unsupported target chunk URL scheme"));
             }
             for file in &entry.manifest.assets {
-                super::assembly::validate_asset_name(&file.asset_name)?;
+                super::assembly::validate_asset_name(file.asset_name_str())?;
                 if files
-                    .insert(
-                        (entry.matching_field.as_str(), file.asset_name.as_str()),
-                        file,
-                    )
+                    .insert((entry.matching_field.as_str(), file.asset_name_str()), file)
                     .is_some()
                 {
                     return Err(invalid_state(format!(
                         "Duplicate target asset: {}",
-                        file.asset_name
+                        file.asset_name_str()
                     )));
                 }
                 if file.is_directory() {
                     if file.asset_size != 0 || !file.asset_chunks.is_empty() {
                         return Err(invalid_state(format!(
                             "Invalid target directory: {}",
-                            file.asset_name
+                            file.asset_name_str()
                         )));
                     }
                     continue;
                 }
-                if !valid_hash(&file.asset_hash_md5) || file.asset_size > i64::MAX as u64 {
+                if !valid_hash(file.asset_hash_md5_str()) || file.asset_size > i64::MAX as u64 {
                     return Err(invalid_state(format!(
                         "Invalid target size/hash: {}",
-                        file.asset_name
+                        file.asset_name_str()
                     )));
                 }
                 let mut chunks: Vec<_> = file.asset_chunks.iter().collect();
                 chunks.sort_by_key(|c| c.chunk_on_file_offset);
                 let mut end = 0u64;
                 for chunk in chunks {
-                    if !super::assembly::validate_chunk_name(&chunk.chunk_name)
+                    if !super::assembly::validate_chunk_name(chunk.chunk_name_str())
                         || chunk.chunk_on_file_offset != end
                         || chunk.chunk_size == 0
                         || chunk.chunk_size > i64::MAX as u64
                         || (chunk.chunk_size_decompressed == 0 && file.asset_size != 0)
                         || (!chunk.chunk_decompressed_hash_md5.is_empty()
-                            && !valid_hash(&chunk.chunk_decompressed_hash_md5))
+                            && !valid_hash(chunk.chunk_decompressed_hash_md5_str()))
                         || (!chunk.chunk_compressed_hash_md5.is_empty()
-                            && !valid_hash(&chunk.chunk_compressed_hash_md5))
+                            && !valid_hash(chunk.chunk_compressed_hash_md5_str()))
                     {
                         return Err(invalid_state(format!(
                             "Invalid target chunk/range: {}",
-                            file.asset_name
+                            file.asset_name_str()
                         )));
                     }
                     end = end
@@ -315,7 +312,7 @@ impl TargetSnapshot {
                 if end != file.asset_size {
                     return Err(invalid_state(format!(
                         "Incomplete target chunk coverage: {}",
-                        file.asset_name
+                        file.asset_name_str()
                     )));
                 }
             }
@@ -350,7 +347,7 @@ impl TargetSnapshot {
                 if file.is_directory()
                     || file.asset_size != asset.target_file_size
                     || !file
-                        .asset_hash_md5
+                        .asset_hash_md5_str()
                         .eq_ignore_ascii_case(&asset.target_file_hash)
                 {
                     return Err(invalid_state(format!(
@@ -406,7 +403,7 @@ impl PreinstallState {
                 for file in &entry.manifest.assets {
                     decompressed = decompressed.saturating_add(file.asset_size);
                     for chunk in &file.asset_chunks {
-                        if seen.insert((entry.matching_field.as_str(), chunk.chunk_name.as_str())) {
+                        if seen.insert((entry.matching_field.as_str(), chunk.chunk_name_str())) {
                             compressed = compressed.saturating_add(chunk.chunk_size);
                         }
                     }
@@ -599,13 +596,13 @@ fn prepare_synthetic_apply_state_with_method(
         matching_field: matching_field.to_owned(),
     };
     let target_chunk = SophonManifestAssetChunk {
-        chunk_name: "synthetic-target-data".to_owned(),
-        chunk_decompressed_hash_md5: target_hash.clone(),
+        chunk_name: bytes::Bytes::from("synthetic-target-data"),
+        chunk_decompressed_hash_md5: target_hash.clone().into(),
         chunk_on_file_offset: 0,
         chunk_size: target_size.max(1),
         chunk_size_decompressed: target_size,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: target_hash.clone(),
+        chunk_compressed_hash_md5: target_hash.clone().into(),
         chunk_old_offset: -1,
     };
     let mut state = PreinstallState {
@@ -635,11 +632,11 @@ fn prepare_synthetic_apply_state_with_method(
             chunk_download,
             manifest: SophonManifestProto {
                 assets: vec![SophonManifestAssetProperty {
-                    asset_name: target_relative_path.to_owned(),
+                    asset_name: target_relative_path.to_owned().into(),
                     asset_chunks: vec![target_chunk],
                     asset_type: 0,
                     asset_size: target_size,
-                    asset_hash_md5: target_hash.clone(),
+                    asset_hash_md5: target_hash.clone().into(),
                 }],
             },
         }],
@@ -1087,16 +1084,16 @@ async fn build_preinstall_plan_from_builds(
     for (matching_field, manifest) in manifest_results {
         for asset in &manifest.assets {
             if asset.is_directory() {
-                seen_patch_targets.insert(asset.asset_name.clone());
+                seen_patch_targets.insert(asset.asset_name_str().to_string());
                 continue;
             }
-            if seen_patch_targets.contains(asset.asset_name.as_str()) {
+            if seen_patch_targets.contains(asset.asset_name_str()) {
                 continue;
             }
             all_patch_assets.push(PatchAssetInfo {
-                target_file_path: asset.asset_name.clone(),
+                target_file_path: asset.asset_name_str().to_string(),
                 target_file_size: asset.asset_size,
-                target_file_hash: asset.asset_hash_md5.clone(),
+                target_file_hash: asset.asset_hash_md5_str().to_string(),
                 patch_method: PatchMethod::DownloadOver,
                 patch_name: String::new(),
                 patch_hash: String::new(),
@@ -1108,7 +1105,7 @@ async fn build_preinstall_plan_from_builds(
                 original_file_size: None,
                 matching_field: matching_field.clone(),
             });
-            seen_patch_targets.insert(asset.asset_name.clone());
+            seen_patch_targets.insert(asset.asset_name_str().to_string());
         }
         let meta = main_by_field[matching_field.as_str()];
         target_manifests.push(TargetManifest {
@@ -1790,8 +1787,8 @@ async fn download_chunk_with_retries(
                 }
                 if attempt < MAX_RETRIES - 1 {
                     log::warn!(
-                        "Chunk {chunk_name} failed (attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
-                        chunk_name = chunk.chunk_name,
+                        "Chunk {} failed (attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
+                        chunk.chunk_name_str(),
                         attempt_num = attempt + 1,
                     );
                     let delay = retry_delay(attempt);
@@ -1800,8 +1797,8 @@ async fn download_chunk_with_retries(
                     }
                 } else {
                     log::warn!(
-                        "Chunk {chunk_name} failed (final attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
-                        chunk_name = chunk.chunk_name,
+                        "Chunk {} failed (final attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
+                        chunk.chunk_name_str(),
                         attempt_num = attempt + 1,
                     );
                 }
@@ -1810,7 +1807,7 @@ async fn download_chunk_with_retries(
     }
 
     Err(SophonError::DownloadFailed {
-        chunk: chunk.chunk_name.clone(),
+        chunk: chunk.chunk_name_str().to_string(),
         attempts: MAX_RETRIES,
         error: last_err,
     })
@@ -3434,7 +3431,7 @@ fn build_download_over_chunk_futures(
     let mut seen_chunks = rustc_hash::FxHashSet::default();
     let mut chunk_futures = Vec::with_capacity(asset_chunks.len());
     for chunk in asset_chunks {
-        if !seen_chunks.insert(chunk.chunk_name.as_str()) {
+        if !seen_chunks.insert(chunk.chunk_name_str()) {
             continue;
         }
         let permit = Arc::clone(&download_semaphore);
@@ -3455,7 +3452,7 @@ fn make_download_over_chunk_future(
     chunk_download: &DownloadInfo,
     handle: &DownloadHandle,
 ) -> impl Future<Output = SophonResult<()>> + 'static {
-    let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
+    let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
     chunk_path.set_extension("zstd");
     let client = client.clone();
     let chunk_download = chunk_download.clone();
@@ -3479,7 +3476,7 @@ where
 {
     let mut seen_chunks = rustc_hash::FxHashSet::default();
     futures_util::stream::iter(asset_chunks.iter())
-        .filter(move |chunk| ready(seen_chunks.insert(chunk.chunk_name.as_str())))
+        .filter(move |chunk| ready(seen_chunks.insert(chunk.chunk_name_str())))
         .map(move |chunk| make_future(chunk))
         .buffer_unordered(limit)
 }

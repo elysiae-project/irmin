@@ -1,16 +1,15 @@
-
 use super::*;
 use crate::api_scrape::Compression;
 
 fn make_chunk(name: &str, size: u64) -> SophonManifestAssetChunk {
     SophonManifestAssetChunk {
-        chunk_name: name.into(),
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_name: name.to_string().into(),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: 0,
         chunk_size: size,
         chunk_size_decompressed: size,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     }
 }
@@ -22,13 +21,13 @@ fn make_chunk_with_hash(
     on_file_offset: u64,
 ) -> SophonManifestAssetChunk {
     SophonManifestAssetChunk {
-        chunk_name: name.into(),
-        chunk_decompressed_hash_md5: decompressed_hash.into(),
+        chunk_name: name.to_string().into(),
+        chunk_decompressed_hash_md5: decompressed_hash.to_string().into(),
         chunk_on_file_offset: on_file_offset,
         chunk_size: size,
         chunk_size_decompressed: size,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     }
 }
@@ -40,21 +39,21 @@ fn make_file(
 ) -> SophonManifestAssetProperty {
     let size: u64 = chunks.iter().map(|c| c.chunk_size_decompressed).sum();
     SophonManifestAssetProperty {
-        asset_name: name.into(),
+        asset_name: name.to_string().into(),
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: size,
-        asset_hash_md5: md5.into(),
+        asset_hash_md5: md5.to_string().into(),
     }
 }
 
 fn make_dir(name: &str) -> SophonManifestAssetProperty {
     SophonManifestAssetProperty {
-        asset_name: name.into(),
+        asset_name: name.to_string().into(),
         asset_chunks: vec![],
         asset_type: 64,
         asset_size: 0,
-        asset_hash_md5: String::new(),
+        asset_hash_md5: bytes::Bytes::new(),
     }
 }
 
@@ -768,7 +767,7 @@ fn compute_diff_files_dirs_included() {
     };
     let diff = compute_diff_files(new_manifest, &FxHashMap::default());
     assert_eq!(diff.len(), 2);
-    let names: Vec<&str> = diff.iter().map(|f| f.asset_name.as_str()).collect();
+    let names: Vec<&str> = diff.iter().map(|f| f.asset_name_str()).collect();
     assert!(names.contains(&"GameData"));
     assert!(names.contains(&"a.pak"));
 }
@@ -788,7 +787,7 @@ fn compute_diff_files_mixed() {
     old_md5_map.insert("unchanged.pak", "same");
     let diff = compute_diff_files(new_manifest, &old_md5_map);
     assert_eq!(diff.len(), 3);
-    let names: Vec<&str> = diff.iter().map(|f| f.asset_name.as_str()).collect();
+    let names: Vec<&str> = diff.iter().map(|f| f.asset_name_str()).collect();
     assert!(names.contains(&"new.pak"));
     assert!(names.contains(&"changed.pak"));
     assert!(names.contains(&"somedir")); // directories are included in diff
@@ -1141,7 +1140,7 @@ async fn check_needs_download_valid_cached_file() {
     );
 
     let mut chunk = make_chunk("c1", data.len() as u64);
-    chunk.chunk_compressed_hash_md5 = md5_hex;
+    chunk.chunk_compressed_hash_md5 = md5_hex.into();
 
     let all_files = Arc::new(CompactManifest::from(vec![make_file(
         "f1",
@@ -1334,13 +1333,13 @@ async fn download_chunk_with_retries_success_on_first() {
 
     let data_len = data.len() as u64;
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "test_retry_chunk".to_string(),
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_name: bytes::Bytes::from("test_retry_chunk"),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: 0,
         chunk_size: data_len,
         chunk_size_decompressed: data_len,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: expected_md5,
+        chunk_compressed_hash_md5: expected_md5.into(),
         chunk_old_offset: -1,
     };
 
@@ -1447,13 +1446,13 @@ async fn download_chunk_with_retries_mismatch_discards_partial() {
     let wrong_md5 = hex::encode(fast_md5::digest(b"wrong_data"));
     let data_len = data.len() as u64;
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "discard_partial_chunk".to_string(),
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_name: bytes::Bytes::from("discard_partial_chunk"),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: 0,
         chunk_size: data_len,
         chunk_size_decompressed: data_len,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: wrong_md5.to_string(),
+        chunk_compressed_hash_md5: wrong_md5.to_string().into(),
         chunk_old_offset: -1,
     };
 
@@ -1554,30 +1553,30 @@ async fn download_chunk_with_retries_mismatch_discards_partial() {
 #[test]
 fn compute_totals_filters_old_reuse_chunks() {
     let chunk_new = SophonManifestAssetChunk {
-        chunk_name: "new_chunk".into(),
+        chunk_name: bytes::Bytes::from("new_chunk"),
         chunk_size: 500,
         chunk_size_decompressed: 500,
         chunk_old_offset: -1,
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: 0,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
     };
     let chunk_reuse = SophonManifestAssetChunk {
-        chunk_name: "reuse_chunk".into(),
+        chunk_name: bytes::Bytes::from("reuse_chunk"),
         chunk_size: 300,
         chunk_size_decompressed: 300,
         chunk_old_offset: 42,
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: 0,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
     };
     let file1 = SophonManifestAssetProperty {
-        asset_name: "a.pak".into(),
+        asset_name: bytes::Bytes::from("a.pak"),
         asset_chunks: vec![chunk_new, chunk_reuse],
         asset_type: 0,
-        asset_hash_md5: String::new(),
+        asset_hash_md5: bytes::Bytes::new(),
         asset_size: 0,
     };
     let (bytes, files_count) = compute_totals(&CompactManifest::from(vec![file1]));

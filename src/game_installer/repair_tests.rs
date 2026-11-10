@@ -32,11 +32,11 @@ async fn verify_assets(
 
 fn empty_asset(name: &str) -> SophonManifestAssetProperty {
     SophonManifestAssetProperty {
-        asset_name: name.into(),
+        asset_name: name.to_string().into(),
         asset_chunks: vec![],
         asset_type: 0,
         asset_size: 0,
-        asset_hash_md5: hex::encode(fast_md5::digest(b"")),
+        asset_hash_md5: hex::encode(fast_md5::digest(b"")).into(),
     }
 }
 
@@ -54,23 +54,23 @@ fn chunk_asset(name: &str, bytes: &[u8]) -> (SophonManifestAssetProperty, Vec<u8
     let compressed = zstd::encode_all(bytes, 1).unwrap();
     let hash = hex::encode(fast_md5::digest(bytes));
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "shared_chunk".into(),
-        chunk_decompressed_hash_md5: hash.clone(),
+        chunk_name: bytes::Bytes::from("shared_chunk"),
+        chunk_decompressed_hash_md5: hash.clone().into(),
         chunk_on_file_offset: 0,
         chunk_size: compressed.len() as u64,
         chunk_size_decompressed: bytes.len() as u64,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: hex::encode(fast_md5::digest(&compressed)),
+        chunk_compressed_hash_md5: bytes::Bytes::from(hex::encode(fast_md5::digest(&compressed))),
         // The protobuf runtime field defaults to zero, not the reuse sentinel.
         chunk_old_offset: 0,
     };
     (
         SophonManifestAssetProperty {
-            asset_name: name.into(),
+            asset_name: name.to_string().into(),
             asset_chunks: vec![chunk],
             asset_type: 0,
             asset_size: bytes.len() as u64,
-            asset_hash_md5: hash,
+            asset_hash_md5: hash.into(),
         },
         compressed,
     )
@@ -180,7 +180,7 @@ async fn repair_shares_chunks_across_files_and_repeated_occurrences() {
     repeated.chunk_on_file_offset = 4;
     first.asset_chunks.push(repeated);
     first.asset_size = 8;
-    first.asset_hash_md5 = hex::encode(fast_md5::digest(b"datadata"));
+    first.asset_hash_md5 = hex::encode(fast_md5::digest(b"datadata")).into();
     cache_chunk(dir.path(), &compressed);
     let mut events = vec![];
     verify_assets(
@@ -287,7 +287,7 @@ async fn repair_ignores_persistent_cache_with_preserved_mtime() {
         cache::check_file_md5_cached(
             &path,
             asset.asset_size,
-            &asset.asset_hash_md5,
+            asset.asset_hash_md5_str(),
             dir.path(),
             &cache
         )
@@ -306,7 +306,7 @@ async fn repair_ignores_persistent_cache_with_preserved_mtime() {
         cache::check_file_md5_cached(
             &path,
             asset.asset_size,
-            &asset.asset_hash_md5,
+            asset.asset_hash_md5_str(),
             dir.path(),
             &cache
         )
@@ -462,7 +462,7 @@ async fn repair_deduplicates_compatible_destination_aliases() {
     let (first, compressed) = chunk_asset("a/file", b"same bytes");
     let mut second = first.clone();
     second.asset_name = "a/./file".into();
-    second.asset_hash_md5.make_ascii_uppercase();
+    second.asset_hash_md5 = second.asset_hash_md5_str().to_ascii_uppercase().into();
     cache_chunk(dir.path(), &compressed);
     let mut events = vec![];
     verify_assets(

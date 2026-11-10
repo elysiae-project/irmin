@@ -73,7 +73,7 @@ fn benchmark_download_over_assembly_hash_strategy() {
     let file_hash = hex::encode(full_hasher.finalize());
     let total_size = chunk_size * 8;
     let file = SophonManifestAssetProperty {
-        asset_name: "assembled.bin".to_owned(),
+        asset_name: bytes::Bytes::from("assembled.bin"),
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: total_size as u64,
@@ -223,11 +223,11 @@ fn benchmark_repair_post_assembly_hash_reread() {
     }
     let expected_hash = hex::encode(file_hasher.finalize());
     let file = SophonManifestAssetProperty {
-        asset_name: "repair-asset.bin".to_owned(),
+        asset_name: bytes::Bytes::from("repair-asset.bin"),
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: total_bytes as u64,
-        asset_hash_md5: expected_hash.clone(),
+        asset_hash_md5: expected_hash.clone().into(),
     };
     let manifest = CompactManifest::from(vec![file]);
     let lookup = ChunkNameLookup::from_arena(StringArena::from(
@@ -590,13 +590,13 @@ fn compute_md5_hex(data: &[u8]) -> String {
 
 fn make_chunk(name: &str, offset: u64, decompressed_size: u64) -> SophonManifestAssetChunk {
     SophonManifestAssetChunk {
-        chunk_name: name.to_string(),
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_name: name.to_string().into(),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: offset,
         chunk_size: 0,
         chunk_size_decompressed: decompressed_size,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     }
 }
@@ -616,11 +616,11 @@ fn assemble_file_from_single_chunk() {
     let md5 = compute_md5_hex(original_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "output.bin".to_string(),
+        asset_name: bytes::Bytes::from("output.bin"),
         asset_chunks: vec![make_chunk("chunk0", 0, original_data.len() as u64)],
         asset_type: 0,
         asset_size: original_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunk0"]);
@@ -665,14 +665,14 @@ fn assemble_file_from_multiple_chunks() {
     let md5 = compute_md5_hex(&full_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "multi.bin".to_string(),
+        asset_name: bytes::Bytes::from("multi.bin"),
         asset_chunks: vec![
             make_chunk("chunkA", 0, data_a.len() as u64),
             make_chunk("chunkB", data_a.len() as u64, data_b.len() as u64),
         ],
         asset_type: 0,
         asset_size: total_size,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunkA", "chunkB"]);
@@ -714,11 +714,11 @@ fn assemble_file_skips_valid_existing() {
     make_chunk_file(&chunks_dir, "chunk_skip", original_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "existing.bin".to_string(),
+        asset_name: bytes::Bytes::from("existing.bin"),
         asset_chunks: vec![make_chunk("chunk_skip", 0, original_data.len() as u64)],
         asset_type: 0,
         asset_size: original_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunk_skip"]);
@@ -757,11 +757,11 @@ fn assemble_file_skip_md5_check_does_not_verify_existing_target() {
     let correct = b"replacement";
     make_chunk_file(&chunks_dir, "replacement", correct);
     let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
-        asset_name: "target.bin".to_owned(),
+        asset_name: bytes::Bytes::from("target.bin"),
         asset_chunks: vec![make_chunk("replacement", 0, correct.len() as u64)],
         asset_type: 0,
         asset_size: correct.len() as u64,
-        asset_hash_md5: compute_md5_hex(correct),
+        asset_hash_md5: bytes::Bytes::from(compute_md5_hex(correct)),
     }]);
     let lookup = make_chunk_names(&["replacement"]);
     let refcounts = [AtomicU32::new(1)];
@@ -803,11 +803,11 @@ fn assemble_file_reassembles_md5_mismatch() {
     make_chunk_file(&chunks_dir, "chunk_fix", correct_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "mismatch.bin".to_string(),
+        asset_name: bytes::Bytes::from("mismatch.bin"),
         asset_chunks: vec![make_chunk("chunk_fix", 0, correct_data.len() as u64)],
         asset_type: 0,
         asset_size: correct_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunk_fix"]);
@@ -862,11 +862,11 @@ fn assemble_file_parallel_file_hash_passes() {
     let chunk_refcounts: Vec<AtomicU32> = (0..chunks.len()).map(|_| AtomicU32::new(1)).collect();
 
     let file = SophonManifestAssetProperty {
-        asset_name: "parallel_hash.bin".to_string(),
+        asset_name: bytes::Bytes::from("parallel_hash.bin"),
         asset_chunks: chunk_specs,
         asset_type: 0,
         asset_size: full.len() as u64,
-        asset_hash_md5: file_md5,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
     };
 
     let verify_cache = DashMap::new();
@@ -920,11 +920,11 @@ fn assemble_file_parallel_file_hash_mismatch_fails() {
         String::from_utf8((0..32).map(|i| if i == 0 { b'f' } else { b'0' }).collect()).unwrap();
 
     let file = SophonManifestAssetProperty {
-        asset_name: "corrupt.bin".to_string(),
+        asset_name: bytes::Bytes::from("corrupt.bin"),
         asset_chunks: chunk_specs,
         asset_type: 0,
         asset_size: full.len() as u64,
-        asset_hash_md5: corrupt_md5,
+        asset_hash_md5: bytes::Bytes::from(corrupt_md5),
     };
 
     let verify_cache = DashMap::new();
@@ -973,7 +973,7 @@ fn assemble_file_download_over_forces_file_hash_with_chunk_hashes() {
                 (index * data.len()) as u64,
                 data.len() as u64,
             );
-            chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data));
+            chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data)).into();
             chunk
         })
         .collect();
@@ -981,11 +981,11 @@ fn assemble_file_download_over_forces_file_hash_with_chunk_hashes() {
     let lookup = ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice()));
     let refcounts: Vec<AtomicU32> = (0..names.len()).map(|_| AtomicU32::new(1)).collect();
     let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
-        asset_name: "fused.bin".to_owned(),
+        asset_name: bytes::Bytes::from("fused.bin"),
         asset_chunks: specs,
         asset_type: 0,
         asset_size: expected.len() as u64,
-        asset_hash_md5: compute_md5_hex(&expected),
+        asset_hash_md5: bytes::Bytes::from(compute_md5_hex(&expected)),
     }]);
     let cache = DashMap::new();
 
@@ -1018,13 +1018,13 @@ fn assemble_file_download_over_forced_hash_rejects_wrong_file_hash() {
     let data = b"valid chunk payload";
     make_chunk_file(&chunks_dir, "single", data);
     let mut chunk = make_chunk("single", 0, data.len() as u64);
-    chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data));
+    chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data)).into();
     let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
-        asset_name: "bad-file-hash.bin".to_owned(),
+        asset_name: bytes::Bytes::from("bad-file-hash.bin"),
         asset_chunks: vec![chunk],
         asset_type: 0,
         asset_size: data.len() as u64,
-        asset_hash_md5: "00000000000000000000000000000000".to_owned(),
+        asset_hash_md5: bytes::Bytes::from("00000000000000000000000000000000"),
     }]);
     let lookup = make_chunk_names(&["single"]);
     let refcounts = [AtomicU32::new(1)];
@@ -1069,16 +1069,16 @@ fn assemble_file_download_over_forces_sequential_hash_for_small_unaligned_file()
                 (index * chunks[0].len()) as u64,
                 data.len() as u64,
             );
-            chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data));
+            chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data)).into();
             chunk
         })
         .collect();
     let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
-        asset_name: "small-unaligned.bin".to_owned(),
+        asset_name: bytes::Bytes::from("small-unaligned.bin"),
         asset_chunks: specs,
         asset_type: 0,
         asset_size: expected.len() as u64,
-        asset_hash_md5: compute_md5_hex(&expected),
+        asset_hash_md5: bytes::Bytes::from(compute_md5_hex(&expected)),
     }]);
     let lookup = ChunkNameLookup::from_arena(StringArena::with_capacity(0, 0));
     let outcome = assemble_file_for_download_over(
@@ -1217,22 +1217,22 @@ fn assemble_file_chunk_md5_passes() {
     let file_md5 = compute_md5_hex(data);
 
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "ck0".to_string(),
-        chunk_decompressed_hash_md5: chunk_md5,
+        chunk_name: bytes::Bytes::from("ck0"),
+        chunk_decompressed_hash_md5: bytes::Bytes::from(chunk_md5),
         chunk_on_file_offset: 0,
         chunk_size: 0,
         chunk_size_decompressed: data.len() as u64,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     };
 
     let file = SophonManifestAssetProperty {
-        asset_name: "verified.bin".to_string(),
+        asset_name: bytes::Bytes::from("verified.bin"),
         asset_chunks: vec![chunk],
         asset_type: 0,
         asset_size: data.len() as u64,
-        asset_hash_md5: file_md5,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
     };
 
     let chunk_names = make_chunk_names(&["ck0"]);
@@ -1269,22 +1269,22 @@ fn assemble_file_chunk_md5_mismatch_fails() {
     let file_md5 = compute_md5_hex(data);
 
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "ck1".to_string(),
-        chunk_decompressed_hash_md5: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+        chunk_name: bytes::Bytes::from("ck1"),
+        chunk_decompressed_hash_md5: bytes::Bytes::from("deadbeefdeadbeefdeadbeefdeadbeef"),
         chunk_on_file_offset: 0,
         chunk_size: 0,
         chunk_size_decompressed: data.len() as u64,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     };
 
     let file = SophonManifestAssetProperty {
-        asset_name: "bad.bin".to_string(),
+        asset_name: bytes::Bytes::from("bad.bin"),
         asset_chunks: vec![chunk],
         asset_type: 0,
         asset_size: data.len() as u64,
-        asset_hash_md5: file_md5,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
     };
 
     let chunk_names = make_chunk_names(&["ck1"]);
@@ -1312,11 +1312,11 @@ fn assemble_file_chunk_md5_mismatch_fails() {
 fn run_assembly_task_out_of_bounds_tmp_dir_idx() {
     let dir = tempfile::tempdir().unwrap();
     let file = SophonManifestAssetProperty {
-        asset_name: "dummy".to_string(),
+        asset_name: bytes::Bytes::from("dummy"),
         asset_chunks: vec![],
         asset_type: 0,
         asset_size: 0,
-        asset_hash_md5: String::new(),
+        asset_hash_md5: bytes::Bytes::new(),
     };
     let params = AssemblyTaskParams {
         file_idx: 0,
@@ -1617,20 +1617,20 @@ fn assemble_file_reuses_chunk_from_old_file() {
 
     // Asset with chunk_old_offset >= 0.
     let file = SophonManifestAssetProperty {
-        asset_name: "reused.bin".to_string(),
+        asset_name: bytes::Bytes::from("reused.bin"),
         asset_chunks: vec![SophonManifestAssetChunk {
-            chunk_name: "not_used".to_string(), // Won't be used due to old_offset
-            chunk_decompressed_hash_md5: md5.clone(),
+            chunk_name: bytes::Bytes::from("not_used"), // Won't be used due to old_offset
+            chunk_decompressed_hash_md5: md5.clone().into(),
             chunk_on_file_offset: 0,
             chunk_size: 0,
             chunk_size_decompressed: old_data.len() as u64,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: 0, // Reuse from old file at offset 0
         }],
         asset_type: 0,
         asset_size: old_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&[]);
@@ -1694,22 +1694,22 @@ fn assemble_file_reuses_chunks_from_permuted_old_offsets() {
         .iter()
         .enumerate()
         .map(|(index, &source_index)| SophonManifestAssetChunk {
-            chunk_name: format!("old_{index}"),
-            chunk_decompressed_hash_md5: compute_md5_hex(&source_chunks[source_index]),
+            chunk_name: format!("old_{index}").into(),
+            chunk_decompressed_hash_md5: compute_md5_hex(&source_chunks[source_index]).into(),
             chunk_on_file_offset: (index * CHUNK_SIZE) as u64,
             chunk_size: 0,
             chunk_size_decompressed: CHUNK_SIZE as u64,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: (source_index * CHUNK_SIZE) as i64,
         })
         .collect();
     let asset = SophonManifestAssetProperty {
-        asset_name: asset_name.to_string(),
+        asset_name: bytes::Bytes::from(asset_name),
         asset_chunks,
         asset_type: 0,
         asset_size: expected.len() as u64,
-        asset_hash_md5: expected_hash.clone(),
+        asset_hash_md5: expected_hash.clone().into(),
     };
 
     let lookup = make_chunk_names(&[]);
@@ -1766,13 +1766,13 @@ fn assemble_file_copies_permuted_old_chunks_without_hashing() {
         .map(|(index, &source_index)| {
             let chunk = source_chunks[source_index];
             let manifest_chunk = SophonManifestAssetChunk {
-                chunk_name: format!("unused_{index}"),
-                chunk_decompressed_hash_md5: String::new(),
+                chunk_name: format!("unused_{index}").into(),
+                chunk_decompressed_hash_md5: bytes::Bytes::new(),
                 chunk_on_file_offset: output_offset,
                 chunk_size: 0,
                 chunk_size_decompressed: chunk.len() as u64,
                 chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: String::new(),
+                chunk_compressed_hash_md5: bytes::Bytes::new(),
                 chunk_old_offset: source_chunks[..source_index]
                     .iter()
                     .map(|source| source.len() as i64)
@@ -1783,11 +1783,11 @@ fn assemble_file_copies_permuted_old_chunks_without_hashing() {
         })
         .collect();
     let asset = SophonManifestAssetProperty {
-        asset_name: asset_name.to_string(),
+        asset_name: bytes::Bytes::from(asset_name),
         asset_chunks,
         asset_type: 0,
         asset_size: expected.len() as u64,
-        asset_hash_md5: "0123456789abcdef0123456789abcdef".to_string(),
+        asset_hash_md5: bytes::Bytes::from("0123456789abcdef0123456789abcdef"),
     };
 
     let lookup = make_chunk_names(&[]);
@@ -1851,22 +1851,22 @@ fn assemble_file_reuses_large_chunks_from_permuted_old_offsets() {
         .iter()
         .enumerate()
         .map(|(index, &source_index)| SophonManifestAssetChunk {
-            chunk_name: format!("old_{index}"),
-            chunk_decompressed_hash_md5: source_chunk_hashes[source_index].clone(),
+            chunk_name: format!("old_{index}").into(),
+            chunk_decompressed_hash_md5: source_chunk_hashes[source_index].clone().into(),
             chunk_on_file_offset: (index * CHUNK_SIZE) as u64,
             chunk_size: 0,
             chunk_size_decompressed: CHUNK_SIZE as u64,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: (source_index * CHUNK_SIZE) as i64,
         })
         .collect();
     let asset = SophonManifestAssetProperty {
-        asset_name: asset_name.to_string(),
+        asset_name: bytes::Bytes::from(asset_name),
         asset_chunks,
         asset_type: 0,
         asset_size: (CHUNK_COUNT * CHUNK_SIZE) as u64,
-        asset_hash_md5: expected_hash.clone(),
+        asset_hash_md5: expected_hash.clone().into(),
     };
 
     let lookup = make_chunk_names(&[]);
@@ -1954,24 +1954,24 @@ fn assemble_file_prng_data_matches_expected_md5() {
         let offset = expected.len() as u64;
         expected.extend_from_slice(data);
         chunks.push(SophonManifestAssetChunk {
-            chunk_name: names[i].clone(),
-            chunk_decompressed_hash_md5: String::new(),
+            chunk_name: names[i].clone().into(),
+            chunk_decompressed_hash_md5: bytes::Bytes::new(),
             chunk_on_file_offset: offset,
             chunk_size: 0,
             chunk_size_decompressed: data.len() as u64,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: -1,
         });
     }
 
     let file_md5 = compute_md5_hex(&expected);
     let file = SophonManifestAssetProperty {
-        asset_name: "assembled_prng.bin".to_string(),
+        asset_name: bytes::Bytes::from("assembled_prng.bin"),
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: expected.len() as u64,
-        asset_hash_md5: file_md5.clone(),
+        asset_hash_md5: file_md5.clone().into(),
     };
 
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();

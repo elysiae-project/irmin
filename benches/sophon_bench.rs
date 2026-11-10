@@ -274,24 +274,24 @@ fn build_assembly_fixture(
                 String::new()
             };
             SophonManifestAssetChunk {
-                chunk_name: name,
-                chunk_decompressed_hash_md5: chunk_hash,
+                chunk_name: name.into(),
+                chunk_decompressed_hash_md5: chunk_hash.into(),
                 chunk_on_file_offset: offset,
                 chunk_size: 0,
                 chunk_size_decompressed: (chunk_mib * 1024 * 1024) as u64,
                 chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: String::new(),
+                chunk_compressed_hash_md5: bytes::Bytes::new(),
                 chunk_old_offset: -1,
             }
         })
         .collect();
     let file_md5 = hex::encode(fast_md5::digest(&raw));
     let file = SophonManifestAssetProperty {
-        asset_name: "assembled.bin".to_string(),
+        asset_name: "assembled.bin".into(),
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: raw.len() as u64,
-        asset_hash_md5: file_md5,
+        asset_hash_md5: file_md5.into(),
     };
     (CompactManifest::from(vec![file]), raw)
 }
@@ -520,27 +520,27 @@ fn bench_assembly_old_chunk_reuse(c: &mut Criterion) {
     let file_md5 = hex::encode(fast_md5::digest(&expected_output));
     let asset_name = format!("reused-{}.bin", std::process::id());
     let reuse_manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
-        asset_name: asset_name.clone(),
+        asset_name: asset_name.clone().into(),
         asset_chunks: (0..num_chunks)
             .map(|index| {
                 let source_index = (index * 3) % num_chunks;
                 let source_start = source_index * chunk_mib * 1024 * 1024;
                 let source_end = source_start + chunk_mib * 1024 * 1024;
                 SophonManifestAssetChunk {
-                    chunk_name: format!("ck{index:02}"),
-                    chunk_decompressed_hash_md5: String::new(),
+                    chunk_name: format!("ck{index:02}").into(),
+                    chunk_decompressed_hash_md5: bytes::Bytes::new(),
                     chunk_on_file_offset: (index * chunk_mib * 1024 * 1024) as u64,
                     chunk_size: 0,
                     chunk_size_decompressed: (source_end - source_start) as u64,
                     chunk_compressed_hash_xxh: 0,
-                    chunk_compressed_hash_md5: String::new(),
+                    chunk_compressed_hash_md5: bytes::Bytes::new(),
                     chunk_old_offset: source_start as i64,
                 }
             })
             .collect(),
         asset_type: 0,
         asset_size: total_bytes,
-        asset_hash_md5: file_md5.clone(),
+        asset_hash_md5: file_md5.clone().into(),
     }]);
     for index in 0..num_chunks {
         let chunk = reuse_manifest.chunk(index);
@@ -1052,24 +1052,24 @@ fn bench_compact_manifest_build(c: &mut Criterion) {
                 .map(|c| {
                     let h = &hash_pool[(f + c) % MANIFEST_FILES];
                     SophonManifestAssetChunk {
-                        chunk_name: format!("f{f}c{c}"),
-                        chunk_decompressed_hash_md5: h.clone(),
+                        chunk_name: format!("f{f}c{c}").into(),
+                        chunk_decompressed_hash_md5: h.clone().into(),
                         chunk_on_file_offset: (c * 1024 * 1024) as u64,
                         chunk_size: 0,
                         chunk_size_decompressed: 0,
                         chunk_compressed_hash_xxh: 0,
-                        chunk_compressed_hash_md5: String::new(),
+                        chunk_compressed_hash_md5: bytes::Bytes::new(),
                         chunk_old_offset: -1,
                     }
                 })
                 .collect();
             let size = chunks.iter().map(|c| c.chunk_size_decompressed).sum();
             SophonManifestAssetProperty {
-                asset_name: format!("asset_{f}.pak"),
+                asset_name: format!("asset_{f}.pak").into(),
                 asset_chunks: chunks,
                 asset_type: 0,
                 asset_size: size,
-                asset_hash_md5: format!("{f:032x}"),
+                asset_hash_md5: format!("{f:032x}").into(),
             }
         })
         .collect();
@@ -1472,22 +1472,22 @@ fn gen_protobuf_manifest(files: usize, chunks: usize) -> Vec<u8> {
         .map(|f| {
             let asset_chunks: Vec<SophonManifestAssetChunk> = (0..chunks)
                 .map(|c| SophonManifestAssetChunk {
-                    chunk_name: format!("f{f}c{c}"),
-                    chunk_decompressed_hash_md5: format!("{:032x}", f * chunks + c),
+                    chunk_name: format!("f{f}c{c}").into(),
+                    chunk_decompressed_hash_md5: format!("{:032x}", f * chunks + c).into(),
                     chunk_on_file_offset: (c * 1024 * 1024) as u64,
                     chunk_size: 512 * 1024,
                     chunk_size_decompressed: 1024 * 1024,
                     chunk_compressed_hash_xxh: (f * chunks + c) as u64,
-                    chunk_compressed_hash_md5: format!("{:032x}", f * chunks + c + 1),
+                    chunk_compressed_hash_md5: format!("{:032x}", f * chunks + c + 1).into(),
                     chunk_old_offset: -1,
                 })
                 .collect();
             SophonManifestAssetProperty {
-                asset_name: format!("data/assets/bundle_{f:04}.pak"),
+                asset_name: format!("data/assets/bundle_{f:04}.pak").into(),
                 asset_chunks,
                 asset_type: 0,
                 asset_size: (chunks * 1024 * 1024) as u64,
-                asset_hash_md5: format!("{f:032x}"),
+                asset_hash_md5: format!("{f:032x}").into(),
             }
         })
         .collect();
@@ -1498,13 +1498,24 @@ fn gen_protobuf_manifest(files: usize, chunks: usize) -> Vec<u8> {
 /// Protobuf manifest decode throughput: prost decode of 5000 assets x 50 chunks.
 fn bench_protobuf_decode(c: &mut Criterion) {
     let encoded = gen_protobuf_manifest(PROTO_FILES, PROTO_CHUNKS_PER_FILE);
+    let encoded_bytes = bytes::Bytes::from(encoded.clone());
 
     let mut group = c.benchmark_group("protobuf_manifest");
     group.throughput(Throughput::Elements(PROTO_FILES as u64));
 
-    group.bench_function("decode_5000x50", |b| {
+    // Slice path: copies each string field into a new String allocation.
+    group.bench_function("decode_slice_5000x50", |b| {
         b.iter(|| {
             let manifest = SophonManifestProto::decode(encoded.as_slice()).unwrap();
+            std::hint::black_box(manifest.assets.len());
+        });
+    });
+
+    // Bytes path: prost stores string fields as refcounted slices of the
+    // input buffer, avoiding per-field allocation and copy.
+    group.bench_function("decode_bytes_5000x50", |b| {
+        b.iter(|| {
+            let manifest = SophonManifestProto::decode(encoded_bytes.clone()).unwrap();
             std::hint::black_box(manifest.assets.len());
         });
     });
@@ -1514,6 +1525,7 @@ fn bench_protobuf_decode(c: &mut Criterion) {
 
 fn bench_manifest_content_hash(c: &mut Criterion) {
     let encoded = gen_protobuf_manifest(PROTO_FILES, PROTO_CHUNKS_PER_FILE);
+    let encoded_bytes = bytes::Bytes::from(encoded.clone());
     let manifest = SophonManifestProto::decode(encoded.as_slice()).unwrap();
     let mut group = c.benchmark_group("manifest_content_hash");
     group.throughput(Throughput::Elements(
@@ -1531,6 +1543,20 @@ fn bench_manifest_content_hash(c: &mut Criterion) {
     group.bench_function("decode_only_5000x50", |b| {
         b.iter(|| {
             let decoded = SophonManifestProto::decode(encoded.as_slice()).unwrap();
+            std::hint::black_box(decoded);
+        });
+    });
+    // Zero-copy path: decode from Bytes so string fields are refcounted
+    // slices of the input buffer instead of copied String allocations.
+    group.bench_function("decode_bytes_and_hash_5000x50", |b| {
+        b.iter(|| {
+            let decoded = SophonManifestProto::decode(encoded_bytes.clone()).unwrap();
+            std::hint::black_box(compute_content_manifest_hash(&decoded))
+        });
+    });
+    group.bench_function("decode_bytes_only_5000x50", |b| {
+        b.iter(|| {
+            let decoded = SophonManifestProto::decode(encoded_bytes.clone()).unwrap();
             std::hint::black_box(decoded);
         });
     });

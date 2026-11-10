@@ -18,11 +18,11 @@ fn eager_context(
         game_dir: root.to_path_buf().into(),
         all_tmp_dirs: Arc::new(vec![]),
         all_files: Arc::new(CompactManifest::from(vec![SophonManifestAssetProperty {
-            asset_name: "eager.bin".to_owned(),
+            asset_name: bytes::Bytes::from("eager.bin"),
             asset_chunks: vec![chunk],
             asset_type: 0,
             asset_size: file_size,
-            asset_hash_md5: file_hash.to_owned(),
+            asset_hash_md5: file_hash.to_owned().into(),
         }])),
         downloaded_bytes: Arc::new(AtomicU64::new(0)),
         assembled_files: Arc::new(AtomicU64::new(0)),
@@ -480,13 +480,13 @@ async fn eager_streaming_download_verifies_hashes_and_marks_bitmap() {
         .preallocate_file(0, "eager.bin", data.len() as u64)
         .unwrap();
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "eager".into(),
-        chunk_decompressed_hash_md5: decompressed_hash,
+        chunk_name: bytes::Bytes::from("eager"),
+        chunk_decompressed_hash_md5: decompressed_hash.into(),
         chunk_on_file_offset: 0,
         chunk_size: compressed.len() as u64,
         chunk_size_decompressed: data.len() as u64,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: compressed_hash,
+        chunk_compressed_hash_md5: compressed_hash.into(),
         chunk_old_offset: -1,
     };
     let ctx = eager_context(
@@ -1383,13 +1383,13 @@ async fn eager_large_chunk_uses_streaming_branch() {
         .preallocate_file(0, "large.bin", size as u64)
         .unwrap();
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "large".into(),
-        chunk_decompressed_hash_md5: decompressed_hash,
+        chunk_name: bytes::Bytes::from("large"),
+        chunk_decompressed_hash_md5: decompressed_hash.into(),
         chunk_on_file_offset: 0,
         chunk_size: compressed.len() as u64,
         chunk_size_decompressed: size as u64,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: compressed_hash,
+        chunk_compressed_hash_md5: compressed_hash.into(),
         chunk_old_offset: -1,
     };
     let ctx = eager_context(
@@ -1699,13 +1699,13 @@ async fn eager_stream_rejects_unsupported_hash_metadata_without_downloading() {
     let allocator = Arc::new(super::output_allocator::OutputAllocator::new(dir.path()));
     allocator.preallocate_file(0, "eager.bin", 1024).unwrap();
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "unsupported-hash".into(),
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_name: bytes::Bytes::from("unsupported-hash"),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: 0,
         chunk_size: 100,
         chunk_size_decompressed: 1024,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: "invalid-hash-size".into(),
+        chunk_compressed_hash_md5: bytes::Bytes::from("invalid-hash-size"),
         chunk_old_offset: -1,
     };
     let ctx = eager_context(

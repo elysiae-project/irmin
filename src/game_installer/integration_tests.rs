@@ -133,7 +133,7 @@ async fn download_chunk_from_cdn() {
         .find(|a| !a.asset_chunks.is_empty())
         .expect("should find an asset with chunks");
     let first_chunk = &first_asset.asset_chunks[0];
-    let url = meta.chunk_download.url_for(&first_chunk.chunk_name);
+    let url = meta.chunk_download.url_for(first_chunk.chunk_name_str());
     let resp = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(30))

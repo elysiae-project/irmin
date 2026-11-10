@@ -7,7 +7,7 @@ use crate::api_scrape::{
     SophonPatchBuildData, SophonPatchBuildResponse, SophonPatchManifestMeta,
 };
 use crate::proto_parse::{
-    SophonManifestProto, SophonPatchProto, decode_manifest, decode_patch_manifest,
+    SophonManifestProto, SophonPatchProto, decode_manifest_from_bytes, decode_patch_manifest,
 };
 
 use super::error::{SophonError, SophonResult};
@@ -121,9 +121,13 @@ pub(crate) async fn fetch_manifest_proto(
             Ok::<Vec<u8>, SophonError>(out)
         })
         .await??;
-        decode_manifest(&raw).map_err(SophonError::ManifestDecode)?
+        // Decode from Bytes so prost stores string fields as refcounted
+        // slices of the input buffer instead of copying each field.
+        decode_manifest_from_bytes(bytes::Bytes::from(raw)).map_err(SophonError::ManifestDecode)?
     } else {
-        decode_manifest(&bytes).map_err(SophonError::ManifestDecode)?
+        // `bytes` is already a `Bytes` from `resp.bytes()`; pass it
+        // directly to preserve zero-copy field storage.
+        decode_manifest_from_bytes(bytes).map_err(SophonError::ManifestDecode)?
     };
     Ok(manifest)
 }

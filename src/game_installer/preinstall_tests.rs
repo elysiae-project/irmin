@@ -2207,20 +2207,20 @@ fn snapshot_state(fields: &[(&str, &str, &[u8])], url: &str) -> PreinstallState 
             chunk_download,
             manifest: SophonManifestProto {
                 assets: vec![SophonManifestAssetProperty {
-                    asset_name: path.into(),
+                    asset_name: path.to_string().into(),
                     asset_size: data.len() as u64,
                     asset_type: 0,
-                    asset_hash_md5: hash.clone(),
+                    asset_hash_md5: hash.clone().into(),
                     asset_chunks: if data.is_empty() {
                         vec![]
                     } else {
                         vec![SophonManifestAssetChunk {
-                            chunk_name: format!("chunk-{field}"),
+                            chunk_name: format!("chunk-{field}").into(),
                             chunk_on_file_offset: 0,
                             chunk_size: data.len() as u64,
                             chunk_size_decompressed: data.len() as u64,
-                            chunk_compressed_hash_md5: hash.clone(),
-                            chunk_decompressed_hash_md5: hash,
+                            chunk_compressed_hash_md5: hash.clone().into(),
+                            chunk_decompressed_hash_md5: hash.into(),
                             chunk_compressed_hash_xxh: 0,
                             chunk_old_offset: 0,
                         }]
@@ -2607,11 +2607,12 @@ async fn serve_target_chunks(
         let compressed = zstd::encode_all(data, 1).unwrap();
         let chunk = &mut entry.manifest.assets[0].asset_chunks[0];
         chunk.chunk_size = compressed.len() as u64;
-        chunk.chunk_compressed_hash_md5 = hex::encode(fast_md5::digest(&compressed));
+        chunk.chunk_compressed_hash_md5 = hex::encode(fast_md5::digest(&compressed)).into();
         entry.chunk_download.compression = crate::api_scrape::Compression::Zstd;
         Mock::given(path(format!(
             "/{}/{}",
-            entry.matching_field, chunk.chunk_name
+            entry.matching_field,
+            chunk.chunk_name_str()
         )))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed))
         .expect(1)
@@ -2976,7 +2977,7 @@ async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
     state.target_snapshot.as_mut().unwrap().manifests[0]
         .manifest
         .assets[0]
-        .asset_hash_md5 = wrong_hash;
+        .asset_hash_md5 = wrong_hash.into();
     reseal(&mut state);
     save_preinstall_state(dir.path(), &state).unwrap();
     fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
@@ -3389,13 +3390,13 @@ async fn bounded_download_stream_deduplicates_chunks_and_respects_limit() {
     let chunks = ["a", "b", "a", "c", "d", "e", "f", "g", "h", "i", "j"]
         .into_iter()
         .map(|chunk_name| SophonManifestAssetChunk {
-            chunk_name: chunk_name.to_owned(),
-            chunk_decompressed_hash_md5: String::new(),
+            chunk_name: chunk_name.to_owned().into(),
+            chunk_decompressed_hash_md5: bytes::Bytes::new(),
             chunk_on_file_offset: 0,
             chunk_size: 1,
             chunk_size_decompressed: 1,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: -1,
         })
         .collect::<Vec<_>>();
@@ -3434,13 +3435,13 @@ async fn bounded_download_stream_stops_scheduling_after_error() {
 
     let chunks = (0..100)
         .map(|index| SophonManifestAssetChunk {
-            chunk_name: format!("chunk-{index}"),
-            chunk_decompressed_hash_md5: String::new(),
+            chunk_name: format!("chunk-{index}").into(),
+            chunk_decompressed_hash_md5: bytes::Bytes::new(),
             chunk_on_file_offset: 0,
             chunk_size: 1,
             chunk_size_decompressed: 1,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: -1,
         })
         .collect::<Vec<_>>();
@@ -3464,13 +3465,13 @@ async fn bounded_download_stream_stops_scheduling_after_error() {
 #[tokio::test]
 async fn bounded_download_stream_rejects_zero_limit() {
     let chunks = [SophonManifestAssetChunk {
-        chunk_name: "chunk".to_owned(),
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_name: bytes::Bytes::from("chunk"),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: 0,
         chunk_size: 1,
         chunk_size_decompressed: 1,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     }];
     let result = run_unique_chunks_bounded(&chunks, 0, |_| async {
@@ -3501,13 +3502,13 @@ async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output
             .mount(&server)
             .await;
         asset_chunks.push(SophonManifestAssetChunk {
-            chunk_name: chunk_name.clone(),
-            chunk_decompressed_hash_md5: decompressed_hash,
+            chunk_name: chunk_name.clone().into(),
+            chunk_decompressed_hash_md5: decompressed_hash.into(),
             chunk_on_file_offset: expected.len() as u64,
             chunk_size: compressed.len() as u64,
             chunk_size_decompressed: data.len() as u64,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: compressed_hash,
+            chunk_compressed_hash_md5: compressed_hash.into(),
             chunk_old_offset: -1,
         });
         expected.extend_from_slice(data);
@@ -3523,18 +3524,18 @@ async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output
     let manifest = SophonManifestProto {
         assets: vec![
             SophonManifestAssetProperty {
-                asset_name: "unused.bin".to_owned(),
+                asset_name: bytes::Bytes::from("unused.bin"),
                 asset_chunks: Vec::new(),
                 asset_type: 0,
                 asset_size: 0,
-                asset_hash_md5: String::new(),
+                asset_hash_md5: bytes::Bytes::new(),
             },
             SophonManifestAssetProperty {
-                asset_name: "downloaded.bin".to_owned(),
+                asset_name: bytes::Bytes::from("downloaded.bin"),
                 asset_chunks: asset_chunks.clone(),
                 asset_type: 0,
                 asset_size: expected.len() as u64,
-                asset_hash_md5: target_hash.clone(),
+                asset_hash_md5: target_hash.clone().into(),
             },
         ],
     };

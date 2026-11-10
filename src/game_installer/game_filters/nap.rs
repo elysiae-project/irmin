@@ -120,11 +120,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let mut assets = vec![SophonManifestAssetProperty {
-            asset_name: format!("{GAME_DATA_DIR}/audio/file.pck"),
+            asset_name: format!("{GAME_DATA_DIR}/audio/file.pck").into(),
             asset_chunks: vec![],
             asset_type: 0,
             asset_size: 100,
-            asset_hash_md5: "abc".into(),
+            asset_hash_md5: bytes::Bytes::from("abc"),
         }];
 
         filter_nap_asset_list(dir.path(), &mut assets);

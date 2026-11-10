@@ -686,8 +686,8 @@ fn collect_deleted_files(
     old_manifest
         .assets
         .iter()
-        .filter(|f| !f.is_directory() && !new_names.contains(f.asset_name.as_str()))
-        .map(|f| f.asset_name.clone())
+        .filter(|f| !f.is_directory() && !new_names.contains(f.asset_name_str()))
+        .map(|f| f.asset_name_str().to_string())
         .collect()
 }
 
@@ -697,7 +697,7 @@ fn build_old_md5_map(old_manifest: &SophonManifestProto) -> FxHashMap<&str, &str
         .assets
         .iter()
         .filter(|f| !f.is_directory())
-        .map(|f| (f.asset_name.as_str(), f.asset_hash_md5.as_str()))
+        .map(|f| (f.asset_name_str(), f.asset_hash_md5_str()))
         .collect()
 }
 
@@ -713,8 +713,8 @@ fn compute_diff_files(
             if f.is_directory() {
                 return true;
             }
-            match old_md5_map.get(f.asset_name.as_str()) {
-                Some(&old_md5) => old_md5 != f.asset_hash_md5.as_str(),
+            match old_md5_map.get(f.asset_name_str()) {
+                Some(&old_md5) => old_md5 != f.asset_hash_md5_str(),
                 None => true,
             }
         })
@@ -749,13 +749,11 @@ pub fn intern_old_chunk_offsets<'a>(
         FxHashMap::with_capacity_and_hasher(total_chunks, Default::default());
     for f in non_dir {
         let next_name_id = name_to_id.len() as u32;
-        let name_id = *name_to_id
-            .entry(f.asset_name.as_str())
-            .or_insert(next_name_id);
+        let name_id = *name_to_id.entry(f.asset_name_str()).or_insert(next_name_id);
         for c in &f.asset_chunks {
             let next_hash_id = hash_to_id.len() as u32;
             let hash_id = *hash_to_id
-                .entry(c.chunk_decompressed_hash_md5.as_str())
+                .entry(c.chunk_decompressed_hash_md5_str())
                 .or_insert(next_hash_id);
             offsets.insert((name_id, hash_id), c.chunk_on_file_offset);
         }
@@ -774,12 +772,12 @@ pub fn assign_chunk_offsets(
     hash_to_id: &FxHashMap<&str, u32>,
 ) {
     for file in diff_files.iter_mut() {
-        let name_id = name_to_id.get(file.asset_name.as_str()).copied();
+        let name_id = name_to_id.get(file.asset_name_str()).copied();
         for chunk in &mut file.asset_chunks {
             chunk.chunk_old_offset = match (
                 name_id,
                 hash_to_id
-                    .get(chunk.chunk_decompressed_hash_md5.as_str())
+                    .get(chunk.chunk_decompressed_hash_md5_str())
                     .copied(),
             ) {
                 (Some(n), Some(h)) => offsets
@@ -826,7 +824,7 @@ async fn build_diff_installers(
             .manifest
             .assets
             .iter()
-            .map(|f| f.asset_name.as_str())
+            .map(|f| f.asset_name_str())
             .collect();
 
         // Keys are interned to `(u32, u32)` ids instead of `(String, String)`
@@ -854,7 +852,7 @@ async fn build_diff_installers(
                         .enumerate()
                         .filter(|(_, f)| !f.is_directory())
                     {
-                        let path = gd.join(&f.asset_name);
+                        let path = gd.join(f.asset_name_str());
                         let corrupted = match std::fs::metadata(&path) {
                             Ok(meta) => meta.len() != f.asset_size,
                             Err(_) => true,
@@ -878,7 +876,7 @@ async fn build_diff_installers(
                     );
                     let corrupted_names_set: rustc_hash::FxHashSet<&str> = corrupted_indices
                         .iter()
-                        .map(|&i| old_manifest.assets[i].asset_name.as_str())
+                        .map(|&i| old_manifest.assets[i].asset_name_str())
                         .collect();
                     let mut corrupted_name_ids = rustc_hash::FxHashSet::default();
                     for name in &corrupted_names_set {
@@ -3082,14 +3080,14 @@ pub async fn install(
             .flat_map(|inst| inst.manifest.assets.iter())
             .filter(|a| a.is_directory())
             .filter_map(|a| {
-                if let Err(err) = validate_asset_name(&a.asset_name) {
+                if let Err(err) = validate_asset_name(a.asset_name_str()) {
                     log::warn!(
-                        "Skipping directory with invalid asset_name \"{name}\": {err}",
-                        name = a.asset_name
+                        "Skipping directory with invalid asset_name \"{}\": {err}",
+                        a.asset_name_str()
                     );
                     None
                 } else {
-                    Some(game_dir.join(&a.asset_name))
+                    Some(game_dir.join(a.asset_name_str()))
                 }
             })
             .collect();
@@ -3146,7 +3144,7 @@ pub async fn install(
                 .iter()
                 .flat_map(|inst| inst.manifest.assets.iter())
                 .flat_map(|asset| asset.asset_chunks.iter())
-                .map(|c| c.chunk_name.as_str())
+                .map(|c| c.chunk_name_str())
                 .collect();
             let before = prev_downloaded_chunks.len();
             prev_downloaded_chunks
@@ -3177,7 +3175,7 @@ pub async fn install(
             for (inst_idx, d) in installer_data.iter().enumerate() {
                 for _ in 0..d.file_count {
                     if idx < all_files_vec.len() {
-                        m.insert(all_files_vec[idx].asset_name.clone(), inst_idx);
+                        m.insert(all_files_vec[idx].asset_name_str().to_string(), inst_idx);
                     }
                     idx += 1;
                 }
@@ -3195,7 +3193,7 @@ pub async fn install(
             d.file_count = 0;
         }
         for f in all_files_vec.iter() {
-            if let Some(&inst_idx) = file_installer_map.get(f.asset_name.as_str()) {
+            if let Some(&inst_idx) = file_installer_map.get(f.asset_name_str()) {
                 installer_data[inst_idx].file_count += 1;
             }
         }
@@ -3814,7 +3812,7 @@ async fn verify_installers(
             }
             let generated = match game_code {
                 "hk4e" => {
-                    super::game_filters::is_generated_pkg_version(&asset.asset_name, &vo_langs)
+                    super::game_filters::is_generated_pkg_version(asset.asset_name_str(), &vo_langs)
                 }
                 "hkrpg" => asset.asset_name == "StarRail_Data/app.info",
                 _ => false,
@@ -3863,10 +3861,12 @@ async fn repair_assets(
     let mut identities = FxHashMap::<PathBuf, usize>::default();
     let mut unique: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)> = Vec::new();
     for (asset, download) in all_assets {
-        validate_asset_name(&asset.asset_name)?;
-        let identity: PathBuf = Path::new(&asset.asset_name).components().collect();
+        validate_asset_name(asset.asset_name_str())?;
+        let identity: PathBuf = Path::new(asset.asset_name_str()).components().collect();
         if identity.as_os_str().is_empty() {
-            return Err(SophonError::InvalidAssetName(asset.asset_name));
+            return Err(SophonError::InvalidAssetName(
+                asset.asset_name_str().to_string(),
+            ));
         }
         if let Some(&index) = identities.get(&identity) {
             let previous = &unique[index].0;
@@ -3876,15 +3876,17 @@ async fn repair_assets(
                     .eq_ignore_ascii_case(&asset.asset_hash_md5)
             {
                 return Err(SophonError::AssemblyFailed {
-                    file: asset.asset_name,
+                    file: asset.asset_name_str().to_string(),
                     error: "Conflicting manifest requirements for one destination".into(),
                 });
             }
             continue;
         }
         for chunk in &asset.asset_chunks {
-            if !validate_chunk_name(&chunk.chunk_name) {
-                return Err(SophonError::PathTraversal(chunk.chunk_name.clone().into()));
+            if !validate_chunk_name(chunk.chunk_name_str()) {
+                return Err(SophonError::PathTraversal(PathBuf::from(
+                    chunk.chunk_name_str(),
+                )));
             }
         }
         identities.insert(identity, unique.len());
@@ -3927,11 +3929,11 @@ async fn repair_assets(
                 if stopped.load(Ordering::Acquire) {
                     return Ok(None);
                 }
-                validate_asset_name(&asset.asset_name)?;
+                validate_asset_name(asset.asset_name_str())?;
 
-                let file_path = game_dir.join(&asset.asset_name);
+                let file_path = game_dir.join(asset.asset_name_str());
                 let asset_size = asset.asset_size;
-                let asset_md5 = asset.asset_hash_md5.clone();
+                let asset_md5 = asset.asset_hash_md5_str().to_string();
 
                 let is_valid = tokio::task::spawn_blocking({
                     let file_path = file_path.clone();
@@ -4006,8 +4008,8 @@ async fn repair_assets(
     for (asset, _, _) in &failed_verifications {
         emit(SophonProgress::Warning {
             message: format!(
-                "File {name} failed integrity check, re-downloading",
-                name = asset.asset_name
+                "File {} failed integrity check, re-downloading",
+                asset.asset_name_str()
             ),
         });
     }
@@ -4027,16 +4029,16 @@ async fn repair_assets(
         );
     for (asset, chunk_download, _) in &failed_verifications {
         for chunk in &asset.asset_chunks {
-            if !insert_new_chunk_name(&mut seen_chunks, chunk.chunk_name.as_str()) {
+            if !insert_new_chunk_name(&mut seen_chunks, chunk.chunk_name_str()) {
                 continue;
             }
-            let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
+            let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
             chunk_path.set_extension("zstd");
             let needs_download = !chunk_path.exists()
                 || !cache::check_file_md5_cached(
                     &chunk_path,
                     chunk.chunk_size,
-                    &chunk.chunk_compressed_hash_md5,
+                    chunk.chunk_compressed_hash_md5_str(),
                     game_dir,
                     &verify_cache,
                 )
@@ -4092,7 +4094,7 @@ async fn repair_assets(
                         if stopped.load(Ordering::Acquire) {
                             return Ok(None);
                         }
-                        let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
+                        let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
                         chunk_path.set_extension("zstd");
                         if let Some(parent) = chunk_path.parent() {
                             fs::create_dir_all(parent)?;

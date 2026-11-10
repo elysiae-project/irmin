@@ -20,14 +20,14 @@ pub fn compute_content_manifest_hash(manifest: &SophonManifestProto) -> String {
 
     let mut hasher = Sha256::new();
     for asset in assets {
-        hasher.update(asset.asset_name.as_bytes());
+        hasher.update(asset.asset_name.as_ref());
         hasher.update(asset.asset_size.to_le_bytes());
         hasher.update(asset.asset_type.to_le_bytes());
-        hasher.update(asset.asset_hash_md5.as_bytes());
+        hasher.update(asset.asset_hash_md5.as_ref());
         for chunk in &asset.asset_chunks {
-            hasher.update(chunk.chunk_name.as_bytes());
-            hasher.update(chunk.chunk_decompressed_hash_md5.as_bytes());
-            hasher.update(chunk.chunk_compressed_hash_md5.as_bytes());
+            hasher.update(chunk.chunk_name.as_ref());
+            hasher.update(chunk.chunk_decompressed_hash_md5.as_ref());
+            hasher.update(chunk.chunk_compressed_hash_md5.as_ref());
             hasher.update(chunk.chunk_on_file_offset.to_le_bytes());
             hasher.update(chunk.chunk_size.to_le_bytes());
             hasher.update(chunk.chunk_size_decompressed.to_le_bytes());
@@ -45,11 +45,11 @@ mod tests {
 
     fn make_asset(name: &str, md5: &str, size: u64) -> SophonManifestAssetProperty {
         SophonManifestAssetProperty {
-            asset_name: name.into(),
+            asset_name: name.to_string().into(),
             asset_chunks: vec![],
             asset_type: 0,
             asset_size: size,
-            asset_hash_md5: md5.into(),
+            asset_hash_md5: md5.to_string().into(),
         }
     }
 
@@ -60,20 +60,20 @@ mod tests {
         xxh: u64,
     ) -> SophonManifestAssetProperty {
         SophonManifestAssetProperty {
-            asset_name: name.into(),
+            asset_name: name.to_string().into(),
             asset_chunks: vec![SophonManifestAssetChunk {
-                chunk_name: "chunk_0".into(),
-                chunk_decompressed_hash_md5: "decomp_md5".into(),
+                chunk_name: bytes::Bytes::from("chunk_0"),
+                chunk_decompressed_hash_md5: bytes::Bytes::from("decomp_md5"),
                 chunk_on_file_offset: 0,
                 chunk_size: size,
                 chunk_size_decompressed: size,
                 chunk_compressed_hash_xxh: xxh,
-                chunk_compressed_hash_md5: "comp_md5".into(),
+                chunk_compressed_hash_md5: bytes::Bytes::from("comp_md5"),
                 chunk_old_offset: -1,
             }],
             asset_type: 0,
             asset_size: size,
-            asset_hash_md5: md5.into(),
+            asset_hash_md5: md5.to_string().into(),
         }
     }
 
@@ -162,48 +162,60 @@ mod tests {
         let manifest = SophonManifestProto {
             assets: vec![
                 SophonManifestAssetProperty {
-                    asset_name: "GameData/level01.pak".into(),
+                    asset_name: bytes::Bytes::from("GameData/level01.pak"),
                     asset_chunks: vec![
                         SophonManifestAssetChunk {
-                            chunk_name: "chunk_a1".into(),
-                            chunk_decompressed_hash_md5: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".into(),
+                            chunk_name: bytes::Bytes::from("chunk_a1"),
+                            chunk_decompressed_hash_md5: bytes::Bytes::from(
+                                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+                            ),
                             chunk_on_file_offset: 0,
                             chunk_size: 524288,
                             chunk_size_decompressed: 1048576,
                             chunk_compressed_hash_xxh: 12345,
-                            chunk_compressed_hash_md5: "d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1".into(),
+                            chunk_compressed_hash_md5: bytes::Bytes::from(
+                                "d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1",
+                            ),
                             chunk_old_offset: -1,
                         },
                         SophonManifestAssetChunk {
-                            chunk_name: "chunk_a2".into(),
-                            chunk_decompressed_hash_md5: "1234567890abcdef1234567890abcdef".into(),
+                            chunk_name: bytes::Bytes::from("chunk_a2"),
+                            chunk_decompressed_hash_md5: bytes::Bytes::from(
+                                "1234567890abcdef1234567890abcdef",
+                            ),
                             chunk_on_file_offset: 1048576,
                             chunk_size: 262144,
                             chunk_size_decompressed: 524288,
                             chunk_compressed_hash_xxh: 67890,
-                            chunk_compressed_hash_md5: "fedcba0987654321fedcba0987654321".into(),
+                            chunk_compressed_hash_md5: bytes::Bytes::from(
+                                "fedcba0987654321fedcba0987654321",
+                            ),
                             chunk_old_offset: -1,
                         },
                     ],
                     asset_type: 0,
                     asset_size: 1572864,
-                    asset_hash_md5: "abcdef1234567890abcdef1234567890".into(),
+                    asset_hash_md5: bytes::Bytes::from("abcdef1234567890abcdef1234567890"),
                 },
                 SophonManifestAssetProperty {
-                    asset_name: "GameData/config.json".into(),
+                    asset_name: bytes::Bytes::from("GameData/config.json"),
                     asset_chunks: vec![SophonManifestAssetChunk {
-                        chunk_name: "chunk_b1".into(),
-                        chunk_decompressed_hash_md5: "00112233445566778899aabbccddeeff".into(),
+                        chunk_name: bytes::Bytes::from("chunk_b1"),
+                        chunk_decompressed_hash_md5: bytes::Bytes::from(
+                            "00112233445566778899aabbccddeeff",
+                        ),
                         chunk_on_file_offset: 0,
                         chunk_size: 4096,
                         chunk_size_decompressed: 8192,
                         chunk_compressed_hash_xxh: 11111,
-                        chunk_compressed_hash_md5: "ffeeddccbbaa99887766554433221100".into(),
+                        chunk_compressed_hash_md5: bytes::Bytes::from(
+                            "ffeeddccbbaa99887766554433221100",
+                        ),
                         chunk_old_offset: -1,
                     }],
                     asset_type: 0,
                     asset_size: 8192,
-                    asset_hash_md5: "11223344556677889900aabbccddeeff".into(),
+                    asset_hash_md5: bytes::Bytes::from("11223344556677889900aabbccddeeff"),
                 },
             ],
         };
@@ -219,20 +231,20 @@ mod tests {
     fn compute_content_manifest_hash_excludes_old_offset() {
         let make = |offset: i64| SophonManifestProto {
             assets: vec![SophonManifestAssetProperty {
-                asset_name: "a.pak".into(),
+                asset_name: bytes::Bytes::from("a.pak"),
                 asset_chunks: vec![SophonManifestAssetChunk {
-                    chunk_name: "c0".into(),
-                    chunk_decompressed_hash_md5: "deadbeef".into(),
+                    chunk_name: bytes::Bytes::from("c0"),
+                    chunk_decompressed_hash_md5: bytes::Bytes::from("deadbeef"),
                     chunk_on_file_offset: 0,
                     chunk_size: 1000,
                     chunk_size_decompressed: 2000,
                     chunk_compressed_hash_xxh: 0,
-                    chunk_compressed_hash_md5: "cafebabe".into(),
+                    chunk_compressed_hash_md5: bytes::Bytes::from("cafebabe"),
                     chunk_old_offset: offset,
                 }],
                 asset_type: 0,
                 asset_size: 2000,
-                asset_hash_md5: "filehash".into(),
+                asset_hash_md5: bytes::Bytes::from("filehash"),
             }],
         };
         assert_eq!(

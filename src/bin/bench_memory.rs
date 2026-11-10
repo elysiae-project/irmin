@@ -2260,12 +2260,12 @@ fn run_download_plan_child(
                 .map_err(|_| "download-plan chunk offset does not fit u64".to_owned())?;
             chunks.push(SophonManifestAssetChunk {
                 chunk_name: format!("download-plan-{index:08}.zstd"),
-                chunk_decompressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                chunk_decompressed_hash_md5: bytes::Bytes::from("0123456789abcdef0123456789abcdef"),
                 chunk_on_file_offset: chunk_offset_u64,
                 chunk_size: chunk_size as u64,
                 chunk_size_decompressed: chunk_size as u64,
                 chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                chunk_compressed_hash_md5: bytes::Bytes::from("0123456789abcdef0123456789abcdef"),
                 chunk_old_offset: -1,
             });
             chunk_offset = chunk_offset
@@ -3060,23 +3060,27 @@ fn prepare_assembly_context(
             let compressed_path = chunks_dir.join(chunk_filename(&format!("chunk-{index:04}")));
             let compressed = fs::read(&compressed_path).expect("generated chunk exists");
             SophonManifestAssetChunk {
-                chunk_name: format!("chunk-{index:04}"),
-                chunk_decompressed_hash_md5: hex::encode(fast_md5::digest(&raw)),
+                chunk_name: format!("chunk-{index:04}").into(),
+                chunk_decompressed_hash_md5: bytes::Bytes::from(hex::encode(fast_md5::digest(
+                    &raw,
+                ))),
                 chunk_on_file_offset: (index * chunk_size) as u64,
                 chunk_size: compressed.len() as u64,
                 chunk_size_decompressed: chunk_size as u64,
                 chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: hex::encode(fast_md5::digest(&compressed)),
+                chunk_compressed_hash_md5: bytes::Bytes::from(hex::encode(fast_md5::digest(
+                    &compressed,
+                ))),
                 chunk_old_offset: -1,
             }
         })
         .collect::<Vec<_>>();
     let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
-        asset_name: "assembled.bin".to_owned(),
+        asset_name: bytes::Bytes::from("assembled.bin"),
         asset_chunks: chunk_rows,
         asset_type: 0,
         asset_size: (size_mib * 1024 * 1024) as u64,
-        asset_hash_md5: expected_hash,
+        asset_hash_md5: expected_hash.into(),
     }]);
     let names = (0..chunks)
         .map(|index| Box::leak(format!("chunk-{index:04}").into_boxed_str()) as &str)
@@ -3131,13 +3135,17 @@ fn prepare_install_context(
             let compressed_path = dir.join(format!("chunk-{fixture_index:04}"));
             let compressed = fs::read(&compressed_path).map_err(|error| error.to_string())?;
             Ok(SophonManifestAssetChunk {
-                chunk_name: format!("chunk-{fixture_index:04}"),
-                chunk_decompressed_hash_md5: hex::encode(fast_md5::digest(&raw)),
+                chunk_name: format!("chunk-{fixture_index:04}").into(),
+                chunk_decompressed_hash_md5: bytes::Bytes::from(hex::encode(fast_md5::digest(
+                    &raw,
+                ))),
                 chunk_on_file_offset: (index * chunk_size) as u64,
                 chunk_size: compressed.len() as u64,
                 chunk_size_decompressed: chunk_size as u64,
                 chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: hex::encode(fast_md5::digest(&compressed)),
+                chunk_compressed_hash_md5: bytes::Bytes::from(hex::encode(fast_md5::digest(
+                    &compressed,
+                ))),
                 chunk_old_offset: -1,
             })
         })
@@ -3156,11 +3164,11 @@ fn prepare_install_context(
     let file_md5 = hex::encode(file_hasher.finalize());
     let manifest = SophonManifestProto {
         assets: vec![SophonManifestAssetProperty {
-            asset_name: "installed.bin".to_owned(),
+            asset_name: bytes::Bytes::from("installed.bin"),
             asset_chunks: chunk_rows,
             asset_type: 0,
             asset_size: (size_mib * 1024 * 1024) as u64,
-            asset_hash_md5: file_md5,
+            asset_hash_md5: bytes::Bytes::from(file_md5),
         }],
     };
     let installer = SophonInstaller {
@@ -3186,13 +3194,13 @@ fn prepare_install_context(
         fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
         let cache = VerificationCache::new();
         for chunk in installer.manifest.assets[0].asset_chunks[..chunks - 1].iter() {
-            let cached_path = chunks_dir.join(chunk_filename(&chunk.chunk_name));
-            fs::hard_link(dir.join(&chunk.chunk_name), &cached_path)
+            let cached_path = chunks_dir.join(chunk_filename(chunk.chunk_name_str()));
+            fs::hard_link(dir.join(chunk.chunk_name_str()), &cached_path)
                 .map_err(|error| error.to_string())?;
             let valid = irmin_rs::game_installer::cache::check_file_md5_cached_with_size(
                 &cached_path,
                 chunk.chunk_size,
-                &chunk.chunk_compressed_hash_md5,
+                chunk.chunk_compressed_hash_md5_str(),
                 &game_dir,
                 &cache,
             )
@@ -3202,7 +3210,7 @@ fn prepare_install_context(
             }
             resume
                 .prev_downloaded_chunks
-                .insert(chunk.chunk_name.clone(), chunk.chunk_size);
+                .insert(chunk.chunk_name_str().to_string(), chunk.chunk_size);
         }
         irmin_rs::game_installer::cache::save_verification_cache(&game_dir, &cache)
             .map_err(|error| error.to_string())?;
