@@ -22,9 +22,12 @@ impl DownloadClient {
     /// Panics if reqwest cannot construct the configured client (for example,
     /// due to an invalid TLS backend configuration).
     pub fn new() -> Self {
+        let max_idle = std::thread::available_parallelism()
+            .map(|n| (n.get() * 4).min(128))
+            .unwrap_or(48);
         Self(
             reqwest::Client::builder()
-                .pool_max_idle_per_host(48)
+                .pool_max_idle_per_host(max_idle)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .tcp_nodelay(true)
                 .http1_only()

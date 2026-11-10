@@ -2713,7 +2713,8 @@ async fn run_downloads(
     handle: DownloadHandle,
 ) -> DownloadSummary {
     const RECLAIM_INTERVAL: usize = 100;
-    const MAX_INFLIGHT_COMPRESSED_BYTES: usize = 128 * 1024 * 1024;
+    let max_inflight_compressed_bytes: usize =
+        super::adaptive_download::max_concurrency() * 8 * 1024 * 1024;
     let adaptive = Arc::new(super::adaptive_download::AdaptiveDownload::new());
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
@@ -2722,7 +2723,7 @@ async fn run_downloads(
     let next_index = Arc::new(AtomicUsize::new(0));
     let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(total));
     let reclaim_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
-    let byte_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_COMPRESSED_BYTES));
+    let byte_semaphore = Arc::new(tokio::sync::Semaphore::new(max_inflight_compressed_bytes));
     let mut workers = tokio::task::JoinSet::new();
 
     ctx.profiler.total_chunks.store(total, Ordering::Relaxed);
@@ -2767,7 +2768,7 @@ async fn run_downloads(
                 };
                 let chunk = ctx.all_files.chunk(global_chunk_idx);
                 let compressed_bytes =
-                    (chunk.chunk_size.max(1) as usize).min(MAX_INFLIGHT_COMPRESSED_BYTES);
+                    (chunk.chunk_size.max(1) as usize).min(max_inflight_compressed_bytes);
                 let _byte_permit = match byte_semaphore.acquire_many(compressed_bytes as u32).await
                 {
                     Ok(permit) => permit,
@@ -4104,7 +4105,7 @@ async fn repair_assets(
         let stream_stopped = Arc::clone(&stopped_for_stream);
         let mut dl_stream = bounded_stoppable_stream(
             redownload_items,
-            super::DOWNLOAD_CONCURRENCY,
+            super::download_concurrency(),
             stream_stopped,
             move |(chunk, dl_info)| {
                 let chunks_dir = chunks_dir_for_stream.clone();

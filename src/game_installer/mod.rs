@@ -61,7 +61,10 @@ pub const MAX_RETRIES: u32 = 5;
 pub const MAX_HASH_RETRIES: u32 = 5;
 
 /// Hard ceiling for concurrent chunk download workers.
-pub const DOWNLOAD_CONCURRENCY: usize = adaptive_download::MAX_CONCURRENCY;
+/// Maximum download concurrency, derived from CPU count at runtime.
+pub fn download_concurrency() -> usize {
+    adaptive_download::max_concurrency()
+}
 
 use std::time::Duration;
 
