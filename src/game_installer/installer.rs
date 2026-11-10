@@ -1175,8 +1175,9 @@ async fn build_download_state(
             .all_files
             .file_chunk(item.file_idx as usize, item.chunk_idx as usize)
             .chunk_name;
-        arena.intern(name);
+        arena.intern_dedup(name);
     }
+    arena.clear_dedup();
     let chunk_names_lookup = Arc::new(ChunkNameLookup::from_arena(arena));
 
     Ok((
