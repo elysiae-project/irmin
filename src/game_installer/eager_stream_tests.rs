@@ -84,6 +84,131 @@ fn eager_stream_threshold_preserves_small_one_shot_path() {
         super::EAGER_STREAM_THRESHOLD,
         Some(false)
     ));
+    for compressed_size in [
+        super::EAGER_STREAM_THRESHOLD - 1,
+        super::EAGER_STREAM_THRESHOLD,
+        super::EAGER_STREAM_THRESHOLD + 1,
+    ] {
+        assert_eq!(
+            super::should_stream_eager(compressed_size, None),
+            compressed_size >= super::EAGER_STREAM_THRESHOLD
+        );
+    }
+}
+
+#[test]
+fn eager_decoded_size_selector_is_opt_in_and_falls_back_on_unknown_size() {
+    let threshold = 32 * 1024 * 1024;
+    let compressed_size = 4 * 1024 * 1024;
+    let select = super::should_stream_eager_with_decoded_size;
+
+    assert!(!select(compressed_size, Some(threshold), None, None));
+    assert!(!select(
+        compressed_size,
+        Some(threshold - 1),
+        Some(threshold),
+        None
+    ));
+    assert!(select(
+        compressed_size,
+        Some(threshold),
+        Some(threshold),
+        None
+    ));
+    assert!(select(
+        compressed_size,
+        Some(threshold + 1),
+        Some(threshold),
+        None
+    ));
+    assert!(!select(compressed_size, None, Some(threshold), None));
+    assert!(!select(compressed_size, Some(0), Some(threshold), None));
+    assert!(!select(
+        2 * 1024,
+        Some(8 * 1024 * 1024),
+        Some(threshold),
+        None
+    ));
+    assert!(select(
+        super::EAGER_STREAM_THRESHOLD,
+        None,
+        Some(threshold),
+        None
+    ));
+    assert!(select(compressed_size, None, Some(threshold), Some(true)));
+    assert!(select(
+        compressed_size,
+        Some(0),
+        Some(threshold),
+        Some(true)
+    ));
+    assert!(!select(
+        compressed_size,
+        Some(threshold),
+        Some(threshold),
+        Some(false)
+    ));
+    assert!(!select(
+        super::EAGER_STREAM_THRESHOLD,
+        Some(threshold),
+        Some(threshold),
+        Some(false)
+    ));
+
+    let mixed = [
+        (8 * 1024 * 1024, Some(16 * 1024 * 1024)),
+        (2 * 1024 * 1024, Some(40 * 1024 * 1024)),
+        (super::EAGER_STREAM_THRESHOLD, Some(8 * 1024 * 1024)),
+        (2 * 1024 * 1024, None),
+    ];
+    let selected_streaming = mixed
+        .iter()
+        .filter(|(compressed, decoded)| select(*compressed, *decoded, Some(threshold), None))
+        .count();
+    assert_eq!(selected_streaming, 2);
+    assert_eq!(mixed.len() - selected_streaming, 2);
+
+    let counts = super::EagerSelectionCounts::default();
+    for (compressed, decoded) in mixed {
+        counts.record(select(compressed, decoded, Some(threshold), None));
+    }
+    assert_eq!(counts.streaming.load(Ordering::Relaxed), 2);
+    assert_eq!(counts.oneshot.load(Ordering::Relaxed), 2);
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn parse_decoded_threshold_mib(value: Option<&str>, mode: &str) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if mode != "threshold" {
+        return Err("decoded-size threshold experiment requires threshold mode".to_owned());
+    }
+    let mib = value
+        .parse::<u64>()
+        .map_err(|_| "IRMIN_EAGER_BENCH_DECODED_THRESHOLD_MIB must be an unsigned integer")?;
+    if mib == 0 {
+        return Err("decoded-size threshold must be positive".to_owned());
+    }
+    mib.checked_mul(1024 * 1024)
+        .map(Some)
+        .ok_or_else(|| "decoded-size threshold is too large".to_owned())
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+fn decoded_threshold_parser_validates_mode_and_value() {
+    assert_eq!(parse_decoded_threshold_mib(None, "oneshot"), Ok(None));
+    assert_eq!(
+        parse_decoded_threshold_mib(Some("32"), "threshold"),
+        Ok(Some(32 * 1024 * 1024))
+    );
+    for invalid in ["", "-1", "nope", "18446744073709551615"] {
+        assert!(parse_decoded_threshold_mib(Some(invalid), "threshold").is_err());
+    }
+    assert!(parse_decoded_threshold_mib(Some("0"), "threshold").is_err());
+    assert!(parse_decoded_threshold_mib(Some("32"), "oneshot").is_err());
+    assert!(parse_decoded_threshold_mib(Some("32"), "stream").is_err());
 }
 
 #[cfg(feature = "bench-diagnostics")]
@@ -424,7 +549,9 @@ fn benchmark_eager_loopback_concurrent_rss() {
 ///
 /// `IRMIN_EAGER_BENCH_MODE` selects streaming, one-shot, or the production
 /// threshold; `IRMIN_EAGER_BENCH_PATTERN` selects payload compressibility, and
-/// `IRMIN_EAGER_BENCH_FS_LABEL` supplies the output filesystem label. The server
+/// `IRMIN_EAGER_BENCH_FS_LABEL` supplies the output filesystem label.
+/// `IRMIN_EAGER_BENCH_DECODED_THRESHOLD_MIB` opts into the decoded-size selector
+/// experiment for the production-threshold mode. The server
 /// applies one response delay per request and an optional shared no-credit
 /// body-rate limit. It does not model TCP windowing, loss, jitter, or a remote
 /// CDN. Process RSS includes both client and server tasks, so use the reset
@@ -781,6 +908,8 @@ async fn benchmark_eager_loopback_inner() {
                 &DownloadHandle::new(),
                 force_streaming,
                 Some(queue_capacity),
+                None,
+                None,
                 Some(timings),
             )
             .await
@@ -860,6 +989,13 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
         "threshold" => None,
         _ => panic!("IRMIN_EAGER_BENCH_MODE must be stream, oneshot, or threshold"),
     };
+    let decoded_threshold = parse_decoded_threshold_mib(
+        std::env::var("IRMIN_EAGER_BENCH_DECODED_THRESHOLD_MIB")
+            .ok()
+            .as_deref(),
+        &mode,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 
     let pattern =
         std::env::var("IRMIN_EAGER_BENCH_PATTERN").unwrap_or_else(|_| "random".to_owned());
@@ -897,7 +1033,12 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
     let compressed_hash = hex::encode(fast_md5::digest(&compressed));
     let expected_output_hash = fast_md5::digest(&data);
     let decompressed_hash = hex::encode(expected_output_hash);
-    let should_stream = super::should_stream_eager(compressed.len() as u64, force_streaming);
+    let should_stream = super::should_stream_eager_with_decoded_size(
+        compressed.len() as u64,
+        Some(data_len as u64),
+        decoded_threshold,
+        force_streaming,
+    );
     drop(data);
 
     let response_count = Arc::new(AtomicU64::new(0));
@@ -1124,6 +1265,7 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
     let offsets = Arc::new((0..=item_count as u32).collect::<Vec<_>>());
     let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = DownloadHandle::new();
+    let selection_counts = Arc::new(super::EagerSelectionCounts::default());
     let (setup_rss, setup_anon, setup_file, setup_shmem) = rss_status_components_kib();
     let hwm_reset = reset_rss_high_water();
     assert!(hwm_reset, "unable to reset process high-water RSS");
@@ -1137,6 +1279,7 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
         let chunk_entries = Arc::clone(&chunk_entries);
         let offsets = Arc::clone(&offsets);
         let next_index = Arc::clone(&next_index);
+        let selection_counts = Arc::clone(&selection_counts);
         let timings = Arc::clone(&timings);
         let handle = handle.clone();
         tasks.spawn(async move {
@@ -1154,6 +1297,8 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
                     &handle,
                     force_streaming,
                     Some(queue_capacity),
+                    decoded_threshold.map(|threshold| (data_len as u64, threshold)),
+                    Some(Arc::clone(&selection_counts)),
                     Some(Arc::clone(&timings)),
                 )
                 .await?;
@@ -1166,7 +1311,12 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
     }
     let elapsed = started.elapsed();
     let downloaded = context.downloaded_bytes.load(Ordering::Relaxed);
+    let selected_streaming = selection_counts.streaming.load(Ordering::Relaxed);
+    let selected_oneshot = selection_counts.oneshot.load(Ordering::Relaxed);
     assert_eq!(response_count.load(Ordering::Relaxed), item_count as u64);
+    assert_eq!(selected_streaming + selected_oneshot, item_count as u32);
+    assert_eq!(selected_streaming == item_count as u32, should_stream);
+    assert_eq!(selected_oneshot == item_count as u32, !should_stream);
     assert_eq!(downloaded, context.total_bytes);
     for index in 0..item_count {
         assert!(context.chunk_bitmap.is_complete(index));
@@ -1175,8 +1325,9 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
         assert_eq!(fast_md5::digest(&output), expected_output_hash);
     }
     println!(
-        "path=fixed-work-eager mode={mode} selected={} pattern={pattern} workers={workers} items={item_count} size_mib={size_mib} total_output_mib={:.1} compressed_mib={:.2} ratio={:.2} queue_capacity={queue_capacity} frame_kib={frame_kib} response_delay_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} temp_root={} fs_label={output_filesystem} requests={} frames={} elapsed_ms={} process_cpu_ms={} hwm_reset={hwm_reset} setup_rss_kib={setup_rss:?} setup_anon_kib={setup_anon:?} setup_file_kib={setup_file:?} setup_shmem_kib={setup_shmem:?} operation_hwm_kib={} downloaded_mib={:.1} achieved_mib_s={:.2}",
+        "path=fixed-work-eager mode={mode} selected={} decoded_threshold_mib={:?} selected_streaming={selected_streaming} selected_oneshot={selected_oneshot} pattern={pattern} workers={workers} items={item_count} size_mib={size_mib} total_output_mib={:.1} compressed_mib={:.2} ratio={:.2} queue_capacity={queue_capacity} frame_kib={frame_kib} response_delay_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} temp_root={} fs_label={output_filesystem} requests={} frames={} elapsed_ms={} process_cpu_ms={} hwm_reset={hwm_reset} setup_rss_kib={setup_rss:?} setup_anon_kib={setup_anon:?} setup_file_kib={setup_file:?} setup_shmem_kib={setup_shmem:?} operation_hwm_kib={} downloaded_mib={:.1} achieved_mib_s={:.2}",
         if should_stream { "stream" } else { "oneshot" },
+        decoded_threshold.map(|threshold| threshold / (1024 * 1024)),
         (size_mib * item_count) as f64,
         compressed.len() as f64 / (1024.0 * 1024.0),
         data_len as f64 / compressed.len() as f64,

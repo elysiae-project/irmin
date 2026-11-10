@@ -1588,6 +1588,10 @@ async fn process_eager_item(
         handle,
         None,
         None,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
         #[cfg(feature = "bench-diagnostics")]
         None,
     )
@@ -1606,6 +1610,8 @@ async fn process_eager_item_with_mode(
     handle: &DownloadHandle,
     force_streaming: Option<bool>,
     stream_queue_capacity: Option<usize>,
+    #[cfg(test)] decoded_selector: Option<(u64, u64)>,
+    #[cfg(test)] selection_counts: Option<Arc<EagerSelectionCounts>>,
     #[cfg(feature = "bench-diagnostics")] timings: Option<
         Arc<super::eager_decompress::EagerStreamPhaseTimings>,
     >,
@@ -1625,7 +1631,25 @@ async fn process_eager_item_with_mode(
             "unsupported compressed chunk hash length",
         )));
     }
-    if should_stream_eager(chunk.chunk_size, force_streaming) {
+    #[cfg(test)]
+    let should_stream = decoded_selector.map_or_else(
+        || should_stream_eager(chunk.chunk_size, force_streaming),
+        |(decoded_size, threshold)| {
+            should_stream_eager_with_decoded_size(
+                chunk.chunk_size,
+                Some(decoded_size),
+                Some(threshold),
+                force_streaming,
+            )
+        },
+    );
+    #[cfg(not(test))]
+    let should_stream = should_stream_eager(chunk.chunk_size, force_streaming);
+    #[cfg(test)]
+    if let Some(counts) = selection_counts.as_ref() {
+        counts.record(should_stream);
+    }
+    if should_stream {
         return process_eager_item_streaming(
             item,
             item_idx,
@@ -1657,8 +1681,49 @@ async fn process_eager_item_with_mode(
 const EAGER_STREAM_THRESHOLD: u64 = 64 * 1024 * 1024;
 const EAGER_STREAM_QUEUE_CAPACITY: usize = 8;
 
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct EagerSelectionCounts {
+    pub(super) streaming: AtomicU32,
+    pub(super) oneshot: AtomicU32,
+}
+
+#[cfg(test)]
+impl EagerSelectionCounts {
+    fn record(&self, streaming: bool) {
+        let counter = if streaming {
+            &self.streaming
+        } else {
+            &self.oneshot
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn should_stream_eager(compressed_size: u64, forced: Option<bool>) -> bool {
     forced.unwrap_or(compressed_size >= EAGER_STREAM_THRESHOLD)
+}
+
+/// Applies the optional decoded-size rule used by selector tests and the ignored
+/// benchmark diagnostic. Production callers retain the compressed-size selector.
+///
+/// Streaming is selected when the compressed-size rule or the optional decoded-size
+/// hint reaches its threshold. Missing or zero decoded sizes do not affect selection.
+#[cfg(any(test, feature = "bench-diagnostics"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn should_stream_eager_with_decoded_size(
+    compressed_size: u64,
+    decoded_size: Option<u64>,
+    decoded_threshold: Option<u64>,
+    forced: Option<bool>,
+) -> bool {
+    if let Some(forced) = forced {
+        return forced;
+    }
+    compressed_size >= EAGER_STREAM_THRESHOLD
+        || decoded_threshold.is_some_and(|threshold| {
+            decoded_size.is_some_and(|size| size != 0 && size >= threshold)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
