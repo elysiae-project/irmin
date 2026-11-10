@@ -2542,7 +2542,7 @@ impl FilterCache {
                     let mut entries: Vec<String> = content
                         .lines()
                         .filter_map(extract_blacklist_filename)
-                        .map(|name| name.to_lowercase())
+                        .map(|name| name.to_ascii_lowercase())
                         .collect();
                     // Generate cross-path variants.
                     let variants: Vec<String> = entries
@@ -2574,7 +2574,7 @@ impl FilterCache {
             let ignored: Vec<String> = all_langs
                 .iter()
                 .filter(|lang| !installed.iter().any(|inst| inst == **lang))
-                .map(|lang| format!("/{lang}/").to_lowercase())
+                .map(|lang| format!("/{lang}/").to_ascii_lowercase())
                 .collect();
             Some(ignored)
         } else {
