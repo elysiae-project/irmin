@@ -110,6 +110,61 @@ fn process_cpu_time_ms() -> u128 {
 }
 
 #[cfg(feature = "bench-diagnostics")]
+fn rss_components_kib() -> (Option<u64>, Option<u64>, Option<u64>) {
+    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
+        return (None, None, None);
+    };
+    let mut anonymous = None;
+    let mut file = None;
+    let mut private_dirty = None;
+    for line in smaps.lines() {
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("RssAnon:") => anonymous = fields.next().and_then(|value| value.parse().ok()),
+            Some("RssFile:") => file = fields.next().and_then(|value| value.parse().ok()),
+            Some("Private_Dirty:") => {
+                private_dirty = fields.next().and_then(|value| value.parse().ok());
+            }
+            _ => {}
+        }
+    }
+    (anonymous, file, private_dirty)
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn rss_status_components_kib() -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (None, None, None, None);
+    };
+    let mut rss = None;
+    let mut anonymous = None;
+    let mut file = None;
+    let mut shmem = None;
+    for line in status.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse().ok());
+        match key {
+            "VmRSS" => rss = value,
+            "RssAnon" => anonymous = value,
+            "RssFile" => file = value,
+            "RssShmem" => shmem = value,
+            _ => {}
+        }
+    }
+    (rss, anonymous, file, shmem)
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn reset_rss_high_water() -> bool {
+    std::fs::write("/proc/self/clear_refs", b"5").is_ok()
+}
+
+#[cfg(feature = "bench-diagnostics")]
 fn eager_benchmark_prefault_label(mode: &str, prefault: bool) -> &'static str {
     if mode == "oneshot" {
         if prefault { "true" } else { "false" }
@@ -1336,23 +1391,47 @@ fn benchmark_eager_decompression_rss() {
     let prefault = std::env::var("IRMIN_EAGER_BENCH_PREFAULT")
         .map(|value| value != "0")
         .unwrap_or(true);
-    let mut random_state = 0xA11C_E5EED_u64;
-    let data = (0..size_mib * 1024 * 1024)
-        .map(|_| {
-            random_state ^= random_state >> 12;
-            random_state ^= random_state << 25;
-            random_state ^= random_state >> 27;
-            (random_state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
-        })
-        .collect::<Vec<_>>();
+    let pattern =
+        std::env::var("IRMIN_EAGER_BENCH_PATTERN").unwrap_or_else(|_| "random".to_owned());
+    let data_len = size_mib * 1024 * 1024;
+    let data = match pattern.as_str() {
+        "random" => {
+            let mut random_state = 0xA11C_E5EED_u64;
+            (0..data_len)
+                .map(|_| {
+                    random_state ^= random_state >> 12;
+                    random_state ^= random_state << 25;
+                    random_state ^= random_state >> 27;
+                    (random_state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+                })
+                .collect::<Vec<_>>()
+        }
+        "low-alphabet" => {
+            let mut random_state = 0xA11C_E5EED_u64;
+            (0..data_len)
+                .map(|_| {
+                    random_state ^= random_state >> 12;
+                    random_state ^= random_state << 25;
+                    random_state ^= random_state >> 27;
+                    (random_state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 60) as u8
+                })
+                .collect::<Vec<_>>()
+        }
+        "repeated" => vec![0xA5; data_len],
+        _ => panic!("IRMIN_EAGER_BENCH_PATTERN must be random, low-alphabet, or repeated"),
+    };
     let compressed = zstd::encode_all(data.as_slice(), 3).unwrap();
     let compressed_hash = hex::encode(fast_md5::digest(&compressed));
     let decompressed_hash = hex::encode(fast_md5::digest(&data));
+    drop(data);
     let dir = match std::env::var_os("IRMIN_EAGER_BENCH_TEMP_DIR") {
         Some(path) => tempfile::tempdir_in(path).unwrap(),
         None => tempfile::tempdir().unwrap(),
     };
     let mode = std::env::var("IRMIN_EAGER_BENCH_MODE").unwrap_or_else(|_| "stream".to_owned());
+    let (setup_rss, setup_anon, setup_file, setup_shmem) = rss_status_components_kib();
+    let (setup_smaps_anon, setup_smaps_file, setup_private_dirty) = rss_components_kib();
+    let hwm_reset = reset_rss_high_water();
     let before = rss_high_water_kib();
     let cpu_before = process_cpu_time_ms();
     let started = Instant::now();
@@ -1366,12 +1445,12 @@ fn benchmark_eager_decompression_rss() {
                 .truncate(true)
                 .open(dir.path().join(format!("output-{index}.bin")))
                 .unwrap();
-            output.set_len(data.len() as u64).unwrap();
+            output.set_len(data_len as u64).unwrap();
             let compressed = &compressed;
             let compressed_hash = &compressed_hash;
             let decompressed_hash = &decompressed_hash;
             let mode = mode.as_str();
-            let size = data.len() as u64;
+            let size = data_len as u64;
             workers.push(scope.spawn(move || {
                 match (mode, prefault) {
                 ("oneshot", true) => {
@@ -1410,9 +1489,12 @@ fn benchmark_eager_decompression_rss() {
     });
     let elapsed = started.elapsed();
     let prefault_label = eager_benchmark_prefault_label(&mode, prefault);
+    let (after_rss, after_anon, after_file, after_shmem) = rss_status_components_kib();
+    let (after_smaps_anon, after_smaps_file, after_dirty) = rss_components_kib();
     println!(
-        "mode={mode} prefault={prefault_label} size_mib={size_mib} concurrency={concurrency} compressed_mib={:.1} elapsed_us={} cpu_ms={} before_kib={before} after_kib={}",
+        "mode={mode} prefault={prefault_label} pattern={pattern} size_mib={size_mib} concurrency={concurrency} compressed_mib={:.2} ratio={:.2} elapsed_us={} cpu_ms={} hwm_reset={hwm_reset} setup_hwm_kib={before} setup_rss_kib={setup_rss:?} setup_anon_kib={setup_anon:?} setup_file_kib={setup_file:?} setup_shmem_kib={setup_shmem:?} setup_smaps_anon_kib={setup_smaps_anon:?} setup_smaps_file_kib={setup_smaps_file:?} setup_private_dirty_kib={setup_private_dirty:?} operation_hwm_kib={} end_rss_kib={after_rss:?} end_anon_kib={after_anon:?} end_file_kib={after_file:?} end_shmem_kib={after_shmem:?} end_smaps_anon_kib={after_smaps_anon:?} end_smaps_file_kib={after_smaps_file:?} end_private_dirty_kib={after_dirty:?}",
         compressed.len() as f64 / (1024.0 * 1024.0),
+        data_len as f64 / compressed.len() as f64,
         elapsed.as_micros(),
         process_cpu_time_ms().saturating_sub(cpu_before),
         rss_high_water_kib(),
