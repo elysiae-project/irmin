@@ -24,7 +24,7 @@ impl DownloadClient {
     pub fn new() -> Self {
         Self(
             reqwest::Client::builder()
-                .pool_max_idle_per_host(8)
+                .pool_max_idle_per_host(10)
                 .pool_idle_timeout(Duration::from_secs(30))
                 .tcp_nodelay(true)
                 .http1_only()

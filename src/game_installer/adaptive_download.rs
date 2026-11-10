@@ -10,16 +10,16 @@ use std::time::Instant;
 
 /// Initial number of download workers.
 /// Starting number of concurrent chunk download workers.
-pub const INITIAL_CONCURRENCY: usize = 8;
+pub const INITIAL_CONCURRENCY: usize = 10;
 /// Maximum download workers (hard ceiling).
 /// Hard upper bound on concurrent chunk download workers.
-pub const MAX_CONCURRENCY: usize = 16;
+pub const MAX_CONCURRENCY: usize = 20;
 /// Interval between throughput checks.
 const MEASURE_INTERVAL_MS: u64 = 1000;
 /// Scale up when throughput grew by at least this fraction.
 const GROWTH_THRESHOLD: f64 = 0.01;
 /// Workers to add per scale-up event.
-const SCALE_STEP: usize = 4;
+const SCALE_STEP: usize = 6;
 
 /// Tracks throughput and decides when to spawn more workers.
 pub struct AdaptiveDownload {

@@ -11,9 +11,9 @@ use super::FILE_WRITE_BUFFER_SIZE;
 use super::error::{SophonError, SophonResult};
 use super::sysio;
 
-const ASSEMBLY_BUFFER_SIZE: usize = 512 * 1024;
+const ASSEMBLY_BUFFER_SIZE: usize = 1024 * 1024;
 
-const ONESHOT_MAX_SIZE: usize = 32 * 1024 * 1024;
+const ONESHOT_MAX_SIZE: usize = 64 * 1024 * 1024;
 
 const EMPTY_MD5: &str = "00000000000000000000000000000000";
 
@@ -455,7 +455,7 @@ fn take_compressed_buf(len: usize) -> Vec<u8> {
 #[inline]
 fn return_compressed_buf(mut buf: Vec<u8>) {
     // Cap retained capacity to avoid holding large buffers indefinitely.
-    const MAX_RETAINED_COMPRESSED_BUF: usize = 4 * 1024 * 1024;
+    const MAX_RETAINED_COMPRESSED_BUF: usize = 8 * 1024 * 1024;
     if buf.capacity() > MAX_RETAINED_COMPRESSED_BUF {
         buf = Vec::with_capacity(MAX_RETAINED_COMPRESSED_BUF);
     }
