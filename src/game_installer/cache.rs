@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, Metadata};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -288,7 +288,7 @@ fn file_md5_digest_with_options(
 }
 
 fn file_md5_digest_with_file(
-    file: File,
+    mut file: File,
     buffer_capacity: usize,
     advise_page_cache: bool,
 ) -> io::Result<[u8; 16]> {
@@ -312,29 +312,92 @@ fn file_md5_digest_with_file(
         super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_SEQUENTIAL);
     }
 
+    // Start small: don't grow the reusable buffer past what this file needs.
+    let read_capacity = buffer_capacity.min(usize::try_from(len).unwrap_or(usize::MAX));
+
     let mut hasher =
         super::assembly_opt::take_md5().map_err(|e| io::Error::other(e.to_string()))?;
-    let mut reader = io::BufReader::with_capacity(buffer_capacity, file);
-    loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            break;
+    let result = (|| {
+        let mut buffer = Md5ReadBufferGuard::take(read_capacity);
+        loop {
+            let n = {
+                let slice = buffer.as_mut_slice();
+                file.read(slice)?
+            };
+            if n == 0 {
+                break;
+            }
+            hasher
+                .update(buffer.filled(n))
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
-        hasher
-            .update(buf)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let n = buf.len();
-        reader.consume(n);
-    }
+        hasher.finish().map_err(|e| io::Error::other(e.to_string()))
+    })();
     if advise_page_cache {
         super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_DONTNEED);
     }
-
-    let digest = hasher
-        .finish()
-        .map_err(|e| io::Error::other(e.to_string()))?;
     super::assembly_opt::return_md5(hasher);
-    Ok(digest)
+    result
+}
+
+thread_local! {
+    static MD5_READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Thread-local read buffer reused across hashing calls.
+///
+/// Retains at most `MD5_READ_BUFFER_SIZE` bytes per thread. Larger requested
+/// capacities fall back to a local allocation so they cannot evict the
+/// production-sized buffer.
+struct Md5ReadBufferGuard {
+    buffer: Vec<u8>,
+    /// Length handed to each `read`; bounded by the file size and by `buffer`.
+    read_len: usize,
+    /// Whether `buffer` came from the thread-local pool and should return to it.
+    pooled: bool,
+}
+
+impl Md5ReadBufferGuard {
+    fn take(capacity: usize) -> Self {
+        if capacity > MD5_READ_BUFFER_SIZE {
+            return Self {
+                buffer: vec![0; capacity],
+                read_len: capacity,
+                pooled: false,
+            };
+        }
+
+        let mut buffer = MD5_READ_BUF
+            .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+            .unwrap_or_default();
+        if buffer.len() < capacity {
+            // `resize` grows amortized and can overshoot the retention cap.
+            buffer.reserve_exact(capacity - buffer.len());
+            buffer.resize(capacity, 0);
+        }
+        Self {
+            buffer,
+            read_len: capacity,
+            pooled: true,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer[..self.read_len]
+    }
+
+    fn filled(&self, len: usize) -> &[u8] {
+        &self.buffer[..len]
+    }
+}
+
+impl Drop for Md5ReadBufferGuard {
+    fn drop(&mut self) {
+        if self.pooled && self.buffer.capacity() <= MD5_READ_BUFFER_SIZE {
+            let buffer = std::mem::take(&mut self.buffer);
+            let _ = MD5_READ_BUF.try_with(|cell| *cell.borrow_mut() = buffer);
+        }
+    }
 }
 
 #[cfg(feature = "bench-internals")]

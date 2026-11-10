@@ -782,6 +782,53 @@ fn bench_verify_file_md5(c: &mut Criterion) {
         );
     });
     small_group.finish();
+
+    // Many tiny files: isolates the remaining per-file cold-verify costs
+    // (open, metadata, cache lookup, hash setup) from large sequential reads.
+    let tiny_dir = game_dir.join("tiny");
+    fs::create_dir_all(&tiny_dir).unwrap();
+    let tiny_files: Vec<(std::path::PathBuf, String)> = (0..1024usize)
+        .map(|index| {
+            let path = tiny_dir.join(format!("tiny-{index:03}.bin"));
+            let data = vec![index as u8; 1024];
+            fs::write(&path, &data).unwrap();
+            (path, hex::encode(fast_md5::digest(&data)))
+        })
+        .collect();
+    let tiny_bytes: u64 = 1024;
+    let mut tiny_group = c.benchmark_group("verify_file_md5_tiny");
+    tiny_group.throughput(Throughput::Bytes(tiny_bytes * tiny_files.len() as u64));
+    tiny_group.bench_function(BenchmarkId::new("miss", tiny_files.len()), |b| {
+        let game_dir = game_dir.clone();
+        let tiny_files = &tiny_files;
+        let tiny_cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
+        b.iter(|| {
+            tiny_cache.clear();
+            for (path, md5) in tiny_files {
+                let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
+                    path,
+                    tiny_bytes,
+                    md5,
+                    &game_dir,
+                    &tiny_cache,
+                )
+                .unwrap();
+                assert!(valid);
+            }
+        });
+    });
+    // Same files, but only open + read + hash: excludes cache bookkeeping so the
+    // read-buffer allocation is the dominant per-file variable.
+    tiny_group.bench_function(BenchmarkId::new("digest_only", tiny_files.len()), |b| {
+        let tiny_files = &tiny_files;
+        b.iter(|| {
+            for (path, md5) in tiny_files {
+                let digest = irmin_rs::game_installer::cache::file_md5_digest(path).unwrap();
+                assert_eq!(hex::encode(digest), *md5);
+            }
+        });
+    });
+    tiny_group.finish();
 }
 
 #[cfg(feature = "bench-internals")]

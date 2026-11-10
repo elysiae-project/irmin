@@ -562,3 +562,42 @@ fn file_md5_digest_buffer_capacities_match_reference() {
         io::ErrorKind::InvalidInput
     );
 }
+
+/// Hashes a large file then small files on the same thread to exercise the
+/// retained thread-local read buffer; each digest must still be correct.
+#[test]
+fn file_md5_digest_reuses_buffer_across_mixed_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let large = dir.path().join("large.bin");
+    let small = dir.path().join("small.bin");
+    let tiny = dir.path().join("tiny.bin");
+    let empty = dir.path().join("empty.bin");
+
+    let large_data = vec![0xA5u8; 300 * 1024];
+    let small_data = vec![0x11u8; 1024];
+    let tiny_data = vec![0x7Eu8; 7];
+    fs::write(&large, &large_data).unwrap();
+    fs::write(&small, &small_data).unwrap();
+    fs::write(&tiny, &tiny_data).unwrap();
+    fs::write(&empty, b"").unwrap();
+
+    // Large first (retains a 256 KiB buffer), then progressively smaller files.
+    assert_eq!(
+        file_md5_digest(&large).unwrap(),
+        fast_md5::digest(&large_data)
+    );
+    assert_eq!(
+        file_md5_digest(&small).unwrap(),
+        fast_md5::digest(&small_data)
+    );
+    assert_eq!(
+        file_md5_digest(&tiny).unwrap(),
+        fast_md5::digest(&tiny_data)
+    );
+    assert_eq!(file_md5_digest(&empty).unwrap(), fast_md5::digest(b""));
+    // Large again after small files, to catch stale bytes from the reused buffer.
+    assert_eq!(
+        file_md5_digest(&large).unwrap(),
+        fast_md5::digest(&large_data)
+    );
+}
