@@ -3,6 +3,7 @@ use super::super::profiling::PipelineProfiler;
 use super::*;
 use crate::game_installer::compact_manifest::CompactManifest;
 use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
+use std::io::Write;
 
 #[cfg(feature = "bench-diagnostics")]
 fn benchmark_download_over_fused_hash() -> bool {
@@ -1659,6 +1660,240 @@ fn assemble_file_reuses_chunk_from_old_file() {
 
     // No chunk was downloaded.
     assert!(chunk_refcounts.is_empty());
+}
+
+#[test]
+fn assemble_file_reuses_chunks_from_permuted_old_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    const CHUNK_SIZE: usize = 4096;
+    const CHUNK_COUNT: usize = 8;
+    let source_chunks: Vec<Vec<u8>> = (0..CHUNK_COUNT)
+        .map(|index| vec![u8::try_from(index + 1).unwrap(); CHUNK_SIZE])
+        .collect();
+    let old_data: Vec<u8> = source_chunks.iter().flatten().copied().collect();
+    let permutation: Vec<usize> = (0..CHUNK_COUNT).map(|index| (index * 3) % CHUNK_COUNT).collect();
+    let expected: Vec<u8> = permutation
+        .iter()
+        .flat_map(|&source_index| source_chunks[source_index].iter().copied())
+        .collect();
+    let expected_hash = compute_md5_hex(&expected);
+    let asset_name = "permuted-reuse.bin";
+    let target_path = game_dir.join(asset_name);
+    fs::write(&target_path, &old_data).unwrap();
+
+    let asset_chunks = permutation
+        .iter()
+        .enumerate()
+        .map(|(index, &source_index)| SophonManifestAssetChunk {
+            chunk_name: format!("old_{index}"),
+            chunk_decompressed_hash_md5: compute_md5_hex(&source_chunks[source_index]),
+            chunk_on_file_offset: (index * CHUNK_SIZE) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: CHUNK_SIZE as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: String::new(),
+            chunk_old_offset: (source_index * CHUNK_SIZE) as i64,
+        })
+        .collect();
+    let asset = SophonManifestAssetProperty {
+        asset_name: asset_name.to_string(),
+        asset_chunks,
+        asset_type: 0,
+        asset_size: expected.len() as u64,
+        asset_hash_md5: expected_hash.clone(),
+    };
+
+    let lookup = make_chunk_names(&[]);
+    let refcounts = Vec::new();
+    let verify_cache = DashMap::new();
+    assemble_test_file(
+        asset,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &verify_cache,
+    )
+    .unwrap();
+
+    let output = fs::read(&target_path).unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(compute_md5_hex(&output), expected_hash);
+}
+
+#[test]
+fn assemble_file_copies_permuted_old_chunks_without_hashing() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_chunks = [b"first chunk".as_slice(), b"second chunk with tail".as_slice(), b"third".as_slice()];
+    let old_data: Vec<u8> = source_chunks.iter().flat_map(|chunk| chunk.iter().copied()).collect();
+    let permutation = [2usize, 0, 1];
+    let expected: Vec<u8> = permutation
+        .iter()
+        .flat_map(|&index| source_chunks[index].iter().copied())
+        .collect();
+    let asset_name = "unverified-permuted-reuse.bin";
+    let target_path = game_dir.join(asset_name);
+    fs::write(&target_path, &old_data).unwrap();
+
+    let mut output_offset = 0u64;
+    let asset_chunks = permutation
+        .iter()
+        .enumerate()
+        .map(|(index, &source_index)| {
+            let chunk = source_chunks[source_index];
+            let manifest_chunk = SophonManifestAssetChunk {
+                chunk_name: format!("unused_{index}"),
+                chunk_decompressed_hash_md5: String::new(),
+                chunk_on_file_offset: output_offset,
+                chunk_size: 0,
+                chunk_size_decompressed: chunk.len() as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: String::new(),
+                chunk_old_offset: source_chunks[..source_index]
+                    .iter()
+                    .map(|source| source.len() as i64)
+                    .sum(),
+            };
+            output_offset += chunk.len() as u64;
+            manifest_chunk
+        })
+        .collect();
+    let asset = SophonManifestAssetProperty {
+        asset_name: asset_name.to_string(),
+        asset_chunks,
+        asset_type: 0,
+        asset_size: expected.len() as u64,
+        asset_hash_md5: "0123456789abcdef0123456789abcdef".to_string(),
+    };
+
+    let lookup = make_chunk_names(&[]);
+    let refcounts = Vec::new();
+    let verify_cache = DashMap::new();
+    let manifest = CompactManifest::from(vec![asset]);
+    assemble_file(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &verify_cache,
+        true,
+        crate::game_installer::VerifyMode::None,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&target_path).unwrap(), expected);
+}
+
+#[test]
+fn assemble_file_reuses_large_chunks_from_permuted_old_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    const CHUNK_COUNT: usize = 8;
+    let target_path = game_dir.join("permuted-large-reuse.bin");
+    let mut old_file = fs::File::create(&target_path).unwrap();
+    let mut source_chunk = vec![0; CHUNK_SIZE];
+    let mut source_chunk_hashes = Vec::with_capacity(CHUNK_COUNT);
+    for index in 0..CHUNK_COUNT {
+        source_chunk.fill((index + 1) as u8);
+        source_chunk_hashes.push(compute_md5_hex(&source_chunk));
+        old_file.write_all(&source_chunk).unwrap();
+    }
+    old_file.sync_all().unwrap();
+    drop(old_file);
+    let permutation: Vec<usize> = (0..CHUNK_COUNT)
+        .map(|index| (index * 3) % CHUNK_COUNT)
+        .collect();
+    let asset_name = "permuted-large-reuse.bin";
+    assert_eq!(target_path.file_name().unwrap(), asset_name);
+    let mut expected_hasher = fast_md5::Md5::new();
+    for &source_index in &permutation {
+        source_chunk.fill((source_index + 1) as u8);
+        expected_hasher.update(&source_chunk);
+    }
+    let expected_hash = hex::encode(expected_hasher.finalize());
+    drop(source_chunk);
+
+    let asset_chunks = permutation
+        .iter()
+        .enumerate()
+        .map(|(index, &source_index)| SophonManifestAssetChunk {
+            chunk_name: format!("old_{index}"),
+            chunk_decompressed_hash_md5: source_chunk_hashes[source_index].clone(),
+            chunk_on_file_offset: (index * CHUNK_SIZE) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: CHUNK_SIZE as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: String::new(),
+            chunk_old_offset: (source_index * CHUNK_SIZE) as i64,
+        })
+        .collect();
+    let asset = SophonManifestAssetProperty {
+        asset_name: asset_name.to_string(),
+        asset_chunks,
+        asset_type: 0,
+        asset_size: (CHUNK_COUNT * CHUNK_SIZE) as u64,
+        asset_hash_md5: expected_hash.clone(),
+    };
+
+    let lookup = make_chunk_names(&[]);
+    let refcounts = Vec::new();
+    let verify_cache = DashMap::new();
+    assemble_test_file(
+        asset,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &verify_cache,
+    )
+    .unwrap();
+
+    let output = fs::File::open(&target_path).unwrap();
+    let mut output_chunk = vec![0; 256 * 1024];
+    let mut output_hasher = fast_md5::Md5::new();
+    for (index, &source_index) in permutation.iter().enumerate() {
+        let expected_byte = (source_index + 1) as u8;
+        for block_start in (0..CHUNK_SIZE).step_by(output_chunk.len()) {
+            let block_len = output_chunk.len().min(CHUNK_SIZE - block_start);
+            output
+                .read_exact_at(
+                    &mut output_chunk[..block_len],
+                    (index * CHUNK_SIZE + block_start) as u64,
+                )
+                .unwrap();
+            assert!(output_chunk[..block_len]
+                .iter()
+                .all(|&byte| byte == expected_byte));
+            output_hasher.update(&output_chunk[..block_len]);
+        }
+    }
+    assert_eq!(hex::encode(output_hasher.finalize()), expected_hash);
 }
 
 /// Verifies assembled output == decompressed chunk concatenation with PRNG data,

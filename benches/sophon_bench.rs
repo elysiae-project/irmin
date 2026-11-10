@@ -495,6 +495,170 @@ fn bench_assembly_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_assembly_old_chunk_reuse(c: &mut Criterion) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let tmp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let chunk_mib = 8;
+    let num_chunks = 8;
+    let total_bytes = (chunk_mib * num_chunks) as u64 * 1024 * 1024;
+    let (_, raw) = build_assembly_fixture(&chunks_dir, chunk_mib, num_chunks, true);
+    let expected_output: Vec<u8> = (0..num_chunks)
+        .flat_map(|index| {
+            let source_index = (index * 3) % num_chunks;
+            let start = source_index * chunk_mib * 1024 * 1024;
+            let end = start + chunk_mib * 1024 * 1024;
+            raw[start..end].iter().copied()
+        })
+        .collect();
+    let file_md5 = hex::encode(fast_md5::digest(&expected_output));
+    let asset_name = format!("reused-{}.bin", std::process::id());
+    let reuse_manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
+        asset_name: asset_name.clone(),
+        asset_chunks: (0..num_chunks)
+            .map(|index| {
+                let source_index = (index * 3) % num_chunks;
+                let source_start = source_index * chunk_mib * 1024 * 1024;
+                let source_end = source_start + chunk_mib * 1024 * 1024;
+                SophonManifestAssetChunk {
+                    chunk_name: format!("ck{index:02}"),
+                    chunk_decompressed_hash_md5: String::new(),
+                    chunk_on_file_offset: (index * chunk_mib * 1024 * 1024) as u64,
+                    chunk_size: 0,
+                    chunk_size_decompressed: (source_end - source_start) as u64,
+                    chunk_compressed_hash_xxh: 0,
+                    chunk_compressed_hash_md5: String::new(),
+                    chunk_old_offset: source_start as i64,
+                }
+            })
+            .collect(),
+        asset_type: 0,
+        asset_size: total_bytes,
+        asset_hash_md5: file_md5.clone(),
+    }]);
+    for index in 0..num_chunks {
+        let chunk = reuse_manifest.chunk(index);
+        let expected_source_offset = ((index * 3) % num_chunks * chunk_mib * 1024 * 1024) as i64;
+        let expected_destination_offset = (index * chunk_mib * 1024 * 1024) as u64;
+        assert_eq!(chunk.chunk_old_offset, expected_source_offset);
+        assert_eq!(
+            reuse_manifest.file_chunk_offset(0, index),
+            expected_destination_offset
+        );
+        assert!(chunk.chunk_decompressed_hash_md5.is_empty());
+    }
+    let names: Vec<String> = (0..num_chunks).map(|i| format!("ck{i:02}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let lookup = ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice()));
+    let refcounts: Vec<AtomicU32> = (0..num_chunks).map(|_| AtomicU32::new(1000)).collect();
+    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
+    let old_data = raw.clone();
+    let make_fixture = || {
+        let fixture = tempfile::tempdir_in(dir.path()).expect("fixture tempdir");
+        let game_dir = fixture.path().join("game");
+        let tmp_dir = fixture.path().join("tmp");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let target = game_dir.join(&asset_name);
+        let mut old_file = fs::File::create(&target).unwrap();
+        old_file.write_all(&old_data).unwrap();
+        old_file.sync_all().unwrap();
+        drop(old_file);
+        for chunk_idx in reuse_manifest.file_chunk_range(0) {
+            let chunk = reuse_manifest.chunk(chunk_idx as usize);
+            let start = chunk.chunk_old_offset as usize;
+            let end = start + chunk.chunk_size_decompressed as usize;
+            assert_eq!(
+                end - start,
+                chunk_mib * 1024 * 1024,
+                "old source length mismatch for chunk {chunk_idx}"
+            );
+            assert_eq!(
+                start,
+                ((chunk_idx as usize * 3) % num_chunks) * chunk_mib * 1024 * 1024,
+                "old source offset mismatch for chunk {chunk_idx}"
+            );
+        }
+        (fixture, game_dir, tmp_dir, target)
+    };
+    let verify_output = |target: &Path| {
+        let output = fs::read(target).expect("read assembled file");
+        assert_eq!(output.len(), expected_output.len(), "reused output size mismatch");
+        for (index, chunk) in output.chunks(chunk_mib * 1024 * 1024).enumerate() {
+            let manifest_chunk = reuse_manifest.chunk(index);
+            let source_start = manifest_chunk.chunk_old_offset as usize;
+            let source_end = source_start + manifest_chunk.chunk_size_decompressed as usize;
+            assert_eq!(
+                fast_md5::digest(chunk),
+                fast_md5::digest(&old_data[source_start..source_end]),
+                "reused output chunk digest mismatch at index {index}"
+            );
+            assert_eq!(chunk, &old_data[source_start..source_end]);
+        }
+        assert_eq!(hex::encode(fast_md5::digest(&output)), file_md5);
+    };
+    let run_unhashed_assembly = |game_dir: &Path, tmp_dir: &Path| {
+        assemble_file(
+            &reuse_manifest,
+            0,
+            game_dir,
+            &chunks_dir,
+            tmp_dir,
+            &lookup,
+            &refcounts,
+            &cache,
+            true,
+            VerifyMode::None,
+        )
+        .expect("assemble reused chunks");
+    };
+    let run_hashed_assembly = |game_dir: &Path, tmp_dir: &Path| {
+        assert!(
+            irmin_rs::game_installer::assembly::assemble_file_with_benchmark_file_hash(
+                &reuse_manifest,
+                0,
+                game_dir,
+                &chunks_dir,
+                tmp_dir,
+                &lookup,
+                &refcounts,
+                &cache,
+            )
+            .expect("assemble reused chunks with file hash")
+        );
+    };
+
+    let mut group = c.benchmark_group("assembly_old_chunk_reuse");
+    group.throughput(Throughput::Bytes(total_bytes));
+    let bench_reuse = |b: &mut criterion::Bencher<'_>, run: &dyn Fn(&Path, &Path)| {
+        b.iter_custom(|iterations| {
+            let mut elapsed = std::time::Duration::ZERO;
+            for _ in 0..iterations {
+                let (fixture, game_dir, tmp_dir, target) = make_fixture();
+                let started = std::time::Instant::now();
+                run(&game_dir, &tmp_dir);
+                elapsed += started.elapsed();
+                verify_output(&target);
+                drop(fixture);
+            }
+            elapsed
+        });
+    };
+    group.bench_function(BenchmarkId::new("kernel_copy_no_hash", num_chunks), |b| {
+        bench_reuse(b, &run_unhashed_assembly);
+    });
+    group.bench_function(
+        BenchmarkId::new("file_hash_end_to_end", num_chunks),
+        |b| bench_reuse(b, &run_hashed_assembly),
+    );
+    group.finish();
+}
+
 const VERIFY_MIB: u64 = 50;
 
 /// `check_file_md5_cached` cache-miss path: full read + MD5 of a 50 MiB file.
@@ -2321,6 +2485,7 @@ criterion_group!(
     bench_md5_resident,
     bench_zstd_decompress,
     bench_assembly_e2e,
+    bench_assembly_old_chunk_reuse,
     bench_verify_file_md5,
     bench_xxh64,
     bench_zstd_oneshot,
