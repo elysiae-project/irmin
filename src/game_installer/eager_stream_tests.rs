@@ -365,6 +365,32 @@ fn benchmark_eager_loopback_concurrent_rss() {
 }
 
 #[cfg(feature = "bench-diagnostics")]
+/// Measures fixed-work eager downloads over a synthetic loopback server.
+///
+/// The server applies one response delay per request and an optional shared
+/// no-credit body-rate limit. It does not model TCP windowing, loss, jitter, or
+/// a remote CDN. Process RSS includes both client and server tasks, so use the
+/// high-water mark as a relative measurement for this fixture only.
+#[test]
+#[ignore = "measures fixed-work loopback eager installer worker limits"]
+fn benchmark_eager_loopback_fixed_work_workers() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                benchmark_eager_loopback_fixed_work_inner(),
+            )
+            .await
+        })
+        .expect("fixed-work eager benchmark exceeded its timeout");
+}
+
+#[cfg(feature = "bench-diagnostics")]
 async fn benchmark_eager_loopback_inner() {
     use futures_util::stream;
     use http_body_util::StreamBody;
@@ -728,6 +754,351 @@ async fn benchmark_eager_loopback_inner() {
         timings.output_hash_ns.load(Ordering::Relaxed) / 1_000_000,
         rss_high_water_kib(),
         compressed.len() as f64 * concurrency as f64 / (1024.0 * 1024.0),
+    );
+    server_guard.shutdown.take().unwrap().send(()).unwrap();
+    server_guard.thread.take().unwrap().join().unwrap();
+}
+
+#[cfg(feature = "bench-diagnostics")]
+async fn benchmark_eager_loopback_fixed_work_inner() {
+    let workers = std::env::var("IRMIN_EAGER_BENCH_WORKERS")
+        .unwrap_or_else(|_| "4".to_owned())
+        .parse::<usize>()
+        .expect("IRMIN_EAGER_BENCH_WORKERS must be an unsigned integer");
+    let item_count = std::env::var("IRMIN_EAGER_BENCH_ITEMS")
+        .unwrap_or_else(|_| "16".to_owned())
+        .parse::<usize>()
+        .expect("IRMIN_EAGER_BENCH_ITEMS must be an unsigned integer");
+    assert!((1..=48).contains(&workers));
+    assert!((1..=256).contains(&item_count));
+    assert!(workers <= item_count);
+
+    let size_mib = std::env::var("IRMIN_EAGER_BENCH_SIZE_MIB")
+        .unwrap_or_else(|_| "17".to_owned())
+        .parse::<usize>()
+        .expect("IRMIN_EAGER_BENCH_SIZE_MIB must be an unsigned integer");
+    assert!((17..=128).contains(&size_mib));
+    let queue_capacity = std::env::var("IRMIN_EAGER_BENCH_QUEUE_CAPACITY")
+        .unwrap_or_else(|_| "8".to_owned())
+        .parse::<usize>()
+        .expect("IRMIN_EAGER_BENCH_QUEUE_CAPACITY must be an unsigned integer");
+    assert!(queue_capacity > 0);
+    let response_delay_ms = std::env::var("IRMIN_EAGER_BENCH_RESPONSE_DELAY_MS")
+        .unwrap_or_else(|_| "0".to_owned())
+        .parse::<u64>()
+        .expect("IRMIN_EAGER_BENCH_RESPONSE_DELAY_MS must be an unsigned integer");
+    let rate_mib_s = std::env::var("IRMIN_EAGER_BENCH_RATE_MIB_S")
+        .unwrap_or_else(|_| "0".to_owned())
+        .parse::<u64>()
+        .expect("IRMIN_EAGER_BENCH_RATE_MIB_S must be an unsigned integer");
+    let frame_kib = std::env::var("IRMIN_EAGER_BENCH_FRAME_KIB")
+        .unwrap_or_else(|_| "64".to_owned())
+        .parse::<usize>()
+        .expect("IRMIN_EAGER_BENCH_FRAME_KIB must be an unsigned integer");
+    assert!((1..=4096).contains(&frame_kib));
+
+    let mut state = 0xBAD5EEDu64;
+    let data = (0..size_mib * 1024 * 1024)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+        })
+        .collect::<Vec<_>>();
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.window_log(25).unwrap();
+    encoder.write_all(&data).unwrap();
+    let compressed = bytes::Bytes::from(encoder.finish().unwrap());
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let expected_output_hash = fast_md5::digest(&data);
+    let decompressed_hash = hex::encode(expected_output_hash);
+    drop(data);
+
+    let response_count = Arc::new(AtomicU64::new(0));
+    let frame_count = Arc::new(AtomicU64::new(0));
+    let pacing = Arc::new(Mutex::new(None::<Instant>));
+    let (address_tx, address_rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_body = compressed.clone();
+    let server_response_count = Arc::clone(&response_count);
+    let server_frame_count = Arc::clone(&frame_count);
+    let server_pacing = Arc::clone(&pacing);
+    let rate_bytes_s = rate_mib_s.checked_mul(1024 * 1024).expect("rate too large");
+    let frame_size = frame_kib.checked_mul(1024).expect("frame size too large");
+    let server = std::thread::spawn(move || {
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        server_runtime.block_on(async move {
+            use futures_util::stream;
+            use http_body_util::StreamBody;
+            use hyper::body::{Frame, Incoming};
+            use hyper::server::conn::http1;
+            use hyper::service::service_fn;
+            use hyper::{Request, Response};
+            use hyper_util::rt::TokioIo;
+            use std::convert::Infallible;
+            use std::net::TcpListener as StdTcpListener;
+
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            let mut shutdown = Box::pin(shutdown_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => break,
+                    accepted = listener.accept() => {
+                        let (socket, _) = accepted.unwrap();
+                        let body_bytes = server_body.clone();
+                        let pacing = Arc::clone(&server_pacing);
+                        let response_count = Arc::clone(&server_response_count);
+                        let frame_count = Arc::clone(&server_frame_count);
+                        tokio::spawn(async move {
+                            let service = service_fn(move |_request: Request<Incoming>| {
+                                let body_bytes = body_bytes.clone();
+                                let pacing = Arc::clone(&pacing);
+                                let response_count = Arc::clone(&response_count);
+                                let frame_count = Arc::clone(&frame_count);
+                                async move {
+                                    response_count.fetch_add(1, Ordering::Relaxed);
+                                    if response_delay_ms > 0 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(response_delay_ms)).await;
+                                    }
+                                    let content_length = body_bytes.len();
+                                    let stream = stream::unfold((0usize, body_bytes), move |(offset, body)| {
+                                        let pacing = Arc::clone(&pacing);
+                                        let frame_count = Arc::clone(&frame_count);
+                                        async move {
+                                            if offset >= body.len() {
+                                                return None;
+                                            }
+                                            let next = (offset + frame_size).min(body.len());
+                                            if rate_bytes_s > 0 {
+                                                let frame_bytes = (next - offset) as u64;
+                                                // A shared no-credit schedule serializes frames without bursting after idle time.
+                                                let deadline = {
+                                                    let mut state = pacing.lock().unwrap_or_else(|e| e.into_inner());
+                                                    let now = Instant::now();
+                                                    let start = state.map_or(now, |available| available.max(now));
+                                                    let duration_nanos = (frame_bytes as u128)
+                                                        .saturating_mul(1_000_000_000)
+                                                        .div_ceil(rate_bytes_s as u128)
+                                                        .min(u64::MAX as u128) as u64;
+                                                    let deadline = start + std::time::Duration::from_nanos(duration_nanos);
+                                                    *state = Some(deadline);
+                                                    deadline
+                                                };
+                                                let now = Instant::now();
+                                                if deadline > now {
+                                                    tokio::time::sleep_until(deadline.into()).await;
+                                                }
+                                            }
+                                            frame_count.fetch_add(1, Ordering::Relaxed);
+                                            Some((Ok::<_, Infallible>(Frame::data(body.slice(offset..next))), (next, body)))
+                                        }
+                                    });
+                                    let mut response = Response::new(StreamBody::new(stream));
+                                    response.headers_mut().insert(
+                                        hyper::header::CONTENT_LENGTH,
+                                        content_length.to_string().parse().unwrap(),
+                                    );
+                                    Ok::<_, Infallible>(response)
+                                }
+                            });
+                            let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), service).await;
+                        });
+                    }
+                }
+            }
+        });
+    });
+
+    struct ServerGuard {
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let mut server_guard = ServerGuard {
+        shutdown: Some(shutdown_tx),
+        thread: Some(server),
+    };
+    let address = address_rx.recv().unwrap();
+    let download = Arc::new(DownloadInfo {
+        encryption: 0,
+        password: String::new(),
+        compression: Compression::None,
+        url_prefix: format!("http://{address}/"),
+        url_suffix: "chunks".to_owned(),
+    });
+    let client = Arc::new(Client::new());
+    let temp_root = std::env::var_os("IRMIN_EAGER_BENCH_TEMP_DIR");
+    let uses_custom_temp_root = temp_root.is_some();
+    let dir = match temp_root {
+        Some(path) => tempfile::Builder::new()
+            .prefix("irmin-fixed-work-")
+            .tempdir_in(path)
+            .unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    let allocator = Arc::new(super::output_allocator::OutputAllocator::new(dir.path()));
+    let bitmap = Arc::new(
+        super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("bitmap"), item_count).unwrap(),
+    );
+    let assets = (0..item_count)
+        .map(|index| SophonManifestAssetProperty {
+            asset_name: format!("fixed-{index}.bin"),
+            asset_chunks: vec![SophonManifestAssetChunk {
+                chunk_name: format!("chunk-{index}"),
+                chunk_decompressed_hash_md5: decompressed_hash.clone(),
+                chunk_on_file_offset: 0,
+                chunk_size: compressed.len() as u64,
+                chunk_size_decompressed: (size_mib * 1024 * 1024) as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: compressed_hash.clone(),
+                chunk_old_offset: -1,
+            }],
+            asset_type: 0,
+            asset_size: (size_mib * 1024 * 1024) as u64,
+            asset_hash_md5: decompressed_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+    let manifest = Arc::new(CompactManifest::from(assets));
+    for index in 0..item_count {
+        allocator
+            .preallocate_file(
+                index,
+                &format!("fixed-{index}.bin"),
+                (size_mib * 1024 * 1024) as u64,
+            )
+            .unwrap();
+    }
+    let pending = Arc::new(
+        (0..item_count)
+            .map(|_| AtomicU32::new(1))
+            .collect::<Vec<_>>(),
+    );
+    let context = Arc::new(InstallContext {
+        installer_clients: Arc::new(vec![Arc::clone(&client)]),
+        installer_downloads: Arc::new(vec![Arc::clone(&download)]),
+        chunks_dir: Arc::new(dir.path().to_path_buf()),
+        game_dir: Arc::new(dir.path().to_path_buf()),
+        all_tmp_dirs: Arc::new(vec![]),
+        all_files: manifest,
+        downloaded_bytes: Arc::new(AtomicU64::new(0)),
+        assembled_files: Arc::new(AtomicU64::new(0)),
+        checked_files: Arc::new(AtomicU64::new(0)),
+        total_bytes: (compressed.len() * item_count) as u64,
+        total_files: item_count as u64,
+        resume_bytes_offset: Arc::new(AtomicU64::new(0)),
+        verify_cache: Arc::new(DashMap::new()),
+        chunk_refcounts: Arc::new(OnceLock::new()),
+        chunk_names: Arc::new(OnceLock::new()),
+        last_assembly_update: Arc::new(Mutex::new(Instant::now())),
+        last_update: Arc::new(AtomicU64::new(now_nanos())),
+        smooth_speed_bps: Arc::new(AtomicU64::new(0)),
+        eta_speed_history: Arc::new(Mutex::new(VecDeque::new())),
+        last_speed_bytes: Arc::new(AtomicU64::new(0)),
+        last_speed_time: Arc::new(AtomicU64::new(now_nanos())),
+        updater: Arc::new(|_| {}),
+        downloaded_chunks: Arc::new(OnceLock::new()),
+        chunks_since_save: Arc::new(AtomicU64::new(0)),
+        last_save: Arc::new(Mutex::new(None)),
+        state_saver: Arc::new(|_| {}),
+        save_chunk_names: Arc::new(OnceLock::new()),
+        adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
+        profiler: Arc::new(super::profiling::PipelineProfiler::new()),
+        completion_flags: Arc::from(
+            (0..item_count)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        ),
+        output_allocator: Arc::clone(&allocator),
+        chunk_bitmap: Arc::clone(&bitmap),
+        verify_mode: VerifyMode::Full,
+    });
+    let chunk_entries = Arc::new(
+        (0..item_count)
+            .map(|index| (index as u32, 0, index as u32))
+            .collect::<Vec<_>>(),
+    );
+    let offsets = Arc::new((0..=item_count as u32).collect::<Vec<_>>());
+    let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = DownloadHandle::new();
+    let peak_before = rss_high_water_kib();
+    let cpu_before = process_cpu_time_ms();
+    let started = Instant::now();
+    let timings = Arc::new(super::super::eager_decompress::EagerStreamPhaseTimings::default());
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..workers {
+        let context = Arc::clone(&context);
+        let pending = Arc::clone(&pending);
+        let chunk_entries = Arc::clone(&chunk_entries);
+        let offsets = Arc::clone(&offsets);
+        let next_index = Arc::clone(&next_index);
+        let timings = Arc::clone(&timings);
+        let handle = handle.clone();
+        tasks.spawn(async move {
+            while let Some(index) = DownloadItem::claim_index(&next_index, item_count) {
+                let mut item = eager_item();
+                item.file_idx = index as u32;
+                process_eager_item_with_mode(
+                    &item,
+                    index,
+                    context.all_files.file_chunk(index, 0),
+                    &context,
+                    chunk_entries.as_slice(),
+                    offsets.as_slice(),
+                    pending.as_slice(),
+                    &handle,
+                    Some(true),
+                    Some(queue_capacity),
+                    Some(Arc::clone(&timings)),
+                )
+                .await?;
+            }
+            Ok::<(), SophonError>(())
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap().unwrap();
+    }
+    let elapsed = started.elapsed();
+    let downloaded = context.downloaded_bytes.load(Ordering::Relaxed);
+    assert_eq!(response_count.load(Ordering::Relaxed), item_count as u64);
+    assert_eq!(downloaded, context.total_bytes);
+    for index in 0..item_count {
+        assert!(context.chunk_bitmap.is_complete(index));
+        let output = fs::read(dir.path().join(format!("fixed-{index}.bin"))).unwrap();
+        assert_eq!(output.len(), size_mib * 1024 * 1024);
+        assert_eq!(fast_md5::digest(&output), expected_output_hash);
+    }
+    println!(
+        "path=fixed-work-eager mode=stream workers={workers} items={item_count} size_mib={size_mib} queue_capacity={queue_capacity} frame_kib={frame_kib} response_delay_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} temp_root={} requests={} frames={} elapsed_ms={} process_cpu_ms={} peak_before_kib={peak_before} peak_after_kib={} downloaded_mib={:.1} achieved_mib_s={:.2}",
+        if uses_custom_temp_root {
+            "custom"
+        } else {
+            "system"
+        },
+        response_count.load(Ordering::Relaxed),
+        frame_count.load(Ordering::Relaxed),
+        elapsed.as_millis(),
+        process_cpu_time_ms().saturating_sub(cpu_before),
+        rss_high_water_kib(),
+        downloaded as f64 / (1024.0 * 1024.0),
+        downloaded as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
     );
     server_guard.shutdown.take().unwrap().send(()).unwrap();
     server_guard.thread.take().unwrap().join().unwrap();
