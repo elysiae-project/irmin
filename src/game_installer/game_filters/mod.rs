@@ -27,7 +27,7 @@ pub fn is_sophon_synthesized_asset(game_code: &str, target_file_path: &str) -> b
             name == "pkg_version"
                 || name == "beyond_pkg_version"
                 || name.starts_with("Audio_") && name.ends_with("_pkg_version")
-                || name.to_lowercase().ends_with("ctable_streaming.dat")
+                || name.to_ascii_lowercase().ends_with("ctable_streaming.dat")
         }
         "hkrpg" => name == "app.info",
         _ => false,
