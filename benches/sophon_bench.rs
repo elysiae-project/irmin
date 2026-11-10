@@ -1077,12 +1077,25 @@ fn bench_compact_manifest_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("compact_manifest");
     group.throughput(Throughput::Elements(MANIFEST_FILES as u64));
 
-    group.bench_function("build_5000x50", |b| {
+    // Measure the clone cost separately so the build-only timing excludes it.
+    group.bench_function("clone_5000x50", |b| {
         b.iter(|| {
             let assets = assets.clone();
-            let manifest = CompactManifest::from(assets);
-            std::hint::black_box(manifest.num_files());
+            std::hint::black_box(&assets);
         });
+    });
+
+    // Build-only: clone once per iteration outside the timed region, then
+    // move the cloned assets into the builder inside the timer.
+    group.bench_function("build_5000x50", |b| {
+        b.iter_batched(
+            || assets.clone(),
+            |assets| {
+                let manifest = CompactManifest::from(assets);
+                std::hint::black_box(manifest.num_files());
+            },
+            criterion::BatchSize::LargeInput,
+        );
     });
 
     group.finish();
