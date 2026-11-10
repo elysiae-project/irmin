@@ -19,7 +19,7 @@ pub struct ChunkBitmap {
     bits: Vec<AtomicU64>,
     path: PathBuf,
     total_chunks: usize,
-    sync_lock: Mutex<()>,
+    sync_lock: Mutex<Vec<u8>>,
 }
 
 impl ChunkBitmap {
@@ -41,7 +41,7 @@ impl ChunkBitmap {
             bits,
             path: path.to_path_buf(),
             total_chunks,
-            sync_lock: Mutex::new(()),
+            sync_lock: Mutex::new(Vec::new()),
         })
     }
 
@@ -108,7 +108,7 @@ impl ChunkBitmap {
             bits,
             path: path.to_path_buf(),
             total_chunks,
-            sync_lock: Mutex::new(()),
+            sync_lock: Mutex::new(Vec::new()),
         })
     }
 
@@ -189,7 +189,7 @@ impl ChunkBitmap {
 
     /// Flushes the bitmap to disk. Serialized: concurrent callers block.
     pub fn sync(&self) -> io::Result<()> {
-        let _guard = self.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buffer = self.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -200,13 +200,13 @@ impl ChunkBitmap {
         f.write_all(&header)?;
 
         let words_per_block = (64 * 1024) / 8;
-        let mut buffer = vec![0u8; words_per_block * 8];
+        buffer.clear();
         for words in self.bits.chunks(words_per_block) {
-            let bytes = &mut buffer[..words.len() * 8];
-            for (word, output) in words.iter().zip(bytes.chunks_exact_mut(8)) {
-                output.copy_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
+            for word in words {
+                buffer.extend_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
             }
-            f.write_all(bytes)?;
+            f.write_all(&buffer)?;
+            buffer.clear();
         }
         f.sync_data()?;
         Ok(())
