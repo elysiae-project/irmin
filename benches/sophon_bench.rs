@@ -204,8 +204,10 @@ fn bench_md5(c: &mut Criterion) {
 
 const ZSTD_MIB: u64 = 8;
 
-/// zstd decompression throughput with 64/128/256 KiB output buffers. Picks the
-/// buffer size `assembly_opt.rs` streams into.
+/// zstd decompression throughput with varying input (BufReader) buffer sizes
+/// while keeping a fixed 1 MiB output buffer to match the production path in
+/// `assembly_opt.rs` (`ASSEMBLY_BUFFER_SIZE` = 1 MiB output, `FILE_WRITE_BUFFER_SIZE`
+/// = 256 KiB input).
 fn bench_zstd_decompress(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let raw = gen_prng_data(0xBEEF, ZSTD_MIB as usize * 1024 * 1024);
@@ -218,21 +220,22 @@ fn bench_zstd_decompress(c: &mut Criterion) {
     }
     let out = dir.path().join("out.bin");
     let bytes = ZSTD_MIB * 1024 * 1024;
+    const OUTPUT_BUF: usize = 1024 * 1024;
 
     let mut group = c.benchmark_group("zstd_decompress");
     group.throughput(Throughput::Bytes(bytes));
 
-    for buf_kib in [64usize, 128, 256] {
-        let buf_bytes = buf_kib * 1024;
-        group.bench_function(BenchmarkId::new("buf", buf_kib), |b| {
+    for input_kib in [64usize, 128, 256, 512] {
+        let input_bytes = input_kib * 1024;
+        group.bench_function(BenchmarkId::new("input_kib", input_kib), |b| {
             b.iter(|| {
                 evict_page_cache(&comp_path);
                 let o = fs::File::create(&out).unwrap();
                 o.set_len(raw.len() as u64).unwrap();
                 let cf = fs::File::open(&comp_path).unwrap();
-                let br = std::io::BufReader::with_capacity(buf_bytes, cf);
+                let br = std::io::BufReader::with_capacity(input_bytes, cf);
                 let mut dec = zstd::Decoder::new(br).unwrap();
-                let mut buf = vec![0u8; buf_bytes];
+                let mut buf = vec![0u8; OUTPUT_BUF];
                 let mut woff = 0u64;
                 loop {
                     let n = dec.read(&mut buf).unwrap();
