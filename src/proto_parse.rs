@@ -72,15 +72,17 @@ impl SophonManifestAssetProperty {
         self.asset_type != 0 || self.asset_hash_md5.is_empty()
     }
 
-    /// Validate and borrow the asset name as `&str`. Manifest names are ASCII
-    /// paths from the CDN and are always valid UTF-8 in practice; this helper
-    /// centralizes the check so callers get a `&str` without per-site panics.
+    /// Borrow the asset name as `&str`. The `Bytes` field is validated as
+    /// UTF-8 at decode time by [`decode_manifest`] / [`decode_manifest_from_bytes`],
+    /// so this is a zero-cost `from_utf8_unchecked`-equivalent in practice.
+    /// The `unwrap_or("")` fallback is defense-in-depth for manifests
+    /// constructed outside the decode path (e.g. tests).
     #[inline]
     pub fn asset_name_str(&self) -> &str {
         std::str::from_utf8(&self.asset_name).unwrap_or("")
     }
 
-    /// Validate and borrow the file MD5 as `&str`.
+    /// Borrow the file MD5 as `&str`. See [`asset_name_str`] for safety notes.
     #[inline]
     pub fn asset_hash_md5_str(&self) -> &str {
         std::str::from_utf8(&self.asset_hash_md5).unwrap_or("")
