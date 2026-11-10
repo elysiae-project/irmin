@@ -25,6 +25,22 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Adapter that feeds bytes written by `serde_json::to_writer` directly into a
+/// SHA-256 hasher, avoiding the intermediate `Vec` allocation that
+/// `serde_json::to_vec` would require.
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl std::io::Write for Sha256Writer<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 use super::api::{
     fetch_build, fetch_front_door, fetch_manifest_proto, fetch_patch_build, fetch_patch_manifest,
     is_known_vo_locale, vo_lang_matches,
@@ -201,21 +217,27 @@ impl TargetSnapshot {
         assets: &[PatchAssetInfo],
         deleted: &[String],
     ) -> SophonResult<String> {
-        // Structs and ordered vectors only: no randomized map iteration in the encoding.
-        let bytes = serde_json::to_vec(&(
-            self.version,
-            &self.game_id,
-            &self.vo_lang,
-            &self.installed_tag,
-            &self.tag,
-            &self.build_id,
-            self.legacy_coverage,
-            &self.manifests,
-            assets,
-            deleted,
-        ))
+        // Stream directly to the SHA-256 hasher, avoiding the intermediate
+        // Vec allocation that serde_json::to_vec would require.
+        let mut hasher = Sha256::new();
+        let mut writer = Sha256Writer(&mut hasher);
+        serde_json::to_writer(
+            &mut writer,
+            &(
+                self.version,
+                &self.game_id,
+                &self.vo_lang,
+                &self.installed_tag,
+                &self.tag,
+                &self.build_id,
+                self.legacy_coverage,
+                &self.manifests,
+                assets,
+                deleted,
+            ),
+        )
         .map_err(|err| invalid_state(err.to_string()))?;
-        Ok(hex::encode(Sha256::digest(bytes)))
+        Ok(hex::encode(hasher.finalize()))
     }
 
     fn validate(&self, state: &PreinstallState) -> SophonResult<()> {
