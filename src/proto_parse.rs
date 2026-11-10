@@ -72,11 +72,9 @@ impl SophonManifestAssetProperty {
         self.asset_type != 0 || self.asset_hash_md5.is_empty()
     }
 
-    /// Borrow the asset name as `&str`. The `Bytes` field is validated as
-    /// UTF-8 at decode time by [`decode_manifest`] / [`decode_manifest_from_bytes`],
-    /// so this is a zero-cost `from_utf8_unchecked`-equivalent in practice.
-    /// The `unwrap_or("")` fallback is defense-in-depth for manifests
-    /// constructed outside the decode path (e.g. tests).
+    /// Borrow the asset name as `&str`. UTF-8 validity is established at
+    /// decode time by [`validate_manifest_utf8`]; the `from_utf8` call
+    /// is a fast scan that succeeds without allocation on valid input.
     #[inline]
     pub fn asset_name_str(&self) -> &str {
         std::str::from_utf8(&self.asset_name).unwrap_or("")
@@ -139,19 +137,20 @@ pub struct SophonManifestAssetChunk {
 }
 
 impl SophonManifestAssetChunk {
-    /// Validate and borrow the chunk name as `&str`.
+    /// Borrow the chunk name as `&str`. UTF-8 validity is established at
+    /// decode time by [`validate_manifest_utf8`].
     #[inline]
     pub fn chunk_name_str(&self) -> &str {
         std::str::from_utf8(&self.chunk_name).unwrap_or("")
     }
 
-    /// Validate and borrow the decompressed MD5 as `&str`.
+    /// Borrow the decompressed MD5 as `&str`.
     #[inline]
     pub fn chunk_decompressed_hash_md5_str(&self) -> &str {
         std::str::from_utf8(&self.chunk_decompressed_hash_md5).unwrap_or("")
     }
 
-    /// Validate and borrow the compressed MD5 as `&str`.
+    /// Borrow the compressed MD5 as `&str`.
     #[inline]
     pub fn chunk_compressed_hash_md5_str(&self) -> &str {
         std::str::from_utf8(&self.chunk_compressed_hash_md5).unwrap_or("")
