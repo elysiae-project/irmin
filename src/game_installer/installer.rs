@@ -19,7 +19,7 @@ impl ChunkNameLookup {
     pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
         let n = arena.len();
         let mut sorted_indices: Vec<u32> = (0..n as u32).collect();
-        sorted_indices.sort_by(|&a, &b| {
+        sorted_indices.sort_unstable_by(|&a, &b| {
             let sa = arena.get(a);
             let sb = arena.get(b);
             sa.cmp(sb)
@@ -670,7 +670,7 @@ fn combine_manifest_hashes(installers: &[SophonInstaller]) -> String {
         .iter()
         .map(|i| i.manifest_hash.as_str())
         .collect();
-    hashes.sort();
+    hashes.sort_unstable();
     let mut hasher = Sha256::new();
     for h in hashes {
         hasher.update(h.as_bytes());

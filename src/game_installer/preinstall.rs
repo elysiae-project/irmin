@@ -204,7 +204,7 @@ fn validate_patch_range(asset: &PatchAssetInfo) -> SophonResult<()> {
 impl TargetSnapshot {
     fn seal(&mut self, assets: &[PatchAssetInfo], deleted: &[String]) -> SophonResult<()> {
         self.manifests
-            .sort_by(|a, b| a.matching_field.cmp(&b.matching_field));
+            .sort_unstable_by(|a, b| a.matching_field.cmp(&b.matching_field));
         for entry in &mut self.manifests {
             normalize_full_download_manifest(&mut entry.manifest);
         }
@@ -309,7 +309,7 @@ impl TargetSnapshot {
                     )));
                 }
                 let mut chunks: Vec<_> = file.asset_chunks.iter().collect();
-                chunks.sort_by_key(|c| c.chunk_on_file_offset);
+                chunks.sort_unstable_by_key(|c| c.chunk_on_file_offset);
                 let mut end = 0u64;
                 for chunk in chunks {
                     if !super::assembly::validate_chunk_name(chunk.chunk_name_str())
