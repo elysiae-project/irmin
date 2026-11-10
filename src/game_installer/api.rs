@@ -114,15 +114,50 @@ pub(crate) async fn fetch_manifest_proto(
 
     let manifest: SophonManifestProto = if dl.is_compressed() {
         let raw = tokio::task::spawn_blocking(move || {
-            let mut decoder = zstd::Decoder::new(bytes.as_ref())?;
-            decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok::<Vec<u8>, SophonError>(out)
+            let src = bytes.as_ref();
+            // Use one-shot DCtx::decompress when the frame content size is known
+            // and reasonable. This is significantly faster than streaming
+            // Decoder + read_to_end for typical manifest sizes.
+            const MAX_ONESHOT_SIZE: u64 = 256 * 1024 * 1024;
+            let content_size = zstd::zstd_safe::get_frame_content_size(src).ok().flatten();
+            if let Some(size) = content_size
+                && size <= MAX_ONESHOT_SIZE
+                && let Ok(size_usize) = usize::try_from(size)
+            {
+                let mut ctx = zstd::zstd_safe::DCtx::create();
+                ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))
+                    .map_err(|_| {
+                        SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax"))
+                    })?;
+                let mut out = Vec::with_capacity(size_usize);
+                match ctx.decompress(&mut out, src) {
+                    Ok(written) => {
+                        if written != size_usize {
+                            return Err(SophonError::Io(std::io::Error::other(
+                                "zstd decompressed size mismatch",
+                            )));
+                        }
+                        Ok(out)
+                    }
+                    Err(_) => {
+                        // Fall back to streaming for multi-frame or other errors.
+                        let mut decoder = zstd::Decoder::new(src)?;
+                        decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
+                        let mut out = Vec::new();
+                        std::io::Read::read_to_end(&mut decoder, &mut out)?;
+                        Ok(out)
+                    }
+                }
+            } else {
+                // Fallback: streaming decode for unknown or oversized content.
+                let mut decoder = zstd::Decoder::new(src)?;
+                decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
+                let mut out = Vec::new();
+                std::io::Read::read_to_end(&mut decoder, &mut out)?;
+                Ok(out)
+            }
         })
         .await??;
-        // Decode from Bytes so prost stores string fields as refcounted
-        // slices of the input buffer instead of copying each field.
         decode_manifest_from_bytes(bytes::Bytes::from(raw)).map_err(SophonError::ManifestDecode)?
     } else {
         // `bytes` is already a `Bytes` from `resp.bytes()`; pass it
