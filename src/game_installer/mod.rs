@@ -246,6 +246,10 @@ pub fn reclaim_memory() {
     {
         let _ = tikv_jemalloc_ctl::epoch::advance();
     }
+    #[cfg(not(feature = "benchmark"))]
+    hdiffpatch::trim_idle_buffers();
+    #[cfg(feature = "benchmark")]
+    hdiffpatch::trim_idle_buffers();
 }
 
 /// Raise RLIMIT_NOFILE to the hard limit. The eager decompression path may
