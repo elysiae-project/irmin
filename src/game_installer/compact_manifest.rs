@@ -588,17 +588,17 @@ fn manifest_storage_estimates(
         .iter()
         .try_fold((0usize, 0usize), |(chunks, bytes), file| {
             let file_bytes = file
-                .asset_name()
+                .asset_name
                 .len()
-                .checked_add(file.asset_hash_md5().len())?;
+                .checked_add(file.asset_hash_md5.len())?;
             file.asset_chunks.iter().try_fold(
                 (chunks, bytes.checked_add(file_bytes)?),
                 |(chunks, bytes), chunk| {
                     let chunk_bytes = chunk
-                        .chunk_name()
+                        .chunk_name
                         .len()
-                        .checked_add(chunk.chunk_decompressed_hash_md5().len())?
-                        .checked_add(chunk.chunk_compressed_hash_md5().len())?;
+                        .checked_add(chunk.chunk_decompressed_hash_md5.len())?
+                        .checked_add(chunk.chunk_compressed_hash_md5.len())?;
                     Some((chunks.checked_add(1)?, bytes.checked_add(chunk_bytes)?))
                 },
             )
