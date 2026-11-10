@@ -16,7 +16,7 @@ use crate::proto_parse::SophonManifestProto;
 /// same manifest; it is not a cryptographic signature or authenticity check.
 pub fn compute_content_manifest_hash(manifest: &SophonManifestProto) -> String {
     let mut assets: Vec<_> = manifest.assets.iter().collect();
-    assets.sort_by_key(|a| &a.asset_name);
+    assets.sort_unstable_by_key(|a| &a.asset_name);
 
     let mut hasher = Sha256::new();
     for asset in assets {
