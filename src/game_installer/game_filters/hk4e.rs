@@ -155,9 +155,9 @@ pub fn write_pkg_version_from_manifest(
     for lang in vo_langs {
         if let Some(lang_name) = locale_code_to_audio_lang_name(lang) {
             let filename = format!("Audio_{lang_name}_pkg_version");
-            let pattern = format!("/{lang_name}/").to_lowercase();
+            let pattern = format!("/{lang_name}/").to_ascii_lowercase();
             let matching_indices: Vec<usize> = (0..assets.num_files())
-                .filter(|&i| assets.file_name(i).to_lowercase().contains(&pattern))
+                .filter(|&i| assets.file_name(i).to_ascii_lowercase().contains(&pattern))
                 .collect();
             write_single_pkg_version_from_indices(game_dir, &filename, assets, &matching_indices)?;
         }
