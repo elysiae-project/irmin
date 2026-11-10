@@ -616,6 +616,131 @@ fn tbytes_determine_rle_type(
     Ok(())
 }
 
+/// Element-wise wrapping add of `src` into `dst` (`dst[i] += src[i]`).
+/// Uses AVX2 when available at runtime, falling back to a generic loop.
+#[inline]
+fn wrapping_add_slices(dst: &mut [u8], src: &[u8]) {
+    // Hard check (not debug_assert): the AVX2 path relies on src.len() >= n.
+    let n = dst.len();
+    let src = &src[..n];
+    if n == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support checked above; src.len() >= dst.len().
+        return unsafe { wrapping_add_slices_avx2(dst, src) };
+    }
+    wrapping_add_slices_generic(dst, src);
+}
+
+#[cfg(target_arch = "x86_64")]
+/// # Safety
+/// Requires AVX2 CPU support at runtime and `src.len() >= dst.len()`.
+#[target_feature(enable = "avx2")]
+unsafe fn wrapping_add_slices_avx2(dst: &mut [u8], src: &[u8]) {
+    use std::arch::x86_64::*;
+    let n = dst.len();
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: i + 32 <= n so both loads and the store are in-bounds.
+        unsafe {
+            let d = _mm256_loadu_si256(dst_ptr.add(i) as *const __m256i);
+            let s = _mm256_loadu_si256(src_ptr.add(i) as *const __m256i);
+            let r = _mm256_add_epi8(d, s);
+            _mm256_storeu_si256(dst_ptr.add(i) as *mut __m256i, r);
+        }
+        i += 32;
+    }
+    if i + 16 <= n {
+        // SAFETY: i + 16 <= n.
+        unsafe {
+            let d = _mm_loadu_si128(dst_ptr.add(i) as *const __m128i);
+            let s = _mm_loadu_si128(src_ptr.add(i) as *const __m128i);
+            let r = _mm_add_epi8(d, s);
+            _mm_storeu_si128(dst_ptr.add(i) as *mut __m128i, r);
+        }
+        i += 16;
+    }
+    while i < n {
+        // SAFETY: i < n.
+        unsafe {
+            *dst_ptr.add(i) = (*dst_ptr.add(i)).wrapping_add(*src_ptr.add(i));
+        }
+        i += 1;
+    }
+}
+
+#[inline(always)]
+fn wrapping_add_slices_generic(dst: &mut [u8], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = d.wrapping_add(*s);
+    }
+}
+
+/// Add a constant `v` to every byte in `dst` (`dst[i] += v`).
+/// Uses AVX2 when available at runtime, falling back to a generic loop.
+#[inline]
+fn wrapping_add_const(dst: &mut [u8], v: u8) {
+    let n = dst.len();
+    if n == 0 || v == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support checked just above; slice is valid.
+        return unsafe { wrapping_add_const_avx2(dst, v) };
+    }
+    wrapping_add_const_generic(dst, v);
+}
+
+#[cfg(target_arch = "x86_64")]
+/// # Safety
+/// Requires AVX2 CPU support at runtime.
+#[target_feature(enable = "avx2")]
+unsafe fn wrapping_add_const_avx2(dst: &mut [u8], v: u8) {
+    use std::arch::x86_64::*;
+    let n = dst.len();
+    let dst_ptr = dst.as_mut_ptr();
+    let vvec = _mm256_set1_epi8(v as i8);
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: i + 32 <= n.
+        unsafe {
+            let d = _mm256_loadu_si256(dst_ptr.add(i) as *const __m256i);
+            let r = _mm256_add_epi8(d, vvec);
+            _mm256_storeu_si256(dst_ptr.add(i) as *mut __m256i, r);
+        }
+        i += 32;
+    }
+    let vvec128 = _mm_set1_epi8(v as i8);
+    if i + 16 <= n {
+        // SAFETY: i + 16 <= n.
+        unsafe {
+            let d = _mm_loadu_si128(dst_ptr.add(i) as *const __m128i);
+            let r = _mm_add_epi8(d, vvec128);
+            _mm_storeu_si128(dst_ptr.add(i) as *mut __m128i, r);
+        }
+        i += 16;
+    }
+    while i < n {
+        // SAFETY: i < n.
+        unsafe {
+            *dst_ptr.add(i) = (*dst_ptr.add(i)).wrapping_add(v);
+        }
+        i += 1;
+    }
+}
+
+#[inline(always)]
+fn wrapping_add_const_generic(dst: &mut [u8], v: u8) {
+    for b in dst.iter_mut() {
+        *b = b.wrapping_add(v);
+    }
+}
+
 pub(crate) fn tbytes_set_rle(
     rle_loader: &mut RleRefClip,
     out_cache: &mut Cursor<Vec<u8>>,
@@ -641,9 +766,11 @@ pub(crate) fn tbytes_set_rle(
     if end_pos > cache_data.len() {
         return Err(std::io::Error::other("RLE vector: cache underflow"));
     }
-    for i in 0..decode_step {
-        cache_data[last_pos + i] = cache_data[last_pos + i].wrapping_add(shared_buffer[i]);
-    }
+    // Reslice once so the per-element bounds check happens up-front, then use
+    // the SIMD-accelerated element-wise add.
+    let dst = &mut cache_data[last_pos..end_pos];
+    let src = &shared_buffer[..decode_step];
+    wrapping_add_slices(dst, src);
     out_cache.set_position(end_pos as u64);
     rle_loader.mem_copy_length -= decode_step as i64;
     *copy_length -= decode_step as i64;
@@ -666,6 +793,7 @@ pub(crate) fn tbytes_set_rle_single(
 
     if rle_loader.mem_set_value != 0 {
         // Operate directly on the cache Vec — avoids two memcpys through shared_buffer.
+        // The broadcast add is SIMD-accelerated when AVX2 is available.
         let pos = out_cache.position() as usize;
         let len = mem_set_step as usize;
         let cache_data = out_cache.get_mut();
@@ -673,9 +801,7 @@ pub(crate) fn tbytes_set_rle_single(
             return Err(std::io::Error::other("RLE single: cache underflow"));
         }
         let v = rle_loader.mem_set_value;
-        for b in &mut cache_data[pos..pos + len] {
-            *b = b.wrapping_add(v);
-        }
+        wrapping_add_const(&mut cache_data[pos..pos + len], v);
         out_cache.set_position((pos + len) as u64);
     } else {
         let cur = out_cache.position();
@@ -1637,5 +1763,105 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(cache.get_ref()[0], 0x00, "0x80 + 0x80 should wrap to 0x00");
+    }
+
+    fn wrapping_add_slices_ref(dst: &mut [u8], src: &[u8]) {
+        for (d, s) in dst.iter_mut().zip(src.iter()) {
+            *d = d.wrapping_add(*s);
+        }
+    }
+
+    fn wrapping_add_const_ref(dst: &mut [u8], v: u8) {
+        for b in dst.iter_mut() {
+            *b = b.wrapping_add(v);
+        }
+    }
+
+    #[test]
+    fn wrapping_add_slices_matches_generic_across_lengths() {
+        let mut rng_state = 0xDEADBEEFu64;
+        let mut next_byte = || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng_state >> 32) as u8
+        };
+        for &len in &[
+            0usize, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 127, 128, 1024, 4096,
+        ] {
+            let mut dst_simd: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            let mut dst_ref = dst_simd.clone();
+            let src: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            super::wrapping_add_slices(&mut dst_simd, &src);
+            wrapping_add_slices_ref(&mut dst_ref, &src);
+            assert_eq!(
+                dst_simd, dst_ref,
+                "wrapping_add_slices mismatch at len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_add_slices_handles_src_longer_than_dst() {
+        let mut dst = vec![0xAAu8; 64];
+        let src = vec![0x55u8; 128];
+        super::wrapping_add_slices(&mut dst, &src);
+        assert!(dst.iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn wrapping_add_slices_handles_unaligned_offsets() {
+        let mut rng_state = 0x1234u64;
+        let mut next_byte = || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng_state >> 32) as u8
+        };
+        let total = 256usize;
+        let backing: Vec<u8> = (0..total).map(|_| next_byte()).collect();
+        for &start in &[0usize, 1, 7, 15, 16, 17, 31] {
+            for &len in &[0usize, 1, 16, 31, 32, 33, 64, 100] {
+                if start + len > backing.len() {
+                    continue;
+                }
+                let mut dst_simd = backing[start..start + len].to_vec();
+                let mut dst_ref = dst_simd.clone();
+                let src: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+                super::wrapping_add_slices(&mut dst_simd, &src);
+                wrapping_add_slices_ref(&mut dst_ref, &src);
+                assert_eq!(
+                    dst_simd, dst_ref,
+                    "unaligned mismatch at start {start}, len {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapping_add_const_matches_generic_across_lengths() {
+        let mut rng_state = 0xC0FFEEu64;
+        let mut next_byte = || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng_state >> 32) as u8
+        };
+        for &len in &[
+            0usize, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 127, 128, 1024, 4096,
+        ] {
+            for &v in &[0u8, 1, 0x37, 0x80, 0xFF] {
+                let mut dst_simd: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+                let mut dst_ref = dst_simd.clone();
+                super::wrapping_add_const(&mut dst_simd, v);
+                wrapping_add_const_ref(&mut dst_ref, v);
+                assert_eq!(
+                    dst_simd, dst_ref,
+                    "wrapping_add_const mismatch at len {len}, v {v:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range for slice")]
+    fn wrapping_add_slices_panics_on_short_src() {
+        let mut dst = vec![0u8; 64];
+        let src = vec![0u8; 32];
+        super::wrapping_add_slices(&mut dst, &src);
     }
 }

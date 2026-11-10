@@ -2647,6 +2647,41 @@ fn bench_hdiffpatch_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+/// Focused RLE-only throughput at larger sizes to isolate the SIMD-accelerated
+/// wrapping-add loops from I/O and decompression overhead.
+fn bench_hdiffpatch_rle_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hdiffpatch_rle");
+    for &size_mib in &[16usize, 64usize] {
+        let old = gen_prng_data(0xBEEF + size_mib as u64, size_mib * 1024 * 1024);
+        let (patch_rle_add, _) = gen_hdiff_v13_rle_patch(&old, 2);
+        let (patch_rle_copy, _) = gen_hdiff_v13_rle_patch(&old, 3);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_path = dir.path().join("old.bin");
+        let add_path = dir.path().join("rle_add.hdiff");
+        let copy_path = dir.path().join("rle_copy.hdiff");
+        let out_path = dir.path().join("out.bin");
+        fs::write(&old_path, &old).unwrap();
+        fs::write(&add_path, &patch_rle_add).unwrap();
+        fs::write(&copy_path, &patch_rle_copy).unwrap();
+
+        for (label, path) in [("rle_add", &add_path), ("rle_copy", &copy_path)] {
+            group.throughput(Throughput::Bytes(old.len() as u64));
+            group.bench_function(BenchmarkId::new(label, size_mib), |b| {
+                b.iter(|| {
+                    let mut hdiff = HDiff::new(
+                        old_path.to_string_lossy().to_string(),
+                        path.to_string_lossy().to_string(),
+                        out_path.to_string_lossy().to_string(),
+                    );
+                    assert!(hdiff.apply(None));
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_file_md5_buffer_capacity_optional(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
     bench_file_md5_buffer_capacity(c);
@@ -2758,6 +2793,7 @@ criterion_group!(
     bench_manifest_content_hash,
     bench_buffer_pool,
     bench_hdiffpatch_e2e,
+    bench_hdiffpatch_rle_throughput,
     bench_v20_cover_shapes,
     bench_v20_step_buffer_stress,
     bench_v13_large_uncovered_prefix,
