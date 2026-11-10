@@ -1,7 +1,7 @@
 use libc;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{BufRead as _, BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1943,7 +1943,7 @@ async fn download_patch_chunk_inner(
 }
 
 pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
     let fd = file.as_raw_fd();
@@ -1960,25 +1960,22 @@ pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
         true
     } else {
         posix_advise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+        let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
+        let mut buffer = super::assembly_opt::HashReadBuffer::take(cap);
         let mut ok = true;
         loop {
-            let buf = match reader.fill_buf() {
-                Ok(b) => b,
+            let n = match file.read(buffer.as_mut_slice()) {
+                Ok(0) => break,
+                Ok(n) => n,
                 Err(_) => {
                     ok = false;
                     break;
                 }
             };
-            if buf.is_empty() {
-                break;
-            }
-            if hasher.update(buf).is_err() {
+            if hasher.update(buffer.filled(n)).is_err() {
                 ok = false;
                 break;
             }
-            let n = buf.len();
-            reader.consume(n);
         }
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         ok
@@ -1996,7 +1993,7 @@ pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
 }
 
 pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(mut file) = fs::File::open(path) else {
         log::warn!(
             "Failed to open file for XXH64 verification: {path_display}",
             path_display = path.display()
@@ -2014,22 +2011,19 @@ pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
         super::assembly_opt::xxh64_hex_eq(hasher.digest(), expected_xxh64)
     } else {
         posix_advise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+        let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
+        let mut buffer = super::assembly_opt::HashReadBuffer::take(cap);
         let mut ok = true;
         loop {
-            let buf = match reader.fill_buf() {
-                Ok(b) => b,
+            let n = match file.read(buffer.as_mut_slice()) {
+                Ok(0) => break,
+                Ok(n) => n,
                 Err(_) => {
                     ok = false;
                     break;
                 }
             };
-            if buf.is_empty() {
-                break;
-            }
-            hasher.update(buf);
-            let n = buf.len();
-            reader.consume(n);
+            hasher.update(buffer.filled(n));
         }
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         if ok {
