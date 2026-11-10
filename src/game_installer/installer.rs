@@ -2712,7 +2712,7 @@ async fn run_downloads(
     handle: DownloadHandle,
 ) -> DownloadSummary {
     const RECLAIM_INTERVAL: usize = 100;
-    const MAX_INFLIGHT_COMPRESSED_BYTES: usize = 48 * 1024 * 1024;
+    const MAX_INFLIGHT_COMPRESSED_BYTES: usize = 32 * 1024 * 1024;
     let adaptive = Arc::new(super::adaptive_download::AdaptiveDownload::new());
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
