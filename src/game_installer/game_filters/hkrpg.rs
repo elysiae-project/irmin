@@ -441,7 +441,7 @@ mod tests {
         filter_hkrpg_asset_list(dir.path(), &mut assets);
         assert_eq!(assets.len(), 1);
         assert_eq!(
-            assets[0].asset_name,
+            assets[0].asset_name_str(),
             format!("{GAME_DATA_DIR}/StreamingAssets/audio/voice_good.pck")
         );
     }
@@ -523,7 +523,7 @@ mod tests {
         filter_hkrpg_asset_list(dir.path(), &mut assets);
         // Malformed line skipped; valid line filters "audio/bad.pck".
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].asset_name, "audio/good.pck");
+        assert_eq!(assets[0].asset_name_str(), "audio/good.pck");
     }
 
     // write_audio_lang_record

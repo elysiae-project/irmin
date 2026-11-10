@@ -360,26 +360,26 @@ fn build_assembly_fixture(
             } else {
                 String::new()
             };
-            SophonManifestAssetChunk {
-                chunk_name: name.into(),
-                chunk_decompressed_hash_md5: chunk_hash.into(),
-                chunk_on_file_offset: offset,
-                chunk_size: 0,
-                chunk_size_decompressed: (chunk_mib * 1024 * 1024) as u64,
-                chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: bytes::Bytes::new(),
-                chunk_old_offset: -1,
-            }
+            SophonManifestAssetChunk::from_parts(
+                name.into(),
+                chunk_hash.into(),
+                offset,
+                0,
+                (chunk_mib * 1024 * 1024) as u64,
+                0,
+                bytes::Bytes::new(),
+                -1,
+            )
         })
         .collect();
     let file_md5 = hex::encode(fast_md5::digest(&raw));
-    let file = SophonManifestAssetProperty {
-        asset_name: "assembled.bin".into(),
-        asset_chunks: chunks,
-        asset_type: 0,
-        asset_size: raw.len() as u64,
-        asset_hash_md5: file_md5.into(),
-    };
+    let file = SophonManifestAssetProperty::from_parts(
+        "assembled.bin".into(),
+        chunks,
+        0,
+        raw.len() as u64,
+        file_md5.into(),
+    );
     (CompactManifest::from(vec![file]), raw)
 }
 
@@ -606,29 +606,29 @@ fn bench_assembly_old_chunk_reuse(c: &mut Criterion) {
         .collect();
     let file_md5 = hex::encode(fast_md5::digest(&expected_output));
     let asset_name = format!("reused-{}.bin", std::process::id());
-    let reuse_manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
-        asset_name: asset_name.clone().into(),
-        asset_chunks: (0..num_chunks)
+    let reuse_manifest = CompactManifest::from(vec![SophonManifestAssetProperty::from_parts(
+        asset_name.clone().into(),
+        (0..num_chunks)
             .map(|index| {
                 let source_index = (index * 3) % num_chunks;
                 let source_start = source_index * chunk_mib * 1024 * 1024;
                 let source_end = source_start + chunk_mib * 1024 * 1024;
-                SophonManifestAssetChunk {
-                    chunk_name: format!("ck{index:02}").into(),
-                    chunk_decompressed_hash_md5: bytes::Bytes::new(),
-                    chunk_on_file_offset: (index * chunk_mib * 1024 * 1024) as u64,
-                    chunk_size: 0,
-                    chunk_size_decompressed: (source_end - source_start) as u64,
-                    chunk_compressed_hash_xxh: 0,
-                    chunk_compressed_hash_md5: bytes::Bytes::new(),
-                    chunk_old_offset: source_start as i64,
-                }
+                SophonManifestAssetChunk::from_parts(
+                    format!("ck{index:02}").into(),
+                    bytes::Bytes::new(),
+                    (index * chunk_mib * 1024 * 1024) as u64,
+                    0,
+                    (source_end - source_start) as u64,
+                    0,
+                    bytes::Bytes::new(),
+                    source_start as i64,
+                )
             })
             .collect(),
-        asset_type: 0,
-        asset_size: total_bytes,
-        asset_hash_md5: file_md5.clone().into(),
-    }]);
+        0,
+        total_bytes,
+        file_md5.clone().into(),
+    )]);
     for index in 0..num_chunks {
         let chunk = reuse_manifest.chunk(index);
         let expected_source_offset = ((index * 3) % num_chunks * chunk_mib * 1024 * 1024) as i64;
@@ -1138,26 +1138,26 @@ fn bench_compact_manifest_build(c: &mut Criterion) {
             let chunks: Vec<SophonManifestAssetChunk> = (0..MANIFEST_CHUNKS_PER_FILE)
                 .map(|c| {
                     let h = &hash_pool[(f + c) % MANIFEST_FILES];
-                    SophonManifestAssetChunk {
-                        chunk_name: format!("f{f}c{c}").into(),
-                        chunk_decompressed_hash_md5: h.clone().into(),
-                        chunk_on_file_offset: (c * 1024 * 1024) as u64,
-                        chunk_size: 0,
-                        chunk_size_decompressed: 0,
-                        chunk_compressed_hash_xxh: 0,
-                        chunk_compressed_hash_md5: bytes::Bytes::new(),
-                        chunk_old_offset: -1,
-                    }
+                    SophonManifestAssetChunk::from_parts(
+                        format!("f{f}c{c}").into(),
+                        h.clone().into(),
+                        (c * 1024 * 1024) as u64,
+                        0,
+                        0,
+                        0,
+                        bytes::Bytes::new(),
+                        -1,
+                    )
                 })
                 .collect();
             let size = chunks.iter().map(|c| c.chunk_size_decompressed).sum();
-            SophonManifestAssetProperty {
-                asset_name: format!("asset_{f}.pak").into(),
-                asset_chunks: chunks,
-                asset_type: 0,
-                asset_size: size,
-                asset_hash_md5: format!("{f:032x}").into(),
-            }
+            SophonManifestAssetProperty::from_parts(
+                format!("asset_{f}.pak").into(),
+                chunks,
+                0,
+                size,
+                format!("{f:032x}").into(),
+            )
         })
         .collect();
 
@@ -1558,24 +1558,26 @@ fn gen_protobuf_manifest(files: usize, chunks: usize) -> Vec<u8> {
     let assets: Vec<SophonManifestAssetProperty> = (0..files)
         .map(|f| {
             let asset_chunks: Vec<SophonManifestAssetChunk> = (0..chunks)
-                .map(|c| SophonManifestAssetChunk {
-                    chunk_name: format!("f{f}c{c}").into(),
-                    chunk_decompressed_hash_md5: format!("{:032x}", f * chunks + c).into(),
-                    chunk_on_file_offset: (c * 1024 * 1024) as u64,
-                    chunk_size: 512 * 1024,
-                    chunk_size_decompressed: 1024 * 1024,
-                    chunk_compressed_hash_xxh: (f * chunks + c) as u64,
-                    chunk_compressed_hash_md5: format!("{:032x}", f * chunks + c + 1).into(),
-                    chunk_old_offset: -1,
+                .map(|c| {
+                    SophonManifestAssetChunk::from_parts(
+                        format!("f{f}c{c}").into(),
+                        format!("{:032x}", f * chunks + c).into(),
+                        (c * 1024 * 1024) as u64,
+                        512 * 1024,
+                        1024 * 1024,
+                        (f * chunks + c) as u64,
+                        format!("{:032x}", f * chunks + c + 1).into(),
+                        -1,
+                    )
                 })
                 .collect();
-            SophonManifestAssetProperty {
-                asset_name: format!("data/assets/bundle_{f:04}.pak").into(),
+            SophonManifestAssetProperty::from_parts(
+                format!("data/assets/bundle_{f:04}.pak").into(),
                 asset_chunks,
-                asset_type: 0,
-                asset_size: (chunks * 1024 * 1024) as u64,
-                asset_hash_md5: format!("{f:032x}").into(),
-            }
+                0,
+                (chunks * 1024 * 1024) as u64,
+                format!("{f:032x}").into(),
+            )
         })
         .collect();
     let manifest = SophonManifestProto { assets };

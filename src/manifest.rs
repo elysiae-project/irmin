@@ -16,18 +16,18 @@ use crate::proto_parse::SophonManifestProto;
 /// same manifest; it is not a cryptographic signature or authenticity check.
 pub fn compute_content_manifest_hash(manifest: &SophonManifestProto) -> String {
     let mut assets: Vec<_> = manifest.assets.iter().collect();
-    assets.sort_unstable_by_key(|a| &a.asset_name);
+    assets.sort_unstable_by_key(|a| a.asset_name());
 
     let mut hasher = Sha256::new();
     for asset in assets {
-        hasher.update(asset.asset_name.as_ref());
+        hasher.update(asset.asset_name().as_ref());
         hasher.update(asset.asset_size.to_le_bytes());
         hasher.update(asset.asset_type.to_le_bytes());
-        hasher.update(asset.asset_hash_md5.as_ref());
+        hasher.update(asset.asset_hash_md5().as_ref());
         for chunk in &asset.asset_chunks {
-            hasher.update(chunk.chunk_name.as_ref());
-            hasher.update(chunk.chunk_decompressed_hash_md5.as_ref());
-            hasher.update(chunk.chunk_compressed_hash_md5.as_ref());
+            hasher.update(chunk.chunk_name().as_ref());
+            hasher.update(chunk.chunk_decompressed_hash_md5().as_ref());
+            hasher.update(chunk.chunk_compressed_hash_md5().as_ref());
             hasher.update(chunk.chunk_on_file_offset.to_le_bytes());
             hasher.update(chunk.chunk_size.to_le_bytes());
             hasher.update(chunk.chunk_size_decompressed.to_le_bytes());

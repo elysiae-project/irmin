@@ -51,10 +51,10 @@ pub fn filter_hk4e_asset_list(
     // Filter ctable_streaming.dat unconditionally (not language-dependent).
     // Use ASCII case-insensitive comparison to avoid allocating a lowercased String.
     assets.retain(|asset| {
-        if asset.asset_name.len() >= "ctable_streaming.dat".len()
-            && asset.asset_name.as_ref().ends_with(b"ctable_streaming.dat")
-            && asset
-                .asset_name
+        let name = asset.asset_name();
+        if name.len() >= "ctable_streaming.dat".len()
+            && name.as_ref().ends_with(b"ctable_streaming.dat")
+            && name
                 .as_ref()
                 .iter()
                 .rev()
@@ -485,7 +485,10 @@ mod tests {
 
         // ctable file filtered even when Chinese is installed.
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].asset_name, "data/asset_bundle/normal_file.pck");
+        assert_eq!(
+            assets[0].asset_name_str(),
+            "data/asset_bundle/normal_file.pck"
+        );
     }
 
     #[test]
@@ -558,7 +561,10 @@ mod tests {
 
         // With empty vo_langs, all audio is filtered, only non-audio remains
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].asset_name, "data/asset_bundle/non_audio/file.dat");
+        assert_eq!(
+            assets[0].asset_name_str(),
+            "data/asset_bundle/non_audio/file.dat"
+        );
     }
 
     // write_audio_lang_record

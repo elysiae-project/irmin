@@ -374,7 +374,7 @@ fn accumulate_diff_manifest_sizes(
             continue;
         }
         let needs_download = match old_files_md5.get(file.asset_name_str()) {
-            Some(old_md5) => *old_md5 != file.asset_hash_md5,
+            Some(old_md5) => *old_md5 != file.asset_hash_md5_str(),
             None => true,
         };
         if needs_download {
@@ -415,7 +415,7 @@ where
             continue;
         }
         let needs_download = match old_files_md5.get(file.asset_name_str()) {
-            Some(old_md5) => old_md5.as_ref() != file.asset_hash_md5,
+            Some(old_md5) => old_md5.as_ref() != file.asset_hash_md5_str(),
             None => true,
         };
         if needs_download {
@@ -827,13 +827,13 @@ mod tests {
                         continue;
                     }
                     let changed = match old_files.get(file.asset_name_str()) {
-                        Some(old_hash) => *old_hash != file.asset_hash_md5,
+                        Some(old_hash) => *old_hash != file.asset_hash_md5_str(),
                         None => true,
                     };
                     if changed {
                         for chunk in &file.asset_chunks {
                             if !old_chunks.contains(chunk.chunk_decompressed_hash_md5_str())
-                                && owned.insert(chunk.chunk_name.clone())
+                                && owned.insert((*chunk.chunk_name()).clone())
                             {
                                 compressed += chunk.chunk_size;
                                 decompressed += chunk.chunk_size_decompressed;

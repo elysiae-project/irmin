@@ -41,7 +41,7 @@ pub struct SophonManifestAssetProperty {
         serialize_with = "serialize_bytes_as_str",
         deserialize_with = "deserialize_bytes_from_str"
     )]
-    pub asset_name: Bytes,
+    pub(crate) asset_name: Bytes,
 
     /// Chunks composing this asset.
     #[prost(message, repeated, tag = "2")]
@@ -61,29 +61,68 @@ pub struct SophonManifestAssetProperty {
         serialize_with = "serialize_bytes_as_str",
         deserialize_with = "deserialize_bytes_from_str"
     )]
-    pub asset_hash_md5: Bytes,
+    pub(crate) asset_hash_md5: Bytes,
 }
 
 impl SophonManifestAssetProperty {
+    /// Construct an asset property from its parts. Intended for benchmark
+    /// and test fixtures; production code obtains these via protobuf decode.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        asset_name: Bytes,
+        asset_chunks: Vec<SophonManifestAssetChunk>,
+        asset_type: u32,
+        asset_size: u64,
+        asset_hash_md5: Bytes,
+    ) -> Self {
+        Self {
+            asset_name,
+            asset_chunks,
+            asset_type,
+            asset_size,
+            asset_hash_md5,
+        }
+    }
+
     /// Returns true when the wire type is nonzero or the asset has no file hash.
     /// This accommodates directory records whose type/hash fields vary.
     #[inline]
     pub fn is_directory(&self) -> bool {
-        self.asset_type != 0 || self.asset_hash_md5.is_empty()
+        self.asset_type != 0 || self.asset_hash_md5().is_empty()
+    }
+
+    /// Borrow the asset name as `&Bytes`.
+    #[inline]
+    pub fn asset_name(&self) -> &Bytes {
+        &self.asset_name
+    }
+
+    /// Borrow the file MD5 as `&Bytes`.
+    #[inline]
+    pub fn asset_hash_md5(&self) -> &Bytes {
+        &self.asset_hash_md5
     }
 
     /// Borrow the asset name as `&str`. UTF-8 validity is established at
-    /// decode time by [`validate_manifest_utf8`]; the `from_utf8` call
-    /// is a fast scan that succeeds without allocation on valid input.
+    /// decode time by [`validate_manifest_utf8`].
     #[inline]
     pub fn asset_name_str(&self) -> &str {
-        std::str::from_utf8(&self.asset_name).unwrap_or("")
+        // SAFETY: `validate_manifest_utf8` rejects manifests with invalid
+        // UTF-8 in `asset_name` at decode time, so every `Bytes` field that
+        // survives decoding is valid UTF-8. `from_parts` callers in test
+        // and benchmark code control their inputs, which are ASCII or hex.
+        debug_assert!(std::str::from_utf8(&self.asset_name).is_ok());
+        unsafe { std::str::from_utf8_unchecked(&self.asset_name) }
     }
 
     /// Borrow the file MD5 as `&str`. See [`asset_name_str`] for safety notes.
     #[inline]
     pub fn asset_hash_md5_str(&self) -> &str {
-        std::str::from_utf8(&self.asset_hash_md5).unwrap_or("")
+        // SAFETY: same invariant as `asset_name_str` — `asset_hash_md5` is
+        // validated as UTF-8 at decode time by `validate_manifest_utf8`.
+        debug_assert!(std::str::from_utf8(&self.asset_hash_md5).is_ok());
+        unsafe { std::str::from_utf8_unchecked(&self.asset_hash_md5) }
     }
 }
 
@@ -96,7 +135,7 @@ pub struct SophonManifestAssetChunk {
         serialize_with = "serialize_bytes_as_str",
         deserialize_with = "deserialize_bytes_from_str"
     )]
-    pub chunk_name: Bytes,
+    pub(crate) chunk_name: Bytes,
 
     /// MD5 of the decompressed chunk.
     #[prost(bytes, tag = "2")]
@@ -104,7 +143,7 @@ pub struct SophonManifestAssetChunk {
         serialize_with = "serialize_bytes_as_str",
         deserialize_with = "deserialize_bytes_from_str"
     )]
-    pub chunk_decompressed_hash_md5: Bytes,
+    pub(crate) chunk_decompressed_hash_md5: Bytes,
 
     /// Offset in the output file. Defaults to 0 for the first chunk.
     #[prost(uint64, tag = "3")]
@@ -128,7 +167,7 @@ pub struct SophonManifestAssetChunk {
         serialize_with = "serialize_bytes_as_str",
         deserialize_with = "deserialize_bytes_from_str"
     )]
-    pub chunk_compressed_hash_md5: Bytes,
+    pub(crate) chunk_compressed_hash_md5: Bytes,
 
     /// Runtime-only: -1 = new data, >= 0 = offset in the old file for chunk
     /// reuse.
@@ -137,23 +176,75 @@ pub struct SophonManifestAssetChunk {
 }
 
 impl SophonManifestAssetChunk {
+    /// Construct a chunk from its parts. Intended for benchmark and test
+    /// fixtures; production code obtains these via protobuf decode.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        chunk_name: Bytes,
+        chunk_decompressed_hash_md5: Bytes,
+        chunk_on_file_offset: u64,
+        chunk_size: u64,
+        chunk_size_decompressed: u64,
+        chunk_compressed_hash_xxh: u64,
+        chunk_compressed_hash_md5: Bytes,
+        chunk_old_offset: i64,
+    ) -> Self {
+        Self {
+            chunk_name,
+            chunk_decompressed_hash_md5,
+            chunk_on_file_offset,
+            chunk_size,
+            chunk_size_decompressed,
+            chunk_compressed_hash_xxh,
+            chunk_compressed_hash_md5,
+            chunk_old_offset,
+        }
+    }
+
+    /// Borrow the chunk name as `&Bytes`.
+    #[inline]
+    pub fn chunk_name(&self) -> &Bytes {
+        &self.chunk_name
+    }
+
+    /// Borrow the decompressed MD5 as `&Bytes`.
+    #[inline]
+    pub fn chunk_decompressed_hash_md5(&self) -> &Bytes {
+        &self.chunk_decompressed_hash_md5
+    }
+
+    /// Borrow the compressed MD5 as `&Bytes`.
+    #[inline]
+    pub fn chunk_compressed_hash_md5(&self) -> &Bytes {
+        &self.chunk_compressed_hash_md5
+    }
+
     /// Borrow the chunk name as `&str`. UTF-8 validity is established at
     /// decode time by [`validate_manifest_utf8`].
     #[inline]
     pub fn chunk_name_str(&self) -> &str {
-        std::str::from_utf8(&self.chunk_name).unwrap_or("")
+        // SAFETY: `validate_manifest_utf8` rejects manifests with invalid
+        // UTF-8 in `chunk_name` at decode time. `from_parts` callers
+        // construct from ASCII/hex strings.
+        debug_assert!(std::str::from_utf8(&self.chunk_name).is_ok());
+        unsafe { std::str::from_utf8_unchecked(&self.chunk_name) }
     }
 
     /// Borrow the decompressed MD5 as `&str`.
     #[inline]
     pub fn chunk_decompressed_hash_md5_str(&self) -> &str {
-        std::str::from_utf8(&self.chunk_decompressed_hash_md5).unwrap_or("")
+        // SAFETY: same invariant as `chunk_name_str`.
+        debug_assert!(std::str::from_utf8(&self.chunk_decompressed_hash_md5).is_ok());
+        unsafe { std::str::from_utf8_unchecked(&self.chunk_decompressed_hash_md5) }
     }
 
     /// Borrow the compressed MD5 as `&str`.
     #[inline]
     pub fn chunk_compressed_hash_md5_str(&self) -> &str {
-        std::str::from_utf8(&self.chunk_compressed_hash_md5).unwrap_or("")
+        // SAFETY: same invariant as `chunk_name_str`.
+        debug_assert!(std::str::from_utf8(&self.chunk_compressed_hash_md5).is_ok());
+        unsafe { std::str::from_utf8_unchecked(&self.chunk_compressed_hash_md5) }
     }
 }
 

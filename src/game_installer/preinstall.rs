@@ -3357,7 +3357,7 @@ async fn apply_download_over(
     let file_index = manifest
         .assets
         .iter()
-        .position(|a| a.asset_name == asset.target_file_path)
+        .position(|a| a.asset_name_str() == asset.target_file_path)
         .ok_or_else(|| SophonError::AssemblyFailed {
             file: asset.target_file_path.clone(),
             error: "File not found in main manifest for DownloadOver".to_string(),
@@ -3392,7 +3392,7 @@ async fn apply_download_over(
                     error: "File index no longer exists in DownloadOver manifest".to_owned(),
                 }
             })?;
-            debug_assert_eq!(file_entry.asset_name, target_file_path);
+            debug_assert_eq!(file_entry.asset_name_str(), target_file_path);
             let manifest =
                 super::compact_manifest::CompactManifest::try_from_property_ref(file_entry)?;
             // No deletion ownership: these are shared cached payloads. Keep

@@ -3799,22 +3799,22 @@ async fn verify_installers(
                 continue;
             }
             has_binary_version |=
-                asset.asset_name == "StarRail_Data/StreamingAssets/BinaryVersion.bytes";
+                asset.asset_name_str() == "StarRail_Data/StreamingAssets/BinaryVersion.bytes";
             if game_code == "hk4e" {
                 // Package indexes need file metadata, not a second copy of all chunks.
-                index_assets.push(SophonManifestAssetProperty {
-                    asset_name: asset.asset_name.clone(),
-                    asset_type: asset.asset_type,
-                    asset_size: asset.asset_size,
-                    asset_hash_md5: asset.asset_hash_md5.clone(),
-                    asset_chunks: vec![],
-                });
+                index_assets.push(SophonManifestAssetProperty::from_parts(
+                    (*asset.asset_name()).clone(),
+                    vec![],
+                    asset.asset_type,
+                    asset.asset_size,
+                    (*asset.asset_hash_md5()).clone(),
+                ));
             }
             let generated = match game_code {
                 "hk4e" => {
                     super::game_filters::is_generated_pkg_version(asset.asset_name_str(), &vo_langs)
                 }
-                "hkrpg" => asset.asset_name == "StarRail_Data/app.info",
+                "hkrpg" => asset.asset_name_str() == "StarRail_Data/app.info",
                 _ => false,
             };
             // beyond_pkg_version is NOT rebuilt by the local generator; repair
@@ -3872,8 +3872,8 @@ async fn repair_assets(
             let previous = &unique[index].0;
             if previous.asset_size != asset.asset_size
                 || !previous
-                    .asset_hash_md5
-                    .eq_ignore_ascii_case(&asset.asset_hash_md5)
+                    .asset_hash_md5_str()
+                    .eq_ignore_ascii_case(asset.asset_hash_md5_str())
             {
                 return Err(SophonError::AssemblyFailed {
                     file: asset.asset_name_str().to_string(),

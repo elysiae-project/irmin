@@ -588,17 +588,17 @@ fn manifest_storage_estimates(
         .iter()
         .try_fold((0usize, 0usize), |(chunks, bytes), file| {
             let file_bytes = file
-                .asset_name
+                .asset_name()
                 .len()
-                .checked_add(file.asset_hash_md5.len())?;
+                .checked_add(file.asset_hash_md5().len())?;
             file.asset_chunks.iter().try_fold(
                 (chunks, bytes.checked_add(file_bytes)?),
                 |(chunks, bytes), chunk| {
                     let chunk_bytes = chunk
-                        .chunk_name
+                        .chunk_name()
                         .len()
-                        .checked_add(chunk.chunk_decompressed_hash_md5.len())?
-                        .checked_add(chunk.chunk_compressed_hash_md5.len())?;
+                        .checked_add(chunk.chunk_decompressed_hash_md5().len())?
+                        .checked_add(chunk.chunk_compressed_hash_md5().len())?;
                     Some((chunks.checked_add(1)?, bytes.checked_add(chunk_bytes)?))
                 },
             )
@@ -860,8 +860,8 @@ mod tests {
 
         let mut global_chunk_idx = 0usize;
         for (fi, asset) in assets.iter().enumerate() {
-            assert_eq!(cm.file_name(fi), asset.asset_name);
-            assert_eq!(cm.file_hash_md5(fi), asset.asset_hash_md5);
+            assert_eq!(cm.file_name(fi), asset.asset_name_str());
+            assert_eq!(cm.file_hash_md5(fi), asset.asset_hash_md5_str());
             assert_eq!(cm.file_type(fi), asset.asset_type);
             assert_eq!(cm.file_size(fi), asset.asset_size);
 
@@ -870,16 +870,16 @@ mod tests {
 
             for (ci, src_chunk) in asset.asset_chunks.iter().enumerate() {
                 let c = cm.file_chunk(fi, ci);
-                assert_eq!(c.chunk_name, src_chunk.chunk_name);
+                assert_eq!(c.chunk_name, src_chunk.chunk_name_str());
                 assert_eq!(
                     c.chunk_decompressed_hash_md5,
-                    src_chunk.chunk_decompressed_hash_md5
+                    src_chunk.chunk_decompressed_hash_md5_str()
                 );
                 assert_eq!(c.chunk_size, src_chunk.chunk_size);
                 assert_eq!(c.chunk_size_decompressed, src_chunk.chunk_size_decompressed);
                 assert_eq!(
                     c.chunk_compressed_hash_md5,
-                    src_chunk.chunk_compressed_hash_md5
+                    src_chunk.chunk_compressed_hash_md5_str()
                 );
                 assert_eq!(c.chunk_old_offset, src_chunk.chunk_old_offset);
                 global_chunk_idx += 1;
