@@ -641,11 +641,8 @@ pub(crate) fn tbytes_set_rle(
     if end_pos > cache_data.len() {
         return Err(std::io::Error::other("RLE vector: cache underflow"));
     }
-    for (old_byte, &delta) in cache_data[last_pos..end_pos]
-        .iter_mut()
-        .zip(&shared_buffer[..decode_step])
-    {
-        *old_byte = old_byte.wrapping_add(delta);
+    for i in 0..decode_step {
+        cache_data[last_pos + i] = cache_data[last_pos + i].wrapping_add(shared_buffer[i]);
     }
     out_cache.set_position(end_pos as u64);
     rle_loader.mem_copy_length -= decode_step as i64;
@@ -676,9 +673,9 @@ pub(crate) fn tbytes_set_rle_single(
             return Err(std::io::Error::other("RLE single: cache underflow"));
         }
         let v = rle_loader.mem_set_value;
-        cache_data[pos..pos + len]
-            .iter_mut()
-            .for_each(|b| *b = b.wrapping_add(v));
+        for b in &mut cache_data[pos..pos + len] {
+            *b = b.wrapping_add(v);
+        }
         out_cache.set_position((pos + len) as u64);
     } else {
         let cur = out_cache.position();
