@@ -698,8 +698,13 @@ pub struct CoverHeaderIterator<'a> {
 }
 
 enum CoverReader<'a> {
-    Buffered { data: Vec<u8>, offset: usize },
-    Streaming { reader: &'a mut dyn Read },
+    Buffered {
+        data: Vec<u8>,
+        offset: usize,
+    },
+    Streaming {
+        reader: std::io::BufReader<&'a mut dyn Read>,
+    },
 }
 
 impl<'a> CoverHeaderIterator<'a> {
@@ -733,7 +738,7 @@ impl<'a> CoverHeaderIterator<'a> {
             }
         } else {
             CoverReader::Streaming {
-                reader: cover_reader,
+                reader: std::io::BufReader::with_capacity(256 * 1024, cover_reader),
             }
         };
         Ok(Self {
