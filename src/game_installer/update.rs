@@ -987,3 +987,36 @@ mod tests {
         assert_eq!(info.current_tag.as_deref(), Some(info.remote_tag.as_str()));
     }
 }
+
+#[cfg(feature = "bench-internals")]
+pub mod benchmark {
+    use super::*;
+
+    pub struct DiffSizeResult {
+        pub compressed: u64,
+        pub decompressed: u64,
+    }
+
+    pub fn run_diff_sizes(
+        old_files_md5: &rustc_hash::FxHashMap<&str, &str>,
+        old_chunks: &rustc_hash::FxHashSet<&str>,
+        new_manifest: &crate::proto_parse::SophonManifestProto,
+    ) -> DiffSizeResult {
+        let mut seen_chunks = CompactChunkNameSet::new();
+        let mut compressed = 0u64;
+        let mut decompressed = 0u64;
+        accumulate_diff_manifest_sizes(
+            old_files_md5,
+            old_chunks,
+            new_manifest,
+            &mut seen_chunks,
+            &mut compressed,
+            &mut decompressed,
+        )
+        .expect("diff sizes calculation failed");
+        DiffSizeResult {
+            compressed,
+            decompressed,
+        }
+    }
+}

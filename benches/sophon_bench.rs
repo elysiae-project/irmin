@@ -2661,6 +2661,83 @@ fn bench_file_metadata_cost_optional(c: &mut Criterion) {
     let _ = c;
 }
 
+#[cfg(feature = "bench-internals")]
+fn bench_update_diff_sizes(c: &mut Criterion) {
+    use bytes::Bytes;
+    use irmin_rs::game_installer::update::benchmark;
+    use irmin_rs::proto_parse::{
+        SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
+    };
+
+    let files = 5000usize;
+    let chunks_per = 50usize;
+
+    let make_file = |idx: usize, is_old: bool| {
+        let chunks: Vec<SophonManifestAssetChunk> = (0..chunks_per)
+            .map(|c| {
+                let hash = if is_old {
+                    format!("hash-{:04}", c % 32)
+                } else {
+                    format!("hash-{idx:06}-{c:04}")
+                };
+                SophonManifestAssetChunk::from_parts(
+                    Bytes::from(format!("chunk-{idx:06}-{c:04}")),
+                    Bytes::from(hash),
+                    (c * 1024 * 1024) as u64,
+                    256 * 1024,
+                    1024 * 1024,
+                    0,
+                    Bytes::new(),
+                    -1,
+                )
+            })
+            .collect();
+        SophonManifestAssetProperty::from_parts(
+            Bytes::from(format!("asset-{idx:06}.pak")),
+            chunks,
+            0,
+            (chunks_per * 1024 * 1024) as u64,
+            Bytes::from(format!("file-{idx:06}")),
+        )
+    };
+
+    let old_manifest = SophonManifestProto {
+        assets: (0..files).map(|i| make_file(i, true)).collect(),
+    };
+    let new_manifest = SophonManifestProto {
+        assets: (0..files).map(|i| make_file(i, false)).collect(),
+    };
+
+    let old_files_md5: rustc_hash::FxHashMap<&str, &str> = old_manifest
+        .assets
+        .iter()
+        .filter(|f| !f.is_directory())
+        .map(|f| (f.asset_name_str(), f.asset_hash_md5_str()))
+        .collect();
+    let old_chunks: rustc_hash::FxHashSet<&str> = old_manifest
+        .assets
+        .iter()
+        .filter(|f| !f.is_directory())
+        .flat_map(|f| f.asset_chunks.iter())
+        .map(|c| c.chunk_decompressed_hash_md5_str())
+        .collect();
+
+    let mut group = c.benchmark_group("update_diff_sizes");
+    group.throughput(Throughput::Elements(files as u64));
+    group.bench_function("5000x50", |b| {
+        b.iter(|| {
+            let result = benchmark::run_diff_sizes(&old_files_md5, &old_chunks, &new_manifest);
+            std::hint::black_box((result.compressed, result.decompressed));
+        });
+    });
+    group.finish();
+}
+
+#[cfg(not(feature = "bench-internals"))]
+fn bench_update_diff_sizes(c: &mut Criterion) {
+    let _ = c;
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -2687,6 +2764,7 @@ criterion_group!(
     bench_eager_decompress,
     bench_file_md5_buffer_capacity_optional,
     bench_file_metadata_cost_optional,
+    bench_update_diff_sizes,
 );
 criterion_main!(benches);
 

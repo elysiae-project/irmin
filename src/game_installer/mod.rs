@@ -38,7 +38,10 @@ pub mod output_allocator;
 mod plugin_api;
 mod plugin_install;
 mod preinstall;
+#[cfg(not(feature = "bench-internals"))]
 mod update;
+#[cfg(feature = "bench-internals")]
+pub mod update;
 
 mod profiling;
 /// Platform file-copy and preallocation helpers.
