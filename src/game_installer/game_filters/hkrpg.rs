@@ -108,8 +108,8 @@ fn extract_filename(line: &str) -> Option<String> {
 
 /// Case-insensitive version of `str::strip_prefix`.
 fn strip_prefix_case_insensitive<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let prefix = prefix.to_lowercase();
-    let lower_s = s.to_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    let lower_s = s.to_ascii_lowercase();
     if lower_s.starts_with(&prefix) {
         Some(&s[prefix.len()..])
     } else {
