@@ -2711,6 +2711,7 @@ async fn run_downloads(
     handle: DownloadHandle,
 ) -> DownloadSummary {
     const RECLAIM_INTERVAL: usize = 100;
+    const MAX_INFLIGHT_COMPRESSED_BYTES: usize = 256 * 1024 * 1024;
     let adaptive = Arc::new(super::adaptive_download::AdaptiveDownload::new());
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
@@ -2719,6 +2720,7 @@ async fn run_downloads(
     let next_index = Arc::new(AtomicUsize::new(0));
     let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(total));
     let reclaim_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let byte_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_COMPRESSED_BYTES));
     let mut workers = tokio::task::JoinSet::new();
 
     ctx.profiler.total_chunks.store(total, Ordering::Relaxed);
@@ -2737,6 +2739,7 @@ async fn run_downloads(
         let first_error = Arc::clone(&first_error);
         let remaining = Arc::clone(&remaining);
         let reclaim_count = Arc::clone(&reclaim_count);
+        let byte_semaphore = Arc::clone(&byte_semaphore);
 
         workers.spawn(async move {
             loop {
@@ -2752,6 +2755,22 @@ async fn run_downloads(
                     let idle_ns = idle_start.elapsed().as_nanos() as u64;
                     ctx.profiler.record_idle(idle_ns);
                 }
+                // Bound in-flight compressed data by acquiring a byte-sized
+                // semaphore permit proportional to the chunk's compressed size.
+                // This prevents 48 workers from each loading a large compressed
+                // chunk simultaneously, bounding peak RSS from compressed data.
+                let global_chunk_idx = {
+                    let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
+                    range.start as usize + item.chunk_idx as usize
+                };
+                let chunk = ctx.all_files.chunk(global_chunk_idx);
+                let compressed_bytes =
+                    (chunk.chunk_size.max(1) as usize).min(MAX_INFLIGHT_COMPRESSED_BYTES);
+                let _byte_permit = match byte_semaphore.acquire_many(compressed_bytes as u32).await
+                {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
                 let result = process_download_item(
                     item,
                     item_idx,
