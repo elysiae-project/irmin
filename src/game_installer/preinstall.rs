@@ -917,7 +917,7 @@ async fn build_preinstall_plan_from_builds(
     let mut seen_patch_targets: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     let mut unique_chunks: Vec<PatchChunkInfo> = Vec::new();
     let mut diff_downloads: rustc_hash::FxHashMap<String, Arc<DownloadInfo>> =
-        rustc_hash::FxHashMap::default();
+        rustc_hash::FxHashMap::with_capacity_and_hasher(qualifying_patch.len(), Default::default());
 
     let fetch_futures: Vec<_> = qualifying_patch
         .iter()
