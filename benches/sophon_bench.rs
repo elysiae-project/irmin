@@ -251,6 +251,90 @@ fn bench_zstd_decompress(c: &mut Criterion) {
     }
     group.finish();
 }
+
+/// lz4 and deflate decompression throughput with varying input (BufReader) buffer sizes.
+/// Measures the hdiffpatch decompression path for lz4- and deflate-compressed clips.
+fn bench_lz4_deflate_decompress(c: &mut Criterion) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw = gen_prng_data(0xBEEF, ZSTD_MIB as usize * 1024 * 1024);
+    let bytes = ZSTD_MIB * 1024 * 1024;
+    const OUTPUT_BUF: usize = 1024 * 1024;
+
+    // Compress with lz4.
+    let lz4_path = dir.path().join("chunk.lz4");
+    {
+        let f = fs::File::create(&lz4_path).unwrap();
+        let mut enc = lz4::EncoderBuilder::new().level(3).build(f).unwrap();
+        std::io::Write::write_all(&mut enc, &raw).unwrap();
+        let (_f, result) = enc.finish();
+        result.unwrap();
+    }
+
+    // Compress with deflate (raw, no zlib header).
+    let deflate_path = dir.path().join("chunk.deflate");
+    {
+        let f = fs::File::create(&deflate_path).unwrap();
+        let mut enc = flate2::write::DeflateEncoder::new(f, flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &raw).unwrap();
+        enc.finish().unwrap();
+    }
+
+    let out = dir.path().join("out.bin");
+
+    let mut group = c.benchmark_group("lz4_deflate_decompress");
+    group.throughput(Throughput::Bytes(bytes));
+
+    for input_kib in [64usize, 128, 256] {
+        let input_bytes = input_kib * 1024;
+
+        group.bench_function(BenchmarkId::new("lz4_input_kib", input_kib), |b| {
+            b.iter(|| {
+                evict_page_cache(&lz4_path);
+                let o = fs::File::create(&out).unwrap();
+                o.set_len(raw.len() as u64).unwrap();
+                let cf = fs::File::open(&lz4_path).unwrap();
+                let br = std::io::BufReader::with_capacity(input_bytes, cf);
+                let mut dec = lz4::Decoder::new(br).unwrap();
+                let mut buf = vec![0u8; OUTPUT_BUF];
+                let mut woff = 0u64;
+                loop {
+                    let n = dec.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    o.write_all_at(&buf[..n], woff).unwrap();
+                    woff += n as u64;
+                }
+                o.sync_all().unwrap();
+            });
+        });
+
+        group.bench_function(BenchmarkId::new("deflate_input_kib", input_kib), |b| {
+            b.iter(|| {
+                evict_page_cache(&deflate_path);
+                let o = fs::File::create(&out).unwrap();
+                o.set_len(raw.len() as u64).unwrap();
+                let cf = fs::File::open(&deflate_path).unwrap();
+                let br = std::io::BufReader::with_capacity(input_bytes, cf);
+                let mut dec = flate2::read::DeflateDecoder::new(br);
+                let mut buf = vec![0u8; OUTPUT_BUF];
+                let mut woff = 0u64;
+                loop {
+                    let n = dec.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    o.write_all_at(&buf[..n], woff).unwrap();
+                    woff += n as u64;
+                }
+                o.sync_all().unwrap();
+            });
+        });
+    }
+
+    group.finish();
+}
+
 /// Build a single-file `CompactManifest` over `num_chunks` equal decompressed
 /// chunks of `chunk_mib` MiB each, zstd-compressed on disk. When
 /// `with_chunk_hashes` is true, each chunk's `chunk_decompressed_hash_md5` is
@@ -2581,6 +2665,7 @@ criterion_group!(
     bench_md5,
     bench_md5_resident,
     bench_zstd_decompress,
+    bench_lz4_deflate_decompress,
     bench_assembly_e2e,
     bench_assembly_old_chunk_reuse,
     bench_verify_file_md5,
