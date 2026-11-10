@@ -43,12 +43,12 @@ pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationE
     // game directory.
     let _ = fs::remove_file(cache_path.with_extension("tmp"));
 
-    let serializable: VerificationCacheSerializable = match File::open(&cache_path) {
-        Ok(f) => serde_json::from_reader(std::io::BufReader::new(f)).unwrap_or_else(|_| {
-            VerificationCacheSerializable {
+    let serializable: VerificationCacheSerializable = match fs::read(&cache_path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| VerificationCacheSerializable {
                 files: HashMap::new(),
-            }
-        }),
+            })
+        }
         Err(_) => VerificationCacheSerializable {
             files: HashMap::new(),
         },
