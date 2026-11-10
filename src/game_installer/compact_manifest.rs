@@ -570,10 +570,16 @@ fn checked_intern(
         {
             return Ok(index);
         }
-        arena
-            .dedup
-            .try_reserve(1)
-            .map_err(|_| CompactManifestLimitError("string index allocation failed"))?;
+        // Reserve fallibly only when the map is full, so allocation failure
+        // returns an error instead of aborting via HashMap::insert's internal
+        // realloc. The per-insert try_reserve(1) added ~7% overhead on
+        // build_5000x50 because it ran unconditionally on every new entry.
+        if arena.dedup.len() == arena.dedup.capacity() {
+            arena
+                .dedup
+                .try_reserve(1)
+                .map_err(|_| CompactManifestLimitError("string index allocation failed"))?;
+        }
         let index = arena.try_intern(value)?;
         arena.dedup.insert(key, index);
         return Ok(index);
