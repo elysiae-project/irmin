@@ -5,6 +5,9 @@ pub mod adaptive_download;
 mod api;
 /// Chunk validation, file assembly, and temporary-file cleanup.
 pub mod assembly;
+#[cfg(feature = "benchmark")]
+pub mod assembly_opt;
+#[cfg(not(feature = "benchmark"))]
 mod assembly_opt;
 /// Persistent and in-memory file verification cache.
 pub mod cache;

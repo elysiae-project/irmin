@@ -2765,8 +2765,138 @@ criterion_group!(
     bench_file_md5_buffer_capacity_optional,
     bench_file_metadata_cost_optional,
     bench_update_diff_sizes,
+    bench_download_throughput,
 );
 criterion_main!(benches);
+
+#[cfg(feature = "bench-internals")]
+fn bench_download_throughput(c: &mut Criterion) {
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
+    use http_body_util::StreamBody;
+    use hyper::body::{Frame, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use irmin_rs::game_installer::assembly_opt;
+    use irmin_rs::game_installer::download_benchmark::download_and_verify_md5;
+    use std::convert::Infallible;
+    use std::net::TcpListener as StdTcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let chunk_mib = 16;
+    let total_bytes = chunk_mib * 1024 * 1024;
+    let pattern = Bytes::from(
+        (0..64 * 1024)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect::<Vec<_>>(),
+    );
+
+    let (address_tx, address_rx) = mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_pattern = pattern.clone();
+    let server = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build server runtime");
+        runtime.block_on(async move {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            let mut shutdown = Box::pin(shutdown_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => break,
+                    accepted = listener.accept() => {
+                        let (socket, _) = accepted.unwrap();
+                        let p = server_pattern.clone();
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let p = p.clone();
+                            async move {
+                                let size = req.headers()
+                                    .get("x-size")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                    .unwrap_or(total_bytes);
+                                let full = size / p.len();
+                                let rem = size % p.len();
+                                let rp = p.clone();
+                                let body = stream::repeat_with(move || rp.clone())
+                                    .take(full)
+                                    .chain(stream::iter((rem > 0).then(|| p.slice(..rem))))
+                                    .map(|b| Ok::<_, Infallible>(Frame::data(b)));
+                                let mut resp = Response::new(StreamBody::new(body));
+                                resp.headers_mut().insert(
+                                    hyper::header::CONTENT_LENGTH,
+                                    size.to_string().parse().unwrap(),
+                                );
+                                Ok::<_, Infallible>(resp)
+                            }
+                        });
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(socket), service)
+                            .await;
+                    }
+                }
+            }
+        });
+    });
+    let address = address_rx.recv().unwrap();
+
+    let mut expected_md5 = fast_md5::Md5::new();
+    for offset in (0..total_bytes).step_by(pattern.len()) {
+        let count = pattern.len().min(total_bytes - offset);
+        expected_md5.update(&pattern[..count]);
+    }
+    let expected_md5_hex = assembly_opt::md5_to_hex(&expected_md5.finalize());
+
+    let client = reqwest::Client::new();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("payload");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("download_throughput");
+    group.throughput(Throughput::Bytes(total_bytes as u64));
+
+    group.bench_function("16m_md5", |b| {
+        b.iter_custom(|iters| {
+            runtime.block_on(async {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let url = format!("http://{address}/payload");
+                    download_and_verify_md5(
+                        &client,
+                        &url,
+                        &dest,
+                        total_bytes as u64,
+                        &expected_md5_hex,
+                    )
+                    .await
+                    .unwrap();
+                }
+                start.elapsed()
+            })
+        });
+    });
+
+    group.finish();
+    let _ = shutdown_tx.send(());
+    server.join().unwrap();
+}
+
+#[cfg(not(feature = "bench-internals"))]
+fn bench_download_throughput(c: &mut Criterion) {
+    let _ = c;
+}
 
 fn bench_eager_decompress(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();

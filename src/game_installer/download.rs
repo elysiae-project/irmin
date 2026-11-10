@@ -165,6 +165,41 @@ pub mod benchmark {
         let mut md5 = None::<fast_md5::Md5>;
         super::update_download_hashes::<fast_md5::Md5>(bytes, md5.as_mut(), Some(hasher))
     }
+
+    use std::path::Path;
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn download_and_verify_md5(
+        client: &reqwest::Client,
+        url: &str,
+        dest: &Path,
+        expected_size: u64,
+        expected_md5: &str,
+    ) -> Result<(), super::SophonError> {
+        use std::path::Path;
+        let resp = client.get(url).send().await?.error_for_status()?;
+        let file = super::create_preallocated_file(dest, expected_size).await?;
+        let mut writer = super::EvictingWriter::new(file);
+        let mut hasher = Some(super::PooledMd5::new(
+            super::super::assembly_opt::take_md5()?
+        ));
+        let mut xxh = None;
+        super::stream_and_verify(
+            &mut writer,
+            resp,
+            &mut hasher,
+            &mut xxh,
+            expected_size,
+            0,
+            "bench",
+            expected_md5,
+            dest,
+            None,
+        )
+        .await?;
+        writer.flush_and_evict_all().await.ok();
+        Ok(())
+    }
 }
 
 impl PooledMd5 {
