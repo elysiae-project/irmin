@@ -912,6 +912,27 @@ fn write_from_old_file(
             chunk_decompressed_hash_md5,
         )
     } else {
+        // Fast path: when no hashing is needed, use kernel copy_file_range
+        // to avoid a userspace copy through the buffer.
+        let need_chunk_hash = super::assembly_opt::chunk_hash_required(chunk_decompressed_hash_md5);
+        if file_hasher.is_none() && !need_chunk_hash {
+            let copied = super::sysio::copy_file_from(
+                old_file,
+                old_offset,
+                out_file,
+                new_offset,
+                expected_size,
+            )?;
+            if copied != expected_size {
+                return Err(SophonError::SizeMismatch {
+                    item: old_file_path.display().to_string(),
+                    expected: expected_size,
+                    actual: copied,
+                });
+            }
+            return Ok(expected_size);
+        }
+
         let fd = old_file.as_raw_fd();
         super::assembly_opt::posix_advise(
             fd,
