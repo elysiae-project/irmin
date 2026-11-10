@@ -66,20 +66,24 @@ thread_local! {
     static MD5_POOL: RefCell<Option<Md5>> = const { RefCell::new(None) };
 }
 
+#[inline]
 pub(crate) fn take_md5() -> SophonResult<Md5> {
     MD5_POOL.with(|cell| cell.borrow_mut().take().map(Ok).unwrap_or_else(Md5::new))
 }
 
+#[inline]
 pub(crate) fn return_md5(md5: Md5) {
     let mut md5 = md5;
     md5.reset();
     let _ = MD5_POOL.try_with(|cell| cell.borrow_mut().replace(md5));
 }
 
+#[inline]
 pub(crate) fn take_xxh64() -> xxhash_rust::xxh64::Xxh64 {
     xxhash_rust::xxh64::Xxh64::new(0)
 }
 
+#[inline]
 pub(crate) fn return_xxh64(_hasher: xxhash_rust::xxh64::Xxh64) {}
 
 /// Upper bound on the per-thread read buffer retained for hashing.
@@ -223,6 +227,7 @@ thread_local! {
 }
 
 /// Take the thread-local eager decompression buffer (1 MiB).
+#[inline]
 pub(crate) fn take_eager_buf() -> Vec<u8> {
     EAGER_BUF.with(|cell| {
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
@@ -233,12 +238,14 @@ pub(crate) fn take_eager_buf() -> Vec<u8> {
 
 /// Return the eager buffer to the thread-local pool. Keeps `len` at
 /// `EAGER_BUFFER_SIZE` so `take_eager_buf`'s `resize` is a no-op on reuse.
+#[inline]
 pub(crate) fn return_eager_buf(buf: Vec<u8>) {
     EAGER_BUF.with(|cell| {
         *cell.borrow_mut() = buf;
     });
 }
 
+#[inline]
 pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
     ZSTD_DCTX.with(|cell| {
         cell.borrow_mut()
@@ -247,8 +254,8 @@ pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
     })
 }
 
+#[inline]
 pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, window_log_used: u32) {
-    // Drops contexts with window > 4 MB to avoid retaining large buffers.
     if window_log_used > 22 {
         return;
     }
@@ -434,6 +441,7 @@ thread_local! {
 
 /// Take the thread-local compressed buffer, growing it if needed.
 /// Caller must return it via [`return_compressed_buf`] when done.
+#[inline]
 fn take_compressed_buf(len: usize) -> Vec<u8> {
     COMPRESSED_BUF.with(|cell| {
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
@@ -445,6 +453,7 @@ fn take_compressed_buf(len: usize) -> Vec<u8> {
 /// Return the compressed buffer to the thread-local pool. Keeps the
 /// buffer's length so `take_compressed_buf`'s `resize` is a no-op when the
 /// next requested size matches.
+#[inline]
 fn return_compressed_buf(buf: Vec<u8>) {
     COMPRESSED_BUF.with(|cell| {
         *cell.borrow_mut() = buf;
