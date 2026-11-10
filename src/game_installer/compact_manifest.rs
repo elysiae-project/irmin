@@ -75,12 +75,18 @@ impl StringArena {
             .checked_add(s.len())
             .filter(|&length| length <= max_string_len)
             .ok_or(CompactManifestLimitError("string byte length"))?;
-        self.data
-            .try_reserve(s.len())
-            .map_err(|_| CompactManifestLimitError("string allocation failed"))?;
-        self.offsets
-            .try_reserve(1)
-            .map_err(|_| CompactManifestLimitError("string index allocation failed"))?;
+        // Reserve fallibly only when capacity is insufficient, avoiding the
+        // per-call try_reserve overhead for the common pre-allocated case.
+        if self.data.capacity() < self.data.len() + s.len() {
+            self.data
+                .try_reserve(s.len())
+                .map_err(|_| CompactManifestLimitError("string allocation failed"))?;
+        }
+        if self.offsets.capacity() == self.offsets.len() {
+            self.offsets
+                .try_reserve(1)
+                .map_err(|_| CompactManifestLimitError("string index allocation failed"))?;
+        }
         self.offsets.push(offset);
         self.data.push_str(s);
         Ok(index)
