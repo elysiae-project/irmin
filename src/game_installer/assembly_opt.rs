@@ -226,17 +226,14 @@ thread_local! {
 pub(crate) fn take_eager_buf() -> Vec<u8> {
     EAGER_BUF.with(|cell| {
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
-        if buf.capacity() < super::eager_decompress::EAGER_BUFFER_SIZE {
-            buf = Vec::with_capacity(super::eager_decompress::EAGER_BUFFER_SIZE);
-        }
-        unsafe { buf.set_len(super::eager_decompress::EAGER_BUFFER_SIZE) };
+        buf.resize(super::eager_decompress::EAGER_BUFFER_SIZE, 0);
         buf
     })
 }
 
-/// Return the eager buffer to the thread-local pool.
-pub(crate) fn return_eager_buf(mut buf: Vec<u8>) {
-    buf.clear();
+/// Return the eager buffer to the thread-local pool. Keeps `len` at
+/// `EAGER_BUFFER_SIZE` so `take_eager_buf`'s `resize` is a no-op on reuse.
+pub(crate) fn return_eager_buf(buf: Vec<u8>) {
     EAGER_BUF.with(|cell| {
         *cell.borrow_mut() = buf;
     });
@@ -440,15 +437,14 @@ thread_local! {
 fn take_compressed_buf(len: usize) -> Vec<u8> {
     COMPRESSED_BUF.with(|cell| {
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
-        if buf.capacity() < len {
-            buf.reserve(len - buf.len());
-        }
-        // Safety: pread will overwrite these bytes; avoid zeroing cost.
-        unsafe { buf.set_len(len) };
+        buf.resize(len, 0);
         buf
     })
 }
 
+/// Return the compressed buffer to the thread-local pool. Keeps the
+/// buffer's length so `take_compressed_buf`'s `resize` is a no-op when the
+/// next requested size matches.
 fn return_compressed_buf(buf: Vec<u8>) {
     COMPRESSED_BUF.with(|cell| {
         *cell.borrow_mut() = buf;
@@ -653,10 +649,7 @@ pub fn write_chunk_from_mmap(
     };
     let mut buf = OPT_BUFFER.with(|cell| {
         let mut buf = cell.take();
-        if buf.capacity() < ASSEMBLY_BUFFER_SIZE {
-            buf = Vec::with_capacity(ASSEMBLY_BUFFER_SIZE);
-        }
-        unsafe { buf.set_len(ASSEMBLY_BUFFER_SIZE) };
+        buf.resize(ASSEMBLY_BUFFER_SIZE, 0);
         buf
     });
 
@@ -691,7 +684,6 @@ pub fn write_chunk_from_mmap(
 
     let bytes_written = (expected_size_u - remaining) as u64;
 
-    buf.clear();
     OPT_BUFFER.with(|cell| cell.replace(buf));
 
     if bytes_written != expected_size {
@@ -823,10 +815,7 @@ fn decompress_chunk_with_window(
 
             let mut buffer = OPT_BUFFER.with(|cell| {
                 let mut buf = cell.take();
-                if buf.capacity() < ASSEMBLY_BUFFER_SIZE {
-                    buf = Vec::with_capacity(ASSEMBLY_BUFFER_SIZE);
-                }
-                unsafe { buf.set_len(ASSEMBLY_BUFFER_SIZE) };
+                buf.resize(ASSEMBLY_BUFFER_SIZE, 0);
                 buf
             });
 
@@ -860,7 +849,6 @@ fn decompress_chunk_with_window(
                 },
             }
 
-            buffer.clear();
             OPT_BUFFER.with(|cell| cell.replace(buffer));
             (bytes, chunk_hasher)
         }; // decoder dropped, ctx borrow released

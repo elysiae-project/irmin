@@ -401,11 +401,7 @@ fn assemble_file_with_options(
 
     let mut transfer_buffer = TRANSFER_BUF.with(|cell| {
         let mut buf = cell.take();
-        if buf.capacity() < FILE_WRITE_BUFFER_SIZE {
-            buf = Vec::with_capacity(FILE_WRITE_BUFFER_SIZE);
-        }
-        // Safety: only the portion filled by read_at is subsequently accessed via &buf[..n].
-        unsafe { buf.set_len(FILE_WRITE_BUFFER_SIZE) };
+        buf.resize(FILE_WRITE_BUFFER_SIZE, 0);
         buf
     });
     let mut guard = DecrementGuard {
@@ -617,10 +613,7 @@ fn assemble_file_with_options(
                 s.spawn(move || {
                     let mut transfer_buf = TRANSFER_BUF.with(|cell| {
                         let mut buf = cell.take();
-                        if buf.capacity() < FILE_WRITE_BUFFER_SIZE {
-                            buf = Vec::with_capacity(FILE_WRITE_BUFFER_SIZE);
-                        }
-                        unsafe { buf.set_len(FILE_WRITE_BUFFER_SIZE) };
+                        buf.resize(FILE_WRITE_BUFFER_SIZE, 0);
                         buf
                     });
                     let mut chunk_path = cdir.to_path_buf();
@@ -704,7 +697,6 @@ fn assemble_file_with_options(
                             }
                         }
                     }
-                    transfer_buf.clear();
                     TRANSFER_BUF.with(|cell| cell.replace(transfer_buf));
                 });
             }
@@ -867,7 +859,6 @@ fn assemble_file_with_options(
 
     let file_hash_verified = has_file_hash && (sequential_file_hash || parallel_hashed_file);
 
-    transfer_buffer.clear();
     TRANSFER_BUF.with(|cell| cell.replace(transfer_buffer));
 
     Ok(AssembleOutcome { file_hash_verified })
