@@ -2324,10 +2324,10 @@ fn run_download_plan_child(
         let single_allocation = single_window.finish().map_err(str::to_owned)?;
         let single_future_construction_ms = single_started.elapsed().as_millis();
         let bounded_in_flight_estimate_bytes = single_future_growth_bytes
-            .saturating_mul(irmin_rs::game_installer::DOWNLOAD_CONCURRENCY as u64);
+            .saturating_mul(irmin_rs::game_installer::download_concurrency() as u64);
         let bounded_future_state_estimate_bytes = (single_future_growth_bytes
             .saturating_add(single_inline_future_bytes as u64))
-        .saturating_mul(irmin_rs::game_installer::DOWNLOAD_CONCURRENCY as u64);
+        .saturating_mul(irmin_rs::game_installer::download_concurrency() as u64);
 
         let pending_started = Instant::now();
         let pending_window = allocation_stats::AllocationWindow::start().map_err(str::to_owned)?;
@@ -2351,7 +2351,7 @@ fn run_download_plan_child(
         }
         let pending_future_count = pending_future_count.load(std::sync::atomic::Ordering::Relaxed);
         let expected_pending_future_count =
-            chunk_count.min(irmin_rs::game_installer::DOWNLOAD_CONCURRENCY);
+            chunk_count.min(irmin_rs::game_installer::download_concurrency());
         if pending_future_count != expected_pending_future_count {
             return Err(format!(
                 "bounded pending stream retained {pending_future_count} futures; expected {expected_pending_future_count}"
@@ -2405,7 +2405,7 @@ fn run_download_plan_child(
             "rss_file_after_drop_kib": rss_after_eager.rss_file_kib,
         });
         let bounded_pending_metrics = serde_json::json!({
-            "concurrency": irmin_rs::game_installer::DOWNLOAD_CONCURRENCY,
+            "concurrency": irmin_rs::game_installer::download_concurrency(),
             "pending_future_count": pending_future_count,
             "pending_live_growth_bytes": pending_live_growth,
             "allocator_peak_bytes": pending_allocation.peak_live_bytes,
@@ -2415,7 +2415,7 @@ fn run_download_plan_child(
             "rss_file_after_poll_kib": rss_after_pending.rss_file_kib,
         });
         let bounded_drain_metrics = serde_json::json!({
-            "concurrency": irmin_rs::game_installer::DOWNLOAD_CONCURRENCY,
+            "concurrency": irmin_rs::game_installer::download_concurrency(),
             "stream_items_drained": drained_chunks,
             "dedup_entry_count": chunk_count,
             "dedup_metadata_scales_with_unique_chunks": true,

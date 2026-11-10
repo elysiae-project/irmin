@@ -3372,7 +3372,7 @@ async fn apply_download_over(
 
     run_unique_chunks_bounded(
         &file_entry.asset_chunks,
-        super::DOWNLOAD_CONCURRENCY,
+        super::download_concurrency(),
         |chunk| make_download_over_chunk_future(chunk, &chunks_dir, client, chunk_download, handle),
     )
     .await?;
@@ -3449,7 +3449,7 @@ fn build_download_over_chunk_futures(
     chunk_download: &DownloadInfo,
     handle: &DownloadHandle,
 ) -> impl std::future::Future<Output = SophonResult<Vec<()>>> + 'static {
-    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(super::DOWNLOAD_CONCURRENCY));
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(super::download_concurrency()));
     let mut seen_chunks = rustc_hash::FxHashSet::default();
     let mut chunk_futures = Vec::with_capacity(asset_chunks.len());
     for chunk in asset_chunks {
@@ -3555,7 +3555,7 @@ pub async fn benchmark_download_over_bounded_stream<'a>(
     handle: &'a DownloadHandle,
 ) -> SophonResult<()> {
     let mut downloads =
-        build_unique_chunk_stream(asset_chunks, super::DOWNLOAD_CONCURRENCY, |chunk| {
+        build_unique_chunk_stream(asset_chunks, super::download_concurrency(), |chunk| {
             make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle)
         });
     while let Some(result) = downloads.next().await {
@@ -3572,7 +3572,7 @@ pub fn benchmark_download_over_bounded_drain_stream<'a>(
     chunk_download: &'a DownloadInfo,
     handle: &'a DownloadHandle,
 ) -> impl futures_util::Stream<Item = SophonResult<()>> + 'a {
-    build_unique_chunk_stream(asset_chunks, super::DOWNLOAD_CONCURRENCY, move |chunk| {
+    build_unique_chunk_stream(asset_chunks, super::download_concurrency(), move |chunk| {
         let download =
             make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
         async move {
@@ -3592,7 +3592,7 @@ pub fn benchmark_download_over_bounded_pending_stream<'a>(
     handle: &'a DownloadHandle,
     started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> impl futures_util::Stream<Item = SophonResult<()>> + 'a {
-    build_unique_chunk_stream(asset_chunks, super::DOWNLOAD_CONCURRENCY, move |chunk| {
+    build_unique_chunk_stream(asset_chunks, super::download_concurrency(), move |chunk| {
         started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let download =
             make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
