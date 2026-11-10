@@ -18,7 +18,7 @@ use super::error::{SophonError, SophonResult};
 
 /// Buffer size for reading from the zstd decoder and writing to the output file.
 /// Buffer size used by eager streaming decompression.
-pub const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
+pub const EAGER_BUFFER_SIZE: usize = 512 * 1024;
 
 #[cfg(feature = "bench-diagnostics")]
 #[derive(Default)]
