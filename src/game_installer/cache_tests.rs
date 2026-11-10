@@ -688,3 +688,40 @@ fn benchmark_load_verification_cache_startup() {
         samples[samples.len() - 1],
     );
 }
+
+#[test]
+fn save_and_load_verification_cache_round_trip() {
+    use super::VerificationEntry;
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path();
+    let cache: DashMap<String, VerificationEntry> = DashMap::new();
+    cache.insert(
+        "data/asset.pak".to_string(),
+        VerificationEntry {
+            size: 12345,
+            md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            mtime_secs: 1700000000,
+        },
+    );
+    cache.insert(
+        "data/中文.pak".to_string(),
+        VerificationEntry {
+            size: 99,
+            md5: "abc123".to_string(),
+            mtime_secs: 1700000001,
+        },
+    );
+
+    save_verification_cache(game_dir, &cache).unwrap();
+
+    let loaded = load_verification_cache(game_dir);
+    assert_eq!(loaded.len(), 2);
+    let e1 = loaded.get("data/asset.pak").unwrap();
+    assert_eq!(e1.size, 12345);
+    assert_eq!(e1.md5, "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(e1.mtime_secs, 1700000000);
+    let e2 = loaded.get("data/中文.pak").unwrap();
+    assert_eq!(e2.size, 99);
+    assert_eq!(e2.md5, "abc123");
+    assert_eq!(e2.mtime_secs, 1700000001);
+}

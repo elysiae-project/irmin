@@ -97,16 +97,13 @@ pub fn save_verification_cache(
 ) -> io::Result<()> {
     let cache_path = game_dir.join(VERIFICATION_CACHE_FILE);
     let tmp_path = cache_path.with_extension("tmp");
-    let serializable = VerificationCacheSerializable {
-        files: cache
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect::<std::collections::HashMap<_, _>>(),
-    };
     {
         let f = File::create(&tmp_path)?;
         let mut writer = std::io::BufWriter::with_capacity(super::FILE_WRITE_BUFFER_SIZE, f);
-        serde_json::to_writer(&mut writer, &serializable)?;
+        // Serialize directly from the DashMap iterator, avoiding the
+        // intermediate HashMap clone of every entry.
+        let wrapper = SaveWrapper { files: cache };
+        serde_json::to_writer(&mut writer, &wrapper)?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
     }
@@ -114,6 +111,23 @@ pub fn save_verification_cache(
         let _ = fs::remove_file(&tmp_path);
     })?;
     Ok(())
+}
+
+/// Serialization-only wrapper that borrows a `DashMap` as the `files` field,
+/// producing the same JSON structure as `VerificationCacheSerializable` without
+/// cloning every entry into an intermediate `HashMap`. The field name `files`
+/// must stay in sync with `VerificationCacheSerializable`.
+struct SaveWrapper<'a> {
+    files: &'a DashMap<String, VerificationEntry>,
+}
+
+impl Serialize for SaveWrapper<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("VerificationCacheSerializable", 1)?;
+        state.serialize_field("files", self.files)?;
+        state.end()
+    }
 }
 
 /// Verify a file using a path relative to `game_dir` as its cache key.
