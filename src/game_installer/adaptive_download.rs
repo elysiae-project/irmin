@@ -10,10 +10,10 @@ use std::time::Instant;
 
 /// Initial number of download workers.
 /// Starting number of concurrent chunk download workers.
-pub const INITIAL_CONCURRENCY: usize = 24;
+pub const INITIAL_CONCURRENCY: usize = 12;
 /// Maximum download workers (hard ceiling).
 /// Hard upper bound on concurrent chunk download workers.
-pub const MAX_CONCURRENCY: usize = 48;
+pub const MAX_CONCURRENCY: usize = 24;
 /// Interval between throughput checks.
 const MEASURE_INTERVAL_MS: u64 = 1000;
 /// Scale up when throughput grew by at least this fraction.

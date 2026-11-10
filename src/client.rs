@@ -24,7 +24,7 @@ impl DownloadClient {
     pub fn new() -> Self {
         Self(
             reqwest::Client::builder()
-                .pool_max_idle_per_host(crate::game_installer::DOWNLOAD_CONCURRENCY)
+                .pool_max_idle_per_host(12)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .tcp_nodelay(true)
                 .http1_only()
