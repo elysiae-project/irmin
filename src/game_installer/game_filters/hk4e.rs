@@ -49,11 +49,20 @@ pub fn filter_hk4e_asset_list(
         .collect();
 
     // Filter ctable_streaming.dat unconditionally (not language-dependent).
+    // Use ASCII case-insensitive comparison to avoid allocating a lowercased String.
     assets.retain(|asset| {
-        if asset
-            .asset_name
-            .to_lowercase()
-            .ends_with("ctable_streaming.dat")
+        if asset.asset_name.len() >= "ctable_streaming.dat".len()
+            && asset
+                .asset_name
+                .as_bytes()
+                .ends_with(b"ctable_streaming.dat")
+            && asset
+                .asset_name
+                .as_bytes()
+                .iter()
+                .rev()
+                .take("ctable_streaming.dat".len())
+                .all(|&b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic())
         {
             log::warn!("Filtered ctable asset: {}", asset.asset_name);
             return false;
@@ -67,12 +76,12 @@ pub fn filter_hk4e_asset_list(
 
     let patterns_lower: Vec<String> = ignored_langs
         .iter()
-        .map(|lang| format!("/{lang}/").to_lowercase())
+        .map(|lang| format!("/{lang}/").to_ascii_lowercase())
         .collect();
 
     let original_len = assets.len();
     assets.retain(|asset| {
-        let asset_lower = asset.asset_name.to_lowercase();
+        let asset_lower = asset.asset_name.to_ascii_lowercase();
 
         for pattern in &patterns_lower {
             if asset_lower.contains(pattern) {
