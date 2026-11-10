@@ -940,7 +940,8 @@ async fn prepare_directories(game_dir: &Path, chunks_dir: &Path) -> SophonResult
 fn build_installer_data(
     installers: Vec<SophonInstaller>,
 ) -> (Vec<InstallerData>, Vec<SophonManifestAssetProperty>) {
-    let mut all_files = Vec::new();
+    let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
+    let mut all_files = Vec::with_capacity(total_assets);
     let mut data = Vec::with_capacity(installers.len());
     for inst in installers {
         let file_count = inst
@@ -3801,7 +3802,8 @@ async fn verify_installers(
                 .any(|s| s.matching_field == i.matching_field)
         });
     }
-    let mut all_assets = Vec::new();
+    let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
+    let mut all_assets = Vec::with_capacity(total_assets);
     let mut index_assets = Vec::new();
     let mut has_binary_version = false;
     for mut installer in installers {
@@ -3879,7 +3881,8 @@ async fn repair_assets(
 ) -> SophonResult<()> {
     all_assets.retain(|(asset, _)| !asset.is_directory());
     let mut identities = FxHashMap::<PathBuf, usize>::default();
-    let mut unique: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)> = Vec::new();
+    let mut unique: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)> =
+        Vec::with_capacity(all_assets.len());
     for (asset, download) in all_assets {
         validate_asset_name(asset.asset_name_str())?;
         let identity: PathBuf = Path::new(asset.asset_name_str()).components().collect();
