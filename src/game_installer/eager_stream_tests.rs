@@ -422,9 +422,12 @@ fn benchmark_eager_loopback_concurrent_rss() {
 #[cfg(feature = "bench-diagnostics")]
 /// Measures fixed-work eager downloads over a synthetic loopback server.
 ///
-/// The server applies one response delay per request and an optional shared
-/// no-credit body-rate limit. It does not model TCP windowing, loss, jitter, or
-/// a remote CDN. Process RSS includes both client and server tasks, so use the
+/// `IRMIN_EAGER_BENCH_MODE` selects streaming, one-shot, or the production
+/// threshold; `IRMIN_EAGER_BENCH_PATTERN` selects payload compressibility, and
+/// `IRMIN_EAGER_BENCH_FS_LABEL` supplies the output filesystem label. The server
+/// applies one response delay per request and an optional shared no-credit
+/// body-rate limit. It does not model TCP windowing, loss, jitter, or a remote
+/// CDN. Process RSS includes both client and server tasks, so use the reset
 /// high-water mark as a relative measurement for this fixture only.
 #[test]
 #[ignore = "measures fixed-work loopback eager installer worker limits"]
@@ -763,7 +766,6 @@ async fn benchmark_eager_loopback_inner() {
         let pending = Arc::clone(&pending);
         let chunk_entries = Arc::clone(&chunk_entries);
         let offsets = Arc::clone(&offsets);
-        let force_streaming = force_streaming;
         let timings = Arc::clone(&timings);
         tasks.spawn(async move {
             let mut item = eager_item();
@@ -832,7 +834,7 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
         .unwrap_or_else(|_| "17".to_owned())
         .parse::<usize>()
         .expect("IRMIN_EAGER_BENCH_SIZE_MIB must be an unsigned integer");
-    assert!((17..=128).contains(&size_mib));
+    assert!((17..=256).contains(&size_mib));
     let queue_capacity = std::env::var("IRMIN_EAGER_BENCH_QUEUE_CAPACITY")
         .unwrap_or_else(|_| "8".to_owned())
         .parse::<usize>()
@@ -851,16 +853,43 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
         .parse::<usize>()
         .expect("IRMIN_EAGER_BENCH_FRAME_KIB must be an unsigned integer");
     assert!((1..=4096).contains(&frame_kib));
+    let mode = std::env::var("IRMIN_EAGER_BENCH_MODE").unwrap_or_else(|_| "stream".to_owned());
+    let force_streaming = match mode.as_str() {
+        "stream" => Some(true),
+        "oneshot" => Some(false),
+        "threshold" => None,
+        _ => panic!("IRMIN_EAGER_BENCH_MODE must be stream, oneshot, or threshold"),
+    };
 
-    let mut state = 0xBAD5EEDu64;
-    let data = (0..size_mib * 1024 * 1024)
-        .map(|_| {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
-        })
-        .collect::<Vec<_>>();
+    let pattern =
+        std::env::var("IRMIN_EAGER_BENCH_PATTERN").unwrap_or_else(|_| "random".to_owned());
+    let data_len = size_mib * 1024 * 1024;
+    let data = match pattern.as_str() {
+        "random" => {
+            let mut state = 0xBAD5EEDu64;
+            (0..data_len)
+                .map(|_| {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+                })
+                .collect::<Vec<_>>()
+        }
+        "low-alphabet" => {
+            let mut state = 0xBAD5EEDu64;
+            (0..data_len)
+                .map(|_| {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 60) as u8
+                })
+                .collect::<Vec<_>>()
+        }
+        "repeated" => vec![0xA5; data_len],
+        _ => panic!("IRMIN_EAGER_BENCH_PATTERN must be random, low-alphabet, or repeated"),
+    };
     let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
     encoder.window_log(25).unwrap();
     encoder.write_all(&data).unwrap();
@@ -868,6 +897,7 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
     let compressed_hash = hex::encode(fast_md5::digest(&compressed));
     let expected_output_hash = fast_md5::digest(&data);
     let decompressed_hash = hex::encode(expected_output_hash);
+    let should_stream = super::should_stream_eager(compressed.len() as u64, force_streaming);
     drop(data);
 
     let response_count = Arc::new(AtomicU64::new(0));
@@ -1008,6 +1038,8 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
             .unwrap(),
         None => tempfile::tempdir().unwrap(),
     };
+    let output_filesystem =
+        std::env::var("IRMIN_EAGER_BENCH_FS_LABEL").unwrap_or_else(|_| "unspecified".to_owned());
     let allocator = Arc::new(super::output_allocator::OutputAllocator::new(dir.path()));
     let bitmap = Arc::new(
         super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("bitmap"), item_count).unwrap(),
@@ -1092,7 +1124,9 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
     let offsets = Arc::new((0..=item_count as u32).collect::<Vec<_>>());
     let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = DownloadHandle::new();
-    let peak_before = rss_high_water_kib();
+    let (setup_rss, setup_anon, setup_file, setup_shmem) = rss_status_components_kib();
+    let hwm_reset = reset_rss_high_water();
+    assert!(hwm_reset, "unable to reset process high-water RSS");
     let cpu_before = process_cpu_time_ms();
     let started = Instant::now();
     let timings = Arc::new(super::super::eager_decompress::EagerStreamPhaseTimings::default());
@@ -1118,7 +1152,7 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
                     offsets.as_slice(),
                     pending.as_slice(),
                     &handle,
-                    Some(true),
+                    force_streaming,
                     Some(queue_capacity),
                     Some(Arc::clone(&timings)),
                 )
@@ -1141,7 +1175,11 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
         assert_eq!(fast_md5::digest(&output), expected_output_hash);
     }
     println!(
-        "path=fixed-work-eager mode=stream workers={workers} items={item_count} size_mib={size_mib} queue_capacity={queue_capacity} frame_kib={frame_kib} response_delay_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} temp_root={} requests={} frames={} elapsed_ms={} process_cpu_ms={} peak_before_kib={peak_before} peak_after_kib={} downloaded_mib={:.1} achieved_mib_s={:.2}",
+        "path=fixed-work-eager mode={mode} selected={} pattern={pattern} workers={workers} items={item_count} size_mib={size_mib} total_output_mib={:.1} compressed_mib={:.2} ratio={:.2} queue_capacity={queue_capacity} frame_kib={frame_kib} response_delay_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} temp_root={} fs_label={output_filesystem} requests={} frames={} elapsed_ms={} process_cpu_ms={} hwm_reset={hwm_reset} setup_rss_kib={setup_rss:?} setup_anon_kib={setup_anon:?} setup_file_kib={setup_file:?} setup_shmem_kib={setup_shmem:?} operation_hwm_kib={} downloaded_mib={:.1} achieved_mib_s={:.2}",
+        if should_stream { "stream" } else { "oneshot" },
+        (size_mib * item_count) as f64,
+        compressed.len() as f64 / (1024.0 * 1024.0),
+        data_len as f64 / compressed.len() as f64,
         if uses_custom_temp_root {
             "custom"
         } else {
