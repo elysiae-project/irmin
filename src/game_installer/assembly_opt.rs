@@ -141,6 +141,7 @@ impl HashReadBuffer {
 }
 
 impl Drop for HashReadBuffer {
+    #[inline]
     fn drop(&mut self) {
         if self.pooled && self.buffer.capacity() <= HASH_READ_BUFFER_SIZE {
             let buffer = std::mem::take(&mut self.buffer);
