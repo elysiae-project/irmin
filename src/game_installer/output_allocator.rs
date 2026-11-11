@@ -79,11 +79,13 @@ impl OutputAllocator {
     }
 
     /// Returns the cached file handle for a given file index.
+    #[inline]
     pub fn get_handle(&self, file_idx: usize) -> Option<Arc<File>> {
         self.handles.get(&file_idx).map(|r| Arc::clone(r.value()))
     }
 
     /// Closes and removes the file handle from cache.
+    #[inline]
     pub fn close_file(&self, file_idx: usize) {
         self.handles.remove(&file_idx);
     }
