@@ -37,7 +37,7 @@ impl ChunkNameLookup {
     }
 
     /// Find a name and return its original arena index, or `None` if absent.
-    #[inline]
+    #[inline(always)]
     pub fn lookup(&self, name: &str) -> Option<usize> {
         let arena = &self.arena;
         let result = self
