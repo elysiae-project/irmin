@@ -456,6 +456,32 @@ fn adaptive_download_scaling_checks_for_unclaimed_items() {
 }
 
 #[test]
+fn from_manifest_dedups_shared_chunk_names_across_files() {
+    use std::sync::Arc;
+
+    use super::compact_manifest::CompactManifest;
+
+    let manifest = Arc::new(CompactManifest::from(vec![
+        make_file("a.pak", "hash-a", vec![make_chunk("shared", 11)]),
+        make_file("b.pak", "hash-b", vec![make_chunk("shared", 11)]),
+    ]));
+
+    // Two files reference the same chunk name "shared". The manifest builder
+    // does not dedup names during interning, so the two entries get distinct
+    // arena ids. from_manifest must dedup by name so lookup returns one index.
+    let items = [(0, 0), (1, 0)];
+    let lookup = ChunkNameLookup::from_manifest(Arc::clone(&manifest), items.into_iter());
+
+    assert_eq!(lookup.name_locs.len(), 1, "shared chunk name must dedup to one dense index");
+    let idx = lookup
+        .lookup("shared")
+        .expect("shared chunk name is findable");
+    assert_eq!(idx, 0);
+    assert_eq!(lookup.get(idx), "shared");
+    assert!(lookup.lookup("absent").is_none());
+}
+
+#[test]
 fn download_cancellation_is_recorded_for_finalization() {
     let cancelled = AtomicU8::new(0);
 

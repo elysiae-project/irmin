@@ -150,6 +150,7 @@ impl From<&[&str]> for StringArena {
 /// Binary blob arena with deduplication, mirroring `StringArena` for `&[u8]`.
 /// Stores MD5/xxh64 hashes as binary (16 or 8 bytes) instead of hex (32 or 16),
 /// halving the memory for hash strings.
+#[derive(Default)]
 pub struct ByteArena {
     data: Vec<u8>,
     offsets: Vec<u32>,
@@ -375,6 +376,44 @@ impl CompactManifest {
         self.chunk_name_idx[chunk_idx]
     }
 
+    /// Resolves a raw arena index (as returned by `chunk_name_arena_idx` or
+    /// `file_chunk_name_id_at`) to its borrowed string.
+    #[inline]
+    pub fn str_at(&self, arena_id: u32) -> &str {
+        self.arena.get(arena_id)
+    }
+
+    /// Returns the byte range `[start, start+len)` of the string at `arena_id`
+    /// within the manifest arena data, for callers that store offsets inline.
+    #[inline]
+    pub(crate) fn str_offsets_at(&self, arena_id: u32) -> (u32, u32) {
+        let idx = arena_id as usize;
+        let start = self.arena.offsets[idx];
+        let end = if idx + 1 < self.arena.offsets.len() {
+            self.arena.offsets[idx + 1]
+        } else {
+            self.arena.data.len() as u32
+        };
+        debug_assert!(end >= start, "arena offsets must be monotonic");
+        (start, end - start)
+    }
+
+    /// Returns the arena's contiguous string storage as a `&str`. Callers that
+    /// cache offsets via `str_offsets_at` can slice this without re-validating
+    /// UTF-8 (the arena is a `String`, valid UTF-8 by construction).
+    #[inline]
+    pub(crate) fn arena_str(&self) -> &str {
+        &self.arena.data
+    }
+
+    /// String-arena index of a file-local chunk's CDN object name, without
+    /// constructing a `ChunkRef` or resolving the string.
+    #[inline]
+    pub fn file_chunk_name_id_at(&self, file_idx: usize, chunk_idx_in_file: usize) -> u32 {
+        let start = self.file_chunk_start[file_idx];
+        self.chunk_name_idx[start as usize + chunk_idx_in_file]
+    }
+
     /// Returns a chunk name by (file_idx, chunk_idx_in_file) without constructing a `ChunkRef`.
     #[inline]
     pub fn file_chunk_name_at(&self, file_idx: usize, chunk_idx_in_file: usize) -> &str {
@@ -496,6 +535,27 @@ impl CompactManifest {
         let mut builder = CompactManifestBuilder::for_properties(std::slice::from_ref(property))?;
         builder.push(property)?;
         builder.finish()
+    }
+
+    /// Wrap a bare `StringArena` as a minimal manifest whose only populated
+    /// column is the arena. Only `arena_str`/`str_offsets_at` are valid on the
+    /// result; all file/chunk accessors panic on the empty columns.
+    pub(crate) fn wrap_arena(arena: StringArena) -> Self {
+        Self {
+            arena,
+            hash_arena: ByteArena::default(),
+            file_name_idx: Vec::new(),
+            file_hash_idx: Vec::new(),
+            file_type: Vec::new(),
+            file_size: Vec::new(),
+            file_chunk_start: Vec::new(),
+            chunk_name_idx: Vec::new(),
+            chunk_decomp_hash_idx: Vec::new(),
+            chunk_comp_hash_idx: Vec::new(),
+            chunk_size: Vec::new(),
+            chunk_size_decompressed: Vec::new(),
+            chunk_old_offset: Vec::new(),
+        }
     }
 }
 

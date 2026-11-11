@@ -5,50 +5,6 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-
-/// Compact sorted index over a `StringArena` for `&str -> usize` lookup
-/// via binary search. Avoids per-entry HashMap overhead.
-/// Compact index that maps chunk names to their original arena index via binary search.
-pub struct ChunkNameLookup {
-    arena: super::compact_manifest::StringArena,
-    sorted_indices: Vec<u32>,
-}
-
-impl ChunkNameLookup {
-    /// Build a sorted lookup index while retaining the arena's original ordering.
-    pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
-        let n = arena.len();
-        let mut sorted_indices: Vec<u32> = (0..n as u32).collect();
-        sorted_indices.sort_unstable_by(|&a, &b| {
-            let sa = arena.get(a);
-            let sb = arena.get(b);
-            sa.cmp(sb)
-        });
-        Self {
-            arena,
-            sorted_indices,
-        }
-    }
-
-    /// Return the arena string at its original index; panics when out of range.
-    #[inline]
-    pub fn get(&self, idx: usize) -> &str {
-        self.arena.get(idx as u32)
-    }
-
-    /// Find a name and return its original arena index, or `None` if absent.
-    #[inline(always)]
-    pub fn lookup(&self, name: &str) -> Option<usize> {
-        let arena = &self.arena;
-        let result = self
-            .sorted_indices
-            .binary_search_by(|&i| arena.get(i).cmp(name));
-        match result {
-            Ok(pos) => Some(self.sorted_indices[pos] as usize),
-            Err(_) => None,
-        }
-    }
-}
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -76,6 +32,107 @@ use crate::api_scrape::{DownloadInfo, SophonBuildData, SophonManifestMeta};
 use crate::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
 
 use crate::proto_parse::SophonManifestAssetChunk;
+
+/// Sorted name index mapping chunk names to dense indices via binary search.
+///
+/// Borrows names from the manifest's `StringArena` to avoid duplicating
+/// chunk-name bytes. `name_locs` stores the byte offset and length of each
+/// name inline (indexed by dense index), so `get` is a single array load
+/// plus a slice of the arena data. `sorted` holds dense indices ordered by
+/// name for binary search.
+pub struct ChunkNameLookup {
+    manifest: Arc<CompactManifest>,
+    /// (start offset, length) of each chunk name within the manifest arena data
+    name_locs: Box<[(u32, u32)]>,
+    /// dense indices ordered by name for binary search
+    sorted: Box<[u32]>,
+}
+
+/// Compare two arena-embedded names by byte content. UTF-8 byte order
+/// matches `str` order, so this is equivalent to `&str::cmp` without the
+/// per-slice char-boundary checks.
+#[inline]
+fn name_cmp(arena: &[u8], a: (u32, u32), b: (u32, u32)) -> std::cmp::Ordering {
+    let na = &arena[a.0 as usize..(a.0 + a.1) as usize];
+    let nb = &arena[b.0 as usize..(b.0 + b.1) as usize];
+    na.cmp(nb)
+}
+
+impl ChunkNameLookup {
+    /// Wrap a bare `StringArena` as the name source; arena indices become
+    /// dense indices one-to-one. Used by tests and the repair path that own
+    /// a standalone arena not backed by a full manifest.
+    pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
+        let n = arena.len();
+        let manifest = Arc::new(CompactManifest::wrap_arena(arena));
+        let name_locs: Vec<(u32, u32)> = (0..n as u32)
+            .map(|i| manifest.str_offsets_at(i))
+            .collect();
+        let bytes = manifest.arena_str().as_bytes();
+        let mut sorted: Vec<u32> = (0..n as u32).collect();
+        sorted.sort_unstable_by(|&a, &b| {
+            name_cmp(bytes, name_locs[a as usize], name_locs[b as usize])
+        });
+        Self {
+            manifest,
+            name_locs: name_locs.into_boxed_slice(),
+            sorted: sorted.into_boxed_slice(),
+        }
+    }
+
+    /// Build a lookup over a real manifest's chunk names, deduplicating by
+    /// name so each unique chunk name maps to one dense index. The manifest
+    /// builder does not dedup chunk names during interning, so dedup happens
+    /// here by comparing the resolved name bytes.
+    pub(crate) fn from_manifest(
+        manifest: Arc<CompactManifest>,
+        items: impl IntoIterator<Item = (u32, u32)>,
+    ) -> Self {
+        let arena_bytes = manifest.arena_str().as_bytes();
+        let mut seen: FxHashMap<&[u8], u32> = FxHashMap::default();
+        let mut name_locs: Vec<(u32, u32)> = Vec::new();
+        for (file_idx, chunk_idx) in items {
+            let id = manifest.file_chunk_name_id_at(file_idx as usize, chunk_idx as usize);
+            let loc = manifest.str_offsets_at(id);
+            let name_bytes = &arena_bytes[loc.0 as usize..(loc.0 + loc.1) as usize];
+            if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(name_bytes) {
+                e.insert(name_locs.len() as u32);
+                name_locs.push(loc);
+            }
+        }
+        let mut sorted: Vec<u32> = (0..name_locs.len() as u32).collect();
+        sorted.sort_unstable_by(|&a, &b| {
+            name_cmp(arena_bytes, name_locs[a as usize], name_locs[b as usize])
+        });
+        Self {
+            manifest,
+            name_locs: name_locs.into_boxed_slice(),
+            sorted: sorted.into_boxed_slice(),
+        }
+    }
+
+    /// Return the chunk name at a dense index; panics when out of range.
+    #[inline]
+    pub fn get(&self, idx: usize) -> &str {
+        let (start, len) = self.name_locs[idx];
+        let arena = self.manifest.arena_str();
+        &arena[start as usize..(start + len) as usize]
+    }
+
+    /// Find a name and return its dense index, or `None` if absent.
+    #[inline]
+    pub fn lookup(&self, name: &str) -> Option<usize> {
+        let arena = self.manifest.arena_str().as_bytes();
+        let name_locs = &self.name_locs;
+        match self.sorted.binary_search_by(|&i| {
+            let (start, len) = name_locs[i as usize];
+            arena[start as usize..(start + len) as usize].cmp(name.as_bytes())
+        }) {
+            Ok(pos) => Some(self.sorted[pos] as usize),
+            Err(_) => None,
+        }
+    }
+}
 
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 /// Thread-safe callback receiving the current downloaded-chunk size map for persistence.
@@ -1161,24 +1218,14 @@ async fn build_download_state(
 
     let (flat_chunk_entries, chunk_entry_offsets) = chunk_entries.finish(download_items.len())?;
 
-    let total_name_bytes: usize = download_items
-        .iter()
-        .map(|item| {
-            ctx.all_files
-                .file_chunk_name_at(item.file_idx as usize, item.chunk_idx as usize)
-                .len()
-        })
-        .sum();
-    let mut arena =
-        super::compact_manifest::StringArena::with_capacity(download_items.len(), total_name_bytes);
-    for item in &download_items {
-        let name = ctx
-            .all_files
-            .file_chunk_name_at(item.file_idx as usize, item.chunk_idx as usize);
-        arena.intern_dedup(name);
-    }
-    arena.clear_dedup();
-    let chunk_names_lookup = Arc::new(ChunkNameLookup::from_arena(arena));
+    // Reuse the manifest's arena as the name source. Dense indices follow the
+    // first occurrence of each chunk name in download_items order.
+    let chunk_names_lookup = Arc::new(ChunkNameLookup::from_manifest(
+        Arc::clone(&ctx.all_files),
+        download_items
+            .iter()
+            .map(|item| (item.file_idx, item.chunk_idx)),
+    ));
 
     Ok((
         download_items,
@@ -1278,7 +1325,7 @@ pub fn snapshot_downloaded_chunks<'a>(
     downloaded_chunks: &[AtomicU32],
     chunk_names: &'a ChunkNameLookup,
 ) -> Vec<(&'a str, u64)> {
-    debug_assert_eq!(downloaded_chunks.len(), chunk_names.sorted_indices.len());
+    debug_assert_eq!(downloaded_chunks.len(), chunk_names.name_locs.len());
     let completed_count = downloaded_chunks
         .iter()
         .filter(|value| value.load(Ordering::Relaxed) > 0)
