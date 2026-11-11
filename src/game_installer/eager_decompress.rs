@@ -360,6 +360,7 @@ fn stream_decompress_to_file_inner(
 struct DctxGuard(Option<zstd::zstd_safe::DCtx<'static>>);
 
 impl Drop for DctxGuard {
+    #[inline]
     fn drop(&mut self) {
         if let Some(ctx) = self.0.take() {
             assembly_opt::return_dctx(ctx, assembly_opt::MAX_WINDOW_LOG);
@@ -370,95 +371,11 @@ impl Drop for DctxGuard {
 struct PooledMd5Guard(Option<Md5>);
 
 impl Drop for PooledMd5Guard {
+    #[inline]
     fn drop(&mut self) {
         if let Some(hasher) = self.0.take() {
             return_md5(hasher);
         }
-    }
-}
-
-struct StreamOutput<'a> {
-    file: &'a File,
-    chunk_offset: u64,
-    expected_size: u64,
-    write_offset: u64,
-    bytes_written: u64,
-    hasher: PooledMd5Guard,
-    #[cfg(feature = "bench-diagnostics")]
-    timings: Option<Arc<EagerStreamPhaseTimings>>,
-}
-
-fn read_decompressed(
-    decoder: &mut impl io::Read,
-    buf: &mut [u8],
-    output: &mut StreamOutput<'_>,
-) -> SophonResult<()> {
-    loop {
-        let remaining = output.expected_size.saturating_sub(output.bytes_written);
-        let read_limit = remaining.saturating_add(1).min(buf.len() as u64) as usize;
-        #[cfg(feature = "bench-diagnostics")]
-        let read_started = std::time::Instant::now();
-        let n = decoder
-            .read(&mut buf[..read_limit])
-            .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
-        #[cfg(feature = "bench-diagnostics")]
-        if let Some(timings) = output.timings.as_ref() {
-            let elapsed = read_started.elapsed().as_nanos() as u64;
-            timings
-                .decoder_read_ns
-                .fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
-            if n > 0 {
-                timings
-                    .decoder_read_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                timings
-                    .decoder_read_bytes
-                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        if n == 0 {
-            return Ok(());
-        }
-        let next_bytes_written = output
-            .bytes_written
-            .checked_add(n as u64)
-            .ok_or_else(|| SophonError::Io(io::Error::other("decompressed size overflow")))?;
-        if next_bytes_written > output.expected_size {
-            return Err(SophonError::SizeMismatch {
-                item: format!("stream chunk at offset {}", output.chunk_offset),
-                expected: output.expected_size,
-                actual: next_bytes_written,
-            });
-        }
-        #[cfg(feature = "bench-diagnostics")]
-        let write_started = std::time::Instant::now();
-        output
-            .file
-            .write_all_at(&buf[..n], output.write_offset)
-            .map_err(SophonError::Io)?;
-        #[cfg(feature = "bench-diagnostics")]
-        if let Some(timings) = output.timings.as_ref() {
-            timings.output_write_ns.fetch_add(
-                write_started.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        #[cfg(feature = "bench-diagnostics")]
-        let hash_started = std::time::Instant::now();
-        if let Some(hasher) = output.hasher.0.as_mut() {
-            hasher.update(&buf[..n])?;
-        }
-        #[cfg(feature = "bench-diagnostics")]
-        if let Some(timings) = output.timings.as_ref()
-            && output.hasher.0.is_some()
-        {
-            timings.output_hash_ns.fetch_add(
-                hash_started.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        output.write_offset += n as u64;
-        output.bytes_written = next_bytes_written;
     }
 }
 
