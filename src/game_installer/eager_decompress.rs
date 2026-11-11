@@ -282,25 +282,21 @@ fn stream_decompress_to_file_inner(
         let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
     }
 
-    let buf = assembly_opt::take_eager_buf();
     let decompressed_hasher = if need_decompressed_hash {
         Some(take_md5()?)
     } else {
         None
     };
     let mut ctx = DctxGuard(Some(ctx));
-    let mut buf = EagerBuffer(Some(buf));
-    let decompressed_hasher = PooledMd5Guard(decompressed_hasher);
-    let mut output = StreamOutput {
-        file: out_file,
-        chunk_offset,
-        expected_size: expected_decompressed_size,
-        write_offset: chunk_offset,
-        bytes_written: 0,
-        hasher: decompressed_hasher,
-        #[cfg(feature = "bench-diagnostics")]
-        timings,
-    };
+    let mut decompressed_hasher = PooledMd5Guard(decompressed_hasher);
+
+    // Mmap the output region and decompress directly into it, eliminating
+    // both the intermediate buffer and pwrite syscalls.
+    let expected_usize = expected_decompressed_size as usize;
+    let mut out_mmap = assembly_opt::mmap_read_write(out_file, chunk_offset, expected_usize)?;
+    let output_slice = out_mmap.as_mut_slice();
+    let mut bytes_written: usize = 0;
+
     {
         #[cfg(feature = "bench-diagnostics")]
         let decoder_thread_started = thread_cpu_time_ns();
@@ -309,40 +305,44 @@ fn stream_decompress_to_file_inner(
             ctx.0.as_mut().expect("decoder context is present"),
         )
         .single_frame();
-        read_decompressed(
-            &mut decoder,
-            buf.0.as_mut().expect("eager buffer is present"),
-            &mut output,
-        )?;
+        loop {
+            let remaining = expected_usize.saturating_sub(bytes_written);
+            if remaining == 0 {
+                break;
+            }
+            let n = decoder
+                .read(&mut output_slice[bytes_written..bytes_written + remaining])
+                .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
+            if n == 0 {
+                break;
+            }
+            bytes_written += n;
+        }
+        if let Some(hasher) = decompressed_hasher.0.as_mut() {
+            hasher.update(&output_slice[..bytes_written])?;
+        }
         decoder
             .finish_frame()
             .map_err(|error| SophonError::Io(io::Error::other(error.to_string())))?;
         #[cfg(feature = "bench-diagnostics")]
-        let mut reader = decoder.finish();
+        let _ = decoder_thread_started;
         #[cfg(not(feature = "bench-diagnostics"))]
         let _ = decoder.finish();
         #[cfg(feature = "bench-diagnostics")]
         if drain_reader_to_eof {
             io::copy(&mut reader, &mut io::sink()).map_err(SophonError::Io)?;
         }
-        #[cfg(feature = "bench-diagnostics")]
-        if let Some(timings) = output.timings.as_ref() {
-            timings.decoder_thread_cpu_ns.fetch_add(
-                thread_cpu_time_ns().saturating_sub(decoder_thread_started),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
     }
 
-    if output.bytes_written != expected_decompressed_size {
+    if bytes_written as u64 != expected_decompressed_size {
         return Err(SophonError::SizeMismatch {
             item: format!("stream chunk at offset {chunk_offset}"),
             expected: expected_decompressed_size,
-            actual: output.bytes_written,
+            actual: bytes_written as u64,
         });
     }
 
-    if let Some(mut hasher) = output.hasher.0.take() {
+    if let Some(mut hasher) = decompressed_hasher.0.take() {
         let digest = hasher.finish()?;
         return_md5(hasher);
         if !md5_hex_eq(&digest, decompressed_hash) {
@@ -354,7 +354,7 @@ fn stream_decompress_to_file_inner(
         }
     }
 
-    Ok(output.bytes_written)
+    Ok(bytes_written as u64)
 }
 
 struct DctxGuard(Option<zstd::zstd_safe::DCtx<'static>>);
@@ -363,16 +363,6 @@ impl Drop for DctxGuard {
     fn drop(&mut self) {
         if let Some(ctx) = self.0.take() {
             assembly_opt::return_dctx(ctx, assembly_opt::MAX_WINDOW_LOG);
-        }
-    }
-}
-
-struct EagerBuffer(Option<Vec<u8>>);
-
-impl Drop for EagerBuffer {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.0.take() {
-            assembly_opt::return_eager_buf(buffer);
         }
     }
 }

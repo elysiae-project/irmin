@@ -228,6 +228,7 @@ thread_local! {
 
 /// Take the thread-local eager decompression buffer (1 MiB).
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn take_eager_buf() -> Vec<u8> {
     EAGER_BUF.with(|cell| {
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
@@ -239,6 +240,7 @@ pub(crate) fn take_eager_buf() -> Vec<u8> {
 /// Return the eager buffer to the thread-local pool. Keeps `len` at
 /// `EAGER_BUFFER_SIZE` so `take_eager_buf`'s `resize` is a no-op on reuse.
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn return_eager_buf(buf: Vec<u8>) {
     EAGER_BUF.with(|cell| {
         *cell.borrow_mut() = buf;
