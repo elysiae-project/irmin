@@ -9,19 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 /// Compact sorted index over a `StringArena` for `&str -> usize` lookup
 /// via binary search. Avoids per-entry HashMap overhead.
 /// Compact index that maps chunk names to their original arena index via binary search.
-enum LookupSource {
-    /// Direct arena lookup — zero overhead, no branch.
-    Arena(super::compact_manifest::StringArena),
-    /// Shared manifest arena — saves 3.2 MB by reusing the manifest's arena.
-    Manifest {
-        manifest: Arc<super::compact_manifest::CompactManifest>,
-        arena_indices: Vec<u32>,
-    },
-}
-
 pub struct ChunkNameLookup {
-    source: LookupSource,
+    arena: super::compact_manifest::StringArena,
     sorted_indices: Vec<u32>,
+    manifest: Option<Arc<super::compact_manifest::CompactManifest>>,
+    arena_indices: Option<Vec<u32>>,
 }
 
 impl ChunkNameLookup {
@@ -36,8 +28,10 @@ impl ChunkNameLookup {
             sa.cmp(sb)
         });
         Self {
-            source: LookupSource::Arena(arena),
+            arena,
             sorted_indices,
+            manifest: None,
+            arena_indices: None,
         }
     }
 
@@ -59,42 +53,37 @@ impl ChunkNameLookup {
             sa.cmp(sb)
         });
         Self {
-            source: LookupSource::Manifest {
-                manifest,
-                arena_indices,
-            },
+            arena: super::compact_manifest::StringArena::default(),
             sorted_indices,
+            manifest: Some(manifest),
+            arena_indices: Some(arena_indices),
         }
     }
 
     /// Return the name at its original index; panics when out of range.
     #[inline]
     pub fn get(&self, idx: usize) -> &str {
-        match &self.source {
-            LookupSource::Arena(arena) => arena.get(idx as u32),
-            LookupSource::Manifest {
-                manifest,
-                arena_indices,
-            } => manifest.chunk_name_by_arena_idx(arena_indices[idx]),
+        if let (Some(manifest), Some(arena_indices)) = (&self.manifest, &self.arena_indices) {
+            return manifest.chunk_name_by_arena_idx(arena_indices[idx]);
         }
+        self.arena.get(idx as u32)
     }
 
     /// Find a name and return its original index, or `None` if absent.
     #[inline]
     pub fn lookup(&self, name: &str) -> Option<usize> {
-        let result = match &self.source {
-            LookupSource::Arena(arena) => self
-                .sorted_indices
-                .binary_search_by(|&i| arena.get(i).cmp(name)),
-            LookupSource::Manifest {
-                manifest,
-                arena_indices,
-            } => self.sorted_indices.binary_search_by(|&i| {
-                manifest
-                    .chunk_name_by_arena_idx(arena_indices[i as usize])
-                    .cmp(name)
-            }),
-        };
+        let result =
+            if let (Some(manifest), Some(arena_indices)) = (&self.manifest, &self.arena_indices) {
+                self.sorted_indices.binary_search_by(|&i| {
+                    manifest
+                        .chunk_name_by_arena_idx(arena_indices[i as usize])
+                        .cmp(name)
+                })
+            } else {
+                let arena = &self.arena;
+                self.sorted_indices
+                    .binary_search_by(|&i| arena.get(i).cmp(name))
+            };
         match result {
             Ok(pos) => Some(self.sorted_indices[pos] as usize),
             Err(_) => None,
