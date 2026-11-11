@@ -13,7 +13,7 @@ pub struct ChunkNameLookup {
     arena: super::compact_manifest::StringArena,
     sorted_indices: Vec<u32>,
     manifest: Option<Arc<super::compact_manifest::CompactManifest>>,
-    arena_indices: Option<Vec<u32>>,
+    chunk_indices: Option<Vec<u32>>,
 }
 
 impl ChunkNameLookup {
@@ -31,7 +31,7 @@ impl ChunkNameLookup {
             arena,
             sorted_indices,
             manifest: None,
-            arena_indices: None,
+            chunk_indices: None,
         }
     }
 
@@ -42,10 +42,6 @@ impl ChunkNameLookup {
         chunk_indices: Vec<u32>,
     ) -> Self {
         let n = chunk_indices.len();
-        let arena_indices: Vec<u32> = chunk_indices
-            .iter()
-            .map(|&ci| manifest.chunk_name_arena_idx(ci as usize))
-            .collect();
         let mut sorted_indices: Vec<u32> = (0..n as u32).collect();
         sorted_indices.sort_unstable_by(|&a, &b| {
             let sa = manifest.chunk_name_by_index(chunk_indices[a as usize] as usize);
@@ -56,15 +52,15 @@ impl ChunkNameLookup {
             arena: super::compact_manifest::StringArena::default(),
             sorted_indices,
             manifest: Some(manifest),
-            arena_indices: Some(arena_indices),
+            chunk_indices: Some(chunk_indices),
         }
     }
 
     /// Return the name at its original index; panics when out of range.
     #[inline]
     pub fn get(&self, idx: usize) -> &str {
-        if let (Some(manifest), Some(arena_indices)) = (&self.manifest, &self.arena_indices) {
-            return manifest.chunk_name_by_arena_idx(arena_indices[idx]);
+        if let (Some(manifest), Some(chunk_indices)) = (&self.manifest, &self.chunk_indices) {
+            return manifest.chunk_name_by_index(chunk_indices[idx] as usize);
         }
         self.arena.get(idx as u32)
     }
@@ -73,10 +69,10 @@ impl ChunkNameLookup {
     #[inline]
     pub fn lookup(&self, name: &str) -> Option<usize> {
         let result =
-            if let (Some(manifest), Some(arena_indices)) = (&self.manifest, &self.arena_indices) {
+            if let (Some(manifest), Some(chunk_indices)) = (&self.manifest, &self.chunk_indices) {
                 self.sorted_indices.binary_search_by(|&i| {
                     manifest
-                        .chunk_name_by_arena_idx(arena_indices[i as usize])
+                        .chunk_name_by_index(chunk_indices[i as usize] as usize)
                         .cmp(name)
                 })
             } else {

@@ -376,12 +376,6 @@ impl CompactManifest {
     }
 
     #[inline]
-    /// Resolves a string-arena index to the chunk name.
-    pub fn chunk_name_by_arena_idx(&self, arena_idx: u32) -> &str {
-        self.arena.get(arena_idx)
-    }
-
-    #[inline]
     /// Chunk name by global chunk index. Panics when `chunk_idx` is out of range.
     pub fn chunk_name_by_index(&self, chunk_idx: usize) -> &str {
         self.arena.get(self.chunk_name_idx[chunk_idx])
