@@ -1438,12 +1438,11 @@ async fn check_needs_download(
     game_dir: Arc<PathBuf>,
     verify_cache: Arc<DashMap<String, VerificationEntry>>,
 ) -> SophonResult<(bool, Option<u64>)> {
-    let chunk_size =
-        all_files.chunk_size_at(all_files.file_chunk_range(file_idx).start as usize + chunk_idx);
+    let global_idx = all_files.file_chunk_range(file_idx).start as usize + chunk_idx;
+    let chunk_size = all_files.chunk_size_at(global_idx);
     let dest = dest.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || {
-        let global_idx = all_files.file_chunk_range(file_idx).start as usize + chunk_idx;
         let expected_md5 = all_files.chunk_compressed_hash_at(global_idx);
         cache::check_file_md5_cached_with_size(
             &dest,
@@ -2015,7 +2014,7 @@ async fn process_eager_item_streaming(
         let decoder_timings = timings.clone();
         let decode_task = tokio::task::spawn_blocking(move || {
             let decompressed_hash: &[u8] = match &all_files {
-                Some(manifest) => manifest.chunk(global_chunk_idx).chunk_decompressed_hash_md5,
+                Some(manifest) => manifest.chunk_decompressed_hash_at(global_chunk_idx),
                 None => b"",
             };
             let reader = std::io::BufReader::with_capacity(
