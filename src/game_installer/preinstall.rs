@@ -1986,7 +1986,7 @@ async fn download_patch_chunk_inner(
     Ok(())
 }
 
-pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
+pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
@@ -2026,7 +2026,7 @@ pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
     };
     let result = if hashed {
         match hasher.finish() {
-            Ok(digest) => md5_hex_eq(&digest, expected_md5),
+            Ok(digest) => super::assembly_opt::md5_bytes_eq(&digest, expected_md5),
             Err(_) => false,
         }
     } else {
@@ -2036,7 +2036,7 @@ pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
     result
 }
 
-pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
+pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         log::warn!(
             "Failed to open file for XXH64 verification: {path_display}",
@@ -2052,7 +2052,7 @@ pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
     let mut hasher = super::assembly_opt::take_xxh64();
     let result = if len == 0 {
         hasher.update(b"");
-        super::assembly_opt::xxh64_hex_eq(hasher.digest(), expected_xxh64)
+        super::assembly_opt::xxh64_bytes_eq(hasher.digest(), expected_xxh64)
     } else {
         posix_advise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
@@ -2071,7 +2071,7 @@ pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
         }
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         if ok {
-            super::assembly_opt::xxh64_hex_eq(hasher.digest(), expected_xxh64)
+            super::assembly_opt::xxh64_bytes_eq(hasher.digest(), expected_xxh64)
         } else {
             false
         }
@@ -2080,18 +2080,17 @@ pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
     result
 }
 
-pub(super) fn verify_file_hash(path: &Path, expected_hash: &str) -> bool {
+pub(super) fn verify_file_hash(path: &Path, expected_hash: &[u8]) -> bool {
     if expected_hash.is_empty() {
         return true;
     }
     match expected_hash.len() {
-        32 => verify_chunk_md5(path, expected_hash),
-        16 => verify_chunk_xxh64(path, expected_hash),
+        16 => verify_chunk_md5(path, expected_hash),
+        8 => verify_chunk_xxh64(path, expected_hash),
         _ => {
             log::warn!(
-                "Unknown hash format (length={len}): {hash}",
-                len = expected_hash.len(),
-                hash = expected_hash
+                "Unknown hash format (length={len})",
+                len = expected_hash.len()
             );
             false
         }
@@ -2523,7 +2522,7 @@ fn is_file_already_patched(path: &Path, expected_size: u64, expected_md5: &[u8])
     if metadata.len() != expected_size {
         return false;
     }
-    verify_file_hash(path, &super::assembly_opt::bytes_to_hex(expected_md5))
+    verify_file_hash(path, expected_md5)
 }
 
 #[derive(Clone)]
@@ -2749,7 +2748,10 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
         if !chunk_path.exists() {
             return Err(SophonError::PatchChunkNotFound(asset.patch_name.clone()));
         }
-    } else if !verify_file_hash(&chunk_path, &asset.patch_hash) {
+    } else if !verify_file_hash(
+        &chunk_path,
+        &super::assembly_opt::hex_to_bytes(&asset.patch_hash).unwrap_or_default(),
+    ) {
         return Err(SophonError::Md5Mismatch {
             item: asset.patch_name.clone(),
             expected: asset.patch_hash.clone(),
@@ -2821,7 +2823,11 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
             actual: actual_size,
         });
     }
-    if !asset.target_file_hash.is_empty() && !verify_file_hash(&temp_path, &asset.target_file_hash)
+    if !asset.target_file_hash.is_empty()
+        && !verify_file_hash(
+            &temp_path,
+            &super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default(),
+        )
     {
         let _ = fs::remove_file(&temp_path);
         return Err(SophonError::Md5Mismatch {
@@ -2932,7 +2938,10 @@ fn apply_hdiff_patch_impl(
                 fs::create_dir_all(parent)?;
             }
             fs::File::create(&diff_ref)?;
-            if !verify_file_hash(&diff_ref, BLANK_FILE_MD5) {
+            if !verify_file_hash(
+                &diff_ref,
+                &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_default(),
+            ) {
                 return Err(SophonError::HDiffPatchFailed {
                     file: asset.target_file_path.clone(),
                     error: format!(
@@ -2999,7 +3008,10 @@ fn apply_hdiff_patch_impl(
         && diff_ref_guard.0.is_none()
         && original_path.exists()
         && !expected_md5.is_empty()
-        && !verify_file_hash(&original_path, expected_md5)
+        && !verify_file_hash(
+            &original_path,
+            &super::assembly_opt::hex_to_bytes(expected_md5).unwrap_or_default(),
+        )
     {
         if is_filtered_asset(cache, asset) {
             log::warn!(
@@ -3082,7 +3094,10 @@ fn apply_hdiff_patch_impl(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash(&temp_output, &asset.target_file_hash)
+                && !verify_file_hash(
+                    &temp_output,
+                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default(),
+                )
             {
                 let _ = fs::remove_file(&temp_output);
                 return Err(SophonError::Md5Mismatch {
@@ -3138,7 +3153,10 @@ fn apply_hdiff_patch_from_files(
         }
         fs::File::create(&empty_original_path)?;
         // Verify the freshly-created diff_ref is empty before proceeding.
-        if !verify_file_hash(&empty_original_path, BLANK_FILE_MD5) {
+        if !verify_file_hash(
+            &empty_original_path,
+            &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_default(),
+        ) {
             let _ = fs::remove_file(&empty_original_path);
             return Err(SophonError::HDiffPatchFailed {
                 file: asset.target_file_path.clone(),
@@ -3183,7 +3201,10 @@ fn apply_hdiff_patch_from_files(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash(&temp_output, &asset.target_file_hash)
+                && !verify_file_hash(
+                    &temp_output,
+                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default(),
+                )
             {
                 let _ = fs::remove_file(&temp_output);
                 return Err(SophonError::Md5Mismatch {

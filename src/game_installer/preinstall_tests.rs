@@ -485,7 +485,10 @@ fn verify_chunk_md5_correct() {
     let data = b"hello world";
     let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(verify_chunk_md5(&path, &md5_hex));
+    assert!(verify_chunk_md5(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default()
+    ));
 }
 
 #[test]
@@ -493,14 +496,14 @@ fn verify_chunk_md5_wrong() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_chunk");
     fs::write(&path, b"hello world").unwrap();
-    assert!(!verify_chunk_md5(&path, "wrong_md5_hash_here"));
+    assert!(!verify_chunk_md5(&path, b"wrong_md5_hash_here"));
 }
 
 #[test]
 fn verify_chunk_md5_missing_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nonexistent");
-    assert!(!verify_chunk_md5(&path, "any_hash"));
+    assert!(!verify_chunk_md5(&path, b"any_hash"));
 }
 
 #[test]
@@ -510,7 +513,11 @@ fn verify_file_hash_md5_uppercase_expected() {
     let data = b"hello world";
     let md5_hex_lower = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(verify_file_hash(&path, &md5_hex_lower.to_uppercase()));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&md5_hex_lower.to_uppercase())
+            .unwrap_or_default()
+    ));
 }
 
 #[test]
@@ -522,7 +529,10 @@ fn verify_file_hash_xxh64_uppercase_expected() {
     let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
     hasher.update(data);
     let xxh64_lower = format!("{:016x}", hasher.digest());
-    assert!(verify_file_hash(&path, &xxh64_lower.to_uppercase()));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&xxh64_lower.to_uppercase()).unwrap_or_default()
+    ));
 }
 
 #[test]
@@ -530,7 +540,7 @@ fn verify_file_hash_empty_returns_true() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_empty");
     fs::write(&path, b"some data").unwrap();
-    assert!(verify_file_hash(&path, ""));
+    assert!(verify_file_hash(&path, b""));
 }
 
 #[test]
@@ -538,9 +548,9 @@ fn verify_file_hash_whitespace_only_returns_false() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_whitespace");
     fs::write(&path, b"some data").unwrap();
-    assert!(!verify_file_hash(&path, "   "));
-    assert!(!verify_file_hash(&path, "\t"));
-    assert!(!verify_file_hash(&path, "\n"));
+    assert!(!verify_file_hash(&path, b"   "));
+    assert!(!verify_file_hash(&path, b"\t"));
+    assert!(!verify_file_hash(&path, b"\n"));
 }
 
 #[test]
@@ -548,10 +558,10 @@ fn verify_file_hash_unknown_length_returns_false() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_unknown");
     fs::write(&path, b"some data").unwrap();
-    assert!(!verify_file_hash(&path, "short"));
+    assert!(!verify_file_hash(&path, b"short"));
     assert!(!verify_file_hash(
         &path,
-        "1234567890abcdef1234567890abcdef1234567890abcdef"
+        b"1234567890abcdef1234567890abcdef1234567890abcdef"
     ));
 }
 
@@ -559,8 +569,11 @@ fn verify_file_hash_unknown_length_returns_false() {
 fn verify_file_hash_missing_file_returns_false() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nonexistent_file");
-    assert!(!verify_file_hash(&path, "0123456789abcdef0123456789abcdef"));
-    assert!(!verify_file_hash(&path, "0123456789abcdef"));
+    assert!(!verify_file_hash(
+        &path,
+        b"0123456789abcdef0123456789abcdef"
+    ));
+    assert!(!verify_file_hash(&path, b"0123456789abcdef"));
 }
 
 /// Lowercase MD5 hash must be accepted (verify_file_hash normalizes to
@@ -572,7 +585,10 @@ fn verify_file_hash_md5_lowercase_expected() {
     let data = b"hello world";
     let md5_lower = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(verify_file_hash(&path, &md5_lower));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&md5_lower).unwrap_or_default()
+    ));
 }
 
 /// A real MD5 mismatch must return false (verify_file_hash dispatcher).
@@ -582,7 +598,10 @@ fn verify_file_hash_md5_wrong_hash_returns_false() {
     let path = dir.path().join("test_md5_wrong");
     fs::write(&path, b"hello world").unwrap();
     // MD5 of "hello world"
-    assert!(!verify_file_hash(&path, "00000000000000000000000000000000"));
+    assert!(!verify_file_hash(
+        &path,
+        b"00000000000000000000000000000000"
+    ));
 }
 
 /// Lowercase XXH64 hash must be accepted (verify_file_hash normalizes to
@@ -596,7 +615,10 @@ fn verify_file_hash_xxh64_lowercase_expected() {
     hasher.update(data);
     let xxh64_lower = format!("{:016x}", hasher.digest());
     fs::write(&path, data).unwrap();
-    assert!(verify_file_hash(&path, &xxh64_lower));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&xxh64_lower).unwrap_or_default()
+    ));
 }
 
 /// A real XXH64 mismatch must return false (verify_file_hash dispatcher).
@@ -606,7 +628,7 @@ fn verify_file_hash_xxh64_wrong_hash_returns_false() {
     let path = dir.path().join("test_xxh64_wrong");
     fs::write(&path, b"hello world").unwrap();
     // All-zero string is not a valid XXH64.
-    assert!(!verify_file_hash(&path, "0000000000000000"));
+    assert!(!verify_file_hash(&path, b"0000000000000000"));
 }
 
 #[test]
@@ -1610,7 +1632,10 @@ fn apply_hdiff_patch_from_files_blank_diff_ref_hash_matches() {
     let empty_path = dir.path().join("empty_file.txt");
     fs::write(&empty_path, b"").unwrap();
     assert!(
-        verify_file_hash(&empty_path, BLANK_FILE_MD5),
+        verify_file_hash(
+            &empty_path,
+            &super::super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_default()
+        ),
         "BLANK_FILE_MD5 should match the hash of an empty file"
     );
 }
@@ -2104,7 +2129,10 @@ fn verify_chunk_md5_large_file_multi_buffer() {
     fs::write(&path, &data).unwrap();
 
     assert!(
-        verify_chunk_md5(&path, &md5_hex),
+        verify_chunk_md5(
+            &path,
+            &super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default()
+        ),
         "multi-buffer MD5 should match single-shot digest"
     );
 }
