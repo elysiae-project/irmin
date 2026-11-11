@@ -1002,7 +1002,7 @@ fn register_chunks_for_file<'a>(
     // A file qualifies for eager decompression when all its chunks are
     // pure downloads (no old_offset chunks requiring the assembly path).
     let all_pure_downloads =
-        (range.start..range.end).all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+        (range.start..range.end).all(|ci| all_files.chunk_old_offset_at(ci as usize) < 0);
     let file_is_eager = all_pure_downloads;
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
@@ -3357,7 +3357,7 @@ pub async fn install(
                         // For eager files (preallocated to full size), size alone is
                         // insufficient — verify bitmap confirms all chunks were written.
                         let is_eager = (chunk_range.start..chunk_range.end)
-                            .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+                            .all(|ci| all_files.chunk_old_offset_at(ci as usize) < 0);
                         if size_ok && is_eager {
                             resume_bitmap.as_ref().is_some_and(|bm| {
                                 bm.all_complete_for_range(
@@ -3384,7 +3384,7 @@ pub async fn install(
                         pre_assembled_arc.fetch_add(1, Ordering::Relaxed);
                     } else {
                         let needs_old_file = (chunk_range.start..chunk_range.end)
-                            .any(|i| all_files.chunk(i as usize).chunk_old_offset >= 0);
+                            .any(|i| all_files.chunk_old_offset_at(i as usize) >= 0);
                         if !needs_old_file {
                             files_to_delete.lock().unwrap().push(target_path);
                         }

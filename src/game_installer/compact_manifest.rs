@@ -375,6 +375,12 @@ impl CompactManifest {
         self.chunk_name_idx[chunk_idx]
     }
 
+    /// Returns the chunk's old offset; negative when the chunk is a pure download.
+    #[inline]
+    pub fn chunk_old_offset_at(&self, chunk_idx: usize) -> i64 {
+        self.chunk_old_offset[chunk_idx]
+    }
+
     /// Compute a chunk's offset within its file by summing decompressed sizes
     /// of all preceding chunks in the same file. O(chunks_before) per call.
     #[inline]
