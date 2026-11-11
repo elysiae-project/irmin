@@ -283,7 +283,15 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // Drop this mapping's page-table entries; the page cache remains authoritative.
+        // Schedule writeback of dirty pages without blocking, then hint
+        // the kernel to discard pages from the page cache. The kernel
+        // will write dirty pages to disk and then reclaim the memory.
+        // Using MS_SYNC would block the thread until writeback completes;
+        // MS_ASYNC starts it asynchronously and MADV_DONTNEED tells the
+        // kernel we don't need the pages anymore.
+        unsafe {
+            libc::msync(self.map_base, self.map_len, libc::MS_ASYNC);
+        }
         unsafe {
             libc::madvise(self.map_base, self.map_len, libc::MADV_DONTNEED);
         }
@@ -600,7 +608,9 @@ pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, le
             fd,
             offset as libc::off64_t,
             len as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                | libc::SYNC_FILE_RANGE_WRITE
+                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
         )
     };
     posix_advise(fd, offset, len, libc::POSIX_FADV_DONTNEED);

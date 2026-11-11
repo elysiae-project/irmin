@@ -260,12 +260,23 @@ impl EvictingWriter {
         if self.written - self.last_evicted >= EVICT_INTERVAL {
             self.inner.flush().await?;
             let fd = self.inner.get_ref().as_raw_fd();
-            posix_advise(
-                fd,
-                self.last_evicted,
-                self.written - self.last_evicted,
-                libc::POSIX_FADV_DONTNEED,
-            );
+            // Sync the written range to disk so pages become clean and
+            // can be immediately reclaimed by posix_fadvise(DONTNEED).
+            // Without the sync, dirty pages stay in the page cache until
+            // the kernel's async writeback timer flushes them.
+            let evict_start = self.last_evicted;
+            let evict_len = self.written - self.last_evicted;
+            let _ = unsafe {
+                libc::sync_file_range(
+                    fd,
+                    evict_start as libc::off64_t,
+                    evict_len as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                )
+            };
+            posix_advise(fd, evict_start, evict_len, libc::POSIX_FADV_DONTNEED);
             self.last_evicted = self.written;
         }
         Ok(())
@@ -278,6 +289,8 @@ impl EvictingWriter {
     pub(crate) async fn flush_and_evict_all(&mut self) -> std::io::Result<()> {
         self.flush().await?;
         let fd = self.inner.get_ref().as_raw_fd();
+        // Sync all written data to disk, then evict from page cache.
+        let _ = unsafe { libc::fdatasync(fd) };
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         Ok(())
     }
