@@ -11,6 +11,7 @@ use super::error::{SophonError, SophonResult};
 /// `src_off` to `dst_fd` at `dst_off`. Returns the number of bytes copied.
 /// Loops if the kernel copies fewer than requested per call.
 /// Copy a byte range between file descriptors using the platform copy-range facility.
+#[inline(always)]
 pub fn copy_file_range(
     src_fd: RawFd,
     src_off: u64,
@@ -53,6 +54,7 @@ pub fn copy_file_range(
 /// Copy a region from `src` to `dst` using `copy_file_range`. Evicts source
 /// pages after the copy. Callers handle destination eviction.
 /// Copy file contents from a source path into an existing destination handle.
+#[inline]
 pub fn copy_file_from(
     src: &File,
     src_off: u64,
