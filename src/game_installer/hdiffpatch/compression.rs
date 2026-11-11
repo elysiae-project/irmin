@@ -137,9 +137,10 @@ pub(crate) fn get_clip_stream(
                 return_dctx(ctx, used_window_log);
                 Ok((Box::new(Cursor::new(out)), file_bytes))
             } else {
-                let mut decoder = zstd::stream::read::Decoder::new(limited)?;
-                decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(MAX_WINDOW_LOG))?;
-                Ok((Box::new(decoder), file_bytes))
+                // Use a pooled DCtx via a self-referential wrapper that returns
+                // the DCtx to the thread-local pool on drop.
+                let pooled = PooledZstdDecoder::new_boxed(limited)?;
+                Ok((pooled, file_bytes))
             }
         }
         CompressionMode::Zlib => {
@@ -199,6 +200,58 @@ pub(crate) fn get_clip_stream(
 struct LimitedFile {
     file: std::fs::File,
     remaining: u64,
+}
+
+/// Wraps a zstd `Decoder` with a pooled `DCtx`. The `Decoder` borrows the
+/// `DCtx` via raw pointer. Constructed in-place inside a `Box` to prevent
+/// moves that would invalidate the self-reference.
+struct PooledZstdDecoder {
+    ctx: zstd::zstd_safe::DCtx<'static>,
+    decoder: zstd::stream::read::Decoder<'static, std::io::BufReader<LimitedFile>>,
+}
+
+impl PooledZstdDecoder {
+    fn new_boxed(limited: LimitedFile) -> std::io::Result<Box<Self>> {
+        let mut ctx = take_dctx();
+        ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
+            .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
+        ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(MAX_WINDOW_LOG))
+            .map_err(|_| std::io::Error::other("zstd DCtx WindowLogMax"))?;
+
+        let buf_reader = std::io::BufReader::with_capacity(256 * 1024, limited);
+
+        // Allocate uninitialized memory for the struct on the heap, then
+        // initialize fields in-place so the self-reference is stable.
+        let layout = std::alloc::Layout::new::<Self>();
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut Self };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // SAFETY: ptr is non-null and properly aligned for Self.
+        let boxed = unsafe { Box::from_raw(ptr) };
+        let mut boxed = boxed;
+        // Initialize ctx first so the decoder can borrow from it.
+        // SAFETY: ctx field is at a stable heap address inside the Box.
+        unsafe { std::ptr::write(&mut boxed.ctx, ctx) };
+        let ctx_ptr: *mut zstd::zstd_safe::DCtx<'static> = &mut boxed.ctx;
+        let decoder =
+            unsafe { zstd::stream::read::Decoder::with_context(buf_reader, &mut *ctx_ptr) };
+        unsafe { std::ptr::write(&mut boxed.decoder, decoder) };
+        Ok(boxed)
+    }
+}
+
+impl std::io::Read for PooledZstdDecoder {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.decoder.read(buf)
+    }
+}
+
+impl Drop for PooledZstdDecoder {
+    fn drop(&mut self) {
+        // Decoder drops first (field order), releasing the DCtx borrow.
+        return_dctx(std::mem::take(&mut self.ctx), MAX_WINDOW_LOG);
+    }
 }
 
 impl Read for LimitedFile {
