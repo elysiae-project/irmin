@@ -36,7 +36,8 @@ impl ChunkNameLookup {
     }
 
     /// Build a lookup sharing a manifest's arena. `chunk_indices` maps each
-    /// entry to a global manifest chunk index; entries must be valid indices.
+    /// entry to a global manifest chunk index. Avoids duplicating chunk name
+    /// strings in a separate arena.
     pub fn from_manifest_indices(
         manifest: Arc<super::compact_manifest::CompactManifest>,
         chunk_indices: Vec<u32>,
@@ -66,7 +67,7 @@ impl ChunkNameLookup {
     }
 
     /// Find a name and return its original index, or `None` if absent.
-    #[inline]
+    #[inline(always)]
     pub fn lookup(&self, name: &str) -> Option<usize> {
         let result =
             if let (Some(manifest), Some(chunk_indices)) = (&self.manifest, &self.chunk_indices) {

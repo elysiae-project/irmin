@@ -376,7 +376,7 @@ impl CompactManifest {
     }
 
     #[inline]
-    /// Chunk name by global chunk index. Panics when `chunk_idx` is out of range.
+    /// Chunk name by global chunk index.
     pub fn chunk_name_by_index(&self, chunk_idx: usize) -> &str {
         self.arena.get(self.chunk_name_idx[chunk_idx])
     }
