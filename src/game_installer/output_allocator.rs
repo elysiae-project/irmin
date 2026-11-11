@@ -5,6 +5,7 @@
 //! to their declared size during download processing.
 
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,7 +65,6 @@ impl OutputAllocator {
                     let _ = sysio::preallocate(&file, size);
                 }
 
-                use std::os::unix::io::AsRawFd;
                 super::assembly_opt::posix_advise(
                     file.as_raw_fd(),
                     0,
@@ -86,6 +86,15 @@ impl OutputAllocator {
     /// Closes and removes the file handle from cache.
     pub fn close_file(&self, file_idx: usize) {
         self.handles.remove(&file_idx);
+    }
+
+    /// Evicts page cache for all open output files. Call on pause to release
+    /// memory held by partially-written output files.
+    pub fn evict_all_open_pages(&self) {
+        for entry in self.handles.iter() {
+            let fd = entry.value().as_raw_fd();
+            super::assembly_opt::posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
     }
 }
 

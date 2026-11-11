@@ -96,6 +96,10 @@ name = "bench_memory"
 path = "src/bin/bench_memory.rs"
 required-features = ["benchmark"]
 
+[[bin]]
+name = "download_profile"
+path = "src/bin/download_profile.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

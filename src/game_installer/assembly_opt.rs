@@ -229,17 +229,15 @@ fn hex_nibble(b: u8) -> Option<u8> {
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Generation counter for lazy thread-local pool cleanup. When
-/// `reclaim_memory()` is called, this counter increments. Each
-/// `take_*` function checks if the stored generation is stale and
-/// clears its buffer if so. This lets `reclaim_memory()` reclaim
-/// pools on ALL threads without needing cross-thread TLS access.
+/// Generation counter for lazy thread-local pool cleanup. `reclaim_memory()`
+/// increments it; `take_*` functions clear their buffer when the stored
+/// generation is stale. Reclaims pools on all threads without cross-thread
+/// TLS access.
 static RECLAIM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static OPT_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ZSTD_DCTX: RefCell<Option<zstd::zstd_safe::DCtx<'static>>> = const { RefCell::new(None) };
-    static EAGER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static TLS_RECLAIM_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -252,9 +250,8 @@ fn tls_reclaim_stale() -> bool {
     stale
 }
 
-/// Clear thread-local pools on the calling thread to release retained
-/// buffers. Also increments the global reclaim generation so other
-/// threads lazily clear their pools on next use.
+/// Clears thread-local pools on the calling thread and bumps the global
+/// reclaim generation so other threads lazily clear their pools on next use.
 pub(crate) fn trim_thread_local_buffers() {
     RECLAIM_GENERATION.fetch_add(1, Ordering::Relaxed);
     TLS_RECLAIM_GEN.set(RECLAIM_GENERATION.load(Ordering::Relaxed));
@@ -264,10 +261,6 @@ pub(crate) fn trim_thread_local_buffers() {
     });
     ZSTD_DCTX.with(|cell| {
         *cell.borrow_mut() = None;
-    });
-    EAGER_BUF.with(|cell| {
-        cell.borrow_mut().clear();
-        cell.borrow_mut().shrink_to_fit();
     });
     COMPRESSED_BUF.with(|cell| {
         cell.borrow_mut().clear();
@@ -280,30 +273,7 @@ pub(crate) fn trim_thread_local_buffers() {
     });
 }
 
-/// Take the thread-local eager decompression buffer (1 MiB).
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn take_eager_buf() -> Vec<u8> {
-    EAGER_BUF.with(|cell| {
-        if tls_reclaim_stale() {
-            *cell.borrow_mut() = Vec::new();
-        }
-        let mut buf = std::mem::take(&mut *cell.borrow_mut());
-        buf.resize(super::eager_decompress::EAGER_BUFFER_SIZE, 0);
-        buf
-    })
-}
-
-/// Return the eager buffer to the thread-local pool. Keeps `len` at
-/// `EAGER_BUFFER_SIZE` so `take_eager_buf`'s `resize` is a no-op on reuse.
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn return_eager_buf(buf: Vec<u8>) {
-    EAGER_BUF.with(|cell| {
-        *cell.borrow_mut() = buf;
-    });
-}
-
+/// Takes a zstd decompression context, creating a fresh one if the pool is empty.
 #[inline]
 pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
     ZSTD_DCTX.with(|cell| {
@@ -317,11 +287,9 @@ pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
 }
 
 #[inline]
-pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, window_log_used: u32) {
-    if window_log_used > 22 {
-        return;
-    }
-    ZSTD_DCTX.with(|cell| cell.borrow_mut().replace(ctx));
+pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, _window_log_used: u32) {
+    // Drop instead of retaining — prevents memory accumulation on idle threads.
+    drop(ctx);
 }
 
 pub(crate) struct MmapGuard {
@@ -341,13 +309,10 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // Write dirty pages to disk synchronously, then discard from page
-        // cache. MS_SYNC blocks until writeback completes — safe here
-        // because callers run on spawn_blocking threads, not async runtime.
-        // Without the sync, MADV_DONTNEED on dirty MAP_SHARED pages is a
-        // no-op: the kernel keeps dirty pages until its async writeback
-        // timer fires (5+ seconds), causing memory to pile up during
-        // sustained download/assembly.
+        // Synchronous writeback before eviction. Callers run on
+        // spawn_blocking threads, so blocking is safe. Without MS_SYNC,
+        // MADV_DONTNEED on dirty MAP_SHARED pages is a no-op: the kernel
+        // keeps dirty pages until its periodic writeback timer fires.
         unsafe {
             libc::msync(self.map_base, self.map_len, libc::MS_SYNC);
         }
@@ -504,15 +469,13 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
     }
 }
 
-// Thread-local reusable buffer for reading compressed chunk data via pread.
-// Grows to fit the largest chunk seen on this thread (up to ONESHOT_MAX_SIZE)
-// and is reused across calls, avoiding mmap/munmap syscall overhead per chunk.
+// Thread-local buffer for reading compressed chunk data via pread.
 thread_local! {
     static COMPRESSED_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Take the thread-local compressed buffer, growing it if needed.
-/// Caller must return it via [`return_compressed_buf`] when done.
+/// Takes the compressed-chunk buffer, growing it if needed. Caller must
+/// return it via [`return_compressed_buf`] when done.
 #[inline]
 fn take_compressed_buf(len: usize) -> Vec<u8> {
     COMPRESSED_BUF.with(|cell| {
@@ -525,19 +488,10 @@ fn take_compressed_buf(len: usize) -> Vec<u8> {
     })
 }
 
-/// Return the compressed buffer to the thread-local pool. Shrinks oversized
-/// buffers to avoid retaining large allocations between chunks.
+/// Drops the compressed buffer instead of retaining it. Prevents memory
+/// accumulation on idle tokio worker threads.
 #[inline]
-fn return_compressed_buf(mut buf: Vec<u8>) {
-    // Cap retained capacity to avoid holding large buffers indefinitely.
-    const MAX_RETAINED_COMPRESSED_BUF: usize = 2 * 1024 * 1024;
-    if buf.capacity() > MAX_RETAINED_COMPRESSED_BUF {
-        buf = Vec::with_capacity(MAX_RETAINED_COMPRESSED_BUF);
-    }
-    COMPRESSED_BUF.with(|cell| {
-        *cell.borrow_mut() = buf;
-    });
-}
+fn return_compressed_buf(_buf: Vec<u8>) {}
 
 #[cfg(all(feature = "bench-diagnostics", test))]
 pub(crate) fn compressed_buffer_capacity() -> usize {
@@ -822,7 +776,9 @@ pub fn write_chunk_from_mmap(
 
     let bytes_written = bytes_written as u64;
 
-    OPT_BUFFER.with(|cell| cell.replace(buf));
+    // Drop instead of returning to the thread-local pool — prevents memory
+    // accumulation on idle tokio worker threads.
+    drop(buf);
 
     if bytes_written != expected_size {
         return Err(SophonError::SizeMismatch {
