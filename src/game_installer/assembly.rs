@@ -625,48 +625,52 @@ fn assemble_file_with_options(
                         if err_flag.load(Ordering::Relaxed) {
                             break;
                         }
-                        let chunk = files.chunk(ci as usize);
-                        let oi = (ci - chunk_range.start) as usize;
+                        let ci_usize = ci as usize;
+                        let oi = ci_usize - chunk_range.start as usize;
                         let offset = chunk_offsets[oi];
-                        let result = if chunk.chunk_old_offset >= 0 {
+                        let chunk_old_offset = files.chunk_old_offset_at(ci_usize);
+                        let chunk_size_decompressed =
+                            files.chunk_size_decompressed_at(ci_usize);
+                        let result = if chunk_old_offset >= 0 {
                             let old_file = old.expect("has_old_chunks guarantees old file");
                             write_from_old_file(
                                 old_file,
                                 target,
                                 out,
                                 offset,
-                                chunk.chunk_old_offset as u64,
-                                chunk.chunk_size_decompressed,
+                                chunk_old_offset as u64,
+                                chunk_size_decompressed,
                                 None,
                                 &mut transfer_buf,
                                 if skip_chunk_hash {
                                     b""
                                 } else {
-                                    chunk.chunk_decompressed_hash_md5
+                                    files.chunk_decompressed_hash_at(ci_usize)
                                 },
                             )
                         } else {
-                            if !validate_chunk_name(chunk.chunk_name) {
+                            let chunk_name = files.chunk_name_at(ci_usize);
+                            if !validate_chunk_name(chunk_name) {
                                 let mut guard = err.lock().unwrap();
                                 if guard.is_none() {
                                     *guard =
-                                        Some(SophonError::PathTraversal(chunk.chunk_name.into()));
+                                        Some(SophonError::PathTraversal(chunk_name.into()));
                                 }
                                 err_flag.store(true, Ordering::Relaxed);
                                 break;
                             }
-                            chunk_path.push(chunk.chunk_name);
+                            chunk_path.push(chunk_name);
                             chunk_path.set_extension("zstd");
                             let result = write_decompressed_chunk_at(
                                 &chunk_path,
                                 out,
                                 offset,
-                                chunk.chunk_size_decompressed,
+                                chunk_size_decompressed,
                                 None,
                                 if skip_chunk_hash {
                                     b""
                                 } else {
-                                    chunk.chunk_decompressed_hash_md5
+                                    files.chunk_decompressed_hash_at(ci_usize)
                                 },
                             );
                             chunk_path.pop();
@@ -675,18 +679,18 @@ fn assemble_file_with_options(
                         match result {
                             Ok(bytes) => {
                                 tw.fetch_add(bytes, Ordering::Relaxed);
-                                if chunk.chunk_old_offset < 0 {
-                                    let idx = (ci - chunk_range.start) as usize;
+                                if chunk_old_offset < 0 {
+                                    let idx = oi;
                                     dl_chunks[idx].store(true, Ordering::Relaxed);
                                 }
                                 if !skip_evict {
                                     super::assembly_opt::sync_and_evict_range(
                                         raw_fd,
                                         offset,
-                                        chunk.chunk_size_decompressed,
+                                        chunk_size_decompressed,
                                     );
                                 }
-                                let idx = (ci - chunk_range.start) as usize;
+                                let idx = oi;
                                 chunk_done[idx].store(true, Ordering::Release);
                                 if let Some(t) = ht.get() {
                                     t.unpark();
