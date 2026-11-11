@@ -2932,6 +2932,7 @@ criterion_group!(
     bench_verify_file_hash,
     bench_state_save,
     bench_hex_to_bytes,
+    bench_md5_hex_eq,
     bench_load_download_state,
 );
 criterion_main!(benches);
@@ -3296,6 +3297,23 @@ fn bench_hex_to_bytes(c: &mut Criterion) {
         b.iter(|| {
             let bytes = hex_to_bytes(&hex);
             criterion::black_box(bytes);
+        });
+    });
+    group.finish();
+}
+
+fn bench_md5_hex_eq(c: &mut Criterion) {
+    use irmin_rs::game_installer::assembly_opt::md5_hex_eq;
+
+    let digest: [u8; 16] = fast_md5::digest(b"hello world");
+    let hex = hex::encode(digest);
+
+    let mut group = c.benchmark_group("md5_hex_eq");
+    group.throughput(Throughput::Bytes(16));
+    group.bench_function("lut", |b| {
+        b.iter(|| {
+            let ok = md5_hex_eq(&digest, &hex);
+            criterion::black_box(ok);
         });
     });
     group.finish();

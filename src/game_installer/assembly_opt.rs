@@ -158,19 +158,20 @@ impl Drop for HashReadBuffer {
 /// Compare an MD5 digest against an expected lowercase hex string without
 /// allocating. Returns false on length mismatch.
 #[inline(always)]
-pub(crate) fn md5_hex_eq(digest: &[u8; 16], expected: &str) -> bool {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub fn md5_hex_eq(digest: &[u8; 16], expected: &str) -> bool {
     if expected.len() != 32 {
         return false;
     }
     let bytes = expected.as_bytes();
     let mut i = 0;
     while i < 16 {
-        let hi = hex_nibble(bytes[i * 2]);
-        let lo = hex_nibble(bytes[i * 2 + 1]);
-        match (hi, lo) {
-            (Some(h), Some(l)) if (h << 4) | l == digest[i] => i += 1,
-            _ => return false,
+        let hi = HEX_DECODE_LUT[bytes[i * 2] as usize];
+        let lo = HEX_DECODE_LUT[bytes[i * 2 + 1] as usize];
+        if hi == 0xFF || lo == 0xFF || (hi << 4) | lo != digest[i] {
+            return false;
         }
+        i += 1;
     }
     true
 }
@@ -241,16 +242,6 @@ fn hex_digit(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
         _ => (b'a' + n - 10) as char,
-    }
-}
-
-#[inline]
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
     }
 }
 
