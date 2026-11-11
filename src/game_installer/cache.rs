@@ -167,6 +167,7 @@ pub fn check_file_md5_with_cache_key(
 }
 
 /// As [`check_file_md5_with_cache_key`], returning `Some(actual_size)` when present.
+#[inline]
 pub fn check_file_md5_with_cache_key_and_size(
     path: &Path,
     expected_size: u64,
@@ -218,6 +219,7 @@ fn cache_key_for_path<'a>(path: &'a Path, game_dir: &Path) -> std::borrow::Cow<'
         .to_string_lossy()
 }
 
+#[inline]
 fn check_file_md5_with_metadata(
     path: &Path,
     expected_size: u64,
@@ -272,6 +274,7 @@ fn check_file_md5_with_metadata(
 
 /// Compute the raw 16-byte MD5 digest of a file using buffered sequential reads.
 /// Returns an I/O error if opening or reading the file fails.
+#[inline]
 pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     file_md5_digest_with_options(path, MD5_READ_BUFFER_SIZE, true)
 }
