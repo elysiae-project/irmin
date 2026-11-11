@@ -1826,35 +1826,40 @@ async fn process_eager_item_oneshot(
         .get_handle(file_idx)
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
     let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
-    let compressed_hash = if skip_hash {
-        ""
+    // Capture the manifest and chunk index instead of copying hash strings,
+    // avoiding two String allocations per chunk. The Arc keeps the arena
+    // alive for the spawn_blocking closure's lifetime.
+    let all_files = if skip_hash {
+        None
     } else {
-        chunk.chunk_compressed_hash_md5
+        Some(Arc::clone(&ctx.all_files))
     };
-    let decompressed_hash = if skip_hash {
-        ""
-    } else {
-        chunk.chunk_decompressed_hash_md5
-    };
-    let compressed_hash = compressed_hash.to_owned();
-    let decompressed_hash = decompressed_hash.to_owned();
     let mut attempts = 0;
     loop {
         let result = tokio::task::spawn_blocking({
             let out = Arc::clone(&out_file);
             let compressed_data = compressed_data.clone();
-            let compressed_hash = compressed_hash.clone();
-            let decompressed_hash = decompressed_hash.clone();
+            let all_files = all_files.clone();
             let chunk_offset = item.output_offset;
             let expected_size = chunk.chunk_size_decompressed;
             move || {
+                let (compressed_hash, decompressed_hash) = match &all_files {
+                    Some(manifest) => {
+                        let chunk = manifest.chunk(global_chunk_idx);
+                        (
+                            chunk.chunk_compressed_hash_md5,
+                            chunk.chunk_decompressed_hash_md5,
+                        )
+                    }
+                    None => ("", ""),
+                };
                 super::eager_decompress::eager_decompress_chunk(
                     &compressed_data,
                     &out,
                     chunk_offset,
                     expected_size,
-                    &compressed_hash,
-                    &decompressed_hash,
+                    compressed_hash,
+                    decompressed_hash,
                 )
             }
         })
