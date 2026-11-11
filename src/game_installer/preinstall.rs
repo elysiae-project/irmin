@@ -1724,7 +1724,8 @@ async fn download_patch_chunk_with_retries(
     dest: &Path,
 ) -> SophonResult<()> {
     validate_patch_name(&chunk_info.patch_name)?;
-    let url = diff_download.url_for(&chunk_info.patch_name);
+    let mut url = String::with_capacity(256);
+    diff_download.url_for_into(&chunk_info.patch_name, &mut url);
     let mut last_err = String::new();
 
     for attempt in 0..super::MAX_RETRIES {
