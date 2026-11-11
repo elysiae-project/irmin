@@ -1967,10 +1967,12 @@ async fn process_eager_item_streaming(
     } else {
         chunk.chunk_compressed_hash_md5
     };
-    let decompressed_hash = if skip_hash {
-        ""
+    // Capture the manifest to reconstruct the decompressed hash inside the
+    // spawn_blocking closure, avoiding a String allocation per attempt.
+    let all_files = if skip_hash {
+        None
     } else {
-        chunk.chunk_decompressed_hash_md5
+        Some(Arc::clone(&ctx.all_files))
     };
 
     if !compressed_hash.is_empty() && !matches!(compressed_hash.len(), 16 | 32) {
@@ -2007,10 +2009,14 @@ async fn process_eager_item_streaming(
         let out = Arc::clone(&out_file);
         let expected_decompressed_size = chunk.chunk_size_decompressed;
         let chunk_offset = item.output_offset;
-        let decompressed_hash = decompressed_hash.to_owned();
+        let all_files = all_files.clone();
         #[cfg(feature = "bench-diagnostics")]
         let decoder_timings = timings.clone();
         let decode_task = tokio::task::spawn_blocking(move || {
+            let decompressed_hash = match &all_files {
+                Some(manifest) => manifest.chunk(global_chunk_idx).chunk_decompressed_hash_md5,
+                None => "",
+            };
             let reader = std::io::BufReader::with_capacity(
                 256 * 1024,
                 ChunkStreamReader {
@@ -2029,7 +2035,7 @@ async fn process_eager_item_streaming(
                     &out,
                     chunk_offset,
                     expected_decompressed_size,
-                    &decompressed_hash,
+                    decompressed_hash,
                     timings,
                 );
             }
@@ -2038,7 +2044,7 @@ async fn process_eager_item_streaming(
                 &out,
                 chunk_offset,
                 expected_decompressed_size,
-                &decompressed_hash,
+                decompressed_hash,
             )
         });
 
