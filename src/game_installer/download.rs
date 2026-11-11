@@ -9,8 +9,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 
 use super::CHUNK_WRITE_BUFFER_SIZE;
 use super::assembly_opt::{
-    Md5, bytes_to_hex, md5_bytes_eq, md5_to_hex, posix_advise, return_md5,
-    take_md5, xxh64_bytes_eq,
+    Md5, bytes_to_hex, md5_bytes_eq, md5_to_hex, posix_advise, return_md5, take_md5, xxh64_bytes_eq,
 };
 use super::compact_manifest::ChunkRef;
 use super::error::{SophonError, SophonResult};
