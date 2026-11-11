@@ -1286,4 +1286,31 @@ mod tests {
         assert_eq!(cm.chunk_file_offset(3), 300);
         assert_eq!(cm.chunk_file_offset(4), 700);
     }
+
+    #[test]
+    fn shared_chunk_names_stored_separately() {
+        let f0 = make_file(
+            "a.pak",
+            "h1",
+            0,
+            200,
+            vec![make_chunk("shared", 0, 100, 200)],
+        );
+        let f1 = make_file(
+            "b.pak",
+            "h2",
+            0,
+            200,
+            vec![make_chunk("shared", 0, 100, 200)],
+        );
+        let cm = CompactManifest::from(vec![f0, f1]);
+
+        // Both chunks resolve to the same name.
+        assert_eq!(cm.chunk_name_at(0), "shared");
+        assert_eq!(cm.chunk_name_at(1), "shared");
+        // The builder does not dedup chunk names; each gets a distinct arena id.
+        assert_ne!(cm.chunk_name_arena_idx(0), cm.chunk_name_arena_idx(1));
+        // Arena holds 4 strings: 2 file names + 2 chunk name copies.
+        assert_eq!(cm.arena.len(), 4);
+    }
 }
