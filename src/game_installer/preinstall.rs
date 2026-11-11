@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// Sentinel used when hex decoding fails — a value that cannot match any real MD5 digest, ensuring verification fails closed.
+const INVALID_HEX_SENTINEL: [u8; 16] = [0xFF; 16];
+
 #[inline]
 fn now_nanos() -> u64 {
     EPOCH.elapsed().as_nanos() as u64
@@ -1386,7 +1389,7 @@ pub async fn preinstall_download(
             let chunks_dir = chunks_dir.clone();
             let patch_name = chunk.patch_name.clone();
             let patch_md5 = super::assembly_opt::hex_to_bytes(&chunk.patch_md5)
-                .unwrap_or_else(|| vec![0xFF; 16]);
+                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec());
             let patch_size = chunk.patch_size;
             async move {
                 let path = chunks_dir.join(&patch_name);
@@ -2231,7 +2234,7 @@ where
             let tp = target_path.clone();
             let sz = asset.target_file_size;
             let md5 = super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                .unwrap_or_else(|| vec![0xFF; 16]);
+                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec());
             tokio::task::spawn_blocking(move || is_file_already_patched(&tp, sz, &md5)).await?
         };
         if already_patched {
@@ -2758,7 +2761,8 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
         }
     } else if !verify_file_hash(
         &chunk_path,
-        &super::assembly_opt::hex_to_bytes(&asset.patch_hash).unwrap_or_else(|| vec![0xFF; 16]),
+        &super::assembly_opt::hex_to_bytes(&asset.patch_hash)
+            .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
     ) {
         return Err(SophonError::Md5Mismatch {
             item: asset.patch_name.clone(),
@@ -2835,7 +2839,7 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
         && !verify_file_hash(
             &temp_path,
             &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                .unwrap_or_else(|| vec![0xFF; 16]),
+                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
         )
     {
         let _ = fs::remove_file(&temp_path);
@@ -2950,7 +2954,7 @@ fn apply_hdiff_patch_impl(
             if !verify_file_hash(
                 &diff_ref,
                 &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5)
-                    .unwrap_or_else(|| vec![0xFF; 16]),
+                    .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
             ) {
                 return Err(SophonError::HDiffPatchFailed {
                     file: asset.target_file_path.clone(),
@@ -3020,7 +3024,8 @@ fn apply_hdiff_patch_impl(
         && !expected_md5.is_empty()
         && !verify_file_hash(
             &original_path,
-            &super::assembly_opt::hex_to_bytes(expected_md5).unwrap_or_else(|| vec![0xFF; 16]),
+            &super::assembly_opt::hex_to_bytes(expected_md5)
+                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
         )
     {
         if is_filtered_asset(cache, asset) {
@@ -3107,7 +3112,7 @@ fn apply_hdiff_patch_impl(
                 && !verify_file_hash(
                     &temp_output,
                     &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                        .unwrap_or_else(|| vec![0xFF; 16]),
+                        .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
                 )
             {
                 let _ = fs::remove_file(&temp_output);
@@ -3166,7 +3171,8 @@ fn apply_hdiff_patch_from_files(
         // Verify the freshly-created diff_ref is empty before proceeding.
         if !verify_file_hash(
             &empty_original_path,
-            &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_else(|| vec![0xFF; 16]),
+            &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5)
+                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
         ) {
             let _ = fs::remove_file(&empty_original_path);
             return Err(SophonError::HDiffPatchFailed {
@@ -3215,7 +3221,7 @@ fn apply_hdiff_patch_from_files(
                 && !verify_file_hash(
                     &temp_output,
                     &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                        .unwrap_or_else(|| vec![0xFF; 16]),
+                        .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
                 )
             {
                 let _ = fs::remove_file(&temp_output);
