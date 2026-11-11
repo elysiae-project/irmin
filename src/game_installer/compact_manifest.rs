@@ -228,8 +228,8 @@ impl CompactManifest {
         self.file_size[file_idx]
     }
 
-    #[inline]
     /// Whether the asset is classified as a directory.
+    #[inline(always)]
     pub fn is_directory(&self, file_idx: usize) -> bool {
         self.file_type[file_idx] != 0 || self.file_hash_md5(file_idx).is_empty()
     }
