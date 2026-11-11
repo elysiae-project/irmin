@@ -257,8 +257,8 @@ impl CompactManifest {
         }
     }
 
-    #[inline]
     /// Borrowed metadata for a global chunk row.
+    #[inline(always)]
     pub fn chunk(&self, chunk_idx: usize) -> ChunkRef<'_> {
         ChunkRef {
             chunk_name: self.arena.get(self.chunk_name_idx[chunk_idx]),
