@@ -361,7 +361,27 @@ fn write_reader_region(
         )?;
         let region_start = cache.get_ref().len();
         debug_assert_eq!(cache.position(), region_start as u64);
-        tbytes_copy_stream_inner(source, cache, shared_buffer, chunk_length)?;
+        // Read directly into the cache Vec's spare capacity, eliminating the
+        // intermediate shared_buffer copy. The Vec is pre-allocated to
+        // chunk_size by prepare_region_cache, so capacity is sufficient.
+        let cache_vec = cache.get_mut();
+        cache_vec.reserve(chunk_length);
+        let spare_end = cache_vec.len() + chunk_length;
+        // SAFETY: `reserve` guarantees capacity for chunk_length additional
+        // bytes. The spare capacity is uninitialized but read_exact writes
+        // all bytes before they are read. On error, the Vec length is
+        // restored to its original value.
+        unsafe {
+            cache_vec.set_len(spare_end);
+        }
+        let read_result = source.read_exact(&mut cache_vec[region_start..spare_end]);
+        if let Err(e) = read_result {
+            // Restore the Vec length on read failure.
+            unsafe {
+                cache_vec.set_len(region_start);
+            }
+            return Err(e);
+        }
         cache.set_position(region_start as u64);
         apply_region_rle(
             cache,
@@ -530,6 +550,7 @@ fn flush_region_cache(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn tbytes_copy_stream_inner(
     input: &mut dyn Read,
     output: &mut Cursor<Vec<u8>>,
