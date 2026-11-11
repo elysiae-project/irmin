@@ -80,6 +80,7 @@ pub fn copy_file_from(
 /// `copy_file_range`. Applies `POSIX_FADV_DONTNEED` on the source region
 /// once copied so the source pages do not stay resident.
 /// Copy a specified source-file region into a destination file at an offset.
+#[inline]
 pub fn copy_file_region_to(
     src_path: &Path,
     src_off: u64,
@@ -95,6 +96,7 @@ pub fn copy_file_region_to(
 /// `fallocate(2)` with `FALLOC_FL_KEEP_SIZE`. Allocates extents without
 /// zeroing or changing file size. Silently ignores unsupported filesystems.
 /// Reserve space for `len` bytes in `file`, returning the operating-system error.
+#[inline]
 pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
     if len == 0 {
         return Ok(());
