@@ -805,6 +805,8 @@ fn decompress_chunk_with_window(
     let compressed_fd = f.as_raw_fd();
     posix_advise(compressed_fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
 
+    let expected_usize = expected_size as usize;
+
     let (bytes_written, mut chunk_hasher) = {
         let mut ctx = take_dctx();
         ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
@@ -826,44 +828,37 @@ fn decompress_chunk_with_window(
                 None
             };
 
-            let mut buffer = OPT_BUFFER.with(|cell| {
-                let mut buf = cell.take();
-                buf.resize(ASSEMBLY_BUFFER_SIZE, 0);
-                buf
-            });
+            // Use mmap for output to eliminate pwrite syscalls — the
+            // decoder writes directly to the mapped output file region.
+            let mut out_mmap = mmap_read_write(out_file, offset, expected_usize)?;
+            let output = out_mmap.as_mut_slice();
 
-            let mut bytes: u64 = 0;
-            let mut write_offset = offset;
+            let mut bytes: usize = 0;
             match file_hasher.as_deref_mut() {
                 Some(hasher) => loop {
-                    let n = decoder.read(&mut buffer)?;
+                    let n = decoder.read(&mut output[bytes..])?;
                     if n == 0 {
                         break;
                     }
                     if let Some(ref mut ch) = chunk_hasher {
-                        ch.update(&buffer[..n])?;
+                        ch.update(&output[bytes..bytes + n])?;
                     }
-                    hasher.update(&buffer[..n])?;
-                    out_file.write_all_at(&buffer[..n], write_offset)?;
-                    write_offset += n as u64;
-                    bytes += n as u64;
+                    hasher.update(&output[bytes..bytes + n])?;
+                    bytes += n;
                 },
                 None => loop {
-                    let n = decoder.read(&mut buffer)?;
+                    let n = decoder.read(&mut output[bytes..])?;
                     if n == 0 {
                         break;
                     }
                     if let Some(ref mut ch) = chunk_hasher {
-                        ch.update(&buffer[..n])?;
+                        ch.update(&output[bytes..bytes + n])?;
                     }
-                    out_file.write_all_at(&buffer[..n], write_offset)?;
-                    write_offset += n as u64;
-                    bytes += n as u64;
+                    bytes += n;
                 },
             }
 
-            OPT_BUFFER.with(|cell| cell.replace(buffer));
-            (bytes, chunk_hasher)
+            (bytes as u64, chunk_hasher)
         }; // decoder dropped, ctx borrow released
 
         return_dctx(ctx, window_log);
