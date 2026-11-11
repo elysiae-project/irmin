@@ -934,6 +934,9 @@ fn write_from_old_file(
             return Ok(expected_size);
         }
 
+        // Hashing path: copy via kernel copy_file_range, then hash from
+        // the mmap'd output. Avoids pread→pwrite double-copy through the
+        // userspace buffer.
         let fd = old_file.as_raw_fd();
         super::assembly_opt::posix_advise(
             fd,
@@ -942,14 +945,72 @@ fn write_from_old_file(
             libc::POSIX_FADV_SEQUENTIAL,
         );
 
-        let mut write_offset = new_offset;
-        let mut bytes_written: u64 = 0;
-        let need_chunk_hash = super::assembly_opt::chunk_hash_required(chunk_decompressed_hash_md5);
+        let expected_size_u = expected_size as usize;
+
+        // Try kernel-side copy first.
+        let copied = super::sysio::copy_file_range(
+            old_file.as_raw_fd(),
+            old_offset,
+            out_file.as_raw_fd(),
+            new_offset,
+            expected_size,
+        )?;
+        if copied != expected_size {
+            return Err(SophonError::SizeMismatch {
+                item: old_file_path.display().to_string(),
+                expected: expected_size,
+                actual: copied,
+            });
+        }
+
+        // Hash from the mmap'd output region.
         let mut chunk_hasher: Option<Md5> = if need_chunk_hash {
             Some(take_md5()?)
         } else {
             None
         };
+
+        // Try mmap for reading the written data back for hashing.
+        let out_file_len = out_file.metadata().map_err(SophonError::Io)?.len();
+        if out_file_len >= new_offset + expected_size
+            && let Ok(out_mmap) = super::assembly_opt::mmap_shared_read_only(
+                out_file,
+                out_file_len as usize,
+                super::assembly_opt::SharedMmapAdvice::DemandSequential,
+            )
+        {
+            let off = new_offset as usize;
+            let end = off + expected_size_u;
+            let slice = &out_mmap.as_slice()[off..end];
+            if let Some(ref mut ch) = chunk_hasher {
+                ch.update(slice)?;
+            }
+            if let Some(hasher) = file_hasher.as_deref_mut() {
+                hasher.update(slice)?;
+            }
+            super::assembly_opt::posix_advise(
+                fd,
+                old_offset,
+                expected_size,
+                libc::POSIX_FADV_DONTNEED,
+            );
+            if let Some(ref mut ch) = chunk_hasher {
+                let digest = ch.finish()?;
+                return_md5(chunk_hasher.take().unwrap());
+                if !md5_hex_eq(&digest, chunk_decompressed_hash_md5) {
+                    return Err(SophonError::Md5Mismatch {
+                        item: old_file_path.display().to_string(),
+                        expected: chunk_decompressed_hash_md5.to_string(),
+                        actual: md5_to_hex(&digest),
+                    });
+                }
+            }
+            return Ok(expected_size);
+        }
+
+        // Fallback: pread into buffer for hashing (original path).
+        let mut write_offset = new_offset;
+        let mut bytes_written: u64 = 0;
         let mut remaining = expected_size;
         let mut read_offset = old_offset;
 
