@@ -115,6 +115,7 @@ impl ChunkBitmap {
     /// Marks a chunk as complete. Thread-safe (atomic OR).
     /// Callers are responsible for calling `sync()` with correct write ordering
     /// (output data must be durable before the bitmap is persisted).
+    #[inline]
     pub fn mark_complete(&self, chunk_idx: usize) {
         if chunk_idx >= self.total_chunks {
             return;
@@ -125,6 +126,7 @@ impl ChunkBitmap {
     }
 
     /// Checks if a chunk is marked complete.
+    #[inline]
     pub fn is_complete(&self, chunk_idx: usize) -> bool {
         if chunk_idx >= self.total_chunks {
             return false;
@@ -135,6 +137,7 @@ impl ChunkBitmap {
     }
 
     /// Checks if all chunks in [start..end) are complete.
+    #[inline]
     pub fn all_complete_for_range(&self, start: usize, end: usize) -> bool {
         if start >= end {
             return true;
@@ -213,6 +216,7 @@ impl ChunkBitmap {
     }
 
     /// Number of chunk indices represented by this bitmap.
+    #[inline]
     pub fn total_chunks(&self) -> usize {
         self.total_chunks
     }
