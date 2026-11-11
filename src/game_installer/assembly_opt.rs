@@ -308,6 +308,7 @@ impl MmapGuard {
 }
 
 impl Drop for MmapGuard {
+    #[inline]
     fn drop(&mut self) {
         if self.map_base != libc::MAP_FAILED && !self.map_base.is_null() {
             unsafe { libc::munmap(self.map_base, self.map_len) };
