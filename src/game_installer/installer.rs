@@ -2591,6 +2591,10 @@ async fn process_download_item(
             ctx.last_update.store(now, Ordering::Relaxed);
             ctx.smooth_speed_bps.store(0, Ordering::Relaxed);
             ctx.eta_speed_history.lock().unwrap().clear();
+            // Reclaim memory when resuming from pause — workers' thread-local
+            // pools and glibc arenas may have accumulated buffers during the
+            // burst of download activity.
+            super::reclaim_memory();
         }
     }
 

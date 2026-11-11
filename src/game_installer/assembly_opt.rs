@@ -228,6 +228,33 @@ thread_local! {
     static EAGER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Clear thread-local pools on the calling thread to release retained
+/// buffers. Called from `reclaim_memory()` which runs on async worker
+/// threads. Other threads' pools are reclaimed by `malloc_trim` which
+/// returns freed arena memory to the OS.
+pub(crate) fn trim_thread_local_buffers() {
+    OPT_BUFFER.with(|cell| {
+        cell.borrow_mut().clear();
+        cell.borrow_mut().shrink_to_fit();
+    });
+    ZSTD_DCTX.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    EAGER_BUF.with(|cell| {
+        cell.borrow_mut().clear();
+        cell.borrow_mut().shrink_to_fit();
+    });
+    COMPRESSED_BUF.with(|cell| {
+        cell.borrow_mut().clear();
+        cell.borrow_mut().shrink_to_fit();
+    });
+    HASH_READ_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.shrink_to_fit();
+    });
+}
+
 /// Take the thread-local eager decompression buffer (1 MiB).
 #[inline]
 #[allow(dead_code)]
@@ -283,14 +310,15 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // Schedule writeback of dirty pages without blocking, then hint
-        // the kernel to discard pages from the page cache. The kernel
-        // will write dirty pages to disk and then reclaim the memory.
-        // Using MS_SYNC would block the thread until writeback completes;
-        // MS_ASYNC starts it asynchronously and MADV_DONTNEED tells the
-        // kernel we don't need the pages anymore.
+        // Write dirty pages to disk synchronously, then discard from page
+        // cache. MS_SYNC blocks until writeback completes — safe here
+        // because callers run on spawn_blocking threads, not async runtime.
+        // Without the sync, MADV_DONTNEED on dirty MAP_SHARED pages is a
+        // no-op: the kernel keeps dirty pages until its async writeback
+        // timer fires (5+ seconds), causing memory to pile up during
+        // sustained download/assembly.
         unsafe {
-            libc::msync(self.map_base, self.map_len, libc::MS_ASYNC);
+            libc::msync(self.map_base, self.map_len, libc::MS_SYNC);
         }
         unsafe {
             libc::madvise(self.map_base, self.map_len, libc::MADV_DONTNEED);
@@ -468,7 +496,7 @@ fn take_compressed_buf(len: usize) -> Vec<u8> {
 #[inline]
 fn return_compressed_buf(mut buf: Vec<u8>) {
     // Cap retained capacity to avoid holding large buffers indefinitely.
-    const MAX_RETAINED_COMPRESSED_BUF: usize = 8 * 1024 * 1024;
+    const MAX_RETAINED_COMPRESSED_BUF: usize = 2 * 1024 * 1024;
     if buf.capacity() > MAX_RETAINED_COMPRESSED_BUF {
         buf = Vec::with_capacity(MAX_RETAINED_COMPRESSED_BUF);
     }

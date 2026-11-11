@@ -252,10 +252,14 @@ pub fn reclaim_memory() {
     {
         let _ = tikv_jemalloc_ctl::epoch::advance();
     }
-    #[cfg(not(feature = "benchmark"))]
     hdiffpatch::trim_idle_buffers();
-    #[cfg(feature = "benchmark")]
-    hdiffpatch::trim_idle_buffers();
+    assembly_opt::trim_thread_local_buffers();
+    // Return freed glibc arena memory to the OS. Without this, freed
+    // allocations stay in per-thread arenas and never get unmapped,
+    // causing RSS to plateau well above the true working set.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// Raise RLIMIT_NOFILE to the hard limit. The eager decompression path may
