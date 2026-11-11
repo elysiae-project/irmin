@@ -509,8 +509,10 @@ fn assemble_file_with_options(
         let chunk_infos: Vec<(u64, u64)> = (chunk_range.start..chunk_range.end)
             .map(|ci| {
                 let i = (ci - chunk_range.start) as usize;
-                let chunk = all_files.chunk(ci as usize);
-                (chunk_offsets[i], chunk.chunk_size_decompressed)
+                (
+                    chunk_offsets[i],
+                    all_files.chunk_size_decompressed_at(ci as usize),
+                )
             })
             .collect();
 

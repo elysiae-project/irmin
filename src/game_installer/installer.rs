@@ -3371,9 +3371,8 @@ pub async fn install(
                     if valid {
                         indices_arc.insert(file_idx);
                         let file_chunk_size: u64 = (chunk_range.start..chunk_range.end)
-                            .map(|i| all_files.chunk(i as usize))
-                            .filter(|c| c.chunk_old_offset < 0)
-                            .map(|c| c.chunk_size)
+                            .filter(|&i| all_files.chunk_old_offset_at(i as usize) < 0)
+                            .map(|i| all_files.chunk_size_at(i as usize))
                             .fold(0u64, |acc, x| acc.saturating_add(x));
                         resume_bytes_offset_arc.fetch_add(file_chunk_size, Ordering::Relaxed);
                         for i in chunk_range.start..chunk_range.end {
@@ -3444,8 +3443,8 @@ pub async fn install(
         let mut m: FxHashMap<u32, u64> =
             FxHashMap::with_capacity_and_hasher(prev_downloaded_chunks.len(), Default::default());
         for i in 0..all_files.num_chunks() {
-            let chunk = all_files.chunk(i);
-            if let Some(&size) = prev_downloaded_chunks.get(chunk.chunk_name) {
+            let chunk_name = all_files.chunk_name_at(i);
+            if let Some(&size) = prev_downloaded_chunks.get(chunk_name) {
                 if completed_chunk_indices.contains(&(i as u32)) {
                     continue;
                 }
