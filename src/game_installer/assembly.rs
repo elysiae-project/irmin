@@ -936,8 +936,8 @@ fn write_from_old_file(
         }
 
         // Hashing path: copy via kernel copy_file_range, then hash from
-        // the mmap'd output. Avoids pread→pwrite double-copy through the
-        // userspace buffer.
+        // the mmap'd output to avoid pread→pwrite double-copy through
+        // userspace.
         let fd = old_file.as_raw_fd();
         super::assembly_opt::posix_advise(
             fd,
@@ -948,7 +948,7 @@ fn write_from_old_file(
 
         let expected_size_u = expected_size as usize;
 
-        // Try kernel-side copy first.
+        // Kernel-side copy first.
         let copied = super::sysio::copy_file_range(
             old_file.as_raw_fd(),
             old_offset,
@@ -971,7 +971,7 @@ fn write_from_old_file(
             None
         };
 
-        // Try mmap for reading the written data back for hashing.
+        // mmap the output to hash the written region without a pread copy.
         let out_file_len = out_file.metadata().map_err(SophonError::Io)?.len();
         if out_file_len >= new_offset + expected_size
             && let Ok(out_mmap) = super::assembly_opt::mmap_shared_read_only(
@@ -1009,7 +1009,7 @@ fn write_from_old_file(
             return Ok(expected_size);
         }
 
-        // Fallback: pread into buffer for hashing (original path).
+        // Fallback: pread into a buffer for hashing when mmap fails.
         let mut write_offset = new_offset;
         let mut bytes_written: u64 = 0;
         let mut remaining = expected_size;

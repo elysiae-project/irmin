@@ -614,9 +614,10 @@ pub(crate) fn posix_advise(
     let _ = unsafe { libc::posix_fadvise(fd, offset as libc::off_t, len as libc::off_t, advice) };
 }
 
-/// Flush a range of the output file to disk, then evict its pages from the
-/// page cache. Reduces peak resident memory during assembly of large multi-
-/// chunk files. Schedules async writeback without waiting.
+/// Flushes a range of the output file to disk, then evicts its pages from
+/// the page cache. Reduces peak resident memory during assembly of large
+/// multi-chunk files. Uses WAIT_AFTER because callers run on blocking
+/// (spawn_blocking or std::thread::scope) threads.
 #[inline]
 pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, len: u64) {
     let _ = unsafe {
