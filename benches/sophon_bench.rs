@@ -2933,6 +2933,7 @@ criterion_group!(
     bench_state_save,
     bench_hex_to_bytes,
     bench_md5_hex_eq,
+    bench_xxh64_hex_eq,
     bench_load_download_state,
 );
 criterion_main!(benches);
@@ -3313,6 +3314,23 @@ fn bench_md5_hex_eq(c: &mut Criterion) {
     group.bench_function("lut", |b| {
         b.iter(|| {
             let ok = md5_hex_eq(&digest, &hex);
+            criterion::black_box(ok);
+        });
+    });
+    group.finish();
+}
+
+fn bench_xxh64_hex_eq(c: &mut Criterion) {
+    use irmin_rs::game_installer::assembly_opt::xxh64_hex_eq;
+
+    let value: u64 = 0x1234567890abcdef;
+    let hex = format!("{value:016x}");
+
+    let mut group = c.benchmark_group("xxh64_hex_eq");
+    group.throughput(Throughput::Bytes(8));
+    group.bench_function("lut", |b| {
+        b.iter(|| {
+            let ok = xxh64_hex_eq(value, &hex);
             criterion::black_box(ok);
         });
     });

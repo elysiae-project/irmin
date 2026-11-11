@@ -186,7 +186,8 @@ pub(crate) fn md5_bytes_eq(digest: &[u8; 16], expected: &[u8]) -> bool {
 /// Compare a u64 value against a 16-char lowercase hex string without
 /// allocating. Used for XXH64 hash verification.
 #[inline]
-pub(crate) fn xxh64_hex_eq(value: u64, expected: &str) -> bool {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub fn xxh64_hex_eq(value: u64, expected: &str) -> bool {
     if expected.len() != 16 {
         return false;
     }
@@ -194,12 +195,10 @@ pub(crate) fn xxh64_hex_eq(value: u64, expected: &str) -> bool {
     let mut acc: u64 = 0;
     let mut i = 0;
     while i < 16 {
-        let nibble = match bytes[i] {
-            b'0'..=b'9' => bytes[i] - b'0',
-            b'a'..=b'f' => bytes[i] - b'a' + 10,
-            b'A'..=b'F' => bytes[i] - b'A' + 10,
-            _ => return false,
-        };
+        let nibble = HEX_DECODE_LUT[bytes[i] as usize];
+        if nibble == 0xFF {
+            return false;
+        }
         acc = (acc << 4) | nibble as u64;
         i += 1;
     }
