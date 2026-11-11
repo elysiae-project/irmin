@@ -2478,21 +2478,17 @@ fn notify_eager_file_complete(
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map_or(0, |d| d.as_secs());
-                    ctx.verify_cache.insert(
-                        file_name.to_string(),
-                        {
-                            let hash = ctx.all_files.file_hash_md5(file_idx);
-                            let mut md5 = [0u8; 16];
-                            if hash.len() == 16 {
-                                md5.copy_from_slice(hash);
-                            }
+                    let hash = ctx.all_files.file_hash_md5(file_idx);
+                    if let Ok(md5) = <[u8; 16]>::try_from(hash) {
+                        ctx.verify_cache.insert(
+                            file_name.to_string(),
                             super::cache::VerificationEntry {
                                 size: ctx.all_files.file_size(file_idx),
                                 md5,
                                 mtime_secs,
-                            }
-                        },
-                    );
+                            },
+                        );
+                    }
                 }
             }
             // Update counters + progress (mirrors assembly coordinator).

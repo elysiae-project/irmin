@@ -68,9 +68,13 @@ impl<'de> Deserialize<'de> for VerificationEntry {
             mtime_secs: u64,
         }
         let raw = Raw::deserialize(deserializer)?;
-        let bytes = hex_to_bytes(&raw.md5).unwrap_or_else(|| raw.md5.into_bytes());
+        // Valid 32-char hex MD5 decodes to 16 bytes. Anything else (short,
+        // non-hex, or legacy raw-byte entries) maps to all zeros, which never
+        // matches a real digest and forces a cache miss + re-hash.
         let mut md5 = [0u8; 16];
-        if bytes.len() == 16 {
+        if let Some(bytes) = hex_to_bytes(&raw.md5)
+            && bytes.len() == 16
+        {
             md5.copy_from_slice(&bytes);
         }
         Ok(VerificationEntry {
@@ -310,10 +314,13 @@ fn check_file_md5_with_metadata(
         if cache.len() >= VERIFICATION_CACHE_MAX_ENTRIES {
             return Ok((true, Some(actual_size)));
         }
-        // md5_bytes_eq above guarantees expected_md5 is 16 bytes (actual is
-        // always 16 bytes from file_md5_digest), so copy is safe here.
-        let mut md5 = [0u8; 16];
-        md5.copy_from_slice(expected_md5);
+        // `matches` is true only when `md5_bytes_eq(&actual, expected_md5)`
+        // succeeds, which requires both slices to be 16 bytes. The try_from
+        // guards against a future invariant break by skipping the insert
+        // instead of panicking.
+        let Ok(md5) = <[u8; 16]>::try_from(expected_md5) else {
+            return Ok((true, Some(actual_size)));
+        };
         cache.insert(
             cache_key.to_string(),
             VerificationEntry {
