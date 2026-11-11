@@ -602,8 +602,9 @@ pub fn state_file_path(state_dir: &Path, game_id: &str) -> PathBuf {
 /// Load the persisted resume state for `game_id` from `state_dir`. Returns
 /// `None` when the file is missing or unparseable. Pure file read; no HTTP.
 pub fn load_download_state(state_dir: &Path, game_id: &str) -> Option<DownloadState> {
-    let content = std::fs::read_to_string(state_file_path(state_dir, game_id)).ok()?;
-    serde_json::from_str(&content).ok()
+    let file = std::fs::File::open(state_file_path(state_dir, game_id)).ok()?;
+    let reader = std::io::BufReader::new(file);
+    serde_json::from_reader(reader).ok()
 }
 
 #[cfg(test)]
