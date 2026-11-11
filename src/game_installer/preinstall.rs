@@ -2457,6 +2457,7 @@ fn regenerate_hk4e_pkg_version(
     Ok(())
 }
 
+#[inline]
 fn validate_asset_path(game_dir: &Path, asset_path: &str) -> SophonResult<PathBuf> {
     super::assembly::validate_asset_name(asset_path)?;
     Ok(game_dir.join(asset_path))
@@ -2636,6 +2637,7 @@ fn contains_ignore_ascii_case(haystack: &str, pattern: &str) -> bool {
     false
 }
 
+#[inline]
 fn is_filtered_asset(cache: &FilterCache, asset: &PatchAssetInfo) -> bool {
     if let Some(ref tokens) = cache.kdel_tokens {
         for token in tokens {

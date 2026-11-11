@@ -279,6 +279,7 @@ pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     file_md5_digest_with_options(path, MD5_READ_BUFFER_SIZE, true)
 }
 
+#[inline]
 fn file_md5_digest_with_options(
     path: &Path,
     buffer_capacity: usize,
