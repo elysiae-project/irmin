@@ -3043,13 +3043,8 @@ fn bench_eager_decompress(c: &mut Criterion) {
     }
 
     let compressed = zstd::encode_all(std::io::Cursor::new(&data), 3).unwrap();
-    let comp_hash = irmin_rs::game_installer::assembly_opt::hex_to_bytes(&hex::encode(
-        fast_md5::digest(&compressed),
-    ))
-    .unwrap();
-    let decomp_hash =
-        irmin_rs::game_installer::assembly_opt::hex_to_bytes(&hex::encode(fast_md5::digest(&data)))
-            .unwrap();
+    let comp_hash = hex::encode(fast_md5::digest(&compressed));
+    let decomp_hash = hex::encode(fast_md5::digest(&data));
 
     let mut group = c.benchmark_group("eager_decompress");
     group.throughput(Throughput::Bytes(data_size as u64));
@@ -3069,8 +3064,8 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 &out_file,
                 0,
                 data_size as u64,
-                comp_hash.as_slice(),
-                decomp_hash.as_slice(),
+                &comp_hash,
+                &decomp_hash,
             )
             .unwrap();
         });
@@ -3087,11 +3082,11 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
             irmin_rs::game_installer::eager_decompress::stream_decompress_to_file(
-                HashingRead::new(&compressed, &hex::encode(&comp_hash)),
+                HashingRead::new(&compressed, &comp_hash),
                 &out_file,
                 0,
                 data_size as u64,
-                decomp_hash.as_slice(),
+                &decomp_hash,
             )
             .unwrap();
         });

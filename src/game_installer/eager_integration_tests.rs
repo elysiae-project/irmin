@@ -67,8 +67,8 @@ fn eager_install_multi_file_multi_chunk() {
                 &handle,
                 offset,
                 chunk_size as u64,
-                comp_hash.as_bytes(),
-                decomp_hash.as_bytes(),
+                &comp_hash,
+                &decomp_hash,
             )
             .unwrap();
 
@@ -166,8 +166,8 @@ fn eager_mixed_mode_coexistence() {
             &handle,
             (chunk_idx * chunk_size) as u64,
             chunk_size as u64,
-            md5_hex(&compressed).as_bytes(),
-            md5_hex(&data).as_bytes(),
+            &md5_hex(&compressed),
+            &md5_hex(&data),
         )
         .unwrap();
         assert_eq!(written, chunk_size as u64);
@@ -189,8 +189,8 @@ fn eager_mixed_mode_coexistence() {
             &handle,
             (i * chunk_size) as u64,
             chunk_size as u64,
-            md5_hex(&compressed).as_bytes(),
-            md5_hex(&data).as_bytes(),
+            &md5_hex(&compressed),
+            &md5_hex(&data),
         )
         .unwrap();
         assert_eq!(written, chunk_size as u64);
@@ -240,8 +240,8 @@ fn eager_hash_mismatch_no_bitmap_mark() {
         &handle,
         0,
         1024,
-        &[0; 16],
-        md5_hex(&data).as_bytes(),
+        "00000000000000000000000000000000",
+        &md5_hex(&data),
     );
 
     assert!(result.is_err());

@@ -757,7 +757,7 @@ fn is_file_already_patched_size_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.bin");
     fs::write(&path, b"short").unwrap();
-    assert!(!is_file_already_patched(&path, 9999, b"any_hash"));
+    assert!(!is_file_already_patched(&path, 9999, "any_hash"));
 }
 
 #[test]
@@ -769,7 +769,7 @@ fn is_file_already_patched_md5_mismatch() {
     assert!(!is_file_already_patched(
         &path,
         data.len() as u64,
-        b"wrong_hash"
+        "wrong_hash"
     ));
 }
 
@@ -780,18 +780,14 @@ fn is_file_already_patched_valid() {
     let data = b"hello world";
     let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(is_file_already_patched(
-        &path,
-        data.len() as u64,
-        &super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap()[..]
-    ));
+    assert!(is_file_already_patched(&path, data.len() as u64, &md5_hex));
 }
 
 #[test]
 fn is_file_already_patched_missing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nonexistent.bin");
-    assert!(!is_file_already_patched(&path, 100, b"any_hash"));
+    assert!(!is_file_already_patched(&path, 100, "any_hash"));
 }
 
 #[test]
@@ -802,11 +798,7 @@ fn is_file_already_patched_returns_false_when_file_missing() {
     // Keep tempdir alive for the duration of the test.
     let _keep_dir_alive = &dir;
 
-    let result = is_file_already_patched(
-        &path,
-        0,
-        &super::super::assembly_opt::hex_to_bytes("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
-    );
+    let result = is_file_already_patched(&path, 0, "d41d8cd98f00b204e9800998ecf8427e");
 
     assert!(!result);
 }
@@ -820,7 +812,11 @@ fn is_file_already_patched_returns_false_when_size_mismatch() {
     fs::write(&path, data).unwrap();
     let actual_size = data.len() as u64;
 
-    let result = is_file_already_patched(&path, actual_size + 9_999, &[0; 16]);
+    let result = is_file_already_patched(
+        &path,
+        actual_size + 9_999,
+        "00000000000000000000000000000000",
+    );
 
     assert!(!result);
 }
@@ -834,11 +830,7 @@ fn is_file_already_patched_returns_true_when_size_and_md5_match() {
     let expected_md5 = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
 
-    let result = is_file_already_patched(
-        &path,
-        data.len() as u64,
-        &super::super::assembly_opt::hex_to_bytes(&expected_md5).unwrap()[..],
-    );
+    let result = is_file_already_patched(&path, data.len() as u64, &expected_md5);
 
     assert!(result);
 }
@@ -851,11 +843,8 @@ fn is_file_already_patched_returns_false_when_only_md5_mismatch() {
     let data = b"hello world";
     fs::write(&path, data).unwrap();
 
-    let result = is_file_already_patched(
-        &path,
-        data.len() as u64,
-        &super::super::assembly_opt::hex_to_bytes("00000000000000000000000000000000").unwrap(),
-    );
+    let result =
+        is_file_already_patched(&path, data.len() as u64, "00000000000000000000000000000000");
 
     assert!(!result);
 }

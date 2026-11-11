@@ -1473,15 +1473,13 @@ async fn check_needs_download(
     let dest = dest.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || {
-        let expected_md5 = super::assembly_opt::bytes_to_hex(
-            all_files
-                .file_chunk(file_idx, chunk_idx)
-                .chunk_compressed_hash_md5,
-        );
+        let expected_md5 = all_files
+            .file_chunk(file_idx, chunk_idx)
+            .chunk_compressed_hash_md5;
         cache::check_file_md5_cached_with_size(
             &dest,
             chunk_size,
-            &expected_md5,
+            expected_md5,
             &game_dir,
             &verify_cache,
         )
@@ -1662,7 +1660,7 @@ async fn process_eager_item_with_mode(
     }
     if ctx.verify_mode == super::VerifyMode::Full
         && !chunk.chunk_compressed_hash_md5.is_empty()
-        && !matches!(chunk.chunk_compressed_hash_md5.len(), 16 | 8)
+        && !matches!(chunk.chunk_compressed_hash_md5.len(), 16 | 32)
     {
         return Err(SophonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1885,7 +1883,7 @@ async fn process_eager_item_oneshot(
                             chunk.chunk_decompressed_hash_md5,
                         )
                     }
-                    None => (&b""[..], &b""[..]),
+                    None => ("", ""),
                 };
                 super::eager_decompress::eager_decompress_chunk(
                     &compressed_data,
@@ -1996,8 +1994,8 @@ async fn process_eager_item_streaming(
         .get_handle(file_idx)
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
     let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
-    let compressed_hash: &[u8] = if skip_hash {
-        b""
+    let compressed_hash = if skip_hash {
+        ""
     } else {
         chunk.chunk_compressed_hash_md5
     };
@@ -2009,7 +2007,7 @@ async fn process_eager_item_streaming(
         Some(Arc::clone(&ctx.all_files))
     };
 
-    if !compressed_hash.is_empty() && !matches!(compressed_hash.len(), 16 | 8) {
+    if !compressed_hash.is_empty() && !matches!(compressed_hash.len(), 16 | 32) {
         return Err(SophonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "unsupported compressed chunk hash length",
@@ -2047,9 +2045,9 @@ async fn process_eager_item_streaming(
         #[cfg(feature = "bench-diagnostics")]
         let decoder_timings = timings.clone();
         let decode_task = tokio::task::spawn_blocking(move || {
-            let decompressed_hash: &[u8] = match &all_files {
+            let decompressed_hash = match &all_files {
                 Some(manifest) => manifest.chunk(global_chunk_idx).chunk_decompressed_hash_md5,
-                None => b"",
+                None => "",
             };
             let reader = std::io::BufReader::with_capacity(
                 256 * 1024,
@@ -2083,9 +2081,9 @@ async fn process_eager_item_streaming(
         });
 
         let mut bytes_received = 0u64;
-        let mut compressed_md5 = (compressed_hash.len() == 16).then(fast_md5::Md5::new);
+        let mut compressed_md5 = (compressed_hash.len() == 32).then(fast_md5::Md5::new);
         let mut compressed_xxh64 =
-            (compressed_hash.len() == 8).then(super::assembly_opt::take_xxh64);
+            (compressed_hash.len() == 16).then(super::assembly_opt::take_xxh64);
         let mut stream_error = None;
         loop {
             #[cfg(feature = "bench-diagnostics")]
@@ -2192,10 +2190,10 @@ async fn process_eager_item_streaming(
         let compressed_hash_mismatch = if stream_error.is_none() {
             if let Some(hasher) = compressed_md5.take() {
                 let digest = hasher.finalize();
-                !super::assembly_opt::md5_bytes_eq(&digest, compressed_hash)
+                !super::assembly_opt::md5_hex_eq(&digest, compressed_hash)
             } else if let Some(hasher) = compressed_xxh64.take() {
                 let digest = hasher.digest();
-                !super::assembly_opt::xxh64_bytes_eq(digest, compressed_hash)
+                !super::assembly_opt::xxh64_hex_eq(digest, compressed_hash)
             } else {
                 false
             }
@@ -2205,7 +2203,7 @@ async fn process_eager_item_streaming(
         if compressed_hash_mismatch {
             stream_error = Some(SophonError::Md5Mismatch {
                 item: chunk.chunk_name.to_string(),
-                expected: super::assembly_opt::bytes_to_hex(compressed_hash),
+                expected: compressed_hash.to_owned(),
                 actual: String::from("streamed compressed hash mismatch"),
             });
         }
@@ -2469,9 +2467,7 @@ fn notify_eager_file_complete(
                         file_name.to_string(),
                         super::cache::VerificationEntry {
                             size: ctx.all_files.file_size(file_idx),
-                            md5: super::assembly_opt::bytes_to_hex(
-                                ctx.all_files.file_hash_md5(file_idx),
-                            ),
+                            md5: ctx.all_files.file_hash_md5(file_idx).to_string(),
                             mtime_secs,
                         },
                     );
@@ -3349,8 +3345,7 @@ pub async fn install(
             async move {
                 let file_name = all_files.file_name(file_idx).to_string();
                 let file_size = all_files.file_size(file_idx);
-                let file_hash =
-                    super::assembly_opt::bytes_to_hex(all_files.file_hash_md5(file_idx));
+                let file_hash = all_files.file_hash_md5(file_idx).to_string();
                 let chunk_range = all_files.file_chunk_range(file_idx);
                 let is_dir = all_files.is_directory(file_idx);
                 let num_chunks = chunk_range.end - chunk_range.start;
@@ -4174,23 +4169,8 @@ async fn repair_assets(
                         if let Some(parent) = chunk_path.parent() {
                             fs::create_dir_all(parent)?;
                         }
-                        let decomp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
-                            chunk.chunk_decompressed_hash_md5_str(),
-                        )
-                        .unwrap_or_default();
-                        let comp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
-                            chunk.chunk_compressed_hash_md5_str(),
-                        )
-                        .unwrap_or_default();
                         download_chunk_with_retry_policy(
-                            ChunkRef {
-                                chunk_name: chunk.chunk_name_str(),
-                                chunk_decompressed_hash_md5: &decomp_hash_bytes,
-                                chunk_size: chunk.chunk_size,
-                                chunk_size_decompressed: chunk.chunk_size_decompressed,
-                                chunk_compressed_hash_md5: &comp_hash_bytes,
-                                chunk_old_offset: chunk.chunk_old_offset,
-                            },
+                            (&chunk).into(),
                             &client,
                             &dl_info,
                             &chunk_path,
@@ -4296,7 +4276,7 @@ async fn repair_assets(
             if !cache::check_file_md5_cached(
                 &path,
                 manifest.file_size(file_idx),
-                &super::assembly_opt::bytes_to_hex(manifest.file_hash_md5(file_idx)),
+                manifest.file_hash_md5(file_idx),
                 &game_dir_owned,
                 &repair_cache,
             )? {

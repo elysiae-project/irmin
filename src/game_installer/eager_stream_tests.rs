@@ -1465,7 +1465,7 @@ fn stream_decompressor_rejects_decompressed_hash_mismatch() {
         &output,
         0,
         data.len() as u64,
-        &[0xff; 16],
+        "ffffffffffffffffffffffffffffffff",
     );
     assert!(matches!(result, Err(SophonError::Md5Mismatch { .. })));
 }

@@ -204,7 +204,7 @@ fn write_single_pkg_version(
         }
         let entry = PkgVersionEntry {
             remoteName: assets.file_name(i).to_string(),
-            md5: super::super::assembly_opt::bytes_to_hex(assets.file_hash_md5(i)),
+            md5: assets.file_hash_md5(i).to_string(),
             file_size: assets.file_size(i),
         };
         let mut line = serde_json::to_string(&entry)?;
@@ -232,7 +232,7 @@ fn write_single_pkg_version_from_indices(
         }
         let entry = PkgVersionEntry {
             remoteName: assets.file_name(i).to_string(),
-            md5: super::super::assembly_opt::bytes_to_hex(assets.file_hash_md5(i)),
+            md5: assets.file_hash_md5(i).to_string(),
             file_size: assets.file_size(i),
         };
         let mut line = serde_json::to_string(&entry)?;
