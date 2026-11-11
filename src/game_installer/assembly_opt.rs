@@ -668,26 +668,74 @@ pub fn write_chunk_from_mmap(
         buf
     });
 
-    let mut remaining = expected_size_u;
-    let mut write_offset = new_offset;
-    while remaining > 0 {
-        let to_read = remaining.min(buf.len());
-        let read_at = old_offset + (expected_size_u - remaining) as u64;
-        let n = old_file
-            .read_at(&mut buf[..to_read], read_at)
-            .map_err(SophonError::Io)?;
-        if n == 0 {
-            break;
+    // Try mmap for output to eliminate pwrite syscalls. Fall back to pwrite
+    // if mmap fails or the output file is not large enough.
+    let out_file_len = out_file.metadata().map_err(SophonError::Io)?.len();
+    let mmap_result = if out_file_len >= new_offset + expected_size {
+        mmap_read_write(out_file, new_offset, expected_size_u)
+    } else {
+        Err(io::Error::other("output file too small for mmap"))
+    };
+    let mut bytes_written: usize = 0;
+    match mmap_result {
+        Ok(mut out_mmap) => {
+            // Prefault pages before borrowing the slice.
+            unsafe {
+                libc::madvise(
+                    out_mmap.map_base,
+                    out_mmap.map_len,
+                    libc::MADV_POPULATE_WRITE,
+                );
+            }
+            let out_slice = out_mmap.as_mut_slice();
+            let mut remaining = expected_size_u;
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len());
+                let read_at = old_offset + (expected_size_u - remaining) as u64;
+                let n = old_file
+                    .read_at(&mut buf[..to_read], read_at)
+                    .map_err(SophonError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                if let Some(ref mut ch) = chunk_hasher {
+                    ch.update(&buf[..n])?;
+                }
+                if let Some(hasher) = file_hasher.as_deref_mut() {
+                    hasher.update(&buf[..n])?;
+                }
+                out_slice[bytes_written..bytes_written + n].copy_from_slice(&buf[..n]);
+                bytes_written += n;
+                remaining -= n;
+            }
         }
-        if let Some(ref mut ch) = chunk_hasher {
-            ch.update(&buf[..n])?;
+        Err(_) => {
+            // Fall back to pwrite if mmap fails.
+            let mut remaining = expected_size_u;
+            let mut write_offset = new_offset;
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len());
+                let read_at = old_offset + (expected_size_u - remaining) as u64;
+                let n = old_file
+                    .read_at(&mut buf[..to_read], read_at)
+                    .map_err(SophonError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                if let Some(ref mut ch) = chunk_hasher {
+                    ch.update(&buf[..n])?;
+                }
+                if let Some(hasher) = file_hasher.as_deref_mut() {
+                    hasher.update(&buf[..n])?;
+                }
+                out_file
+                    .write_all_at(&buf[..n], write_offset)
+                    .map_err(SophonError::Io)?;
+                write_offset += n as u64;
+                bytes_written += n;
+                remaining -= n;
+            }
         }
-        if let Some(hasher) = file_hasher.as_deref_mut() {
-            hasher.update(&buf[..n])?;
-        }
-        out_file.write_all_at(&buf[..n], write_offset)?;
-        write_offset += n as u64;
-        remaining -= n;
     }
 
     posix_advise(
@@ -697,7 +745,7 @@ pub fn write_chunk_from_mmap(
         libc::POSIX_FADV_DONTNEED,
     );
 
-    let bytes_written = (expected_size_u - remaining) as u64;
+    let bytes_written = bytes_written as u64;
 
     OPT_BUFFER.with(|cell| cell.replace(buf));
 
