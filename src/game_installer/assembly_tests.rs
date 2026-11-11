@@ -314,7 +314,7 @@ fn benchmark_repair_post_assembly_hash_reread() {
         {
             let entry = verify_cache.get(path_key).unwrap();
             assert_eq!(entry.value().size, total_bytes as u64);
-            assert_eq!(entry.value().md5, expected_hash);
+            assert_eq!(entry.value().md5.as_slice(), expected_hash);
             assert_eq!(entry.value().mtime_secs, expected_mtime);
         }
         verify_cache.remove(path_key);
@@ -409,7 +409,7 @@ fn benchmark_cached_assembly_target_checks() {
             name.clone(),
             super::super::cache::VerificationEntry {
                 size: 0,
-                md5: empty_hash.clone(),
+                md5: { let mut m = [0u8; 16]; if empty_hash.len() == 16 { m.copy_from_slice(&empty_hash); } m },
                 mtime_secs,
             },
         );

@@ -1177,7 +1177,7 @@ pub fn run_assembly_task(
         Ok(metadata) if metadata.len() == file_size => {
             if let Some(entry) = verify_cache.get(file_name)
                 && entry.size == file_size
-                && entry.md5 == file_hash_md5
+                && entry.md5.as_slice() == file_hash_md5
             {
                 for ci in chunk_range.start..chunk_range.end {
                     decrement_chunk_refcount(

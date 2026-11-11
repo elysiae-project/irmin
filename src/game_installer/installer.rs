@@ -2480,10 +2480,17 @@ fn notify_eager_file_complete(
                         .map_or(0, |d| d.as_secs());
                     ctx.verify_cache.insert(
                         file_name.to_string(),
-                        super::cache::VerificationEntry {
-                            size: ctx.all_files.file_size(file_idx),
-                            md5: ctx.all_files.file_hash_md5(file_idx).to_vec(),
-                            mtime_secs,
+                        {
+                            let hash = ctx.all_files.file_hash_md5(file_idx);
+                            let mut md5 = [0u8; 16];
+                            if hash.len() == 16 {
+                                md5.copy_from_slice(hash);
+                            }
+                            super::cache::VerificationEntry {
+                                size: ctx.all_files.file_size(file_idx),
+                                md5,
+                                mtime_secs,
+                            }
                         },
                     );
                 }

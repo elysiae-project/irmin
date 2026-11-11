@@ -34,27 +34,15 @@ fn save_load_roundtrip() {
     let cache = DashMap::new();
     cache.insert(
         "file1".to_string(),
-        VerificationEntry {
-            size: 100,
-            md5: super::super::assembly_opt::hex_to_bytes("abc123").unwrap_or_default(),
-            mtime_secs: 1000,
-        },
+        VerificationEntry::from_hex_md5(100, "abc12300000000000000000000000000", 1000),
     );
     cache.insert(
         "file2".to_string(),
-        VerificationEntry {
-            size: 200,
-            md5: super::super::assembly_opt::hex_to_bytes("def456").unwrap_or_default(),
-            mtime_secs: 2000,
-        },
+        VerificationEntry::from_hex_md5(200, "def45600000000000000000000000000", 2000),
     );
     cache.insert(
         "file3".to_string(),
-        VerificationEntry {
-            size: 300,
-            md5: super::super::assembly_opt::hex_to_bytes("ghi789").unwrap_or_default(),
-            mtime_secs: 3000,
-        },
+        VerificationEntry::from_hex_md5(300, "abcdef01000000000000000000000000", 3000),
     );
     save_verification_cache(&game_dir, &cache).unwrap();
     let loaded = load_verification_cache(&game_dir);
@@ -62,21 +50,27 @@ fn save_load_roundtrip() {
     let e1 = loaded.get("file1").unwrap();
     assert_eq!(e1.size, 100);
     assert_eq!(
-        &e1.md5,
-        &super::super::assembly_opt::hex_to_bytes("abc123").unwrap_or_default()
+        e1.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("abc12300000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
     );
     assert_eq!(e1.mtime_secs, 1000);
     let e2 = loaded.get("file2").unwrap();
     assert_eq!(e2.size, 200);
     assert_eq!(
-        &e2.md5,
-        &super::super::assembly_opt::hex_to_bytes("def456").unwrap_or_default()
+        e2.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("def45600000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
     );
     let e3 = loaded.get("file3").unwrap();
     assert_eq!(e3.size, 300);
     assert_eq!(
-        &e3.md5,
-        &super::super::assembly_opt::hex_to_bytes("ghi789").unwrap_or_default()
+        e3.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("abcdef01000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
     );
 }
 
@@ -116,7 +110,7 @@ fn check_file_md5_cached_hit() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: mtime,
         },
     );
@@ -151,7 +145,7 @@ fn check_file_md5_cached_with_metadata_matches_regular_cache_hit() {
         "test.dat".to_owned(),
         VerificationEntry {
             size: 11,
-            md5: super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: mtime,
         },
     );
@@ -181,19 +175,16 @@ fn check_file_md5_cached_with_metadata_removes_size_mismatch() {
     let cache = DashMap::new();
     cache.insert(
         "test.dat".to_owned(),
-        VerificationEntry {
-            size: 11,
-            md5: super::super::assembly_opt::hex_to_bytes(&hex::encode(fast_md5::digest(
-                b"hello world",
-            )))
-            .unwrap_or_default(),
-            mtime_secs: metadata
+        VerificationEntry::from_hex_md5(
+            11,
+            &hex::encode(fast_md5::digest(b"hello world")),
+            metadata
                 .modified()
                 .unwrap()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-        },
+        ),
     );
 
     assert!(
@@ -227,7 +218,7 @@ fn check_file_md5_cached_with_metadata_follows_symlink() {
         "link.dat".to_owned(),
         VerificationEntry {
             size: 11,
-            md5: super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: metadata
                 .modified()
                 .unwrap()
@@ -278,7 +269,7 @@ fn check_file_md5_cached_miss_size_changed() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: super::super::assembly_opt::hex_to_bytes("old_md5").unwrap_or_default(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("old_md5").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: mtime,
         },
     );
@@ -313,7 +304,7 @@ fn check_file_md5_cached_miss_md5_changed() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: b"stale_cached_md5".to_vec(),
+            md5: { let mut m = [0u8; 16]; let b = b"stale_cached_md5"; if b.len() == 16 { m.copy_from_slice(b); } m },
             mtime_secs: mtime,
         },
     );
@@ -363,8 +354,8 @@ fn check_file_md5_cached_populates_on_match() {
     let entry = cache.get(&rel_path).unwrap();
     assert_eq!(entry.size, 11);
     assert_eq!(
-        &entry.md5,
-        &super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default()
+        entry.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice()
     );
     assert_eq!(entry.mtime_secs, mtime);
 }
@@ -399,7 +390,7 @@ fn save_verification_cache_atomic_write() {
         "file".to_string(),
         VerificationEntry {
             size: 42,
-            md5: super::super::assembly_opt::hex_to_bytes("deadbeef").unwrap_or_default(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("deadbeef").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: 999,
         },
     );
@@ -422,17 +413,20 @@ fn concurrent_cache_access() {
         handles.push(std::thread::spawn(move || {
             for j in 0..100 {
                 let key = format!("key-{i}-{j}");
+                let mut md5 = [0u8; 16];
+                md5[0] = i as u8;
+                md5[1] = j as u8;
                 c.insert(
                     key.clone(),
                     VerificationEntry {
                         size: i as u64 + j as u64,
-                        md5: format!("md5-{i}-{j}").into_bytes(),
+                        md5,
                         mtime_secs: i as u64 * 100 + j as u64,
                     },
                 );
                 if let Some(entry) = c.get(&key) {
                     assert_eq!(entry.size, i as u64 + j as u64);
-                    assert_eq!(&entry.md5, &format!("md5-{i}-{j}").into_bytes());
+                    assert_eq!(entry.md5, md5);
                 }
             }
         }));
@@ -478,7 +472,7 @@ fn load_verification_cache_loads_stale_entries() {
             "nonexistent.bin".to_string(),
             VerificationEntry {
                 size: 100,
-                md5: super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(),
+                md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
                 mtime_secs: 1000,
             },
         )]),
@@ -501,7 +495,7 @@ fn load_verification_cache_keeps_all_entries() {
                 "a.bin".to_string(),
                 VerificationEntry {
                     size: 1,
-                    md5: super::super::assembly_opt::hex_to_bytes("m1").unwrap_or_default(),
+                    md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("m1").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
                     mtime_secs: 10,
                 },
             ),
@@ -509,7 +503,7 @@ fn load_verification_cache_keeps_all_entries() {
                 "b.bin".to_string(),
                 VerificationEntry {
                     size: 2,
-                    md5: super::super::assembly_opt::hex_to_bytes("m2").unwrap_or_default(),
+                    md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("m2").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
                     mtime_secs: 20,
                 },
             ),
@@ -533,7 +527,7 @@ fn save_verification_cache_writes_to_disk() {
         "f".to_string(),
         VerificationEntry {
             size: 42,
-            md5: super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: 999,
         },
     );
@@ -565,7 +559,7 @@ fn check_file_md5_cached_skips_insert_at_capacity() {
             format!("fill_{i}"),
             VerificationEntry {
                 size: 0,
-                md5: Vec::new(),
+                md5: [0u8; 16],
                 mtime_secs: 0,
             },
         );
@@ -737,7 +731,7 @@ fn benchmark_load_verification_cache_startup() {
             format!("asset-{index:06}.pak"),
             VerificationEntry {
                 size: 1,
-                md5: "0123456789abcdef0123456789abcdef".to_owned(),
+                md5: { let mut m = [0u8; 16]; let b = b"0123456789abcdef0123456789abcdef"; if b.len() == 16 { m.copy_from_slice(b); } m },
                 mtime_secs: index as u64,
             },
         );
@@ -785,20 +779,11 @@ fn save_and_load_verification_cache_round_trip() {
     let cache: DashMap<String, VerificationEntry> = DashMap::new();
     cache.insert(
         "data/asset.pak".to_string(),
-        VerificationEntry {
-            size: 12345,
-            md5: super::super::assembly_opt::hex_to_bytes("d41d8cd98f00b204e9800998ecf8427e")
-                .unwrap_or_default(),
-            mtime_secs: 1700000000,
-        },
+        VerificationEntry::from_hex_md5(12345, "d41d8cd98f00b204e9800998ecf8427e", 1700000000),
     );
     cache.insert(
         "data/中文.pak".to_string(),
-        VerificationEntry {
-            size: 99,
-            md5: super::super::assembly_opt::hex_to_bytes("abc123").unwrap_or_default(),
-            mtime_secs: 1700000001,
-        },
+        VerificationEntry::from_hex_md5(99, "abc12300000000000000000000000000", 1700000001),
     );
 
     save_verification_cache(game_dir, &cache).unwrap();
@@ -808,7 +793,7 @@ fn save_and_load_verification_cache_round_trip() {
     let e1 = loaded.get("data/asset.pak").unwrap();
     assert_eq!(e1.size, 12345);
     assert_eq!(
-        &e1.md5,
+        e1.md5.as_slice(),
         &super::super::assembly_opt::hex_to_bytes("d41d8cd98f00b204e9800998ecf8427e")
             .unwrap_or_default()
     );
@@ -816,8 +801,10 @@ fn save_and_load_verification_cache_round_trip() {
     let e2 = loaded.get("data/中文.pak").unwrap();
     assert_eq!(e2.size, 99);
     assert_eq!(
-        &e2.md5,
-        &super::super::assembly_opt::hex_to_bytes("abc123").unwrap_or_default()
+        e2.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("abc12300000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
     );
     assert_eq!(e2.mtime_secs, 1700000001);
 }

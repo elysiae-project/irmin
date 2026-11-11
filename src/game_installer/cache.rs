@@ -24,8 +24,27 @@ use super::assembly_opt::{bytes_to_hex, hex_to_bytes, md5_bytes_eq};
 /// whole-second modification time. A changed size or timestamp forces hashing.
 pub struct VerificationEntry {
     pub size: u64,
-    pub md5: Vec<u8>,
+    pub md5: [u8; 16],
     pub mtime_secs: u64,
+}
+
+impl VerificationEntry {
+    /// Build an entry from a hex MD5 string, storing an all-zero digest when
+    /// the string is not a valid 32-char hex MD5.
+    #[cfg(test)]
+    pub(crate) fn from_hex_md5(size: u64, md5_hex: &str, mtime_secs: u64) -> Self {
+        let mut md5 = [0u8; 16];
+        if let Some(bytes) = super::assembly_opt::hex_to_bytes(md5_hex)
+            && bytes.len() == 16
+        {
+            md5.copy_from_slice(&bytes);
+        }
+        Self {
+            size,
+            md5,
+            mtime_secs,
+        }
+    }
 }
 
 impl Serialize for VerificationEntry {
@@ -49,7 +68,11 @@ impl<'de> Deserialize<'de> for VerificationEntry {
             mtime_secs: u64,
         }
         let raw = Raw::deserialize(deserializer)?;
-        let md5 = hex_to_bytes(&raw.md5).unwrap_or_else(|| raw.md5.into_bytes());
+        let bytes = hex_to_bytes(&raw.md5).unwrap_or_else(|| raw.md5.into_bytes());
+        let mut md5 = [0u8; 16];
+        if bytes.len() == 16 {
+            md5.copy_from_slice(&bytes);
+        }
         Ok(VerificationEntry {
             size: raw.size,
             md5,
@@ -274,7 +297,7 @@ fn check_file_md5_with_metadata(
 
     if let Some(entry) = cache.get(cache_key)
         && entry.size == expected_size
-        && entry.md5 == expected_md5
+        && entry.md5.as_slice() == expected_md5
         && entry.mtime_secs == mtime
     {
         return Ok((true, Some(actual_size)));
@@ -287,11 +310,15 @@ fn check_file_md5_with_metadata(
         if cache.len() >= VERIFICATION_CACHE_MAX_ENTRIES {
             return Ok((true, Some(actual_size)));
         }
+        // md5_bytes_eq above guarantees expected_md5 is 16 bytes (actual is
+        // always 16 bytes from file_md5_digest), so copy is safe here.
+        let mut md5 = [0u8; 16];
+        md5.copy_from_slice(expected_md5);
         cache.insert(
             cache_key.to_string(),
             VerificationEntry {
                 size: expected_size,
-                md5: expected_md5.to_vec(),
+                md5,
                 mtime_secs: mtime,
             },
         );

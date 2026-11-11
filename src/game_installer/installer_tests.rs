@@ -1181,7 +1181,7 @@ async fn check_needs_download_valid_cached_file() {
         rel_path,
         VerificationEntry {
             size: data.len() as u64,
-            md5: super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: mtime,
         },
     );
@@ -1273,7 +1273,7 @@ async fn benchmark_resume_chunk_check_dispatch() {
                 name,
                 VerificationEntry {
                     size: data.len() as u64,
-                    md5: md5.clone(),
+                    md5: { let mut m = [0u8; 16]; if md5.len() == 16 { m.copy_from_slice(&md5); } m },
                     mtime_secs,
                 },
             );
