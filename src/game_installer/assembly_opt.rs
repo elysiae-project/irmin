@@ -287,9 +287,11 @@ pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
 }
 
 #[inline]
-pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, _window_log_used: u32) {
-    // Drop instead of retaining — prevents memory accumulation on idle threads.
-    drop(ctx);
+pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, window_log_used: u32) {
+    if window_log_used > 22 {
+        return;
+    }
+    ZSTD_DCTX.with(|cell| cell.borrow_mut().replace(ctx));
 }
 
 pub(crate) struct MmapGuard {
@@ -309,13 +311,9 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // Synchronous writeback before eviction. Callers run on
-        // spawn_blocking threads, so blocking is safe. Without MS_SYNC,
-        // MADV_DONTNEED on dirty MAP_SHARED pages is a no-op: the kernel
-        // keeps dirty pages until its periodic writeback timer fires.
-        unsafe {
-            libc::msync(self.map_base, self.map_len, libc::MS_SYNC);
-        }
+        // Discard pages from the page cache. Dirty MAP_SHARED pages stay
+        // until the kernel's writeback completes; the periodic
+        // reclaim_memory() + malloc_trim handles eventual settlement.
         unsafe {
             libc::madvise(self.map_base, self.map_len, libc::MADV_DONTNEED);
         }
@@ -488,10 +486,18 @@ fn take_compressed_buf(len: usize) -> Vec<u8> {
     })
 }
 
-/// Drops the compressed buffer instead of retaining it. Prevents memory
-/// accumulation on idle tokio worker threads.
+/// Returns the compressed buffer to the thread-local pool. Shrinks oversized
+/// buffers to cap retained memory.
 #[inline]
-fn return_compressed_buf(_buf: Vec<u8>) {}
+fn return_compressed_buf(mut buf: Vec<u8>) {
+    const MAX_RETAINED_COMPRESSED_BUF: usize = 8 * 1024 * 1024;
+    if buf.capacity() > MAX_RETAINED_COMPRESSED_BUF {
+        buf = Vec::with_capacity(MAX_RETAINED_COMPRESSED_BUF);
+    }
+    COMPRESSED_BUF.with(|cell| {
+        *cell.borrow_mut() = buf;
+    });
+}
 
 #[cfg(all(feature = "bench-diagnostics", test))]
 pub(crate) fn compressed_buffer_capacity() -> usize {
@@ -616,8 +622,8 @@ pub(crate) fn posix_advise(
 
 /// Flushes a range of the output file to disk, then evicts its pages from
 /// the page cache. Reduces peak resident memory during assembly of large
-/// multi-chunk files. Uses WAIT_AFTER because callers run on blocking
-/// (spawn_blocking or std::thread::scope) threads.
+/// multi-chunk files. Omits WAIT_AFTER to avoid blocking on writeback;
+/// dirty pages remain until the kernel's periodic writeback completes.
 #[inline]
 pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, len: u64) {
     let _ = unsafe {
@@ -625,9 +631,7 @@ pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, le
             fd,
             offset as libc::off64_t,
             len as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                | libc::SYNC_FILE_RANGE_WRITE
-                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
         )
     };
     posix_advise(fd, offset, len, libc::POSIX_FADV_DONTNEED);
@@ -777,9 +781,7 @@ pub fn write_chunk_from_mmap(
 
     let bytes_written = bytes_written as u64;
 
-    // Drop instead of returning to the thread-local pool — prevents memory
-    // accumulation on idle tokio worker threads.
-    drop(buf);
+    OPT_BUFFER.with(|cell| cell.replace(buf));
 
     if bytes_written != expected_size {
         return Err(SophonError::SizeMismatch {
