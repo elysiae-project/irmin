@@ -1385,7 +1385,8 @@ pub async fn preinstall_download(
             let last_emit = Arc::clone(&last_check_emit);
             let chunks_dir = chunks_dir.clone();
             let patch_name = chunk.patch_name.clone();
-            let patch_md5 = super::assembly_opt::hex_to_bytes(&chunk.patch_md5).unwrap_or_default();
+            let patch_md5 = super::assembly_opt::hex_to_bytes(&chunk.patch_md5)
+                .unwrap_or_else(|| vec![0xFF; 16]);
             let patch_size = chunk.patch_size;
             async move {
                 let path = chunks_dir.join(&patch_name);
@@ -2229,8 +2230,8 @@ where
         let already_patched = {
             let tp = target_path.clone();
             let sz = asset.target_file_size;
-            let md5 =
-                super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default();
+            let md5 = super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
+                .unwrap_or_else(|| vec![0xFF; 16]);
             tokio::task::spawn_blocking(move || is_file_already_patched(&tp, sz, &md5)).await?
         };
         if already_patched {
@@ -2757,7 +2758,7 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
         }
     } else if !verify_file_hash(
         &chunk_path,
-        &super::assembly_opt::hex_to_bytes(&asset.patch_hash).unwrap_or_default(),
+        &super::assembly_opt::hex_to_bytes(&asset.patch_hash).unwrap_or_else(|| vec![0xFF; 16]),
     ) {
         return Err(SophonError::Md5Mismatch {
             item: asset.patch_name.clone(),
@@ -2833,7 +2834,8 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
     if !asset.target_file_hash.is_empty()
         && !verify_file_hash(
             &temp_path,
-            &super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default(),
+            &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
+                .unwrap_or_else(|| vec![0xFF; 16]),
         )
     {
         let _ = fs::remove_file(&temp_path);
@@ -2947,7 +2949,8 @@ fn apply_hdiff_patch_impl(
             fs::File::create(&diff_ref)?;
             if !verify_file_hash(
                 &diff_ref,
-                &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_default(),
+                &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5)
+                    .unwrap_or_else(|| vec![0xFF; 16]),
             ) {
                 return Err(SophonError::HDiffPatchFailed {
                     file: asset.target_file_path.clone(),
@@ -3017,7 +3020,7 @@ fn apply_hdiff_patch_impl(
         && !expected_md5.is_empty()
         && !verify_file_hash(
             &original_path,
-            &super::assembly_opt::hex_to_bytes(expected_md5).unwrap_or_default(),
+            &super::assembly_opt::hex_to_bytes(expected_md5).unwrap_or_else(|| vec![0xFF; 16]),
         )
     {
         if is_filtered_asset(cache, asset) {
@@ -3103,7 +3106,8 @@ fn apply_hdiff_patch_impl(
             if !asset.target_file_hash.is_empty()
                 && !verify_file_hash(
                     &temp_output,
-                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default(),
+                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
+                        .unwrap_or_else(|| vec![0xFF; 16]),
                 )
             {
                 let _ = fs::remove_file(&temp_output);
@@ -3162,7 +3166,7 @@ fn apply_hdiff_patch_from_files(
         // Verify the freshly-created diff_ref is empty before proceeding.
         if !verify_file_hash(
             &empty_original_path,
-            &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_default(),
+            &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_else(|| vec![0xFF; 16]),
         ) {
             let _ = fs::remove_file(&empty_original_path);
             return Err(SophonError::HDiffPatchFailed {
@@ -3210,7 +3214,8 @@ fn apply_hdiff_patch_from_files(
             if !asset.target_file_hash.is_empty()
                 && !verify_file_hash(
                     &temp_output,
-                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default(),
+                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
+                        .unwrap_or_else(|| vec![0xFF; 16]),
                 )
             {
                 let _ = fs::remove_file(&temp_output);
