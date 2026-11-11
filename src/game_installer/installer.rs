@@ -1166,8 +1166,7 @@ async fn build_download_state(
         .iter()
         .map(|item| {
             ctx.all_files
-                .file_chunk(item.file_idx as usize, item.chunk_idx as usize)
-                .chunk_name
+                .file_chunk_name_at(item.file_idx as usize, item.chunk_idx as usize)
                 .len()
         })
         .sum();
@@ -1176,8 +1175,7 @@ async fn build_download_state(
     for item in &download_items {
         let name = ctx
             .all_files
-            .file_chunk(item.file_idx as usize, item.chunk_idx as usize)
-            .chunk_name;
+            .file_chunk_name_at(item.file_idx as usize, item.chunk_idx as usize);
         arena.intern_dedup(name);
     }
     arena.clear_dedup();
@@ -4233,7 +4231,7 @@ async fn repair_assets(
     )?;
     let mut occurrences = FxHashMap::<&str, u32>::default();
     for i in 0..manifest.num_chunks() {
-        *occurrences.entry(manifest.chunk(i).chunk_name).or_default() += 1;
+        *occurrences.entry(manifest.chunk_name_at(i)).or_default() += 1;
     }
     let mut names = super::compact_manifest::StringArena::default();
     let mut refcounts = Vec::with_capacity(occurrences.len());

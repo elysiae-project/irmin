@@ -363,7 +363,7 @@ fn assemble_file_with_options(
             );
             for ci in chunk_range.start..chunk_range.end {
                 decrement_chunk_refcount(
-                    all_files.chunk(ci as usize).chunk_name,
+                    all_files.chunk_name_at(ci as usize),
                     chunk_lookup,
                     chunk_refcounts,
                     chunks_dir,
@@ -707,7 +707,7 @@ fn assemble_file_with_options(
         for (i, flag) in downloaded_chunks.iter().enumerate() {
             if flag.load(Ordering::Relaxed) {
                 let ci = chunk_range.start + i as u32;
-                guard.chunks.push(all_files.chunk(ci as usize).chunk_name);
+                guard.chunks.push(all_files.chunk_name_at(ci as usize));
             }
         }
         total_written = total_written_atomic.into_inner();
@@ -1133,7 +1133,7 @@ pub fn run_assembly_task(
     if completion_flags[file_idx].swap(true, Ordering::AcqRel) {
         for ci in chunk_range.start..chunk_range.end {
             decrement_chunk_refcount(
-                all_files.chunk(ci as usize).chunk_name,
+                all_files.chunk_name_at(ci as usize),
                 &chunk_names,
                 &chunk_refcounts,
                 &chunks_dir,
@@ -1179,7 +1179,7 @@ pub fn run_assembly_task(
             {
                 for ci in chunk_range.start..chunk_range.end {
                     decrement_chunk_refcount(
-                        all_files.chunk(ci as usize).chunk_name,
+                        all_files.chunk_name_at(ci as usize),
                         &chunk_names,
                         &chunk_refcounts,
                         &chunks_dir,
@@ -1193,7 +1193,7 @@ pub fn run_assembly_task(
                     Ok(ref digest) if md5_bytes_eq(digest, file_hash_md5) => {
                         for ci in chunk_range.start..chunk_range.end {
                             decrement_chunk_refcount(
-                                all_files.chunk(ci as usize).chunk_name,
+                                all_files.chunk_name_at(ci as usize),
                                 &chunk_names,
                                 &chunk_refcounts,
                                 &chunks_dir,

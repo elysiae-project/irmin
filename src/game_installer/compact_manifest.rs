@@ -375,6 +375,19 @@ impl CompactManifest {
         self.chunk_name_idx[chunk_idx]
     }
 
+    /// Returns a chunk name by (file_idx, chunk_idx_in_file) without constructing a `ChunkRef`.
+    #[inline]
+    pub fn file_chunk_name_at(&self, file_idx: usize, chunk_idx_in_file: usize) -> &str {
+        let range = self.file_chunk_range(file_idx);
+        self.chunk_name_at(range.start as usize + chunk_idx_in_file)
+    }
+
+    /// Returns the chunk's CDN object name.
+    #[inline]
+    pub fn chunk_name_at(&self, chunk_idx: usize) -> &str {
+        self.arena.get(self.chunk_name_idx[chunk_idx])
+    }
+
     /// Returns the chunk's old offset; negative when the chunk is a pure download.
     #[inline]
     pub fn chunk_old_offset_at(&self, chunk_idx: usize) -> i64 {
