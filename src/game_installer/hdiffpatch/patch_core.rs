@@ -301,6 +301,7 @@ fn write_cover_stream_inner_with_chunk_size(
     Ok(())
 }
 
+#[inline]
 fn write_cache_to_output(
     cache: &mut Cursor<Vec<u8>>,
     output: &mut dyn Write,
@@ -449,6 +450,7 @@ fn write_slice_region(
     Ok(())
 }
 
+#[inline(always)]
 fn apply_region_rle(
     cache: &mut Cursor<Vec<u8>>,
     region_start: usize,
@@ -477,6 +479,7 @@ fn apply_region_rle(
     Ok(())
 }
 
+#[inline(always)]
 fn ensure_region_cache_room(
     cache: &mut Cursor<Vec<u8>>,
     chunk_length: usize,
@@ -502,6 +505,7 @@ fn ensure_region_cache_room(
     Ok(())
 }
 
+#[inline(always)]
 fn flush_region_cache(
     cache: &mut Cursor<Vec<u8>>,
     output: &mut dyn Write,
