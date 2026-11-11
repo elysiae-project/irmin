@@ -254,8 +254,25 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Decode a lowercase hex string to binary. Returns `None` on invalid hex or
-/// odd length.
+/// Lookup table mapping each byte to its hex nibble value (0-15) or 0xFF for
+/// invalid hex. Built at compile time.
+static HEX_DECODE_LUT: [u8; 256] = {
+    let mut lut = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 256 {
+        lut[i] = match i as u8 {
+            b'0'..=b'9' => i as u8 - b'0',
+            b'a'..=b'f' => i as u8 - b'a' + 10,
+            b'A'..=b'F' => i as u8 - b'A' + 10,
+            _ => 0xFF,
+        };
+        i += 1;
+    }
+    lut
+};
+
+/// Decode a hex string to binary. Returns `None` on invalid hex or
+/// odd length. Uses a 256-entry lookup table for single-access nibble decode.
 pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     let bytes = hex.as_bytes();
     if !bytes.len().is_multiple_of(2) {
@@ -264,8 +281,11 @@ pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut i = 0;
     while i < bytes.len() {
-        let hi = hex_nibble(bytes[i])?;
-        let lo = hex_nibble(bytes[i + 1])?;
+        let hi = HEX_DECODE_LUT[bytes[i] as usize];
+        let lo = HEX_DECODE_LUT[bytes[i + 1] as usize];
+        if hi == 0xFF || lo == 0xFF {
+            return None;
+        }
         out.push((hi << 4) | lo);
         i += 2;
     }

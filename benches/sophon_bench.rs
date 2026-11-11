@@ -2931,6 +2931,7 @@ criterion_group!(
     bench_download_throughput,
     bench_verify_file_hash,
     bench_state_save,
+    bench_hex_to_bytes,
     bench_load_download_state,
 );
 criterion_main!(benches);
@@ -3279,6 +3280,22 @@ fn bench_verify_file_hash(c: &mut Criterion) {
         b.iter(|| {
             let ok = verify_file_hash(&path, &md5_bytes);
             criterion::black_box(ok);
+        });
+    });
+    group.finish();
+}
+
+fn bench_hex_to_bytes(c: &mut Criterion) {
+    use irmin_rs::game_installer::assembly_opt::hex_to_bytes;
+
+    let hex = "d41d8cd98f00b204e9800998ecf8427e".to_string();
+
+    let mut group = c.benchmark_group("hex_to_bytes");
+    group.throughput(Throughput::Bytes(16));
+    group.bench_function("lut", |b| {
+        b.iter(|| {
+            let bytes = hex_to_bytes(&hex);
+            criterion::black_box(bytes);
         });
     });
     group.finish();
