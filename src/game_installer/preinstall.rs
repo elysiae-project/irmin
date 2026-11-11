@@ -1206,11 +1206,12 @@ fn snapshot_downloaded_chunks(
     chunk_bytes_map: Arc<DashMap<String, u64>>,
     state_saver: &super::installer::StateSaver,
 ) -> rustc_hash::FxHashSet<String> {
-    let snapshot: HashMap<String, u64> = chunk_bytes_map
+    let snapshot: Vec<(String, u64)> = chunk_bytes_map
         .iter()
         .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
-    state_saver(&snapshot);
+    let snapshot_refs: Vec<(&str, u64)> = snapshot.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    state_saver(&snapshot_refs);
     drop(snapshot);
 
     match Arc::try_unwrap(chunk_bytes_map) {
@@ -1258,12 +1259,14 @@ async fn process_preinstall_chunk(
 
     let save_count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if save_count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL as usize) {
-        let map: HashMap<String, u64> = ctx
+        let entries: Vec<(String, u64)> = ctx
             .chunk_bytes_map
             .iter()
             .map(|r| (r.key().clone(), *r.value()))
             .collect();
-        (ctx.state_saver)(&map);
+        let entries_refs: Vec<(&str, u64)> =
+            entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        (ctx.state_saver)(&entries_refs);
     }
 
     Ok(())

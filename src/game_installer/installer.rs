@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -79,7 +79,7 @@ use crate::proto_parse::SophonManifestAssetChunk;
 
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 /// Thread-safe callback receiving the current downloaded-chunk size map for persistence.
-pub type StateSaver = Arc<dyn Fn(&HashMap<String, u64>) + Send + Sync>;
+pub type StateSaver = Arc<dyn Fn(&[(&str, u64)]) + Send + Sync>;
 
 /// Previously persisted data used to reuse valid chunks and completed files.
 pub struct ResumeContext {
@@ -1259,12 +1259,12 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
         let _ = h.await;
     }
     let new_handle = tokio::task::spawn_blocking(move || {
-        let map: HashMap<String, u64> = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+        let entries: Vec<(&str, u64)> = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
             snapshot_downloaded_chunks(dc, names)
         } else {
-            HashMap::new()
+            Vec::new()
         };
-        saver(&map);
+        saver(&entries);
     });
     {
         let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
@@ -1275,24 +1275,24 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
     }
 }
 
-fn snapshot_downloaded_chunks(
+fn snapshot_downloaded_chunks<'a>(
     downloaded_chunks: &[AtomicU32],
-    chunk_names: &ChunkNameLookup,
-) -> HashMap<String, u64> {
+    chunk_names: &'a ChunkNameLookup,
+) -> Vec<(&'a str, u64)> {
     debug_assert_eq!(downloaded_chunks.len(), chunk_names.sorted_indices.len());
     let completed_count = downloaded_chunks
         .iter()
         .filter(|value| value.load(Ordering::Relaxed) > 0)
         .count();
     // Concurrent updates can change the snapshot between passes; capacity is a hint.
-    let mut map = HashMap::with_capacity(completed_count);
+    let mut entries = Vec::with_capacity(completed_count);
     for (i, value) in downloaded_chunks.iter().enumerate() {
         let value = value.load(Ordering::Relaxed);
         if value > 0 {
-            map.insert(chunk_names.get(i).to_owned(), value as u64);
+            entries.push((chunk_names.get(i), value as u64));
         }
     }
-    map
+    entries
 }
 
 #[allow(clippy::let_and_return)]
@@ -2959,12 +2959,12 @@ async fn finalize_install(
         let names = Arc::clone(&ctx.save_chunk_names);
         let saver = Arc::clone(&ctx.state_saver);
         tokio::task::spawn_blocking(move || {
-            let map = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+            let entries = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
                 snapshot_downloaded_chunks(dc, names)
             } else {
-                HashMap::new()
+                Vec::new()
             };
-            saver(&map);
+            saver(&entries);
         })
         .await
         .unwrap_or_else(|err| {

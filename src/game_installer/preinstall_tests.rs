@@ -259,18 +259,19 @@ fn snapshot_downloaded_chunks_saves_sizes_and_moves_names() {
     let map = Arc::new(DashMap::new());
     map.insert("chunk-a".to_owned(), 11);
     map.insert("chunk-b".to_owned(), 22);
-    let saved = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let saved = Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
     let saved_for_callback = Arc::clone(&saved);
     let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
-        *saved_for_callback.lock().unwrap() = snapshot.clone();
+        *saved_for_callback.lock().unwrap() =
+            snapshot.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     });
 
     let names = snapshot_downloaded_chunks(map, &saver);
 
-    assert_eq!(
-        *saved.lock().unwrap(),
-        HashMap::from([("chunk-a".to_owned(), 11), ("chunk-b".to_owned(), 22),])
-    );
+    let saved = saved.lock().unwrap();
+    assert_eq!(saved.len(), 2);
+    assert!(saved.iter().any(|(k, v)| k == "chunk-a" && *v == 11));
+    assert!(saved.iter().any(|(k, v)| k == "chunk-b" && *v == 22));
     assert_eq!(
         names,
         rustc_hash::FxHashSet::from_iter(["chunk-a".into(), "chunk-b".into()])
@@ -283,10 +284,11 @@ fn snapshot_downloaded_chunks_clones_names_when_map_is_shared() {
     map.insert("chunk-a".to_owned(), 11);
     map.insert("chunk-b".to_owned(), 22);
     let extra_owner = Arc::clone(&map);
-    let saved = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let saved = Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
     let saved_for_callback = Arc::clone(&saved);
     let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
-        *saved_for_callback.lock().unwrap() = snapshot.clone();
+        *saved_for_callback.lock().unwrap() =
+            snapshot.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     });
 
     let names = snapshot_downloaded_chunks(map, &saver);
@@ -2369,7 +2371,7 @@ async fn publication_saves_valid_state_before_marker_and_rejects_changed_source(
     assert!(!PreinstallState::marker_file_path(dir.path(), &state.tag).exists());
     fs::remove_dir(state_path).unwrap();
     let gd = dir.path().to_owned();
-    let change_source = Arc::new(move |_: &HashMap<String, u64>| {
+    let change_source = Arc::new(move |_: &[(&str, u64)]| {
         super::super::write_installed_tag(&gd, "changed").unwrap();
     });
     let result = preinstall_download(

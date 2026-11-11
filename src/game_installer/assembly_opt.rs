@@ -33,7 +33,7 @@ pub(crate) fn window_log_for_size(decompressed_size: u64) -> u32 {
 
 /// MD5 hasher backed by hand-written x86_64 assembly (fast-md5 crate).
 /// No FFI overhead — the compression function inlines into the update loop.
-pub(crate) struct Md5 {
+pub struct Md5 {
     inner: fast_md5::Md5,
 }
 

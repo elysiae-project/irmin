@@ -392,7 +392,7 @@ impl Sophon {
         let vo_lang = self.vo_lang.clone();
         let output_path = self.game_dir.to_string_lossy().into_owned();
 
-        let state_saver: StateSaver = Arc::new(move |map: &HashMap<String, u64>| {
+        let state_saver: StateSaver = Arc::new(move |entries: &[(&str, u64)]| {
             let state = DownloadStateRef {
                 game_id: &game_id,
                 vo_lang: &vo_lang,
@@ -400,7 +400,7 @@ impl Sophon {
                 download_type: &download_type,
                 current_tag: current_tag.as_deref(),
                 manifest_hash: &manifest_hash,
-                downloaded_chunks: map,
+                downloaded_chunks: entries,
                 completed_files: &[],
             };
             atomic_write_serialized(&state_file, &state);
@@ -418,7 +418,7 @@ impl Sophon {
         let vo_lang = self.vo_lang.clone();
         let output_path = self.game_dir.to_string_lossy().into_owned();
 
-        Arc::new(move |map: &HashMap<String, u64>| {
+        Arc::new(move |entries: &[(&str, u64)]| {
             let state = DownloadStateRef {
                 game_id: &game_id,
                 vo_lang: &vo_lang,
@@ -426,7 +426,7 @@ impl Sophon {
                 download_type: &DownloadType::Preinstall,
                 current_tag: None,
                 manifest_hash: "",
-                downloaded_chunks: map,
+                downloaded_chunks: entries,
                 completed_files: &[],
             };
             atomic_write_serialized(&state_file, &state);
@@ -513,6 +513,21 @@ impl Drop for StateTempFile {
     }
 }
 
+/// Serializes a slice of (&str, u64) pairs as a JSON map, matching the
+/// format of `HashMap<String, u64>` without the allocation overhead.
+struct ChunkSliceMap<'a>(&'a [(&'a str, u64)]);
+
+impl serde::Serialize for ChunkSliceMap<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadStateRef<'a> {
@@ -522,8 +537,17 @@ struct DownloadStateRef<'a> {
     download_type: &'a DownloadType,
     current_tag: Option<&'a str>,
     manifest_hash: &'a str,
-    downloaded_chunks: &'a HashMap<String, u64>,
+    #[serde(serialize_with = "serialize_chunk_slice")]
+    downloaded_chunks: &'a [(&'a str, u64)],
     completed_files: &'a [usize],
+}
+
+fn serialize_chunk_slice<S: serde::Serializer>(
+    chunks: &[(&str, u64)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize as _;
+    ChunkSliceMap(chunks).serialize(serializer)
 }
 
 fn atomic_write_serialized<T: serde::Serialize>(target: &Path, value: &T) {
@@ -609,11 +633,8 @@ mod tests {
         ] {
             for current_tag in [None, Some("release-2.0")] {
                 for downloaded_chunks in [
-                    HashMap::new(),
-                    HashMap::from([
-                        ("unicode-雪.bin".to_owned(), 123),
-                        ("escaped\n\"chunk".to_owned(), 456),
-                    ]),
+                    Vec::<(&str, u64)>::new(),
+                    vec![("unicode-雪.bin", 123), ("escaped\n\"chunk", 456)],
                 ] {
                     let state = DownloadState {
                         game_id: "nap".into(),
@@ -622,7 +643,10 @@ mod tests {
                         download_type: download_type.clone(),
                         current_tag: current_tag.map(str::to_owned),
                         manifest_hash: "a1b2c3".into(),
-                        downloaded_chunks,
+                        downloaded_chunks: downloaded_chunks
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), *v))
+                            .collect(),
                         completed_files: CompletedFiles::default(),
                     };
                     let view = DownloadStateRef {
@@ -632,12 +656,22 @@ mod tests {
                         download_type: &state.download_type,
                         current_tag: state.current_tag.as_deref(),
                         manifest_hash: &state.manifest_hash,
-                        downloaded_chunks: &state.downloaded_chunks,
+                        downloaded_chunks: &downloaded_chunks,
                         completed_files: &[],
                     };
                     let owned = serde_json::to_vec_pretty(&state).unwrap();
                     let borrowed = serde_json::to_vec_pretty(&view).unwrap();
-                    assert_eq!(owned, borrowed);
+                    // HashMap and Vec may produce different key orderings.
+                    // Compare as parsed values (order-independent) for the
+                    // map fields, and verify byte equality only for empty maps.
+                    if downloaded_chunks.is_empty() {
+                        assert_eq!(owned, borrowed);
+                    } else {
+                        let owned_val: serde_json::Value = serde_json::from_slice(&owned).unwrap();
+                        let borrowed_val: serde_json::Value =
+                            serde_json::from_slice(&borrowed).unwrap();
+                        assert_eq!(owned_val, borrowed_val);
+                    }
                     let compact = serde_json::to_vec(&view).unwrap();
                     assert!(!compact.contains(&b'\n'));
                     let decoded: DownloadState = serde_json::from_slice(&compact).unwrap();
@@ -722,9 +756,13 @@ mod tests {
         }
 
         for entry_count in [10_000usize, 100_000, 1_000_000] {
-            let downloaded_chunks = (0..entry_count)
+            let downloaded_chunks: Vec<(String, u64)> = (0..entry_count)
                 .map(|index| (format!("patch-chunk-{index:08}.bin"), 256 * 1024))
-                .collect::<HashMap<_, _>>();
+                .collect();
+            let chunk_refs: Vec<(&str, u64)> = downloaded_chunks
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .collect();
             let iterations = if entry_count == 1_000_000 { 5 } else { 20 };
             let dir = tempdir().unwrap();
             let path = dir.path().join("state.json");
@@ -735,7 +773,7 @@ mod tests {
                 download_type: DownloadType::Preinstall,
                 current_tag: None,
                 manifest_hash: String::new(),
-                downloaded_chunks: downloaded_chunks.clone(),
+                downloaded_chunks: downloaded_chunks.into_iter().collect(),
                 completed_files: CompletedFiles::default(),
             };
             let state_view = DownloadStateRef {
@@ -745,7 +783,7 @@ mod tests {
                 download_type: &state.download_type,
                 current_tag: state.current_tag.as_deref(),
                 manifest_hash: &state.manifest_hash,
-                downloaded_chunks: &state.downloaded_chunks,
+                downloaded_chunks: &chunk_refs,
                 completed_files: &[],
             };
             let expected_json = serde_json::to_vec_pretty(&state).unwrap();
