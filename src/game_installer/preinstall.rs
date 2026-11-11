@@ -1368,7 +1368,7 @@ pub async fn preinstall_download(
     {
         let map = Arc::clone(&chunk_bytes_map);
         let upd = Arc::clone(&updater);
-        let futures = plan.unique_chunks.iter().cloned().map(|chunk| {
+        let futures = plan.unique_chunks.iter().map(|chunk| {
             let checked = Arc::clone(&checked_arc);
             let offset = Arc::clone(&resume_offset_arc);
             let map = Arc::clone(&map);
