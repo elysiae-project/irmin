@@ -150,7 +150,7 @@ impl Drop for HashReadBuffer {
 
 /// Compare an MD5 digest against an expected lowercase hex string without
 /// allocating. Returns false on length mismatch.
-#[inline]
+#[inline(always)]
 pub(crate) fn md5_hex_eq(digest: &[u8; 16], expected: &str) -> bool {
     if expected.len() != 32 {
         return false;

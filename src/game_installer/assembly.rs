@@ -34,7 +34,7 @@ pub fn chunk_filename(chunk_name: &str) -> String {
 
 /// Decrement the shared usage count and remove the cached chunk when its last
 /// consumer releases it. Invalid or unknown names are ignored.
-#[inline]
+#[inline(always)]
 pub fn decrement_chunk_refcount(
     chunk_name: &str,
     chunk_lookup: &ChunkNameLookup,
@@ -77,6 +77,7 @@ pub fn cleanup_tmp_files(dir: &Path) -> std::io::Result<()> {
 
 /// Single-pass byte scan for path-safety. Rejects empty names, null bytes,
 /// absolute paths, drive letters, and `..` path components.
+#[inline(always)]
 pub fn validate_chunk_name(chunk_name: &str) -> bool {
     let b = chunk_name.as_bytes();
     if b.is_empty() {
