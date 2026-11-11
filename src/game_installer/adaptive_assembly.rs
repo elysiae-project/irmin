@@ -75,6 +75,7 @@ impl AdaptiveAssembly {
 
     /// Current worker target; while downloading this is always the fixed
     /// assembly concurrency, then the adaptive target with that floor.
+    #[inline]
     pub fn current_target(&self) -> usize {
         if self.download_active.load(Ordering::Relaxed) {
             ASSEMBLY_CONCURRENCY
@@ -84,6 +85,7 @@ impl AdaptiveAssembly {
     }
 
     /// Switch between download-constrained and adaptive assembly scheduling.
+    #[inline]
     pub fn set_download_active(&self, active: bool) {
         self.download_active.store(active, Ordering::Relaxed);
     }
