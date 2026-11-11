@@ -111,10 +111,10 @@ impl StringArena {
         idx
     }
 
-    #[inline]
     /// Resolve an index returned by an interning operation.
     ///
     /// Panics when `idx` is outside the arena; returned text borrows the arena.
+    #[inline]
     pub fn get(&self, idx: u32) -> &str {
         let start = self.offsets[idx as usize] as usize;
         let end = self
@@ -125,14 +125,14 @@ impl StringArena {
         &self.data[start..end]
     }
 
-    #[inline]
     /// Number of strings interned, including duplicates.
+    #[inline]
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
 
-    #[inline]
     /// UTF-8 byte length of all concatenated strings, excluding offsets.
+    #[inline]
     pub fn byte_len(&self) -> usize {
         self.data.len()
     }
