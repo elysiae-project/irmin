@@ -31,6 +31,7 @@ impl ChunkNameLookup {
     }
 
     /// Return the arena string at its original index; panics when out of range.
+    #[inline]
     pub fn get(&self, idx: usize) -> &str {
         self.arena.get(idx as u32)
     }
