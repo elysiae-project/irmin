@@ -2155,6 +2155,8 @@ where
     let download_over_context = Arc::new(DownloadOverContext::from_snapshot(snapshot));
 
     let chunks_dir = patching_chunk_dir(game_dir);
+    let game_dir: Arc<std::path::Path> = Arc::from(game_dir);
+    let chunks_dir: Arc<std::path::Path> = Arc::from(chunks_dir);
     let total_files = state.patch_assets.len() as u64;
     let applied_files = Arc::new(AtomicU64::new(0u64));
     let last_apply_update = AtomicU64::new(0);
@@ -2193,7 +2195,7 @@ where
             continue;
         }
 
-        let target_path = validate_asset_path(game_dir, &asset.target_file_path)?;
+        let target_path = validate_asset_path(&game_dir, &asset.target_file_path)?;
         let already_patched = {
             let tp = target_path.clone();
             let sz = asset.target_file_size;
@@ -2268,7 +2270,7 @@ where
                 if fallback_to_download {
                     apply_download_over_with_retry(
                         client,
-                        game_dir,
+                        &game_dir,
                         &state,
                         asset.as_ref(),
                         &download_over_context,
@@ -2283,8 +2285,8 @@ where
                 let mut skip_progress = false;
 
                 for attempt in 0..=PATCH_MAX_RETRIES {
-                    let gd = game_dir.to_path_buf();
-                    let cd = chunks_dir.to_path_buf();
+                    let gd = std::sync::Arc::clone(&game_dir);
+                    let cd = std::sync::Arc::clone(&chunks_dir);
                     let a = Arc::clone(&asset);
                     let fc = filter_cache.clone();
                     let result = tokio::task::spawn_blocking(move || {
@@ -2337,7 +2339,7 @@ where
                 if fallback_to_download {
                     apply_download_over_with_retry(
                         client,
-                        game_dir,
+                        &game_dir,
                         &state,
                         asset.as_ref(),
                         &download_over_context,
@@ -2349,7 +2351,7 @@ where
             PatchMethod::DownloadOver => {
                 apply_download_over_with_retry(
                     client,
-                    game_dir,
+                    &game_dir,
                     &state,
                     asset.as_ref(),
                     &download_over_context,
