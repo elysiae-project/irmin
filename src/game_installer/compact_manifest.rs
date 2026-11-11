@@ -375,12 +375,6 @@ impl CompactManifest {
         self.chunk_name_idx[chunk_idx]
     }
 
-    #[inline]
-    /// Chunk name by global chunk index.
-    pub fn chunk_name_by_index(&self, chunk_idx: usize) -> &str {
-        self.arena.get(self.chunk_name_idx[chunk_idx])
-    }
-
     /// Compute a chunk's offset within its file by summing decompressed sizes
     /// of all preceding chunks in the same file. O(chunks_before) per call.
     #[inline]

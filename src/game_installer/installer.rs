@@ -12,13 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 pub struct ChunkNameLookup {
     arena: super::compact_manifest::StringArena,
     sorted_indices: Vec<u32>,
-    manifest: Option<Arc<super::compact_manifest::CompactManifest>>,
-    chunk_indices: Option<Vec<u32>>,
 }
 
 impl ChunkNameLookup {
-    /// Build a sorted lookup index from an existing arena, retaining the
-    /// arena's original ordering.
+    /// Build a sorted lookup index while retaining the arena's original ordering.
     pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
         let n = arena.len();
         let mut sorted_indices: Vec<u32> = (0..n as u32).collect();
@@ -30,57 +27,22 @@ impl ChunkNameLookup {
         Self {
             arena,
             sorted_indices,
-            manifest: None,
-            chunk_indices: None,
         }
     }
 
-    /// Build a lookup sharing a manifest's arena. `chunk_indices` maps each
-    /// entry to a global manifest chunk index. Avoids duplicating chunk name
-    /// strings in a separate arena.
-    pub fn from_manifest_indices(
-        manifest: Arc<super::compact_manifest::CompactManifest>,
-        chunk_indices: Vec<u32>,
-    ) -> Self {
-        let n = chunk_indices.len();
-        let mut sorted_indices: Vec<u32> = (0..n as u32).collect();
-        sorted_indices.sort_unstable_by(|&a, &b| {
-            let sa = manifest.chunk_name_by_index(chunk_indices[a as usize] as usize);
-            let sb = manifest.chunk_name_by_index(chunk_indices[b as usize] as usize);
-            sa.cmp(sb)
-        });
-        Self {
-            arena: super::compact_manifest::StringArena::default(),
-            sorted_indices,
-            manifest: Some(manifest),
-            chunk_indices: Some(chunk_indices),
-        }
-    }
-
-    /// Return the name at its original index; panics when out of range.
+    /// Return the arena string at its original index; panics when out of range.
     #[inline]
     pub fn get(&self, idx: usize) -> &str {
-        if let (Some(manifest), Some(chunk_indices)) = (&self.manifest, &self.chunk_indices) {
-            return manifest.chunk_name_by_index(chunk_indices[idx] as usize);
-        }
         self.arena.get(idx as u32)
     }
 
-    /// Find a name and return its original index, or `None` if absent.
+    /// Find a name and return its original arena index, or `None` if absent.
     #[inline(always)]
     pub fn lookup(&self, name: &str) -> Option<usize> {
-        let result =
-            if let (Some(manifest), Some(chunk_indices)) = (&self.manifest, &self.chunk_indices) {
-                self.sorted_indices.binary_search_by(|&i| {
-                    manifest
-                        .chunk_name_by_index(chunk_indices[i as usize] as usize)
-                        .cmp(name)
-                })
-            } else {
-                let arena = &self.arena;
-                self.sorted_indices
-                    .binary_search_by(|&i| arena.get(i).cmp(name))
-            };
+        let arena = &self.arena;
+        let result = self
+            .sorted_indices
+            .binary_search_by(|&i| arena.get(i).cmp(name));
         match result {
             Ok(pos) => Some(self.sorted_indices[pos] as usize),
             Err(_) => None,
@@ -1200,17 +1162,26 @@ async fn build_download_state(
 
     let (flat_chunk_entries, chunk_entry_offsets) = chunk_entries.finish(download_items.len())?;
 
-    let chunk_indices: Vec<u32> = download_items
+    let total_name_bytes: usize = download_items
         .iter()
         .map(|item| {
-            let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
-            range.start + item.chunk_idx
+            ctx.all_files
+                .file_chunk(item.file_idx as usize, item.chunk_idx as usize)
+                .chunk_name
+                .len()
         })
-        .collect();
-    let chunk_names_lookup = Arc::new(ChunkNameLookup::from_manifest_indices(
-        Arc::clone(&ctx.all_files),
-        chunk_indices,
-    ));
+        .sum();
+    let mut arena =
+        super::compact_manifest::StringArena::with_capacity(download_items.len(), total_name_bytes);
+    for item in &download_items {
+        let name = ctx
+            .all_files
+            .file_chunk(item.file_idx as usize, item.chunk_idx as usize)
+            .chunk_name;
+        arena.intern_dedup(name);
+    }
+    arena.clear_dedup();
+    let chunk_names_lookup = Arc::new(ChunkNameLookup::from_arena(arena));
 
     Ok((
         download_items,
