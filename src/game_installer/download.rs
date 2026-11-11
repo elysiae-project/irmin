@@ -262,8 +262,10 @@ impl EvictingWriter {
             let fd = self.inner.get_ref().as_raw_fd();
             // Sync the written range to disk so pages become clean and
             // can be immediately reclaimed by posix_fadvise(DONTNEED).
-            // Without the sync, dirty pages stay in the page cache until
-            // the kernel's async writeback timer flushes them.
+            // Use WAIT_BEFORE|WRITE without WAIT_AFTER to avoid blocking
+            // the async runtime thread — the kernel will write pages
+            // asynchronously and DONTNEED will evict clean ones immediately.
+            // Dirty pages remain until writeback completes, then get evicted.
             let evict_start = self.last_evicted;
             let evict_len = self.written - self.last_evicted;
             let _ = unsafe {
@@ -271,9 +273,7 @@ impl EvictingWriter {
                     fd,
                     evict_start as libc::off64_t,
                     evict_len as libc::off64_t,
-                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                        | libc::SYNC_FILE_RANGE_WRITE
-                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
                 )
             };
             posix_advise(fd, evict_start, evict_len, libc::POSIX_FADV_DONTNEED);
