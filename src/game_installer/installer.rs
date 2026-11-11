@@ -53,9 +53,19 @@ pub struct ChunkNameLookup {
 /// per-slice char-boundary checks.
 #[inline]
 fn name_cmp(arena: &[u8], a: (u32, u32), b: (u32, u32)) -> std::cmp::Ordering {
-    let na = &arena[a.0 as usize..(a.0 + a.1) as usize];
-    let nb = &arena[b.0 as usize..(b.0 + b.1) as usize];
-    na.cmp(nb)
+    let na = span(a, arena.len());
+    let nb = span(b, arena.len());
+    arena[na].cmp(&arena[nb])
+}
+
+/// Convert a `(start, len)` pair to a byte range, widening to `usize` before
+/// addition so a u32 overflow in the intermediate sum cannot occur.
+#[inline]
+fn span(loc: (u32, u32), arena_len: usize) -> std::ops::Range<usize> {
+    let start = loc.0 as usize;
+    let end = start + loc.1 as usize;
+    debug_assert!(end <= arena_len, "name range exceeds arena data");
+    start..end
 }
 
 impl ChunkNameLookup {
@@ -88,13 +98,17 @@ impl ChunkNameLookup {
         manifest: Arc<CompactManifest>,
         items: impl IntoIterator<Item = (u32, u32)>,
     ) -> Self {
+        let items = items.into_iter();
+        let (lower, upper) = items.size_hint();
+        let hint = upper.unwrap_or(lower);
         let arena_bytes = manifest.arena_str().as_bytes();
-        let mut seen: FxHashMap<&[u8], u32> = FxHashMap::default();
-        let mut name_locs: Vec<(u32, u32)> = Vec::new();
+        let arena_len = arena_bytes.len();
+        let mut seen: FxHashMap<&[u8], u32> = FxHashMap::with_capacity_and_hasher(hint, Default::default());
+        let mut name_locs: Vec<(u32, u32)> = Vec::with_capacity(hint);
         for (file_idx, chunk_idx) in items {
             let id = manifest.file_chunk_name_id_at(file_idx as usize, chunk_idx as usize);
             let loc = manifest.str_offsets_at(id);
-            let name_bytes = &arena_bytes[loc.0 as usize..(loc.0 + loc.1) as usize];
+            let name_bytes = &arena_bytes[span(loc, arena_len)];
             if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(name_bytes) {
                 e.insert(name_locs.len() as u32);
                 name_locs.push(loc);
@@ -114,9 +128,10 @@ impl ChunkNameLookup {
     /// Return the chunk name at a dense index; panics when out of range.
     #[inline]
     pub fn get(&self, idx: usize) -> &str {
-        let (start, len) = self.name_locs[idx];
+        let loc = self.name_locs[idx];
         let arena = self.manifest.arena_str();
-        &arena[start as usize..(start + len) as usize]
+        let range = span(loc, arena.len());
+        &arena[range]
     }
 
     /// Find a name and return its dense index, or `None` if absent.
@@ -125,8 +140,9 @@ impl ChunkNameLookup {
         let arena = self.manifest.arena_str().as_bytes();
         let name_locs = &self.name_locs;
         match self.sorted.binary_search_by(|&i| {
-            let (start, len) = name_locs[i as usize];
-            arena[start as usize..(start + len) as usize].cmp(name.as_bytes())
+            let loc = name_locs[i as usize];
+            let range = span(loc, arena.len());
+            arena[range].cmp(name.as_bytes())
         }) {
             Ok(pos) => Some(self.sorted[pos] as usize),
             Err(_) => None,

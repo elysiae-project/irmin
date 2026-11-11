@@ -1313,4 +1313,26 @@ mod tests {
         // Arena holds 4 strings: 2 file names + 2 chunk name copies.
         assert_eq!(cm.arena.len(), 4);
     }
+
+    #[test]
+    fn str_offsets_at_last_entry_uses_data_len() {
+        use super::StringArena;
+        let arena = StringArena::from(&["first", "second", "last"][..]);
+        let manifest = CompactManifest::wrap_arena(arena);
+        // Last entry: end is data.len(), not a sentinel offset.
+        let (start, len) = manifest.str_offsets_at(2);
+        let arena_str = manifest.arena_str();
+        assert_eq!(&arena_str[start as usize..(start + len) as usize], "last");
+    }
+
+    #[test]
+    fn str_offsets_at_empty_string() {
+        use super::StringArena;
+        let arena = StringArena::from(&[""][..]);
+        let manifest = CompactManifest::wrap_arena(arena);
+        let (start, len) = manifest.str_offsets_at(0);
+        assert_eq!(len, 0);
+        let arena_str = manifest.arena_str();
+        assert_eq!(&arena_str[start as usize..(start + len) as usize], "");
+    }
 }

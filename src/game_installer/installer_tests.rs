@@ -482,6 +482,29 @@ fn from_manifest_dedups_shared_chunk_names_across_files() {
 }
 
 #[test]
+fn from_arena_round_trips_get_and_lookup() {
+    use super::super::compact_manifest::StringArena;
+    let names = ["alpha", "beta", "gamma"];
+    let arena = StringArena::from(&names[..]);
+    let lookup = ChunkNameLookup::from_arena(arena);
+
+    assert_eq!(lookup.name_locs.len(), 3);
+    assert_eq!(lookup.get(0), "alpha");
+    assert_eq!(lookup.get(1), "beta");
+    assert_eq!(lookup.get(2), "gamma");
+    assert_eq!(lookup.lookup("beta"), Some(1));
+    assert_eq!(lookup.lookup("delta"), None);
+}
+
+#[test]
+fn from_arena_empty_lookup_returns_none() {
+    use super::super::compact_manifest::StringArena;
+    let lookup = ChunkNameLookup::from_arena(StringArena::default());
+    assert_eq!(lookup.name_locs.len(), 0);
+    assert!(lookup.lookup("anything").is_none());
+}
+
+#[test]
 fn download_cancellation_is_recorded_for_finalization() {
     let cancelled = AtomicU8::new(0);
 
