@@ -108,6 +108,11 @@ pub(crate) struct HashReadBuffer {
 impl HashReadBuffer {
     #[inline(always)]
     pub(crate) fn take(capacity: usize) -> Self {
+        if tls_reclaim_stale() {
+            HASH_READ_BUF.with(|cell| {
+                *cell.borrow_mut() = Vec::new();
+            });
+        }
         if capacity > HASH_READ_BUFFER_SIZE {
             return Self {
                 buffer: vec![0; capacity],
@@ -222,17 +227,37 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Generation counter for lazy thread-local pool cleanup. When
+/// `reclaim_memory()` is called, this counter increments. Each
+/// `take_*` function checks if the stored generation is stale and
+/// clears its buffer if so. This lets `reclaim_memory()` reclaim
+/// pools on ALL threads without needing cross-thread TLS access.
+static RECLAIM_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
     static OPT_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ZSTD_DCTX: RefCell<Option<zstd::zstd_safe::DCtx<'static>>> = const { RefCell::new(None) };
     static EAGER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static TLS_RECLAIM_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn tls_reclaim_stale() -> bool {
+    let generation = RECLAIM_GENERATION.load(Ordering::Relaxed);
+    let stale = TLS_RECLAIM_GEN.get() != generation;
+    if stale {
+        TLS_RECLAIM_GEN.set(generation);
+    }
+    stale
 }
 
 /// Clear thread-local pools on the calling thread to release retained
-/// buffers. Called from `reclaim_memory()` which runs on async worker
-/// threads. Other threads' pools are reclaimed by `malloc_trim` which
-/// returns freed arena memory to the OS.
+/// buffers. Also increments the global reclaim generation so other
+/// threads lazily clear their pools on next use.
 pub(crate) fn trim_thread_local_buffers() {
+    RECLAIM_GENERATION.fetch_add(1, Ordering::Relaxed);
+    TLS_RECLAIM_GEN.set(RECLAIM_GENERATION.load(Ordering::Relaxed));
     OPT_BUFFER.with(|cell| {
         cell.borrow_mut().clear();
         cell.borrow_mut().shrink_to_fit();
@@ -260,6 +285,9 @@ pub(crate) fn trim_thread_local_buffers() {
 #[allow(dead_code)]
 pub(crate) fn take_eager_buf() -> Vec<u8> {
     EAGER_BUF.with(|cell| {
+        if tls_reclaim_stale() {
+            *cell.borrow_mut() = Vec::new();
+        }
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
         buf.resize(super::eager_decompress::EAGER_BUFFER_SIZE, 0);
         buf
@@ -279,6 +307,9 @@ pub(crate) fn return_eager_buf(buf: Vec<u8>) {
 #[inline]
 pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
     ZSTD_DCTX.with(|cell| {
+        if tls_reclaim_stale() {
+            *cell.borrow_mut() = None;
+        }
         cell.borrow_mut()
             .take()
             .unwrap_or_else(zstd::zstd_safe::DCtx::create)
@@ -485,6 +516,9 @@ thread_local! {
 #[inline]
 fn take_compressed_buf(len: usize) -> Vec<u8> {
     COMPRESSED_BUF.with(|cell| {
+        if tls_reclaim_stale() {
+            *cell.borrow_mut() = Vec::new();
+        }
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
         buf.resize(len, 0);
         buf
