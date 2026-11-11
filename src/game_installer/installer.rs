@@ -1275,7 +1275,9 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
     }
 }
 
-fn snapshot_downloaded_chunks<'a>(
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
+pub fn snapshot_downloaded_chunks<'a>(
     downloaded_chunks: &[AtomicU32],
     chunk_names: &'a ChunkNameLookup,
 ) -> Vec<(&'a str, u64)> {
@@ -4347,3 +4349,8 @@ mod repair_tests;
 #[cfg(test)]
 #[path = "eager_stream_tests.rs"]
 mod eager_stream_tests;
+
+#[cfg(feature = "benchmark")]
+pub mod bench_internals {
+    pub use super::{ChunkNameLookup, snapshot_downloaded_chunks};
+}

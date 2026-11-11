@@ -2895,6 +2895,7 @@ criterion_group!(
     bench_file_metadata_cost_optional,
     bench_update_diff_sizes,
     bench_download_throughput,
+    bench_state_save,
 );
 criterion_main!(benches);
 
@@ -3141,4 +3142,38 @@ impl std::io::Read for HashingRead<'_> {
         }
         Ok(count)
     }
+}
+
+fn bench_state_save(c: &mut Criterion) {
+    use irmin_rs::game_installer::compact_manifest::StringArena;
+    use irmin_rs::game_installer::installer::bench_internals::{
+        ChunkNameLookup, snapshot_downloaded_chunks,
+    };
+    use std::sync::atomic::AtomicU32;
+
+    let chunk_counts = [10_000usize, 100_000, 200_000];
+
+    let mut group = c.benchmark_group("state_save");
+
+    for &count in &chunk_counts {
+        let names: Vec<String> = (0..count)
+            .map(|i| format!("patch-chunk-{i:08}.bin"))
+            .collect();
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let arena = StringArena::from(name_refs.as_slice());
+        let lookup = ChunkNameLookup::from_arena(arena);
+        let downloaded: Vec<AtomicU32> = (0..count)
+            .map(|i| AtomicU32::new(if i % 2 == 0 { 256 * 1024 } else { 0 }))
+            .collect();
+
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &downloaded, |b, dc| {
+            b.iter(|| {
+                let entries = snapshot_downloaded_chunks(dc, &lookup);
+                criterion::black_box(entries);
+            });
+        });
+    }
+
+    group.finish();
 }
