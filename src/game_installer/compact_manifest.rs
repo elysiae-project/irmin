@@ -194,11 +194,13 @@ pub struct CompactManifest {
 
 impl CompactManifest {
     /// Number of asset records.
+    #[inline]
     pub fn num_files(&self) -> usize {
         self.file_name_idx.len()
     }
 
     /// Number of chunk records across all assets.
+    #[inline]
     pub fn num_chunks(&self) -> usize {
         self.chunk_name_idx.len()
     }
