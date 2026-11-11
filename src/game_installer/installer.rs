@@ -1443,9 +1443,8 @@ async fn check_needs_download(
     let dest = dest.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || {
-        let expected_md5 = all_files
-            .file_chunk(file_idx, chunk_idx)
-            .chunk_compressed_hash_md5;
+        let global_idx = all_files.file_chunk_range(file_idx).start as usize + chunk_idx;
+        let expected_md5 = all_files.chunk_compressed_hash_at(global_idx);
         cache::check_file_md5_cached_with_size(
             &dest,
             chunk_size,

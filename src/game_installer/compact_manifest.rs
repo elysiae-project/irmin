@@ -406,6 +406,18 @@ impl CompactManifest {
         self.chunk_size_decompressed[chunk_idx] as u64
     }
 
+    /// Returns the chunk's compressed hash (binary).
+    #[inline]
+    pub fn chunk_compressed_hash_at(&self, chunk_idx: usize) -> &[u8] {
+        self.hash_arena.get(self.chunk_comp_hash_idx[chunk_idx])
+    }
+
+    /// Returns the chunk's decompressed hash (binary).
+    #[inline]
+    pub fn chunk_decompressed_hash_at(&self, chunk_idx: usize) -> &[u8] {
+        self.hash_arena.get(self.chunk_decomp_hash_idx[chunk_idx])
+    }
+
     /// Compute a chunk's offset within its file by summing decompressed sizes
     /// of all preceding chunks in the same file. O(chunks_before) per call.
     #[inline]
