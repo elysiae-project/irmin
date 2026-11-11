@@ -299,6 +299,7 @@ mod diagnostics_tests {
     }
 }
 
+#[inline]
 fn decode_cover(
     covers: &[u8],
     offset: &mut usize,
@@ -368,7 +369,7 @@ impl<'a> Rle0Decoder<'a> {
     /// If the decoder is currently in a zero-run of at least `n` bytes,
     /// consume those bytes (leaving data untouched) and return true.
     /// Otherwise return false and consume nothing.
-    // hot fast-path for large unchanged regions; avoids io_buf chunking entirely.
+    #[inline]
     fn try_skip_zeros(&mut self, n: usize) -> std::io::Result<bool> {
         // Ensure we're in the len0 state. If we just finished a lenv and
         // need_decode0 is true with lenv==0, decode the next len0 first.
@@ -488,6 +489,7 @@ impl<'a> Rle0Decoder<'a> {
     }
 }
 
+#[inline]
 fn rle_varint(buf: &[u8], pos: &mut usize) -> Option<usize> {
     if *pos >= buf.len() {
         return None;
