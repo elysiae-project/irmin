@@ -1368,7 +1368,14 @@ pub async fn preinstall_download(
     {
         let map = Arc::clone(&chunk_bytes_map);
         let upd = Arc::clone(&updater);
-        let futures = plan.unique_chunks.iter().map(|chunk| {
+        // .cloned() is required: it makes `chunk` an owned PatchChunkInfo
+        // instead of &PatchChunkInfo, so the async move future is 'static.
+        // Removing it triggers clippy::redundant_iter_cloned but causes
+        // the future to borrow plan.unique_chunks, breaking buffer_unordered
+        // with HRTB inference errors when awaited inside tokio::spawn.
+        // See commit 6881fd2 for the original fix and efb38b1 for the bug.
+        #[allow(clippy::redundant_iter_cloned)]
+        let futures = plan.unique_chunks.iter().cloned().map(|chunk| {
             let checked = Arc::clone(&checked_arc);
             let offset = Arc::clone(&resume_offset_arc);
             let map = Arc::clone(&map);
