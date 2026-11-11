@@ -771,7 +771,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             cache.clear();
             evict_page_cache(&path);
             let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
-                &path, bytes, &md5, &game_dir, &cache,
+                &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
             )
             .unwrap();
             assert!(valid);
@@ -790,7 +790,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             },
             |_| {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
-                    &path, bytes, &md5, &game_dir, &cache,
+                    &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
                 )
                 .unwrap();
                 assert!(valid);
@@ -809,7 +809,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             },
             |_| {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
-                    &path, bytes, &md5, &game_dir, &cache,
+                    &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
                 )
                 .unwrap();
                 assert!(valid);
@@ -823,7 +823,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
     {
         cache.clear();
         let result = irmin_rs::game_installer::cache::check_file_md5_cached(
-            &path, bytes, &md5, &game_dir, &cache,
+            &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
         )
         .unwrap();
         assert!(result, "cache population should succeed");
@@ -833,7 +833,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
         let game_dir = game_dir.clone();
         b.iter(|| {
             let result = irmin_rs::game_installer::cache::check_file_md5_cached(
-                &path, bytes, &md5, &game_dir, &cache,
+                &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
             )
             .unwrap();
             assert!(result);
@@ -861,7 +861,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
                     &small_path,
                     small_bytes,
-                    &small_md5,
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&small_md5).unwrap_or_default().as_slice(),
                     &game_dir,
                     &small_cache,
                 )
@@ -899,7 +899,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
                     path,
                     tiny_bytes,
-                    md5,
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(),
                     &game_dir,
                     &tiny_cache,
                 )
@@ -3043,8 +3043,13 @@ fn bench_eager_decompress(c: &mut Criterion) {
     }
 
     let compressed = zstd::encode_all(std::io::Cursor::new(&data), 3).unwrap();
-    let comp_hash = hex::encode(fast_md5::digest(&compressed));
-    let decomp_hash = hex::encode(fast_md5::digest(&data));
+    let comp_hash = irmin_rs::game_installer::assembly_opt::hex_to_bytes(&hex::encode(
+        fast_md5::digest(&compressed),
+    ))
+    .unwrap();
+    let decomp_hash =
+        irmin_rs::game_installer::assembly_opt::hex_to_bytes(&hex::encode(fast_md5::digest(&data)))
+            .unwrap();
 
     let mut group = c.benchmark_group("eager_decompress");
     group.throughput(Throughput::Bytes(data_size as u64));
@@ -3064,8 +3069,8 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 &out_file,
                 0,
                 data_size as u64,
-                &comp_hash,
-                &decomp_hash,
+                comp_hash.as_slice(),
+                decomp_hash.as_slice(),
             )
             .unwrap();
         });
@@ -3082,11 +3087,11 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
             irmin_rs::game_installer::eager_decompress::stream_decompress_to_file(
-                HashingRead::new(&compressed, &comp_hash),
+                HashingRead::new(&compressed, &hex::encode(&comp_hash)),
                 &out_file,
                 0,
                 data_size as u64,
-                &decomp_hash,
+                decomp_hash.as_slice(),
             )
             .unwrap();
         });

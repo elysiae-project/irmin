@@ -287,7 +287,9 @@ async fn repair_ignores_persistent_cache_with_preserved_mtime() {
         cache::check_file_md5_cached(
             &path,
             asset.asset_size,
-            asset.asset_hash_md5_str(),
+            super::super::assembly_opt::hex_to_bytes(asset.asset_hash_md5_str())
+                .unwrap_or_default()
+                .as_slice(),
             dir.path(),
             &cache
         )
@@ -306,7 +308,9 @@ async fn repair_ignores_persistent_cache_with_preserved_mtime() {
         cache::check_file_md5_cached(
             &path,
             asset.asset_size,
-            asset.asset_hash_md5_str(),
+            super::super::assembly_opt::hex_to_bytes(asset.asset_hash_md5_str())
+                .unwrap_or_default()
+                .as_slice(),
             dir.path(),
             &cache
         )

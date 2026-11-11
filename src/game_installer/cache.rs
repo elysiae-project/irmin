@@ -17,15 +17,45 @@ use fast_md5;
 use serde::{Deserialize, Serialize};
 
 use super::VERIFICATION_CACHE_FILE;
-use super::assembly_opt::md5_hex_eq;
+use super::assembly_opt::{bytes_to_hex, hex_to_bytes, md5_bytes_eq};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 /// Cached proof that a file matched a manifest size and MD5 at a particular
 /// whole-second modification time. A changed size or timestamp forces hashing.
 pub struct VerificationEntry {
     pub size: u64,
-    pub md5: String,
+    pub md5: Vec<u8>,
     pub mtime_secs: u64,
+}
+
+impl Serialize for VerificationEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("VerificationEntry", 3)?;
+        state.serialize_field("size", &self.size)?;
+        state.serialize_field("md5", &bytes_to_hex(&self.md5))?;
+        state.serialize_field("mtime_secs", &self.mtime_secs)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for VerificationEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            size: u64,
+            md5: String,
+            #[serde(alias = "mtime_secs")]
+            mtime_secs: u64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let md5 = hex_to_bytes(&raw.md5).unwrap_or_else(|| raw.md5.into_bytes());
+        Ok(VerificationEntry {
+            size: raw.size,
+            md5,
+            mtime_secs: raw.mtime_secs,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +164,7 @@ impl Serialize for SaveWrapper<'_> {
 pub fn check_file_md5_cached(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<bool> {
@@ -146,7 +176,7 @@ pub fn check_file_md5_cached(
 pub fn check_file_md5_cached_with_size(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<(bool, Option<u64>)> {
@@ -158,7 +188,7 @@ pub fn check_file_md5_cached_with_size(
 pub fn check_file_md5_with_cache_key(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     cache_key: &str,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<bool> {
@@ -171,7 +201,7 @@ pub fn check_file_md5_with_cache_key(
 pub fn check_file_md5_with_cache_key_and_size(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     cache_key: &str,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<(bool, Option<u64>)> {
@@ -196,7 +226,7 @@ pub fn check_file_md5_with_cache_key_and_size(
 pub(crate) fn check_file_md5_cached_with_metadata(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
     metadata: Metadata,
@@ -223,7 +253,7 @@ fn cache_key_for_path<'a>(path: &'a Path, game_dir: &Path) -> std::borrow::Cow<'
 fn check_file_md5_with_metadata(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     cache_key: &str,
     cache: &DashMap<String, VerificationEntry>,
     metadata: Metadata,
@@ -251,7 +281,7 @@ fn check_file_md5_with_metadata(
     }
 
     let actual = file_md5_digest(path)?;
-    let matches = md5_hex_eq(&actual, expected_md5);
+    let matches = md5_bytes_eq(&actual, expected_md5);
 
     if matches {
         if cache.len() >= VERIFICATION_CACHE_MAX_ENTRIES {
@@ -261,7 +291,7 @@ fn check_file_md5_with_metadata(
             cache_key.to_string(),
             VerificationEntry {
                 size: expected_size,
-                md5: expected_md5.to_string(),
+                md5: expected_md5.to_vec(),
                 mtime_secs: mtime,
             },
         );

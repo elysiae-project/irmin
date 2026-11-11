@@ -9,7 +9,8 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 
 use super::CHUNK_WRITE_BUFFER_SIZE;
 use super::assembly_opt::{
-    Md5, md5_hex_eq, md5_to_hex, posix_advise, return_md5, take_md5, xxh64_hex_eq,
+    Md5, bytes_to_hex, md5_bytes_eq, md5_to_hex, posix_advise, return_md5,
+    take_md5, xxh64_bytes_eq,
 };
 use super::compact_manifest::ChunkRef;
 use super::error::{SophonError, SophonResult};
@@ -499,7 +500,7 @@ async fn create_preallocated_file(path: &Path, len: u64) -> std::io::Result<toki
 
 async fn verify_existing_file_hash(
     path: &Path,
-    expected_hash: &str,
+    expected_hash: &[u8],
     known_size: Option<u64>,
 ) -> SophonResult<bool> {
     if expected_hash.is_empty() {
@@ -507,22 +508,20 @@ async fn verify_existing_file_hash(
     }
     let path = path.to_path_buf();
     let expected_len = expected_hash.len();
-    if expected_len > 32 {
+    if expected_len > 16 {
         log::warn!("Unknown hash format (length={expected_len}) for verification");
         return Ok(false);
     }
-    let mut hash_buf = [0u8; 32];
-    hash_buf[..expected_len].copy_from_slice(expected_hash.as_bytes());
+    let mut hash_buf = [0u8; 16];
+    hash_buf[..expected_len].copy_from_slice(expected_hash);
     tokio::task::spawn_blocking(move || match expected_len {
-        32 => {
-            let digest = pread_hash_md5_digest(&path, known_size)?;
-            let expected = std::str::from_utf8(&hash_buf[..32]).unwrap_or("");
-            Ok(md5_hex_eq(&digest, expected))
-        }
         16 => {
+            let digest = pread_hash_md5_digest(&path, known_size)?;
+            Ok(md5_bytes_eq(&digest, &hash_buf[..16]))
+        }
+        8 => {
             let digest = pread_hash_xxh64_digest(&path, known_size)?;
-            let expected = std::str::from_utf8(&hash_buf[..16]).unwrap_or("");
-            Ok(xxh64_hex_eq(digest, expected))
+            Ok(xxh64_bytes_eq(digest, &hash_buf[..8]))
         }
         _ => {
             log::warn!(
@@ -707,7 +706,7 @@ async fn stream_and_verify(
     expected_total: u64,
     starting_len: u64,
     chunk_name: &str,
-    compressed_hash: &str,
+    compressed_hash: &[u8],
     dest: &Path,
     handle: Option<&DownloadHandle>,
     #[cfg(feature = "bench-diagnostics")] mut timings: Option<&mut DownloadPhaseTimings>,
@@ -840,31 +839,31 @@ async fn stream_and_verify(
 
     if !compressed_hash.is_empty() {
         match compressed_hash.len() {
-            32 => {
+            16 => {
                 let digest: [u8; 16] = hasher
                     .as_mut()
                     .expect("hasher present when compressed hash is non-empty")
                     .finish()
                     .map_err(SophonError::Io)?;
-                if !md5_hex_eq(&digest, compressed_hash) {
+                if !md5_bytes_eq(&digest, compressed_hash) {
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::Md5Mismatch {
                         item: chunk_name.to_string(),
-                        expected: compressed_hash.to_string(),
+                        expected: bytes_to_hex(compressed_hash),
                         actual: md5_to_hex(&digest),
                     });
                 }
             }
-            16 => {
+            8 => {
                 let digest = xxh64_hasher
                     .as_ref()
                     .expect("xxh64_hasher present when hash len == 16")
                     .digest();
-                if !xxh64_hex_eq(digest, compressed_hash) {
+                if !xxh64_bytes_eq(digest, compressed_hash) {
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::Md5Mismatch {
                         item: chunk_name.to_string(),
-                        expected: compressed_hash.to_string(),
+                        expected: bytes_to_hex(compressed_hash),
                         actual: format!("{:016x}", digest),
                     });
                 }
@@ -926,13 +925,13 @@ async fn download_full_file_with_response(
 
     let file = create_preallocated_file(dest, chunk.chunk_size).await?;
     let mut file = EvictingWriter::new(file);
-    let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
+    let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
         Some(PooledMd5::new(take_md5()?))
     } else {
         None
     };
     let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> =
-        if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
+        if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 8 {
             Some(super::assembly_opt::take_xxh64())
         } else {
             None
@@ -957,7 +956,7 @@ async fn download_full_file_with_response(
         0,
         chunk.chunk_name,
         if skip_hash {
-            ""
+            b""
         } else {
             chunk.chunk_compressed_hash_md5
         },
@@ -1000,13 +999,13 @@ async fn download_with_resume(
 
     check_available_space(dest, remaining)?;
 
-    let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 32 {
+    let mut hasher = if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
         Some(PooledMd5::new(take_md5()?))
     } else {
         None
     };
     let mut xxh64_hasher: Option<xxhash_rust::xxh64::Xxh64> =
-        if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 16 {
+        if !skip_hash && chunk.chunk_compressed_hash_md5.len() == 8 {
             Some(super::assembly_opt::take_xxh64())
         } else {
             None
@@ -1048,7 +1047,7 @@ async fn download_with_resume(
         existing_size,
         chunk.chunk_name,
         if skip_hash {
-            ""
+            b""
         } else {
             chunk.chunk_compressed_hash_md5
         },
@@ -1159,10 +1158,10 @@ mod tests {
 
         let chunk = ChunkRef {
             chunk_name: "payload",
-            chunk_decompressed_hash_md5: "",
+            chunk_decompressed_hash_md5: b"",
             chunk_size: body.len() as u64,
             chunk_size_decompressed: body.len() as u64,
-            chunk_compressed_hash_md5: "00000000000000000000000000000000",
+            chunk_compressed_hash_md5: &[0; 16],
             chunk_old_offset: -1,
         };
         let download = DownloadInfo {
@@ -1379,10 +1378,10 @@ mod tests {
         let dest = dir.path().join("payload");
         let chunk = ChunkRef {
             chunk_name: "../payload",
-            chunk_decompressed_hash_md5: "",
+            chunk_decompressed_hash_md5: b"",
             chunk_size: 0,
             chunk_size_decompressed: 0,
-            chunk_compressed_hash_md5: "",
+            chunk_compressed_hash_md5: b"",
             chunk_old_offset: -1,
         };
 
@@ -1619,7 +1618,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
         std::fs::write(&path, b"data").unwrap();
-        assert!(verify_existing_file_hash(&path, "", None).await.unwrap());
+        assert!(verify_existing_file_hash(&path, b"", None).await.unwrap());
     }
 
     #[tokio::test]

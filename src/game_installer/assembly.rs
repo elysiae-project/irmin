@@ -15,7 +15,7 @@ thread_local! {
     static TRANSFER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-use super::assembly_opt::{Md5, md5_hex_eq, md5_to_hex, return_md5, take_md5};
+use super::assembly_opt::{Md5, bytes_to_hex, md5_bytes_eq, md5_to_hex, return_md5, take_md5};
 use super::cache::{VerificationEntry, file_md5_digest};
 use super::error::{SophonError, SophonResult};
 use super::installer::ChunkNameLookup;
@@ -359,7 +359,7 @@ fn assemble_file_with_options(
                 "assemble_file: skipping already-valid file '{name}' ({size} bytes, md5={md5})",
                 name = file_name,
                 size = file_size,
-                md5 = file_hash_md5
+                md5 = bytes_to_hex(file_hash_md5)
             );
             for ci in chunk_range.start..chunk_range.end {
                 decrement_chunk_refcount(
@@ -638,7 +638,7 @@ fn assemble_file_with_options(
                                 None,
                                 &mut transfer_buf,
                                 if skip_chunk_hash {
-                                    ""
+                                    b""
                                 } else {
                                     chunk.chunk_decompressed_hash_md5
                                 },
@@ -662,7 +662,7 @@ fn assemble_file_with_options(
                                 chunk.chunk_size_decompressed,
                                 None,
                                 if skip_chunk_hash {
-                                    ""
+                                    b""
                                 } else {
                                     chunk.chunk_decompressed_hash_md5
                                 },
@@ -736,7 +736,7 @@ fn assemble_file_with_options(
                     file_hasher.as_mut(),
                     &mut transfer_buffer,
                     if skip_chunk_hash {
-                        ""
+                        b""
                     } else {
                         chunk.chunk_decompressed_hash_md5
                     },
@@ -761,7 +761,7 @@ fn assemble_file_with_options(
                     chunk.chunk_size_decompressed,
                     file_hasher.as_mut(),
                     if skip_chunk_hash {
-                        ""
+                        b""
                     } else {
                         chunk.chunk_decompressed_hash_md5
                     },
@@ -795,11 +795,11 @@ fn assemble_file_with_options(
     if parallel_hashed_file {
         let result = hasher_result.into_inner().unwrap();
         match result {
-            Some(Ok(ref digest)) if !md5_hex_eq(digest, file_hash_md5) => {
+            Some(Ok(ref digest)) if !md5_bytes_eq(digest, file_hash_md5) => {
                 let _ = fs::remove_file(&tmp_path);
                 return Err(SophonError::Md5Mismatch {
                     item: file_name.to_string(),
-                    expected: file_hash_md5.to_string(),
+                    expected: bytes_to_hex(file_hash_md5),
                     actual: md5_to_hex(digest),
                 });
             }
@@ -835,11 +835,11 @@ fn assemble_file_with_options(
     if let Some(mut hasher) = file_hasher {
         let digest = hasher.finish()?;
         return_md5(hasher);
-        if !md5_hex_eq(&digest, file_hash_md5) {
+        if !md5_bytes_eq(&digest, file_hash_md5) {
             let _ = fs::remove_file(&tmp_path);
             return Err(SophonError::Md5Mismatch {
                 item: file_name.to_string(),
-                expected: file_hash_md5.to_string(),
+                expected: bytes_to_hex(file_hash_md5),
                 actual: md5_to_hex(&digest),
             });
         }
@@ -872,7 +872,7 @@ fn write_decompressed_chunk_at(
     offset: u64,
     expected_size: u64,
     file_hasher: Option<&mut Md5>,
-    chunk_decompressed_hash_md5: &str,
+    chunk_decompressed_hash_md5: &[u8],
 ) -> SophonResult<u64> {
     super::assembly_opt::decompress_chunk_optimized(
         chunk_path,
@@ -898,7 +898,7 @@ fn write_from_old_file(
     expected_size: u64,
     mut file_hasher: Option<&mut Md5>,
     buffer: &mut [u8],
-    chunk_decompressed_hash_md5: &str,
+    chunk_decompressed_hash_md5: &[u8],
 ) -> SophonResult<u64> {
     const MMA_THRESHOLD: u64 = 1024 * 1024;
 
@@ -998,10 +998,10 @@ fn write_from_old_file(
             if let Some(ref mut ch) = chunk_hasher {
                 let digest = ch.finish()?;
                 return_md5(chunk_hasher.take().unwrap());
-                if !md5_hex_eq(&digest, chunk_decompressed_hash_md5) {
+                if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
                     return Err(SophonError::Md5Mismatch {
                         item: old_file_path.display().to_string(),
-                        expected: chunk_decompressed_hash_md5.to_string(),
+                        expected: bytes_to_hex(chunk_decompressed_hash_md5),
                         actual: md5_to_hex(&digest),
                     });
                 }
@@ -1049,10 +1049,10 @@ fn write_from_old_file(
         if let Some(ref mut ch) = chunk_hasher {
             let digest = ch.finish()?;
             return_md5(chunk_hasher.take().unwrap());
-            if !md5_hex_eq(&digest, chunk_decompressed_hash_md5) {
+            if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
                 return Err(SophonError::Md5Mismatch {
                     item: old_file_path.display().to_string(),
-                    expected: chunk_decompressed_hash_md5.to_string(),
+                    expected: bytes_to_hex(chunk_decompressed_hash_md5),
                     actual: md5_to_hex(&digest),
                 });
             }
@@ -1190,7 +1190,7 @@ pub fn run_assembly_task(
                 // No verify_cache entry — hash the file to check correctness
                 // (handles eager files that bypassed the cache).
                 match file_md5_digest(&target_path) {
-                    Ok(ref digest) if md5_hex_eq(digest, file_hash_md5) => {
+                    Ok(ref digest) if md5_bytes_eq(digest, file_hash_md5) => {
                         for ci in chunk_range.start..chunk_range.end {
                             decrement_chunk_refcount(
                                 all_files.chunk(ci as usize).chunk_name,

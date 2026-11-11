@@ -15,7 +15,7 @@ const ASSEMBLY_BUFFER_SIZE: usize = 1024 * 1024;
 
 const ONESHOT_MAX_SIZE: usize = 64 * 1024 * 1024;
 
-const EMPTY_MD5: &str = "00000000000000000000000000000000";
+const EMPTY_MD5_BYTES: [u8; 16] = [0; 16];
 
 pub(crate) const MAX_WINDOW_LOG: u32 = 26;
 
@@ -175,6 +175,13 @@ pub(crate) fn md5_hex_eq(digest: &[u8; 16], expected: &str) -> bool {
     true
 }
 
+/// Compare an MD5 digest against an expected binary hash. Returns false on
+/// length mismatch.
+#[inline(always)]
+pub(crate) fn md5_bytes_eq(digest: &[u8; 16], expected: &[u8]) -> bool {
+    expected.len() == 16 && expected == digest
+}
+
 /// Compare a u64 value against a 16-char lowercase hex string without
 /// allocating. Used for XXH64 hash verification.
 #[inline]
@@ -198,11 +205,31 @@ pub(crate) fn xxh64_hex_eq(value: u64, expected: &str) -> bool {
     acc == value
 }
 
+/// Compare a u64 value against an 8-byte binary hash.
+#[inline]
+pub(crate) fn xxh64_bytes_eq(value: u64, expected: &[u8]) -> bool {
+    if expected.len() != 8 {
+        return false;
+    }
+    let bytes: [u8; 8] = expected.try_into().unwrap_or([0; 8]);
+    u64::from_be_bytes(bytes) == value
+}
+
 /// Encode an MD5 digest to a lowercase hex String. Only for error paths.
 #[inline(always)]
 pub fn md5_to_hex(digest: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for b in digest {
+        s.push(hex_digit(b >> 4));
+        s.push(hex_digit(b & 0xf));
+    }
+    s
+}
+
+/// Encode binary bytes to a lowercase hex String. Only for error paths.
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         s.push(hex_digit(b >> 4));
         s.push(hex_digit(b & 0xf));
     }
@@ -225,6 +252,24 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Decode a lowercase hex string to binary. Returns `None` on invalid hex or
+/// odd length.
+pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -529,7 +574,7 @@ fn decompress_chunk_oneshot(
     offset: u64,
     expected_size: u64,
     file_hasher: &mut Option<&mut Md5>,
-    chunk_decompressed_hash_md5: &str,
+    chunk_decompressed_hash_md5: &[u8],
 ) -> SophonResult<u64> {
     if expected_size == 0 {
         return Ok(0);
@@ -602,10 +647,10 @@ fn decompress_chunk_oneshot(
             chunk_hasher.update(&output[..written])?;
             let digest = chunk_hasher.finish()?;
             return_md5(chunk_hasher);
-            if !md5_hex_eq(&digest, chunk_decompressed_hash_md5) {
+            if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
                 return Err(SophonError::Md5Mismatch {
                     item: chunk_path.display().to_string(),
-                    expected: chunk_decompressed_hash_md5.to_string(),
+                    expected: bytes_to_hex(chunk_decompressed_hash_md5),
                     actual: md5_to_hex(&digest),
                 });
             }
@@ -657,10 +702,11 @@ pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, le
 }
 
 /// Returns true when the chunk hash must be verified against the decompressed
-/// bytes.
-#[inline]
-pub(crate) fn chunk_hash_required(chunk_decompressed_hash_md5: &str) -> bool {
-    chunk_decompressed_hash_md5.len() == 32 && chunk_decompressed_hash_md5 != EMPTY_MD5
+/// bytes. Accepts binary hash (16 bytes = MD5, 8 bytes = xxh64, 0 = none).
+pub(crate) fn chunk_hash_required(chunk_decompressed_hash_md5: &[u8]) -> bool {
+    !chunk_decompressed_hash_md5.is_empty()
+        && chunk_decompressed_hash_md5 != &EMPTY_MD5_BYTES[..]
+        && matches!(chunk_decompressed_hash_md5.len(), 16 | 8)
 }
 
 /// Copy a chunk from an old file into `out_file` at `new_offset`. Uses the
@@ -676,7 +722,7 @@ pub fn write_chunk_from_mmap(
     old_offset: u64,
     expected_size: u64,
     mut file_hasher: Option<&mut Md5>,
-    chunk_decompressed_hash_md5: &str,
+    chunk_decompressed_hash_md5: &[u8],
 ) -> SophonResult<u64> {
     let needs_chunk_hash = chunk_hash_required(chunk_decompressed_hash_md5);
     if file_hasher.is_none() && !needs_chunk_hash {
@@ -813,10 +859,10 @@ pub fn write_chunk_from_mmap(
     if let Some(ref mut ch) = chunk_hasher {
         let digest = ch.finish()?;
         return_md5(chunk_hasher.take().unwrap());
-        if !md5_hex_eq(&digest, chunk_decompressed_hash_md5) {
+        if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
             return Err(SophonError::Md5Mismatch {
                 item: old_file_path.display().to_string(),
-                expected: chunk_decompressed_hash_md5.to_string(),
+                expected: bytes_to_hex(chunk_decompressed_hash_md5),
                 actual: md5_to_hex(&digest),
             });
         }
@@ -838,7 +884,7 @@ pub fn decompress_chunk_optimized(
     offset: u64,
     expected_size: u64,
     file_hasher: Option<&mut Md5>,
-    chunk_decompressed_hash_md5: &str,
+    chunk_decompressed_hash_md5: &[u8],
 ) -> SophonResult<u64> {
     let mut file_hasher = file_hasher;
 
@@ -901,7 +947,7 @@ fn decompress_chunk_with_window(
     offset: u64,
     expected_size: u64,
     file_hasher: &mut Option<&mut Md5>,
-    chunk_decompressed_hash_md5: &str,
+    chunk_decompressed_hash_md5: &[u8],
     window_log: u32,
 ) -> SophonResult<u64> {
     let f = File::open(chunk_path)?;
@@ -981,10 +1027,10 @@ fn decompress_chunk_with_window(
     if let Some(ref mut ch) = chunk_hasher {
         let digest = ch.finish()?;
         return_md5(chunk_hasher.take().unwrap());
-        if !md5_hex_eq(&digest, chunk_decompressed_hash_md5) {
+        if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
             return Err(SophonError::Md5Mismatch {
                 item: chunk_path.display().to_string(),
-                expected: chunk_decompressed_hash_md5.to_string(),
+                expected: bytes_to_hex(chunk_decompressed_hash_md5),
                 actual: md5_to_hex(&digest),
             });
         }
@@ -1027,7 +1073,7 @@ mod tests {
         let dst_path = dir.path().join("out.bin");
         let out = write_at_new(&dst_path);
         let src_file = File::open(&src).unwrap();
-        let bytes = write_chunk_from_mmap(&src_file, &src, &out, 0, 0, 11, None, "").unwrap();
+        let bytes = write_chunk_from_mmap(&src_file, &src, &out, 0, 0, 11, None, b"").unwrap();
         drop(out);
         assert_eq!(bytes, 11);
         assert_eq!(std::fs::read(&dst_path).unwrap(), b"hello world");
@@ -1043,8 +1089,9 @@ mod tests {
         let dst_path = dir.path().join("out.bin");
         let out = write_at_new(&dst_path);
         let src_file = File::open(&src).unwrap();
-        let bytes = write_chunk_from_mmap(&src_file, &src, &out, 0, 0, data.len() as u64, None, "")
-            .unwrap();
+        let bytes =
+            write_chunk_from_mmap(&src_file, &src, &out, 0, 0, data.len() as u64, None, b"")
+                .unwrap();
         drop(out);
         assert_eq!(bytes, data.len() as u64);
         assert_eq!(std::fs::read(&dst_path).unwrap().len(), data.len());
@@ -1073,7 +1120,7 @@ mod tests {
             0,
             data.len() as u64,
             None,
-            &chunk_md5,
+            chunk_md5.as_bytes(),
         )
         .unwrap();
         drop(out);
@@ -1092,8 +1139,16 @@ mod tests {
         let dst_path = dir.path().join("out.bin");
         let out = write_at_new(&dst_path);
         let src_file = File::open(&src).unwrap();
-        let res =
-            write_chunk_from_mmap(&src_file, &src, &out, 0, 0, data.len() as u64, None, wrong);
+        let res = write_chunk_from_mmap(
+            &src_file,
+            &src,
+            &out,
+            0,
+            0,
+            data.len() as u64,
+            None,
+            &super::super::assembly_opt::hex_to_bytes(wrong).unwrap()[..],
+        );
         assert!(res.is_err());
     }
 
@@ -1111,7 +1166,7 @@ mod tests {
         let out = write_at_new(&dst_path);
         out.set_len(raw.len() as u64).unwrap();
         let bytes =
-            decompress_chunk_optimized(&chunk_path, &out, 0, raw.len() as u64, None, "").unwrap();
+            decompress_chunk_optimized(&chunk_path, &out, 0, raw.len() as u64, None, b"").unwrap();
         drop(out);
         assert_eq!(bytes, raw.len() as u64);
         assert_eq!(std::fs::read(&dst_path).unwrap(), raw);
@@ -1178,10 +1233,13 @@ mod tests {
 
     #[test]
     fn chunk_hash_required_detects_empty_and_placeholder() {
-        assert!(!chunk_hash_required(""));
-        assert!(!chunk_hash_required("00000000000000000000000000000000"));
-        assert!(chunk_hash_required("d41d8cd98f00b204e9800998ecf8427e"));
-        assert!(!chunk_hash_required("short"));
+        assert!(!chunk_hash_required(b""));
+        assert!(!chunk_hash_required(&[0; 16]));
+        assert!(chunk_hash_required(&[
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e
+        ]));
+        assert!(!chunk_hash_required(b"short"));
     }
 
     #[test]

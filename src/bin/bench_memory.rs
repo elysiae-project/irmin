@@ -3192,7 +3192,7 @@ fn prepare_install_context(
             let valid = irmin_rs::game_installer::cache::check_file_md5_cached_with_size(
                 &cached_path,
                 chunk.chunk_size,
-                chunk.chunk_compressed_hash_md5_str(),
+                irmin_rs::game_installer::assembly_opt::hex_to_bytes(chunk.chunk_compressed_hash_md5_str()).unwrap_or_default().as_slice(),
                 &game_dir,
                 &cache,
             )
@@ -3357,7 +3357,11 @@ fn run_operation(
                         &game_dir.join("assembled.bin"),
                     )
                     .map_err(|error| format!("DownloadOver output hash failed: {error}"))?;
-                    if !hex::encode(actual).eq_ignore_ascii_case(manifest.file_hash_md5(0)) {
+                    if !hex::encode(actual).eq_ignore_ascii_case(
+                        &irmin_rs::game_installer::assembly_opt::bytes_to_hex(
+                            manifest.file_hash_md5(0),
+                        ),
+                    ) {
                         return Err("DownloadOver output hash mismatch".to_owned());
                     }
                 }
