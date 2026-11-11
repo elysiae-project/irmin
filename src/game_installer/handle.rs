@@ -84,11 +84,13 @@ impl DownloadHandle {
     }
 
     /// Whether cancellation has been requested.
+    #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_CANCELLED
     }
 
     /// Whether a pause request is currently active.
+    #[inline]
     pub fn is_paused(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_PAUSED
     }
@@ -99,6 +101,7 @@ impl DownloadHandle {
     }
 
     /// Read the current control state.
+    #[inline]
     pub fn get_state(&self) -> ControlState {
         match self.state.load(Ordering::Acquire) {
             STATE_RUNNING => ControlState::Running,
