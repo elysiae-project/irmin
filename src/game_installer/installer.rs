@@ -971,10 +971,9 @@ fn build_installer_data(
 fn compute_totals(all_files: &CompactManifest) -> (u64, u64) {
     let mut seen_chunks: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
     let total_compressed: u64 = (0..all_files.num_chunks())
-        .map(|i| all_files.chunk(i))
-        .filter(|c| c.chunk_old_offset < 0)
-        .filter(|c| seen_chunks.insert(c.chunk_name))
-        .map(|c| c.chunk_size)
+        .filter(|&i| all_files.chunk_old_offset_at(i) < 0)
+        .filter(|&i| seen_chunks.insert(all_files.chunk_name_at(i)))
+        .map(|i| all_files.chunk_size_at(i))
         .fold(0u64, |acc, x| acc.saturating_add(x));
 
     let total_files: u64 = all_files.num_files() as u64;
@@ -1439,7 +1438,8 @@ async fn check_needs_download(
     game_dir: Arc<PathBuf>,
     verify_cache: Arc<DashMap<String, VerificationEntry>>,
 ) -> SophonResult<(bool, Option<u64>)> {
-    let chunk_size = all_files.file_chunk(file_idx, chunk_idx).chunk_size;
+    let chunk_size =
+        all_files.chunk_size_at(all_files.file_chunk_range(file_idx).start as usize + chunk_idx);
     let dest = dest.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || {

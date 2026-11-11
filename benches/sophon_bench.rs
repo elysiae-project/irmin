@@ -2913,6 +2913,7 @@ criterion_group!(
     bench_xxh64,
     bench_zstd_oneshot,
     bench_compact_manifest_build,
+    bench_chunk_accessors,
     bench_chunk_lookup,
     bench_varint_decode,
     bench_cover_stream_decode,
@@ -3334,5 +3335,68 @@ fn bench_xxh64_hex_eq(c: &mut Criterion) {
             criterion::black_box(ok);
         });
     });
+    group.finish();
+}
+
+fn bench_chunk_accessors(c: &mut Criterion) {
+    let hash_pool: Vec<String> = (0..MANIFEST_FILES).map(|i| format!("{i:032x}")).collect();
+    let assets: Vec<SophonManifestAssetProperty> = (0..MANIFEST_FILES)
+        .map(|f| {
+            let chunks: Vec<SophonManifestAssetChunk> = (0..MANIFEST_CHUNKS_PER_FILE)
+                .map(|c| {
+                    let h = &hash_pool[(f + c) % MANIFEST_FILES];
+                    SophonManifestAssetChunk::from_parts(
+                        format!("f{f}c{c}").into(),
+                        h.clone().into(),
+                        (c * 1024 * 1024) as u64,
+                        0,
+                        0,
+                        0,
+                        bytes::Bytes::new(),
+                        -1,
+                    )
+                })
+                .collect();
+            let size = chunks.iter().map(|c| c.chunk_size_decompressed).sum();
+            SophonManifestAssetProperty::from_parts(
+                format!("asset_{f}.pak").into(),
+                chunks,
+                0,
+                size,
+                format!("{f:032x}").into(),
+            )
+        })
+        .collect();
+    let manifest = CompactManifest::from(assets);
+    let total_chunks = manifest.num_chunks();
+
+    let mut group = c.benchmark_group("chunk_accessors");
+    group.throughput(Throughput::Elements(total_chunks as u64));
+
+    group.bench_function("chunkref_scan", |b| {
+        b.iter(|| {
+            let mut seen: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+            let total: u64 = (0..total_chunks)
+                .map(|i| manifest.chunk(i))
+                .filter(|c| c.chunk_old_offset < 0)
+                .filter(|c| seen.insert(c.chunk_name))
+                .map(|c| c.chunk_size)
+                .fold(0u64, |acc, x| acc.saturating_add(x));
+            criterion::black_box(total);
+        });
+    });
+
+    group.bench_function("direct_accessor_scan", |b| {
+        b.iter(|| {
+            let mut seen: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+            let total: u64 = (0..total_chunks)
+                .filter(|&i| manifest.chunk_old_offset_at(i) < 0)
+                .filter(|&i| seen.insert(manifest.chunk_name_at(i)))
+                .map(|i| manifest.chunk_size_at(i))
+                .fold(0u64, |acc, x| acc.saturating_add(x));
+            criterion::black_box(total);
+        });
+    });
+
     group.finish();
 }

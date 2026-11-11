@@ -394,6 +394,18 @@ impl CompactManifest {
         self.chunk_old_offset[chunk_idx]
     }
 
+    /// Returns the chunk's compressed size.
+    #[inline]
+    pub fn chunk_size_at(&self, chunk_idx: usize) -> u64 {
+        self.chunk_size[chunk_idx] as u64
+    }
+
+    /// Returns the chunk's decompressed size.
+    #[inline]
+    pub fn chunk_size_decompressed_at(&self, chunk_idx: usize) -> u64 {
+        self.chunk_size_decompressed[chunk_idx] as u64
+    }
+
     /// Compute a chunk's offset within its file by summing decompressed sizes
     /// of all preceding chunks in the same file. O(chunks_before) per call.
     #[inline]
