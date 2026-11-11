@@ -2896,6 +2896,7 @@ criterion_group!(
     bench_update_diff_sizes,
     bench_download_throughput,
     bench_state_save,
+    bench_load_download_state,
 );
 criterion_main!(benches);
 
@@ -3176,4 +3177,47 @@ fn bench_state_save(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+fn bench_load_download_state(c: &mut Criterion) {
+    use irmin_rs::DownloadType;
+    use irmin_rs::sophon::load_download_state;
+    use irmin_rs::sophon::state_file_path;
+    use irmin_rs::types::DownloadState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path();
+
+    for &entry_count in &[10_000usize, 100_000, 200_000] {
+        let state = DownloadState {
+            game_id: "hk4e".into(),
+            vo_lang: "en-us".into(),
+            output_path: "/games/test".into(),
+            download_type: DownloadType::Fresh,
+            current_tag: None,
+            manifest_hash: "abc123".into(),
+            downloaded_chunks: (0..entry_count)
+                .map(|i| (format!("patch-chunk-{i:08}.bin"), 256 * 1024))
+                .collect(),
+            completed_files: Default::default(),
+        };
+        let path = state_file_path(state_dir, "hk4e");
+        let json = serde_json::to_vec(&state).unwrap();
+        std::fs::write(&path, &json).unwrap();
+        let file_size = json.len() as u64;
+
+        let mut group = c.benchmark_group("load_download_state");
+        group.throughput(Throughput::Bytes(file_size));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(entry_count),
+            &path,
+            |b, path| {
+                b.iter(|| {
+                    let state = load_download_state(path.parent().unwrap(), "hk4e");
+                    criterion::black_box(state);
+                });
+            },
+        );
+        group.finish();
+    }
 }
