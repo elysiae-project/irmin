@@ -218,6 +218,7 @@ impl DownloadInfo {
 
     /// Write the same URL as [`Self::url_for`] into `buf`, clearing its previous
     /// contents first so the allocation can be reused.
+    #[inline]
     pub fn url_for_into(&self, item_name: &str, buf: &mut String) {
         buf.clear();
         let prefix = self.url_prefix.trim_end_matches('/');
@@ -233,6 +234,7 @@ impl DownloadInfo {
 
     /// Whether the caller's chunk-processing path should decompress this
     /// object. Currently only `Zstd` is treated as compressed here.
+    #[inline]
     pub fn is_compressed(&self) -> bool {
         matches!(self.compression, Compression::Zstd)
     }
