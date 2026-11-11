@@ -299,6 +299,7 @@ pub(crate) struct MmapGuard {
     pub(crate) len: usize,
     pub(crate) map_base: *mut libc::c_void,
     pub(crate) map_len: usize,
+    pub(crate) file_offset: u64,
     pub(crate) fd: std::os::unix::io::RawFd,
 }
 
@@ -312,17 +313,17 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // Start async writeback of dirty pages, then evict clean pages.
-        // sync_file_range with WAIT_BEFORE|WRITE starts writeback without
-        // blocking (no WAIT_AFTER). MADV_DONTNEED evicts clean pages
-        // immediately; dirty pages stay until writeback completes, then
-        // the kernel reclaims them.
-        let map_offset = self.ptr as usize - self.map_base as usize;
+        // Queues writeback of dirty pages without waiting for completion
+        // (no WAIT_AFTER). MADV_DONTNEED evicts clean pages immediately;
+        // dirty pages stay until writeback completes, then the kernel
+        // reclaims them.
+        // Only valid for guards from `mmap_read_write` (fd != -1).
+        debug_assert_ne!(self.fd, -1, "flush_and_evict requires a write mmap");
         unsafe {
             libc::sync_file_range(
                 self.fd,
-                map_offset as libc::off64_t,
-                self.map_len as libc::off64_t,
+                self.file_offset as libc::off64_t,
+                self.len as libc::off64_t,
                 libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
             );
         }
@@ -385,6 +386,7 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
         len,
         map_base: ptr,
         map_len: len,
+        file_offset: 0,
         fd: -1,
     })
 }
@@ -438,6 +440,7 @@ pub(crate) fn mmap_shared_read_only(
         len,
         map_base: ptr,
         map_len: len,
+        file_offset: 0,
         fd: -1,
     })
 }
@@ -477,6 +480,7 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
             len,
             map_base: base,
             map_len,
+            file_offset: offset,
             fd: file.as_raw_fd(),
         })
     }

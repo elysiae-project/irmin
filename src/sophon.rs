@@ -513,8 +513,7 @@ impl Drop for StateTempFile {
     }
 }
 
-/// Serializes a slice of (&str, u64) pairs as a JSON map, matching the
-/// format of `HashMap<String, u64>` without the allocation overhead.
+/// Serializes `&[(&str, u64)]` as a JSON map.
 struct ChunkSliceMap<'a>(&'a [(&'a str, u64)]);
 
 impl serde::Serialize for ChunkSliceMap<'_> {
