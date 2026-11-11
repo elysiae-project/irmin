@@ -106,6 +106,7 @@ pub(crate) struct HashReadBuffer {
 }
 
 impl HashReadBuffer {
+    #[inline(always)]
     pub(crate) fn take(capacity: usize) -> Self {
         if capacity > HASH_READ_BUFFER_SIZE {
             return Self {
@@ -192,7 +193,7 @@ pub(crate) fn xxh64_hex_eq(value: u64, expected: &str) -> bool {
 }
 
 /// Encode an MD5 digest to a lowercase hex String. Only for error paths.
-#[inline]
+#[inline(always)]
 pub fn md5_to_hex(digest: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for b in digest {

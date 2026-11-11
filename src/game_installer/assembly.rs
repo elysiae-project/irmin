@@ -119,6 +119,7 @@ pub fn validate_chunk_name(chunk_name: &str) -> bool {
 ///
 /// Returns `InvalidAssetName` for empty/NUL names and `PathTraversal` for
 /// paths that could escape the game directory.
+#[inline(always)]
 pub fn validate_asset_name(name: &str) -> SophonResult<()> {
     if name.is_empty() {
         return Err(SophonError::InvalidAssetName(

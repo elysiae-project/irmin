@@ -562,6 +562,7 @@ fn validate_allocation_sizes(
     Ok(())
 }
 
+#[inline]
 fn checked_intern(
     arena: &mut StringArena,
     value: &str,
