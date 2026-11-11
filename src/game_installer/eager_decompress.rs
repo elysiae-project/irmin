@@ -12,7 +12,8 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 use super::assembly_opt::{
-    self, Md5, chunk_hash_required, md5_hex_eq, md5_to_hex, return_md5, take_md5, xxh64_hex_eq,
+    self, Md5, bytes_to_hex, chunk_hash_required, md5_bytes_eq, md5_hex_eq, md5_to_hex, return_md5,
+    take_md5, xxh64_bytes_eq, xxh64_hex_eq,
 };
 use super::error::{SophonError, SophonResult};
 
@@ -61,8 +62,8 @@ pub fn eager_decompress_chunk(
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
-    compressed_hash: &str,
-    decompressed_hash: &str,
+    compressed_hash: &[u8],
+    decompressed_hash: &[u8],
 ) -> SophonResult<u64> {
     eager_decompress_chunk_inner::<true>(
         compressed_data,
@@ -80,8 +81,8 @@ pub(crate) fn benchmark_eager_decompress_chunk_with_prefault(
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
-    compressed_hash: &str,
-    decompressed_hash: &str,
+    compressed_hash: &[u8],
+    decompressed_hash: &[u8],
 ) -> SophonResult<u64> {
     eager_decompress_chunk_inner::<true>(
         compressed_data,
@@ -99,8 +100,8 @@ pub(crate) fn benchmark_eager_decompress_chunk_without_prefault(
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
-    compressed_hash: &str,
-    decompressed_hash: &str,
+    compressed_hash: &[u8],
+    decompressed_hash: &[u8],
 ) -> SophonResult<u64> {
     eager_decompress_chunk_inner::<false>(
         compressed_data,
@@ -117,34 +118,34 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
-    compressed_hash: &str,
-    decompressed_hash: &str,
+    compressed_hash: &[u8],
+    decompressed_hash: &[u8],
 ) -> SophonResult<u64> {
     // Verify compressed hash first.
     if !compressed_hash.is_empty() {
         match compressed_hash.len() {
-            32 => {
+            16 => {
                 let mut hasher = take_md5()?;
                 hasher.update(compressed_data)?;
                 let digest = hasher.finish()?;
                 return_md5(hasher);
-                if !md5_hex_eq(&digest, compressed_hash) {
+                if !md5_bytes_eq(&digest, compressed_hash) {
                     return Err(SophonError::Md5Mismatch {
                         item: format!("eager chunk at offset {chunk_offset}"),
-                        expected: compressed_hash.to_string(),
+                        expected: bytes_to_hex(compressed_hash),
                         actual: md5_to_hex(&digest),
                     });
                 }
             }
-            16 => {
+            8 => {
                 let mut xxh = assembly_opt::take_xxh64();
                 xxh.update(compressed_data);
                 let digest = xxh.digest();
                 assembly_opt::return_xxh64(xxh);
-                if !xxh64_hex_eq(digest, compressed_hash) {
+                if !xxh64_bytes_eq(digest, compressed_hash) {
                     return Err(SophonError::Md5Mismatch {
                         item: format!("eager chunk at offset {chunk_offset}"),
-                        expected: compressed_hash.to_string(),
+                        expected: bytes_to_hex(compressed_hash),
                         actual: format!("{:016x}", digest),
                     });
                 }
@@ -203,11 +204,11 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
         hasher.update(&output[..written])?;
         let digest = hasher.finish()?;
         return_md5(hasher);
-        if !md5_hex_eq(&digest, decompressed_hash) {
+        if !md5_bytes_eq(&digest, decompressed_hash) {
             out_mmap.flush_and_evict();
             return Err(SophonError::Md5Mismatch {
                 item: format!("eager chunk decompressed at offset {chunk_offset}"),
-                expected: decompressed_hash.to_string(),
+                expected: bytes_to_hex(decompressed_hash),
                 actual: md5_to_hex(&digest),
             });
         }
@@ -223,7 +224,7 @@ pub fn stream_decompress_to_file(
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
-    decompressed_hash: &str,
+    decompressed_hash: &[u8],
 ) -> SophonResult<u64> {
     stream_decompress_to_file_inner(
         reader,
@@ -244,7 +245,7 @@ pub(crate) fn stream_decompress_to_file_with_timings(
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
-    decompressed_hash: &str,
+    decompressed_hash: &[u8],
     timings: Arc<EagerStreamPhaseTimings>,
 ) -> SophonResult<u64> {
     stream_decompress_to_file_inner(
@@ -264,7 +265,7 @@ fn stream_decompress_to_file_inner(
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
-    decompressed_hash: &str,
+    decompressed_hash: &[u8],
     #[cfg(feature = "bench-diagnostics")] timings: Option<Arc<EagerStreamPhaseTimings>>,
     #[cfg(feature = "bench-diagnostics")] drain_reader_to_eof: bool,
 ) -> SophonResult<u64> {
@@ -345,10 +346,10 @@ fn stream_decompress_to_file_inner(
     if let Some(mut hasher) = decompressed_hasher.0.take() {
         let digest = hasher.finish()?;
         return_md5(hasher);
-        if !md5_hex_eq(&digest, decompressed_hash) {
+        if !md5_bytes_eq(&digest, decompressed_hash) {
             return Err(SophonError::Md5Mismatch {
                 item: format!("stream chunk decompressed at offset {chunk_offset}"),
-                expected: decompressed_hash.to_string(),
+                expected: bytes_to_hex(decompressed_hash),
                 actual: md5_to_hex(&digest),
             });
         }
@@ -399,8 +400,8 @@ mod tests {
 
         let original = vec![0xABu8; 4096];
         let compressed = compress_data(&original);
-        let comp_hash = md5_hex(&compressed);
-        let decomp_hash = md5_hex(&original);
+        let comp_hash = super::assembly_opt::hex_to_bytes(&md5_hex(&compressed)).unwrap();
+        let decomp_hash = super::assembly_opt::hex_to_bytes(&md5_hex(&original)).unwrap();
 
         let out_file = std::fs::OpenOptions::new()
             .read(true)
@@ -411,9 +412,15 @@ mod tests {
             .unwrap();
         out_file.set_len(4096).unwrap();
 
-        let written =
-            eager_decompress_chunk(&compressed, &out_file, 0, 4096, &comp_hash, &decomp_hash)
-                .unwrap();
+        let written = eager_decompress_chunk(
+            &compressed,
+            &out_file,
+            0,
+            4096,
+            comp_hash.as_slice(),
+            decomp_hash.as_slice(),
+        )
+        .unwrap();
 
         assert_eq!(written, 4096);
 
@@ -443,8 +450,8 @@ mod tests {
             &out_file,
             0,
             1024,
-            "00000000000000000000000000000000", // wrong hash
-            &md5_hex(&original),
+            &[0; 16], // wrong hash
+            &super::assembly_opt::hex_to_bytes(&md5_hex(&original)).unwrap()[..],
         );
 
         assert!(result.is_err());
@@ -461,8 +468,8 @@ mod tests {
 
         let chunk_data = vec![0x42u8; 2048];
         let compressed = compress_data(&chunk_data);
-        let comp_hash = md5_hex(&compressed);
-        let decomp_hash = md5_hex(&chunk_data);
+        let comp_hash = super::assembly_opt::hex_to_bytes(&md5_hex(&compressed)).unwrap();
+        let decomp_hash = super::assembly_opt::hex_to_bytes(&md5_hex(&chunk_data)).unwrap();
 
         let out_file = std::fs::OpenOptions::new()
             .read(true)
@@ -474,9 +481,15 @@ mod tests {
         // File is 8192 bytes, chunk goes at offset 4096
         out_file.set_len(8192).unwrap();
 
-        let written =
-            eager_decompress_chunk(&compressed, &out_file, 4096, 2048, &comp_hash, &decomp_hash)
-                .unwrap();
+        let written = eager_decompress_chunk(
+            &compressed,
+            &out_file,
+            4096,
+            2048,
+            comp_hash.as_slice(),
+            decomp_hash.as_slice(),
+        )
+        .unwrap();
 
         assert_eq!(written, 2048);
 
@@ -495,8 +508,12 @@ mod tests {
         let original = vec![0x77u8; 2048];
         let compressed = compress_data(&original);
         // XXH64 hash is 16 hex chars
-        let xxh = format!("{:016x}", xxhash_rust::xxh64::xxh64(&compressed, 0));
-        let decomp_hash = md5_hex(&original);
+        let xxh = super::assembly_opt::hex_to_bytes(&format!(
+            "{:016x}",
+            xxhash_rust::xxh64::xxh64(&compressed, 0)
+        ))
+        .unwrap();
+        let decomp_hash = super::assembly_opt::hex_to_bytes(&md5_hex(&original)).unwrap();
 
         let out_file = std::fs::OpenOptions::new()
             .read(true)
@@ -507,8 +524,15 @@ mod tests {
             .unwrap();
         out_file.set_len(2048).unwrap();
 
-        let written =
-            eager_decompress_chunk(&compressed, &out_file, 0, 2048, &xxh, &decomp_hash).unwrap();
+        let written = eager_decompress_chunk(
+            &compressed,
+            &out_file,
+            0,
+            2048,
+            xxh.as_slice(),
+            decomp_hash.as_slice(),
+        )
+        .unwrap();
 
         assert_eq!(written, 2048);
         let result = std::fs::read(&out_path).unwrap();
@@ -533,7 +557,7 @@ mod tests {
         out_file.set_len(1024).unwrap();
 
         // Empty hash = skip verification, let decoder fail
-        let result = eager_decompress_chunk(&garbage, &out_file, 0, 1024, "", "");
+        let result = eager_decompress_chunk(&garbage, &out_file, 0, 1024, b"", b"");
         assert!(result.is_err());
     }
 
@@ -544,7 +568,7 @@ mod tests {
 
         let original = vec![0x55u8; 1024];
         let compressed = compress_data(&original);
-        let comp_hash = md5_hex(&compressed);
+        let comp_hash = super::assembly_opt::hex_to_bytes(&md5_hex(&compressed)).unwrap();
 
         let out_file = std::fs::OpenOptions::new()
             .read(true)
@@ -562,7 +586,7 @@ mod tests {
             0,
             2048, // wrong expected size
             &comp_hash,
-            "",
+            b"",
         );
 
         assert!(result.is_err());
@@ -584,7 +608,7 @@ mod tests {
 
         let original = vec![0x99u8; 512];
         let compressed = compress_data(&original);
-        let comp_hash = md5_hex(&compressed);
+        let comp_hash = super::assembly_opt::hex_to_bytes(&md5_hex(&compressed)).unwrap();
 
         let out_file = std::fs::OpenOptions::new()
             .read(true)
@@ -602,7 +626,7 @@ mod tests {
             0,
             512,
             &comp_hash,
-            "ffffffffffffffffffffffffffffffff", // wrong decompressed hash
+            &[0xff; 16], // wrong decompressed hash
         );
 
         assert!(result.is_err());

@@ -1439,7 +1439,22 @@ async fn download_chunk_with_retries_success_on_first() {
     let handle = DownloadHandle::new();
 
     let result = download_chunk_with_retries(
-        (&chunk).into(),
+        crate::game_installer::compact_manifest::ChunkRef {
+            chunk_name: chunk.chunk_name_str(),
+            chunk_decompressed_hash_md5: crate::game_installer::assembly_opt::hex_to_bytes(
+                chunk.chunk_decompressed_hash_md5_str(),
+            )
+            .unwrap_or_default()
+            .leak(),
+            chunk_size: chunk.chunk_size,
+            chunk_size_decompressed: chunk.chunk_size_decompressed,
+            chunk_compressed_hash_md5: crate::game_installer::assembly_opt::hex_to_bytes(
+                chunk.chunk_compressed_hash_md5_str(),
+            )
+            .unwrap_or_default()
+            .leak(),
+            chunk_old_offset: chunk.chunk_old_offset,
+        },
         &client,
         &chunk_download,
         &dest,
@@ -1547,7 +1562,22 @@ async fn download_chunk_with_retries_mismatch_discards_partial() {
     let handle = DownloadHandle::new();
 
     let result = download_chunk_with_retries(
-        (&chunk).into(),
+        crate::game_installer::compact_manifest::ChunkRef {
+            chunk_name: chunk.chunk_name_str(),
+            chunk_decompressed_hash_md5: crate::game_installer::assembly_opt::hex_to_bytes(
+                chunk.chunk_decompressed_hash_md5_str(),
+            )
+            .unwrap_or_default()
+            .leak(),
+            chunk_size: chunk.chunk_size,
+            chunk_size_decompressed: chunk.chunk_size_decompressed,
+            chunk_compressed_hash_md5: crate::game_installer::assembly_opt::hex_to_bytes(
+                chunk.chunk_compressed_hash_md5_str(),
+            )
+            .unwrap_or_default()
+            .leak(),
+            chunk_old_offset: chunk.chunk_old_offset,
+        },
         &client,
         &chunk_download,
         &dest,

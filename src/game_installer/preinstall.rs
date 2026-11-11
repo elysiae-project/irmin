@@ -1385,7 +1385,7 @@ pub async fn preinstall_download(
             let last_emit = Arc::clone(&last_check_emit);
             let chunks_dir = chunks_dir.clone();
             let patch_name = chunk.patch_name.clone();
-            let patch_md5 = chunk.patch_md5.clone();
+            let patch_md5 = super::assembly_opt::hex_to_bytes(&chunk.patch_md5).unwrap_or_default();
             let patch_size = chunk.patch_size;
             async move {
                 let path = chunks_dir.join(&patch_name);
@@ -1800,10 +1800,25 @@ async fn download_chunk_with_retries(
         if handle.is_cancelled() {
             return Err(SophonError::Cancelled);
         }
+        let decomp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+            chunk.chunk_decompressed_hash_md5_str(),
+        )
+        .unwrap_or_default();
+        let comp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+            chunk.chunk_compressed_hash_md5_str(),
+        )
+        .unwrap_or_default();
         match super::download::download_chunk(
             client,
             chunk_download,
-            chunk.into(),
+            crate::game_installer::compact_manifest::ChunkRef {
+                chunk_name: chunk.chunk_name_str(),
+                chunk_decompressed_hash_md5: &decomp_hash_bytes,
+                chunk_size: chunk.chunk_size,
+                chunk_size_decompressed: chunk.chunk_size_decompressed,
+                chunk_compressed_hash_md5: &comp_hash_bytes,
+                chunk_old_offset: chunk.chunk_old_offset,
+            },
             dest,
             None,
             Some(handle),
@@ -2208,7 +2223,8 @@ where
         let already_patched = {
             let tp = target_path.clone();
             let sz = asset.target_file_size;
-            let md5 = asset.target_file_hash.clone();
+            let md5 =
+                super::assembly_opt::hex_to_bytes(&asset.target_file_hash).unwrap_or_default();
             tokio::task::spawn_blocking(move || is_file_already_patched(&tp, sz, &md5)).await?
         };
         if already_patched {
@@ -2500,14 +2516,14 @@ fn validate_patch_name(patch_name: &str) -> SophonResult<()> {
     Ok(())
 }
 
-fn is_file_already_patched(path: &Path, expected_size: u64, expected_md5: &str) -> bool {
+fn is_file_already_patched(path: &Path, expected_size: u64, expected_md5: &[u8]) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
     if metadata.len() != expected_size {
         return false;
     }
-    verify_file_hash(path, expected_md5)
+    verify_file_hash(path, &super::assembly_opt::bytes_to_hex(expected_md5))
 }
 
 #[derive(Clone)]

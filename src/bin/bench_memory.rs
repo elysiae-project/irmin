@@ -3357,7 +3357,11 @@ fn run_operation(
                         &game_dir.join("assembled.bin"),
                     )
                     .map_err(|error| format!("DownloadOver output hash failed: {error}"))?;
-                    if !hex::encode(actual).eq_ignore_ascii_case(manifest.file_hash_md5(0)) {
+                    if !hex::encode(actual).eq_ignore_ascii_case(
+                        &irmin_rs::game_installer::assembly_opt::bytes_to_hex(
+                            manifest.file_hash_md5(0),
+                        ),
+                    ) {
                         return Err("DownloadOver output hash mismatch".to_owned());
                     }
                 }
