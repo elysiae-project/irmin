@@ -299,6 +299,7 @@ pub(crate) struct MmapGuard {
     pub(crate) len: usize,
     pub(crate) map_base: *mut libc::c_void,
     pub(crate) map_len: usize,
+    pub(crate) fd: std::os::unix::io::RawFd,
 }
 
 impl MmapGuard {
@@ -311,9 +312,20 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // Discard pages from the page cache. Dirty MAP_SHARED pages stay
-        // until the kernel's writeback completes; the periodic
-        // reclaim_memory() + malloc_trim handles eventual settlement.
+        // Start async writeback of dirty pages, then evict clean pages.
+        // sync_file_range with WAIT_BEFORE|WRITE starts writeback without
+        // blocking (no WAIT_AFTER). MADV_DONTNEED evicts clean pages
+        // immediately; dirty pages stay until writeback completes, then
+        // the kernel reclaims them.
+        let map_offset = self.ptr as usize - self.map_base as usize;
+        unsafe {
+            libc::sync_file_range(
+                self.fd,
+                map_offset as libc::off64_t,
+                self.map_len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
+            );
+        }
         unsafe {
             libc::madvise(self.map_base, self.map_len, libc::MADV_DONTNEED);
         }
@@ -373,6 +385,7 @@ pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Re
         len,
         map_base: ptr,
         map_len: len,
+        fd: -1,
     })
 }
 
@@ -425,6 +438,7 @@ pub(crate) fn mmap_shared_read_only(
         len,
         map_base: ptr,
         map_len: len,
+        fd: -1,
     })
 }
 
@@ -463,6 +477,7 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
             len,
             map_base: base,
             map_len,
+            fd: file.as_raw_fd(),
         })
     }
 }
