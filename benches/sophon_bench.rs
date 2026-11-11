@@ -771,7 +771,13 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             cache.clear();
             evict_page_cache(&path);
             let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
-                &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
+                &path,
+                bytes,
+                irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                    .unwrap_or_default()
+                    .as_slice(),
+                &game_dir,
+                &cache,
             )
             .unwrap();
             assert!(valid);
@@ -790,7 +796,13 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             },
             |_| {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
-                    &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
+                    &path,
+                    bytes,
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                        .unwrap_or_default()
+                        .as_slice(),
+                    &game_dir,
+                    &cache,
                 )
                 .unwrap();
                 assert!(valid);
@@ -809,7 +821,13 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             },
             |_| {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
-                    &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
+                    &path,
+                    bytes,
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                        .unwrap_or_default()
+                        .as_slice(),
+                    &game_dir,
+                    &cache,
                 )
                 .unwrap();
                 assert!(valid);
@@ -823,7 +841,13 @@ fn bench_verify_file_md5(c: &mut Criterion) {
     {
         cache.clear();
         let result = irmin_rs::game_installer::cache::check_file_md5_cached(
-            &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
+            &path,
+            bytes,
+            irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                .unwrap_or_default()
+                .as_slice(),
+            &game_dir,
+            &cache,
         )
         .unwrap();
         assert!(result, "cache population should succeed");
@@ -833,7 +857,13 @@ fn bench_verify_file_md5(c: &mut Criterion) {
         let game_dir = game_dir.clone();
         b.iter(|| {
             let result = irmin_rs::game_installer::cache::check_file_md5_cached(
-                &path, bytes, irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(), &game_dir, &cache,
+                &path,
+                bytes,
+                irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                    .unwrap_or_default()
+                    .as_slice(),
+                &game_dir,
+                &cache,
             )
             .unwrap();
             assert!(result);
@@ -861,7 +891,9 @@ fn bench_verify_file_md5(c: &mut Criterion) {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
                     &small_path,
                     small_bytes,
-                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&small_md5).unwrap_or_default().as_slice(),
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&small_md5)
+                        .unwrap_or_default()
+                        .as_slice(),
                     &game_dir,
                     &small_cache,
                 )
@@ -899,7 +931,9 @@ fn bench_verify_file_md5(c: &mut Criterion) {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
                     path,
                     tiny_bytes,
-                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice(),
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                        .unwrap_or_default()
+                        .as_slice(),
                     &game_dir,
                     &tiny_cache,
                 )
@@ -2895,6 +2929,7 @@ criterion_group!(
     bench_file_metadata_cost_optional,
     bench_update_diff_sizes,
     bench_download_throughput,
+    bench_verify_file_hash,
     bench_state_save,
     bench_load_download_state,
 );
@@ -3225,4 +3260,26 @@ fn bench_load_download_state(c: &mut Criterion) {
         );
         group.finish();
     }
+}
+
+fn bench_verify_file_hash(c: &mut Criterion) {
+    use irmin_rs::game_installer::assembly_opt::hex_to_bytes;
+    use irmin_rs::game_installer::preinstall::bench_internals::verify_file_hash;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.bin");
+    let data = b"hello world, this is test data for hashing";
+    fs::write(&path, data).unwrap();
+    let md5_hex = hex::encode(fast_md5::digest(data));
+    let md5_bytes = hex_to_bytes(&md5_hex).unwrap();
+
+    let mut group = c.benchmark_group("verify_file_hash");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+    group.bench_function("binary", |b| {
+        b.iter(|| {
+            let ok = verify_file_hash(&path, &md5_bytes);
+            criterion::black_box(ok);
+        });
+    });
+    group.finish();
 }

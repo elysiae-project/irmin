@@ -40,7 +40,8 @@ pub mod installer;
 pub mod output_allocator;
 mod plugin_api;
 mod plugin_install;
-mod preinstall;
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub mod preinstall;
 #[cfg(not(feature = "bench-internals"))]
 mod update;
 #[cfg(feature = "bench-internals")]

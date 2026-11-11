@@ -1986,7 +1986,9 @@ async fn download_patch_chunk_inner(
     Ok(())
 }
 
-pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
@@ -2036,7 +2038,9 @@ pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
     result
 }
 
-pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         log::warn!(
             "Failed to open file for XXH64 verification: {path_display}",
@@ -2080,7 +2084,10 @@ pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
     result
 }
 
-pub(super) fn verify_file_hash(path: &Path, expected_hash: &[u8]) -> bool {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
+pub fn verify_file_hash(path: &Path, expected_hash: &[u8]) -> bool {
     if expected_hash.is_empty() {
         return true;
     }
@@ -3659,3 +3666,8 @@ use crate::SophonProgress;
 #[cfg(test)]
 #[path = "preinstall_tests.rs"]
 mod tests;
+
+#[cfg(feature = "benchmark")]
+pub mod bench_internals {
+    pub use super::{verify_chunk_md5, verify_chunk_xxh64, verify_file_hash};
+}
