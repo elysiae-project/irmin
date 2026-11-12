@@ -63,6 +63,7 @@ pub const MAX_HASH_RETRIES: u32 = 5;
 
 /// Hard ceiling for concurrent chunk download workers.
 /// Maximum download concurrency, derived from CPU count at runtime.
+#[inline]
 pub fn download_concurrency() -> usize {
     adaptive_download::max_concurrency()
 }
