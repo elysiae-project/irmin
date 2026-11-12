@@ -51,6 +51,7 @@ impl StringArena {
             .expect("string exceeds compact u32 index limits")
     }
 
+    #[inline(never)]
     pub fn try_intern(&mut self, s: &str) -> Result<u32, CompactManifestLimitError> {
         let index = u32::try_from(self.offsets.len())
             .map_err(|_| CompactManifestLimitError("string index count"))?;
@@ -330,11 +331,7 @@ impl CompactManifest {
     /// Global half-open chunk-index range belonging to `file_idx`.
     pub fn file_chunk_range(&self, file_idx: usize) -> std::ops::Range<u32> {
         let start = self.file_chunk_start[file_idx];
-        let end = self
-            .file_chunk_start
-            .get(file_idx + 1)
-            .copied()
-            .unwrap_or(self.chunk_name_idx.len() as u32);
+        let end = self.file_chunk_start[file_idx + 1];
         start..end
     }
 
@@ -622,6 +619,7 @@ impl CompactManifestBuilder {
         }
     }
 
+    #[inline(never)]
     fn push(
         &mut self,
         file: &SophonManifestAssetProperty,
@@ -712,6 +710,7 @@ fn validate_limits(
     Ok(span_count)
 }
 
+#[inline(never)]
 fn validate_allocation_sizes(
     total_files: usize,
     total_chunks: usize,
