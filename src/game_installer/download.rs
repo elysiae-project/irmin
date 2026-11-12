@@ -104,6 +104,7 @@ impl ChunkHasher for fast_md5::Md5 {
     }
 }
 
+#[inline]
 fn update_download_hashes<H: ChunkHasher>(
     bytes: &[u8],
     hasher: Option<&mut H>,
@@ -118,6 +119,7 @@ fn update_download_hashes<H: ChunkHasher>(
     Ok(())
 }
 
+#[inline]
 fn check_download_chunk_size(
     bytes: &[u8],
     expected_total: u64,
