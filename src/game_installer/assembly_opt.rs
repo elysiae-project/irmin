@@ -51,6 +51,7 @@ impl Md5 {
         Ok(())
     }
 
+    #[inline]
     pub fn finish(&mut self) -> io::Result<[u8; 16]> {
         let state = std::mem::replace(&mut self.inner, fast_md5::Md5::new());
         Ok(state.finalize())
