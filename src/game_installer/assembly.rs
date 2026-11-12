@@ -503,8 +503,6 @@ fn assemble_file_with_options(
         let total_written_atomic = AtomicU64::new(0);
         let first_error = Mutex::new(None);
         let has_error = AtomicBool::new(false);
-        let downloaded_chunks: Vec<AtomicBool> =
-            (0..total_chunks).map(|_| AtomicBool::new(false)).collect();
         let raw_fd = out_file.as_raw_fd();
 
         let chunk_done: Vec<AtomicBool> =
@@ -602,7 +600,6 @@ fn assemble_file_with_options(
                 let tw = &total_written_atomic;
                 let err = &first_error;
                 let err_flag = &has_error;
-                let dl_chunks = &downloaded_chunks;
                 let target = &target_path;
                 let old = old_file.as_ref();
                 let out = &out_file;
@@ -676,9 +673,6 @@ fn assemble_file_with_options(
                         match result {
                             Ok(bytes) => {
                                 tw.fetch_add(bytes, Ordering::Relaxed);
-                                if chunk_old_offset < 0 {
-                                    dl_chunks[oi].store(true, Ordering::Relaxed);
-                                }
                                 if !skip_evict {
                                     super::assembly_opt::sync_and_evict_range(
                                         raw_fd,
@@ -705,9 +699,11 @@ fn assemble_file_with_options(
             }
         });
 
-        for (i, flag) in downloaded_chunks.iter().enumerate() {
-            if flag.load(Ordering::Relaxed) {
-                let ci = chunk_range.start + i as u32;
+        // Collect downloaded chunk names for refcount decrement. A chunk is
+        // downloaded (not old-source) when its chunk_old_offset is negative;
+        // the manifest is the source of truth, so no separate bitmap is needed.
+        for ci in chunk_range.start..chunk_range.end {
+            if all_files.chunk_old_offset_at(ci as usize) < 0 {
                 guard.chunks.push(all_files.chunk_name_at(ci as usize));
             }
         }
