@@ -2752,6 +2752,8 @@ pub(super) fn filter_patch_assets_for_removed_features(
 }
 
 /// Apply copyover patch to target file. Caller performs path validation.
+// Cold-path: one-time patch asset copy, keep caller compact.
+#[inline(never)]
 fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -> SophonResult<()> {
     validate_patch_name(&asset.patch_name)?;
     let chunk_path = chunks_dir.join(&asset.patch_name);
@@ -2925,6 +2927,8 @@ pub fn apply_synthetic_hdiff_for_benchmark(
     Ok(observer.timings)
 }
 
+// Cold-path: one-time HDiff patch application, keep caller compact.
+#[inline(never)]
 fn apply_hdiff_patch_impl(
     game_dir: &Path,
     chunks_dir: &Path,
@@ -3153,6 +3157,8 @@ fn apply_hdiff_patch_impl(
     }
 }
 
+// Cold-path: one-time HDiff patch from file handles, keep caller compact.
+#[inline(never)]
 fn apply_hdiff_patch_from_files(
     game_dir: &Path,
     diff_path: &Path,
