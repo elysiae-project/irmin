@@ -700,8 +700,10 @@ fn assemble_file_with_options(
         });
 
         // Collect downloaded chunk names for refcount decrement. A chunk is
-        // downloaded (not old-source) when its chunk_old_offset is negative;
-        // the manifest is the source of truth, so no separate bitmap is needed.
+        // downloaded (not old-source) when its chunk_old_offset is negative.
+        // In the success path (no error), every such chunk was written by a
+        // worker — error paths return before this point. The manifest is the
+        // source of truth, so no separate bitmap is needed.
         for ci in chunk_range.start..chunk_range.end {
             if all_files.chunk_old_offset_at(ci as usize) < 0 {
                 guard.chunks.push(all_files.chunk_name_at(ci as usize));
