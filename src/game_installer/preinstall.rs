@@ -1991,7 +1991,6 @@ async fn download_patch_chunk_inner(
 }
 
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
-#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
@@ -2043,7 +2042,6 @@ pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
 }
 
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
-#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 pub fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         log::warn!(
@@ -2088,7 +2086,6 @@ pub fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
     result
 }
 
-#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 #[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
 pub fn verify_file_hash(path: &Path, expected_hash: &[u8]) -> bool {
