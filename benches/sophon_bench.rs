@@ -583,6 +583,70 @@ fn bench_assembly_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+
+/// Assembly with many small chunks — exercises the worker loop's per-chunk
+/// accessor calls, hash lookups, and sync_and_evict_range overhead. Uses
+/// 1000 chunks of 64 KiB to amplify per-chunk costs relative to I/O.
+fn bench_assembly_many_chunks(c: &mut Criterion) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let tmp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let chunk_mib = 1;
+    let num_chunks = 100;
+    let total_bytes = (chunk_mib * 1024 * 1024 * num_chunks) as u64;
+
+    let (manifest, raw) = build_assembly_fixture(&chunks_dir, chunk_mib, num_chunks, false);
+
+    let name_refs: Vec<&str> = (0..num_chunks)
+        .map(|i| Box::leak(format!("ck{i:02}").into_boxed_str()) as &str)
+        .collect();
+    let lookup = ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice()));
+    let refcounts: Vec<AtomicU32> = (0..num_chunks).map(|_| AtomicU32::new(1000)).collect();
+    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
+
+    assemble_file(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &tmp_dir,
+        &lookup,
+        &refcounts,
+        &cache,
+        true,
+        VerifyMode::Full,
+    )
+    .expect("warmup assemble");
+    let assembled = fs::read(game_dir.join("assembled.bin")).unwrap();
+    assert_eq!(assembled, raw, "assemble_file bytes must match raw input");
+
+    let mut group = c.benchmark_group("assembly_many_chunks");
+    group.throughput(Throughput::Bytes(total_bytes));
+    group.bench_function(BenchmarkId::from_parameter(num_chunks), |b| {
+        b.iter(|| {
+            assemble_file(
+                &manifest,
+                0,
+                &game_dir,
+                &chunks_dir,
+                &tmp_dir,
+                &lookup,
+                &refcounts,
+                &cache,
+                true,
+                VerifyMode::Full,
+            )
+            .expect("assemble");
+        });
+    });
+    group.finish();
+}
+
 fn bench_assembly_old_chunk_reuse(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let game_dir = dir.path().join("game");
@@ -2908,6 +2972,7 @@ criterion_group!(
     bench_zstd_decompress,
     bench_lz4_deflate_decompress,
     bench_assembly_e2e,
+    bench_assembly_many_chunks,
     bench_assembly_old_chunk_reuse,
     bench_verify_file_md5,
     bench_xxh64,
