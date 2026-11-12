@@ -167,7 +167,7 @@ const ZIP_MAX_ENTRIES: usize = 8 * 1024;
 /// from a 1 KiB compressed entry is rejected (ratio > 1_000_000).
 const ZIP_MAX_RATIO: u64 = 1_000;
 
-// Cold-path: one-time ZIP extraction.
+// Large function; keeping it out-of-line preserves hot-path code layout.
 #[inline(never)]
 fn extract_zip(zip_path: &Path, game_dir: &Path) -> SophonResult<()> {
     let file = File::open(zip_path)?;

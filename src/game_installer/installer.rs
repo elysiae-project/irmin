@@ -1054,8 +1054,7 @@ fn compute_totals(all_files: &CompactManifest) -> (u64, u64) {
     (total_compressed, total_files)
 }
 
-// Cold-path: called once per file during build_download_state setup.
-// #[inline(never)] keeps the caller compact and improves hot-path code layout.
+// Large function; keeping it out-of-line preserves hot-path code layout.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn register_chunks_for_file<'a>(
@@ -1360,7 +1359,7 @@ pub fn snapshot_downloaded_chunks<'a>(
     entries
 }
 
-// Cold-path: spawned once per install session.
+// Large function; keeping it out-of-line preserves hot-path code layout.
 #[inline(never)]
 #[allow(clippy::let_and_return)]
 fn spawn_assembly_coordinator(
