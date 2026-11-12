@@ -1089,6 +1089,7 @@ pub struct AssemblyTaskParams {
 }
 
 /// Run an assembly worker over queued file indices until the channel closes.
+#[inline(never)]
 pub fn run_assembly_task(
     params: AssemblyTaskParams,
     updater: impl Fn(SophonProgress) + Send + Sync + 'static,

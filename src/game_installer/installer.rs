@@ -1360,6 +1360,8 @@ pub fn snapshot_downloaded_chunks<'a>(
     entries
 }
 
+// Cold-path: spawned once per install session.
+#[inline(never)]
 #[allow(clippy::let_and_return)]
 fn spawn_assembly_coordinator(
     ctx: &Arc<InstallContext>,
