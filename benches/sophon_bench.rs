@@ -3283,6 +3283,24 @@ fn bench_state_save(c: &mut Criterion) {
                 criterion::black_box(entries);
             });
         });
+
+        // Full save: snapshot plus serialize + write through the production
+        // state-file path. Compare against the /200000 snapshot bench from
+        // the same criterion run; cross-run subtraction is unreliable on
+        // this machine.
+        if count == *chunk_counts.last().expect("non-empty") {
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let state_file = state_dir.path().join("state.json");
+            group.bench_function(
+                BenchmarkId::new("end_to_end", count),
+                |b| {
+                    b.iter(|| {
+                        let entries = snapshot_downloaded_chunks(&downloaded, &lookup);
+                        irmin_rs::sophon::bench_write_state_file(&state_file, &entries);
+                    });
+                },
+            );
+        }
     }
 
     group.finish();

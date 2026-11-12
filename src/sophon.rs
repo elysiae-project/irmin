@@ -527,6 +527,24 @@ impl serde::Serialize for ChunkSliceMap<'_> {
     }
 }
 
+/// Write a downloaded-chunks snapshot through the production state-file
+/// path (serialize + temp file + rename) so benchmarks cover the full save.
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+pub fn bench_write_state_file(target: &std::path::Path, entries: &[(&str, u64)]) {
+    let state = DownloadStateRef {
+        game_id: "bench",
+        vo_lang: "en-us",
+        output_path: "bench",
+        download_type: &DownloadType::Fresh,
+        current_tag: None,
+        manifest_hash: "bench",
+        downloaded_chunks: entries,
+        completed_files: &[],
+    };
+    atomic_write_serialized(target, &state);
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadStateRef<'a> {
