@@ -20,11 +20,12 @@ pub struct CompactManifestLimitError(&'static str);
 /// `String` and referenced by offset. Length is derived from consecutive
 /// offsets, so each string costs 4 bytes (u32 offset) instead of 8.
 #[derive(Default)]
-#[allow(clippy::len_without_is_empty)]
 pub struct StringArena {
     data: String,
     offsets: Vec<u32>,
     dedup: FxHashMap<u64, u32>,
+    /// Trailing sentinel offset is present; see `seal()`.
+    sealed: bool,
 }
 
 impl StringArena {
@@ -41,6 +42,7 @@ impl StringArena {
             data: String::with_capacity(total_bytes),
             offsets: Vec::with_capacity(spans + 1),
             dedup: FxHashMap::with_capacity_and_hasher(spans / 2, Default::default()),
+            sealed: false,
         }
     }
 
@@ -89,7 +91,7 @@ impl StringArena {
         s.hash(&mut h);
         let key = h.finish();
         if let Some(&idx) = self.dedup.get(&key)
-            && self.get_with_fallback(idx) == s
+            && self.get_unsealed(idx) == s
         {
             return idx;
         }
@@ -100,17 +102,20 @@ impl StringArena {
 
     /// Resolve an index returned by an interning operation.
     ///
-    /// Panics when `idx` is outside the arena; returned text borrows the arena.
-    /// Requires a trailing sentinel offset (pushed by `finish()` or `wrap_arena()`).
+    /// Requires `seal()` to have been called; panics otherwise, and when
+    /// `idx` is outside the arena. Returned text borrows the arena.
     #[inline]
     pub fn get(&self, idx: u32) -> &str {
+        debug_assert!(self.sealed, "call seal() before get()");
         let start = self.offsets[idx as usize] as usize;
         let end = self.offsets[idx as usize + 1] as usize;
         &self.data[start..end]
     }
 
-    /// Fallback accessor for arenas without a trailing sentinel.
-    pub fn get_with_fallback(&self, idx: u32) -> &str {
+    /// Accessor for arenas that have not been sealed; panics when `idx` is
+    /// outside the arena.
+    #[inline]
+    pub fn get_unsealed(&self, idx: u32) -> &str {
         let start = self.offsets[idx as usize] as usize;
         let end = self
             .offsets
@@ -120,14 +125,25 @@ impl StringArena {
         &self.data[start..end]
     }
 
-    /// Number of strings interned, including duplicates.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.offsets.len()
+    /// Append the trailing sentinel offset that lets `get()` use direct
+    /// indexing. Call once after all interning; a second call is a no-op.
+    /// Interning after sealing produces incorrect spans, so seal last.
+    pub fn seal(&mut self) {
+        if !self.sealed {
+            self.offsets.push(self.data.len() as u32);
+            self.sealed = true;
+        }
     }
 
+    /// Number of interned strings, excluding the trailing sentinel offset.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.offsets.len() - self.sealed as usize
+    }
+
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.len() == 0
     }
 
     /// UTF-8 byte length of all concatenated strings, excluding offsets.
@@ -163,6 +179,8 @@ pub struct ByteArena {
     data: Vec<u8>,
     offsets: Vec<u32>,
     dedup: FxHashMap<u64, u32>,
+    /// Trailing sentinel offset is present; see `seal()`.
+    sealed: bool,
 }
 
 impl ByteArena {
@@ -177,6 +195,7 @@ impl ByteArena {
             data: Vec::with_capacity(total_bytes),
             offsets: Vec::with_capacity(entries + 1),
             dedup: FxHashMap::with_capacity_and_hasher(entries / 2, Default::default()),
+            sealed: false,
         }
     }
 
@@ -187,7 +206,7 @@ impl ByteArena {
         bytes.hash(&mut h);
         let key = h.finish();
         if let Some(&idx) = self.dedup.get(&key)
-            && self.get_with_fallback(idx) == bytes
+            && self.get_unsealed(idx) == bytes
         {
             return idx;
         }
@@ -221,17 +240,20 @@ impl ByteArena {
         Ok(index)
     }
 
-    /// Resolve an index. Panics when `idx` is out of range.
-    /// Requires a trailing sentinel offset (pushed by `finish()` or `wrap_arena()`).
+    /// Resolve an index. Requires `seal()` to have been called; panics
+    /// otherwise, and when `idx` is out of range.
     #[inline]
     pub fn get(&self, idx: u32) -> &[u8] {
+        debug_assert!(self.sealed, "call seal() before get()");
         let start = self.offsets[idx as usize] as usize;
         let end = self.offsets[idx as usize + 1] as usize;
         &self.data[start..end]
     }
 
-    /// Fallback accessor for arenas without a trailing sentinel.
-    pub fn get_with_fallback(&self, idx: u32) -> &[u8] {
+    /// Accessor for arenas that have not been sealed; panics when `idx` is
+    /// out of range.
+    #[inline]
+    pub fn get_unsealed(&self, idx: u32) -> &[u8] {
         let start = self.offsets[idx as usize] as usize;
         let end = self
             .offsets
@@ -241,13 +263,25 @@ impl ByteArena {
         &self.data[start..end]
     }
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.offsets.len()
+    /// Append the trailing sentinel offset that lets `get()` use direct
+    /// indexing. Call once after all interning; a second call is a no-op.
+    /// Interning after sealing produces incorrect spans, so seal last.
+    pub fn seal(&mut self) {
+        if !self.sealed {
+            self.offsets.push(self.data.len() as u32);
+            self.sealed = true;
+        }
     }
 
+    /// Number of interned entries, excluding the trailing sentinel offset.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.offsets.len() - self.sealed as usize
+    }
+
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.len() == 0
     }
 
     #[inline]
@@ -503,8 +537,7 @@ impl CompactManifest {
     /// Arena byte size for memory logging.
     /// Approximate arena storage bytes, including its u32 offsets.
     pub fn arena_bytes(&self) -> usize {
-        self.arena.byte_len()
-            + self.arena.offsets.len().saturating_sub(1) * std::mem::size_of::<u32>()
+        self.arena.byte_len() + self.arena.len() * std::mem::size_of::<u32>()
     }
 
     /// Columnar byte size for memory logging.
@@ -550,9 +583,11 @@ impl CompactManifest {
     /// column is the arena. Only `arena_str`/`str_offsets_at` are valid on the
     /// result; all file/chunk accessors panic on the empty columns.
     pub(crate) fn wrap_arena(mut arena: StringArena) -> Self {
-        arena.offsets.push(arena.data.len() as u32);
+        arena.seal();
         let mut hash_arena = ByteArena::default();
-        hash_arena.offsets.push(0);
+        // Solely keeps `ByteArena::get()` in bounds on wrapped manifests,
+        // which only use `arena_str`/`str_offsets_at` and never the hashes.
+        hash_arena.seal();
         Self {
             arena,
             hash_arena,
@@ -683,8 +718,8 @@ impl CompactManifestBuilder {
         );
         self.arena.clear_dedup();
         self.hash_arena.clear_dedup();
-        self.arena.offsets.push(self.arena.data.len() as u32);
-        self.hash_arena.offsets.push(self.hash_arena.data.len() as u32);
+        self.arena.seal();
+        self.hash_arena.seal();
         Ok(CompactManifest {
             arena: self.arena,
             hash_arena: self.hash_arena,
@@ -785,7 +820,7 @@ fn checked_intern(
         value.hash(&mut hasher);
         let key = hasher.finish();
         if let Some(&index) = arena.dedup.get(&key)
-            && arena.get_with_fallback(index) == value
+            && arena.get_unsealed(index) == value
         {
             return Ok(index);
         }
@@ -1057,8 +1092,8 @@ mod tests {
         let f1 = make_file("a.pak", "shared", 0, 100, vec![]);
         let f2 = make_file("b.pak", "shared", 0, 200, vec![]);
         let cm = CompactManifest::from(vec![f1, f2]);
-        assert_eq!(cm.arena.len(), 3);
-        assert_eq!(cm.hash_arena.len(), 2);
+        assert_eq!(cm.arena.len(), 2);
+        assert_eq!(cm.hash_arena.len(), 1);
     }
 
     /// Verifies all stored fields survive Proto -> CompactManifest for 100 assets
@@ -1183,8 +1218,8 @@ mod tests {
         let mut arena = StringArena::default();
         let first = arena.try_intern("alpha").unwrap();
         let second = arena.try_intern("beta").unwrap();
-        assert_eq!(arena.get_with_fallback(first), "alpha");
-        assert_eq!(arena.get_with_fallback(second), "beta");
+        assert_eq!(arena.get_unsealed(first), "alpha");
+        assert_eq!(arena.get_unsealed(second), "beta");
         assert_eq!(arena.intern("gamma"), 2);
     }
 
@@ -1199,8 +1234,8 @@ mod tests {
         let appended = arena.intern("");
         assert_ne!(appended, first);
         assert_eq!(arena.len(), 2);
-        assert_eq!(arena.get_with_fallback(first), "");
-        assert_eq!(arena.get_with_fallback(appended), "");
+        assert_eq!(arena.get_unsealed(first), "");
+        assert_eq!(arena.get_unsealed(appended), "");
     }
 
     #[test]
@@ -1212,8 +1247,8 @@ mod tests {
         let second = arena.intern_dedup("");
         assert_ne!(first, second);
         assert_eq!(arena.len(), 2);
-        assert_eq!(arena.get_with_fallback(first), "");
-        assert_eq!(arena.get_with_fallback(second), "");
+        assert_eq!(arena.get_unsealed(first), "");
+        assert_eq!(arena.get_unsealed(second), "");
     }
 
     #[test]
@@ -1326,16 +1361,16 @@ mod tests {
         assert_eq!(cm.chunk_name_at(1), "shared");
         // The builder does not dedup chunk names; each gets a distinct arena id.
         assert_ne!(cm.chunk_name_arena_idx(0), cm.chunk_name_arena_idx(1));
-        // Arena holds 4 strings: 2 file names + 2 chunk name copies.
-        assert_eq!(cm.arena.len(), 5);
+        // 2 file names + 2 chunk name copies; `len()` excludes the sentinel.
+        assert_eq!(cm.arena.len(), 4);
     }
 
     #[test]
-    fn str_offsets_at_last_entry_uses_data_len() {
+    fn str_offsets_at_last_entry_spans_to_end_of_data() {
         use super::StringArena;
         let arena = StringArena::from(&["first", "second", "last"][..]);
         let manifest = CompactManifest::wrap_arena(arena);
-        // Last entry: end is data.len(), not a sentinel offset.
+        // Last entry ends at the sentinel offset, equal to data.len().
         let (start, len) = manifest.str_offsets_at(2);
         let arena_str = manifest.arena_str();
         assert_eq!(&arena_str[start as usize..(start + len) as usize], "last");
