@@ -2196,8 +2196,9 @@ where
     let last_apply_update = AtomicU64::new(0);
 
     let game_dir_owned = game_dir.to_path_buf();
-    let filter_cache =
-        tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned)).await?;
+    let filter_cache = Arc::new(
+        tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned)).await?,
+    );
     filter_patch_assets_for_removed_features(&filter_cache, &mut state.patch_assets);
 
     let regenerate_pkg_version = if state.game_id == "hk4e" {
@@ -2250,11 +2251,10 @@ where
                 const COPY_MAX_RETRIES: usize = 4;
                 let mut fallback_to_download = false;
                 let mut skip_progress = false;
-                let asset = Arc::new(asset.clone());
 
                 for attempt in 0..=COPY_MAX_RETRIES {
-                    let gd = game_dir.to_path_buf();
-                    let cd = chunks_dir.to_path_buf();
+                    let gd = Arc::clone(&game_dir);
+                    let cd = Arc::clone(&chunks_dir);
                     let a = Arc::clone(&asset);
                     let result =
                         tokio::task::spawn_blocking(move || apply_copy_over(&gd, &cd, a.as_ref()))
@@ -2323,7 +2323,7 @@ where
                     let gd = std::sync::Arc::clone(&game_dir);
                     let cd = std::sync::Arc::clone(&chunks_dir);
                     let a = Arc::clone(&asset);
-                    let fc = filter_cache.clone();
+                    let fc = Arc::clone(&filter_cache);
                     let result = tokio::task::spawn_blocking(move || {
                         apply_hdiff_patch(&gd, &cd, a.as_ref(), &fc)
                     })
