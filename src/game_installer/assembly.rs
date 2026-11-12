@@ -298,6 +298,9 @@ pub fn assemble_file_with_benchmark_mmap_advice(
     .map(|_| ())
 }
 
+// Cold-path: 568-line function called once per file via spawn_blocking wrappers.
+// #[inline(never)] keeps the caller compact and improves hot-path code layout.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn assemble_file_with_options(
     all_files: &CompactManifest,
