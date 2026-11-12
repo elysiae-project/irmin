@@ -3300,6 +3300,13 @@ fn bench_state_save(c: &mut Criterion) {
                     });
                 },
             );
+            group.bench_function(BenchmarkId::new("serialize_only", count), |b| {
+                b.iter(|| {
+                    let entries = snapshot_downloaded_chunks(&downloaded, &lookup);
+                    let len = irmin_rs::sophon::bench_serialize_state(&entries);
+                    criterion::black_box(len);
+                });
+            });
         }
     }
 

@@ -545,6 +545,26 @@ pub fn bench_write_state_file(target: &std::path::Path, entries: &[(&str, u64)])
     atomic_write_serialized(target, &state);
 }
 
+/// Serialize the same state as `bench_write_state_file` into memory,
+/// isolating the CPU cost of JSON encoding from file I/O.
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+pub fn bench_serialize_state(entries: &[(&str, u64)]) -> usize {
+    let state = DownloadStateRef {
+        game_id: "bench",
+        vo_lang: "en-us",
+        output_path: "bench",
+        download_type: &DownloadType::Fresh,
+        current_tag: None,
+        manifest_hash: "bench",
+        downloaded_chunks: entries,
+        completed_files: &[],
+    };
+    let mut buf = Vec::with_capacity(4 * 1024 * 1024);
+    serde_json::to_writer(&mut buf, &state).expect("serialize");
+    buf.len()
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadStateRef<'a> {
