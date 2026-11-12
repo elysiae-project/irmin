@@ -88,11 +88,10 @@ impl StringArena {
         let mut h = rustc_hash::FxHasher::default();
         s.hash(&mut h);
         let key = h.finish();
-        if let Some(&idx) = self.dedup.get(&key) {
-            // Verify match to handle (rare) hash collisions.
-            if self.get(idx) == s {
-                return idx;
-            }
+        if let Some(&idx) = self.dedup.get(&key)
+            && self.get_with_fallback(idx) == s
+        {
+            return idx;
         }
         let idx = self.intern(s);
         self.dedup.insert(key, idx);
@@ -102,8 +101,16 @@ impl StringArena {
     /// Resolve an index returned by an interning operation.
     ///
     /// Panics when `idx` is outside the arena; returned text borrows the arena.
+    /// Requires a trailing sentinel offset (pushed by `finish()` or `wrap_arena()`).
     #[inline]
     pub fn get(&self, idx: u32) -> &str {
+        let start = self.offsets[idx as usize] as usize;
+        let end = self.offsets[idx as usize + 1] as usize;
+        &self.data[start..end]
+    }
+
+    /// Fallback accessor for arenas without a trailing sentinel.
+    pub fn get_with_fallback(&self, idx: u32) -> &str {
         let start = self.offsets[idx as usize] as usize;
         let end = self
             .offsets
@@ -180,7 +187,7 @@ impl ByteArena {
         bytes.hash(&mut h);
         let key = h.finish();
         if let Some(&idx) = self.dedup.get(&key)
-            && self.get(idx) == bytes
+            && self.get_with_fallback(idx) == bytes
         {
             return idx;
         }
@@ -215,8 +222,16 @@ impl ByteArena {
     }
 
     /// Resolve an index. Panics when `idx` is out of range.
+    /// Requires a trailing sentinel offset (pushed by `finish()` or `wrap_arena()`).
     #[inline]
     pub fn get(&self, idx: u32) -> &[u8] {
+        let start = self.offsets[idx as usize] as usize;
+        let end = self.offsets[idx as usize + 1] as usize;
+        &self.data[start..end]
+    }
+
+    /// Fallback accessor for arenas without a trailing sentinel.
+    pub fn get_with_fallback(&self, idx: u32) -> &[u8] {
         let start = self.offsets[idx as usize] as usize;
         let end = self
             .offsets
@@ -386,11 +401,7 @@ impl CompactManifest {
     pub(crate) fn str_offsets_at(&self, arena_id: u32) -> (u32, u32) {
         let idx = arena_id as usize;
         let start = self.arena.offsets[idx];
-        let end = if idx + 1 < self.arena.offsets.len() {
-            self.arena.offsets[idx + 1]
-        } else {
-            self.arena.data.len() as u32
-        };
+        let end = self.arena.offsets[idx + 1];
         debug_assert!(end >= start, "arena offsets must be monotonic");
         (start, end - start)
     }
@@ -492,7 +503,8 @@ impl CompactManifest {
     /// Arena byte size for memory logging.
     /// Approximate arena storage bytes, including its u32 offsets.
     pub fn arena_bytes(&self) -> usize {
-        self.arena.byte_len() + self.arena.len() * std::mem::size_of::<u32>()
+        self.arena.byte_len()
+            + self.arena.offsets.len().saturating_sub(1) * std::mem::size_of::<u32>()
     }
 
     /// Columnar byte size for memory logging.
@@ -537,10 +549,13 @@ impl CompactManifest {
     /// Wrap a bare `StringArena` as a minimal manifest whose only populated
     /// column is the arena. Only `arena_str`/`str_offsets_at` are valid on the
     /// result; all file/chunk accessors panic on the empty columns.
-    pub(crate) fn wrap_arena(arena: StringArena) -> Self {
+    pub(crate) fn wrap_arena(mut arena: StringArena) -> Self {
+        arena.offsets.push(arena.data.len() as u32);
+        let mut hash_arena = ByteArena::default();
+        hash_arena.offsets.push(0);
         Self {
             arena,
-            hash_arena: ByteArena::default(),
+            hash_arena,
             file_name_idx: Vec::new(),
             file_hash_idx: Vec::new(),
             file_type: Vec::new(),
@@ -668,6 +683,8 @@ impl CompactManifestBuilder {
         );
         self.arena.clear_dedup();
         self.hash_arena.clear_dedup();
+        self.arena.offsets.push(self.arena.data.len() as u32);
+        self.hash_arena.offsets.push(self.hash_arena.data.len() as u32);
         Ok(CompactManifest {
             arena: self.arena,
             hash_arena: self.hash_arena,
@@ -768,7 +785,7 @@ fn checked_intern(
         value.hash(&mut hasher);
         let key = hasher.finish();
         if let Some(&index) = arena.dedup.get(&key)
-            && arena.get(index) == value
+            && arena.get_with_fallback(index) == value
         {
             return Ok(index);
         }
@@ -1040,8 +1057,8 @@ mod tests {
         let f1 = make_file("a.pak", "shared", 0, 100, vec![]);
         let f2 = make_file("b.pak", "shared", 0, 200, vec![]);
         let cm = CompactManifest::from(vec![f1, f2]);
-        assert_eq!(cm.arena.len(), 2);
-        assert_eq!(cm.hash_arena.len(), 1);
+        assert_eq!(cm.arena.len(), 3);
+        assert_eq!(cm.hash_arena.len(), 2);
     }
 
     /// Verifies all stored fields survive Proto -> CompactManifest for 100 assets
@@ -1166,8 +1183,8 @@ mod tests {
         let mut arena = StringArena::default();
         let first = arena.try_intern("alpha").unwrap();
         let second = arena.try_intern("beta").unwrap();
-        assert_eq!(arena.get(first), "alpha");
-        assert_eq!(arena.get(second), "beta");
+        assert_eq!(arena.get_with_fallback(first), "alpha");
+        assert_eq!(arena.get_with_fallback(second), "beta");
         assert_eq!(arena.intern("gamma"), 2);
     }
 
@@ -1182,8 +1199,8 @@ mod tests {
         let appended = arena.intern("");
         assert_ne!(appended, first);
         assert_eq!(arena.len(), 2);
-        assert_eq!(arena.get(first), "");
-        assert_eq!(arena.get(appended), "");
+        assert_eq!(arena.get_with_fallback(first), "");
+        assert_eq!(arena.get_with_fallback(appended), "");
     }
 
     #[test]
@@ -1195,8 +1212,8 @@ mod tests {
         let second = arena.intern_dedup("");
         assert_ne!(first, second);
         assert_eq!(arena.len(), 2);
-        assert_eq!(arena.get(first), "");
-        assert_eq!(arena.get(second), "");
+        assert_eq!(arena.get_with_fallback(first), "");
+        assert_eq!(arena.get_with_fallback(second), "");
     }
 
     #[test]
@@ -1310,7 +1327,7 @@ mod tests {
         // The builder does not dedup chunk names; each gets a distinct arena id.
         assert_ne!(cm.chunk_name_arena_idx(0), cm.chunk_name_arena_idx(1));
         // Arena holds 4 strings: 2 file names + 2 chunk name copies.
-        assert_eq!(cm.arena.len(), 4);
+        assert_eq!(cm.arena.len(), 5);
     }
 
     #[test]
