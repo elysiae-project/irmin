@@ -92,6 +92,7 @@ struct VerificationCacheSerializable {
 
 /// Load the per-install verification cache, treating missing or malformed
 /// cache files as empty and trimming oversized caches to the configured limit.
+#[inline(never)]
 pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationEntry> {
     let cache_path = game_dir.join(VERIFICATION_CACHE_FILE);
 
