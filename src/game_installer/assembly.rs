@@ -413,7 +413,6 @@ fn assemble_file_with_options(
         chunks_dir,
     };
 
-    let chunk_offsets: Vec<u64> = all_files.file_chunk_offsets(file_idx);
     // Verify total decompressed size, check chunk hashes, and detect old chunks in one pass.
     let mut total_decompressed: u64 = 0;
     let mut all_chunks_have_hashes = true;
@@ -497,6 +496,7 @@ fn assemble_file_with_options(
     };
 
     if parallelize {
+        let chunk_offsets: Vec<u64> = all_files.file_chunk_offsets(file_idx);
         let total_written_atomic = AtomicU64::new(0);
         let first_error = Mutex::new(None);
         let has_error = AtomicBool::new(false);
@@ -716,12 +716,13 @@ fn assemble_file_with_options(
         }
     } else {
         let mut chunk_path = chunks_dir.to_path_buf();
+        let mut offset: u64 = 0;
         for ci in chunk_range.start..chunk_range.end {
             let ci = ci as usize;
-            let oi = ci - chunk_range.start as usize;
-            let offset = chunk_offsets[oi];
             let chunk_old_offset = all_files.chunk_old_offset_at(ci);
             let chunk_size_decompressed = all_files.chunk_size_decompressed_at(ci);
+            let chunk_offset = offset;
+            offset += chunk_size_decompressed;
             if chunk_old_offset >= 0 {
                 let old_file = old_file
                     .as_ref()
@@ -730,7 +731,7 @@ fn assemble_file_with_options(
                     old_file,
                     &target_path,
                     &out_file,
-                    offset,
+                    chunk_offset,
                     chunk_old_offset as u64,
                     chunk_size_decompressed,
                     file_hasher.as_mut(),
@@ -758,7 +759,7 @@ fn assemble_file_with_options(
                 let bytes_written = write_decompressed_chunk_at(
                     &chunk_path,
                     &out_file,
-                    offset,
+                    chunk_offset,
                     chunk_size_decompressed,
                     file_hasher.as_mut(),
                     if skip_chunk_hash {
@@ -779,7 +780,7 @@ fn assemble_file_with_options(
             // memory low during assembly of large multi-chunk files.
             super::assembly_opt::sync_and_evict_range(
                 out_file.as_raw_fd(),
-                offset,
+                chunk_offset,
                 chunk_size_decompressed,
             );
         }
