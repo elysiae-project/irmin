@@ -509,6 +509,7 @@ fn assemble_file_with_options(
 
         let hasher_thread_handle: std::sync::OnceLock<std::thread::Thread> =
             std::sync::OnceLock::new();
+        debug_assert_eq!(chunk_offsets.len(), total_chunks);
 
         std::thread::scope(|s| {
             if parallel_hashed_file {
@@ -516,7 +517,7 @@ fn assemble_file_with_options(
                 let chunk_done = &chunk_done;
                 let chunk_offsets = &chunk_offsets[..];
                 let all_files_ref = all_files;
-                let chunk_range_start = chunk_range.start;
+                let chunk_range_start = chunk_range.start as usize;
                 let err_flag = &has_error;
                 let hasher_result = &hasher_result;
                 let ht = &hasher_thread_handle;
@@ -551,9 +552,8 @@ fn assemble_file_with_options(
                             return;
                         }
                     };
-                    for i in 0..total_chunks {
-                        let offset = chunk_offsets[i];
-                        let size = all_files_ref.chunk_size_decompressed_at(chunk_range_start as usize + i);
+                    for (i, &offset) in chunk_offsets.iter().enumerate() {
+                        let size = all_files_ref.chunk_size_decompressed_at(chunk_range_start + i);
                         loop {
                             if err_flag.load(Ordering::Relaxed) {
                                 return;
