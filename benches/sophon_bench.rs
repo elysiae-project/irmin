@@ -150,6 +150,55 @@ fn bench_io_copy(c: &mut Criterion) {
 
 const MD5_MIB: u64 = 50;
 
+/// MD5 throughput on N independent same-size messages: sequential fast_md5
+/// (per-message scalar) vs the md5-simd crate's AVX2 multi-buffer `hash_many`,
+/// one core each. Measures the ceiling of multi-buffer SIMD MD5 on this CPU.
+fn bench_md5_multibuffer(c: &mut Criterion) {
+    use md5_simd::{Md5Engine, digest as simd_digest};
+
+    const MSG_MIB: usize = 64;
+    const N_MSG: usize = 8;
+    let msgs: Vec<Vec<u8>> = (0..N_MSG)
+        .map(|i| gen_prng_data(0x5EED + i as u64, MSG_MIB * 1024 * 1024))
+        .collect();
+    let inputs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+    let total = (MSG_MIB * N_MSG) as u64 * 1024 * 1024;
+
+    let mut group = c.benchmark_group("md5_multibuffer");
+    group.throughput(Throughput::Bytes(total));
+
+    group.bench_function("sequential_x8", |b| {
+        b.iter(|| {
+            for m in &msgs {
+                let mut hasher = fast_md5::Md5::new();
+                hasher.update(m);
+                std::hint::black_box(hasher.finalize());
+            }
+        });
+    });
+
+    group.bench_function("hash_many_avx2", |b| {
+        b.iter(|| {
+            let mut engine = Md5Engine::new();
+            let mut outputs = [[0u8; 16]; N_MSG];
+            engine.hash_many(&inputs, &mut outputs);
+            std::hint::black_box(outputs);
+        });
+    });
+
+    // Correctness cross-check against fast_md5 (runs once per sample batch).
+    let mut outputs = [[0u8; 16]; N_MSG];
+    Md5Engine::new().hash_many(&inputs, &mut outputs);
+    for (i, m) in msgs.iter().enumerate() {
+        let expect = fast_md5::digest(m);
+        assert_eq!(outputs[i], expect, "lane {i} digest mismatch");
+        let _ = simd_digest; // keep import honest: also compare crate one-shot
+        assert_eq!(simd_digest(&inputs[i]), expect, "lane {i} one-shot mismatch");
+    }
+
+    group.finish();
+}
+
 fn bench_md5_resident(c: &mut Criterion) {
     const SIZE: usize = 64 * 1024 * 1024;
     let data = gen_prng_data(0x5EED, SIZE);
@@ -3029,6 +3078,7 @@ criterion_group!(
     bench_io_copy,
     bench_md5,
     bench_md5_resident,
+    bench_md5_multibuffer,
     bench_zstd_decompress,
     bench_lz4_deflate_decompress,
     bench_assembly_e2e,
