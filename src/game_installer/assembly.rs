@@ -506,15 +506,6 @@ fn assemble_file_with_options(
 
         let chunk_done: Vec<AtomicBool> =
             (0..total_chunks).map(|_| AtomicBool::new(false)).collect();
-        let chunk_infos: Vec<(u64, u64)> = (chunk_range.start..chunk_range.end)
-            .map(|ci| {
-                let i = (ci - chunk_range.start) as usize;
-                (
-                    chunk_offsets[i],
-                    all_files.chunk_size_decompressed_at(ci as usize),
-                )
-            })
-            .collect();
 
         let hasher_thread_handle: std::sync::OnceLock<std::thread::Thread> =
             std::sync::OnceLock::new();
@@ -523,7 +514,9 @@ fn assemble_file_with_options(
             if parallel_hashed_file {
                 let tmp_path = &tmp_path;
                 let chunk_done = &chunk_done;
-                let chunk_infos = &chunk_infos;
+                let chunk_offsets = &chunk_offsets[..];
+                let all_files_ref = all_files;
+                let chunk_range_start = chunk_range.start;
                 let err_flag = &has_error;
                 let hasher_result = &hasher_result;
                 let ht = &hasher_thread_handle;
@@ -558,7 +551,9 @@ fn assemble_file_with_options(
                             return;
                         }
                     };
-                    for (i, &(offset, size)) in chunk_infos.iter().enumerate() {
+                    for i in 0..total_chunks {
+                        let offset = chunk_offsets[i];
+                        let size = all_files_ref.chunk_size_decompressed_at(chunk_range_start as usize + i);
                         loop {
                             if err_flag.load(Ordering::Relaxed) {
                                 return;
