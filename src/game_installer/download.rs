@@ -178,7 +178,6 @@ pub mod benchmark {
         expected_size: u64,
         expected_md5: &str,
     ) -> Result<(), super::SophonError> {
-        use std::path::Path;
         let resp = client.get(url).send().await?.error_for_status()?;
         let file = super::create_preallocated_file(dest, expected_size).await?;
         let mut writer = super::EvictingWriter::new(file);
@@ -186,6 +185,8 @@ pub mod benchmark {
             super::super::assembly_opt::take_md5()?
         ));
         let mut xxh = None;
+        let hash_bytes = super::super::assembly_opt::hex_to_bytes(expected_md5)
+            .unwrap_or_default();
         super::stream_and_verify(
             &mut writer,
             resp,
@@ -194,7 +195,7 @@ pub mod benchmark {
             expected_size,
             0,
             "bench",
-            expected_md5,
+            &hash_bytes,
             dest,
             None,
         )
