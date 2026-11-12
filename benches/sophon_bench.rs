@@ -153,6 +153,8 @@ const MD5_MIB: u64 = 50;
 /// MD5 throughput on N independent same-size messages: sequential fast_md5
 /// (per-message scalar) vs the md5-simd crate's AVX2 multi-buffer `hash_many`,
 /// one core each. Measures the ceiling of multi-buffer SIMD MD5 on this CPU.
+/// Gated on `bench-internals` because the md5-simd dependency is optional.
+#[cfg(feature = "bench-internals")]
 fn bench_md5_multibuffer(c: &mut Criterion) {
     use md5_simd::{Md5Engine, digest as simd_digest};
 
@@ -2989,6 +2991,20 @@ fn bench_file_md5_buffer_capacity_optional(c: &mut Criterion) {
     let _ = c;
 }
 
+fn bench_md5_multibuffer_optional(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    bench_md5_multibuffer(c);
+    #[cfg(not(feature = "bench-internals"))]
+    let _ = c;
+}
+
+fn bench_phase2a_chunk_verify_optional(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    bench_phase2a_chunk_verify(c);
+    #[cfg(not(feature = "bench-internals"))]
+    let _ = c;
+}
+
 fn bench_file_metadata_cost_optional(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
     bench_file_metadata_cost(c);
@@ -3078,7 +3094,8 @@ criterion_group!(
     bench_io_copy,
     bench_md5,
     bench_md5_resident,
-    bench_md5_multibuffer,
+    bench_md5_multibuffer_optional,
+    bench_phase2a_chunk_verify_optional,
     bench_zstd_decompress,
     bench_lz4_deflate_decompress,
     bench_assembly_e2e,
@@ -3465,6 +3482,64 @@ fn bench_load_download_state(c: &mut Criterion) {
         );
         group.finish();
     }
+}
+
+/// Repair-sweep chunk verification: unique chunks re-verified before
+/// re-download. Baseline is the old serial scalar loop (cache miss per
+/// chunk, one fast_md5 stream); candidate is the SIMD multi-buffer batch
+/// (8 mmap lanes per dispatch through md5-simd's AVX2 kernel).
+/// Gated on `bench-internals` because the md5-simd dependency is optional.
+#[cfg(feature = "bench-internals")]
+fn bench_phase2a_chunk_verify(c: &mut Criterion) {
+    const CHUNK_MIB: usize = 8;
+    const NUM_CHUNKS: usize = 64;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut items = Vec::with_capacity(NUM_CHUNKS);
+    let mut files = Vec::with_capacity(NUM_CHUNKS);
+    for i in 0..NUM_CHUNKS {
+        let raw = gen_prng_data(0xA11CE + i as u64, CHUNK_MIB * 1024 * 1024);
+        let comp = zstd::encode_all(&raw[..], 3).unwrap();
+        let path = dir.path().join(format!("chunk_{i:04}.zstd"));
+        fs::write(&path, &comp).unwrap();
+        items.push((path, fast_md5::digest(&comp)));
+        files.push(comp);
+    }
+    let total: u64 = files.iter().map(|c| c.len() as u64).sum();
+
+    let mut group = c.benchmark_group("phase2a_chunk_verify");
+    group.throughput(Throughput::Bytes(total));
+
+    group.bench_function("scalar_serial", |b| {
+        b.iter(|| {
+            // Old production path: per-chunk buffered scalar hash. Page-cache
+            // advice disabled to isolate CPU hashing cost from eviction
+            // policy (the SIMD path does not evict either).
+            #[cfg(feature = "bench-internals")]
+            {
+                for (path, expected) in &items {
+                    let actual = irmin_rs::game_installer::cache::benchmark::file_md5_digest_with_options(path, 256 * 1024, false).unwrap();
+                    criterion::black_box(actual == *expected);
+                }
+            }
+            #[cfg(not(feature = "bench-internals"))]
+            {
+                for (path, expected) in &items {
+                    let actual = irmin_rs::game_installer::cache::file_md5_digest(path).unwrap();
+                    criterion::black_box(actual == *expected);
+                }
+            }
+        });
+    });
+
+    group.bench_function("simd_batched", |b| {
+        b.iter(|| {
+            let results =
+                irmin_rs::game_installer::md5_multibuffer::verify_md5_batch(&items).unwrap();
+            criterion::black_box(results);
+        });
+    });
+
+    group.finish();
 }
 
 fn bench_verify_file_hash(c: &mut Criterion) {

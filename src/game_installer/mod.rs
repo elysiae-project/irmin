@@ -38,6 +38,12 @@ mod hdiffpatch;
 pub mod installer;
 /// Output-file preallocation and shared file-handle management.
 pub mod output_allocator;
+/// SIMD multi-buffer MD5 verification for batches of independent files.
+/// Gated on `bench-internals`: the md5-simd dependency is optional; the
+/// module carries the differential tests and benchmarks for the SIMD
+/// batch-verifier experiments pending a CPU-bound consumer.
+#[cfg(feature = "bench-internals")]
+pub mod md5_multibuffer;
 mod plugin_api;
 mod plugin_install;
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
