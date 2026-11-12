@@ -1050,6 +1050,14 @@ fn decompress_chunk_with_window(
     Ok(bytes_written)
 }
 
+/// Production oneshot decompress path for benchmarks: pread compressed chunk,
+/// mmap output at offset, one-shot decode, flush and evict.
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+pub mod bench_internals {
+    pub use super::decompress_chunk_optimized;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

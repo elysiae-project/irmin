@@ -1178,8 +1178,68 @@ const ONESHOT_MIB: u64 = 8;
 /// One-shot zstd decompression (mmap input + single ZSTD_decompressDCtx) vs
 /// streaming decompression (BufReader + Decoder). The one-shot path is what
 /// `decompress_chunk_oneshot` uses for chunks <= 8 MiB.
-fn bench_zstd_oneshot(c: &mut Criterion) {
+/// Production oneshot chunk-decompression path: per-chunk open + pread +
+/// output mmap + madvise + one-shot decode + sync_file_range + DONTNEED +
+/// munmap. This is what assembly workers execute per downloaded chunk;
+/// unlike zstd_oneshot, it includes all syscall and page-cache costs.
+fn bench_chunk_decompress_production(c: &mut Criterion) {
+    use irmin_rs::game_installer::assembly_opt::bench_internals::decompress_chunk_optimized;
+
+    const CHUNK_MIB: usize = 8;
+    const NUM_CHUNKS: usize = 8;
+
     let dir = tempfile::tempdir().expect("tempdir");
+    let chunks_dir = dir.path().join("chunks");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    let out_path = dir.path().join("out.bin");
+
+    let mut chunk_paths = Vec::with_capacity(NUM_CHUNKS);
+    for i in 0..NUM_CHUNKS {
+        let raw = gen_prng_data(0xBEEF + i as u64, CHUNK_MIB * 1024 * 1024);
+        let comp = zstd::encode_all(&raw[..], 3).unwrap();
+        let p = chunks_dir.join(format!("c{i}.zstd"));
+        fs::write(&p, &comp).unwrap();
+        chunk_paths.push(p);
+    }
+
+    let out_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(true)
+        .open(&out_path)
+        .unwrap();
+    out_file
+        .set_len((CHUNK_MIB * 1024 * 1024 * NUM_CHUNKS) as u64)
+        .unwrap();
+
+    let bytes = (CHUNK_MIB * NUM_CHUNKS) as u64 * 1024 * 1024;
+    let mut group = c.benchmark_group("chunk_decompress_production");
+    group.throughput(Throughput::Bytes(bytes));
+    group.bench_function(BenchmarkId::from_parameter(NUM_CHUNKS), |b| {
+        b.iter(|| {
+            let mut hasher = irmin_rs::game_installer::assembly_opt::Md5::new().unwrap();
+            for (i, path) in chunk_paths.iter().enumerate() {
+                let offset = (i * CHUNK_MIB * 1024 * 1024) as u64;
+                let written = decompress_chunk_optimized(
+                    path,
+                    &out_file,
+                    offset,
+                    (CHUNK_MIB * 1024 * 1024) as u64,
+                    Some(&mut hasher),
+                    b"",
+                )
+                .expect("decompress");
+                assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
+            }
+            let digest = hasher.finish().unwrap();
+            criterion::black_box(digest);
+        });
+    });
+    group.finish();
+}
+
+fn bench_zstd_oneshot(c: &mut Criterion) {    let dir = tempfile::tempdir().expect("tempdir");
     let raw = gen_prng_data(0xCAFE, ONESHOT_MIB as usize * 1024 * 1024);
     let comp = zstd::encode_all(&raw[..], 3).unwrap();
     let comp_path = dir.path().join("oneshot.zst");
@@ -2977,6 +3037,7 @@ criterion_group!(
     bench_verify_file_md5,
     bench_xxh64,
     bench_zstd_oneshot,
+    bench_chunk_decompress_production,
     bench_compact_manifest_build,
     bench_chunk_accessors,
     bench_chunk_lookup,
