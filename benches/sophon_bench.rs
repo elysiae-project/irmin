@@ -3444,6 +3444,99 @@ fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
 }
 
 #[cfg(feature = "bench-internals")]
+fn bench_preinstall_save_offload(c: &mut Criterion) {
+    use irmin_rs::game_installer::installer::{SaveSlot, StateSaver};
+    use irmin_rs::game_installer::preinstall::bench_internals::{ChunkSizes, save_state_snapshot};
+    use irmin_rs::game_installer::preinstall::PatchChunkInfo;
+    use irmin_rs::sophon::bench_write_state_file;
+
+    // 50k entries keeps blocking-pool background work bounded while the
+    // inline-vs-handoff gap stays orders of magnitude wide.
+    const COUNT: usize = 50_000;
+    let unique_chunks: std::sync::Arc<[PatchChunkInfo]> = (0..COUNT)
+        .map(|i| PatchChunkInfo {
+            patch_name: format!("patch-chunk-{i:08}.bin"),
+            patch_size: 256 * 1024,
+            patch_md5: String::new(),
+            matching_field: String::new(),
+        })
+        .collect();
+    let sizes = ChunkSizes::new(COUNT);
+    for i in 0..COUNT {
+        sizes.mark(i, 256 * 1024);
+    }
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_file = state_dir.path().join("state.json");
+    let saver: StateSaver = {
+        let state_file = state_file.clone();
+        Arc::new(move |entries: &[(&str, u64)]| {
+            bench_write_state_file(&state_file, entries);
+        })
+    };
+
+    let mut group = c.benchmark_group("preinstall_save_offload");
+    group.throughput(Throughput::Elements(COUNT as u64));
+
+    // Legacy shape: the async caller runs the full serialize-and-rename
+    // itself, so the worker thread is blocked for the entire save.
+    group.bench_function("legacy_inline", |b| {
+        b.iter(|| {
+            save_state_snapshot(&sizes, &unique_chunks, &saver);
+        })
+    });
+
+    // New shape: the caller only hands the save to the blocking pool.
+    // The handle is drained outside the timed region so the pool is
+    // quiescent for every iteration and the measurement is the pure
+    // async-side handoff (lock + spawn), not the save itself. This is a
+    // stall-removal metric (async-side cost per save), not total save
+    // throughput; the runtime is built once per sample, outside the
+    // timed region.
+    group.bench_function("offloaded_handoff", |b| {
+        b.iter_custom(|iters| {
+            // trigger() calls spawn_blocking, which needs a runtime
+            // context; criterion's thread has none. A dedicated
+            // current-thread runtime drives the handoff and the drain.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("bench runtime");
+            runtime.block_on(async {
+                let slot = SaveSlot::new();
+                // The save is read-only over the sizes, so one populated
+                // payload serves every iteration; triggers hand off a clone.
+                let payload = std::sync::Arc::new(ChunkSizes::new(COUNT));
+                for i in 0..COUNT {
+                    payload.mark(i, 256 * 1024);
+                }
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let sizes = std::sync::Arc::clone(&payload);
+                    let chunks = std::sync::Arc::clone(&unique_chunks);
+                    let saver = Arc::clone(&saver);
+                    let start = std::time::Instant::now();
+                    slot.trigger(move || {
+                        save_state_snapshot(&sizes, &chunks, &saver);
+                    });
+                    total += start.elapsed();
+                    // Untimed: quiesce the pool so the next timed handoff
+                    // measures a real spawn, not a coalescing skip.
+                    slot.drain().await;
+                }
+                total
+            })
+        })
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "bench-internals"))]
+fn bench_preinstall_save_offload(c: &mut Criterion) {
+    let _ = c;
+}
+
+#[cfg(feature = "bench-internals")]
 fn bench_update_diff_sizes(c: &mut Criterion) {
     use bytes::Bytes;
     use irmin_rs::game_installer::update::benchmark;
@@ -3564,6 +3657,7 @@ criterion_group!(
     bench_load_download_state,
     bench_planner_attribution,
     bench_preinstall_chunk_tracking,
+    bench_preinstall_save_offload,
 );
 criterion_main!(benches);
 

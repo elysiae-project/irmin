@@ -1241,6 +1241,7 @@ struct PreinstallWorkerCtx {
     total_bytes: u64,
     chunk_sizes: Arc<ChunkSizes>,
     unique_chunks: Arc<[PatchChunkInfo]>,
+    save_slot: Arc<super::installer::SaveSlot>,
     state_saver: super::installer::StateSaver,
     chunks_since_save: Arc<AtomicUsize>,
 }
@@ -1320,7 +1321,12 @@ async fn process_preinstall_chunk(
 
     let save_count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if save_count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL as usize) {
-        save_state_snapshot(&ctx.chunk_sizes, &ctx.unique_chunks, &ctx.state_saver);
+        let sizes = Arc::clone(&ctx.chunk_sizes);
+        let chunks = Arc::clone(&ctx.unique_chunks);
+        let saver = Arc::clone(&ctx.state_saver);
+        ctx.save_slot.trigger(move || {
+            save_state_snapshot(&sizes, &chunks, &saver);
+        });
     }
 
     Ok(())
@@ -1486,6 +1492,7 @@ pub async fn preinstall_download(
     });
 
     let chunks_since_save = Arc::new(AtomicUsize::new(0usize));
+    let save_slot = Arc::new(super::installer::SaveSlot::new());
 
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
@@ -1597,6 +1604,7 @@ pub async fn preinstall_download(
             total_bytes,
             chunk_sizes: Arc::clone(&chunk_sizes),
             unique_chunks: Arc::clone(&unique_chunks),
+            save_slot: Arc::clone(&save_slot),
             state_saver: Arc::clone(&state_saver),
             chunks_since_save: Arc::clone(&chunks_since_save),
         };
@@ -1731,6 +1739,11 @@ pub async fn preinstall_download(
                 .get_or_insert(SophonError::JoinError(err));
         }
     }
+
+    // Workers are joined, so no further periodic triggers can occur. One
+    // drain here covers every exit path and guarantees no state write
+    // outlives this call; the terminal snapshot below is ordered after it.
+    save_slot.drain().await;
 
     super::reclaim_memory();
 

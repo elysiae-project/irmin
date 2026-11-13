@@ -155,6 +155,66 @@ type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 /// Thread-safe callback receiving the current downloaded-chunk size map for persistence.
 pub type StateSaver = Arc<dyn Fn(&[(&str, u64)]) + Send + Sync>;
 
+/// Coalescing single-flight slot for background state saves.
+///
+/// A trigger while the previous save is still running is skipped: saved
+/// state is cumulative, so the next trigger (or the terminal save) persists
+/// everything a skipped save would have. A skipped boundary extends the
+/// worst-case staleness to two save intervals instead of one. Running
+/// saves execute on the blocking pool so an async worker never performs
+/// the blocking serialize-and-rename itself.
+#[derive(Default)]
+pub struct SaveSlot {
+    in_flight: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl SaveSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Spawn `save` on the blocking pool unless one is already running.
+    /// Does not await or block on the save; the snapshot must be built
+    /// inside `save` from live shared state so a save delayed behind the
+    /// blocking pool still captures current progress. Must be called
+    /// within a Tokio runtime (spawn_blocking panics outside one).
+    pub fn trigger<F>(&self, save: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        // Only an Option swap happens under the lock, so recovering from
+        // poisoning is safe.
+        let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        if let Some(prev) = guard.take() {
+            debug_assert!(prev.is_finished(), "unfinished handle took the early return");
+            // Surface a panic from the finished save rather than dropping
+            // its JoinError.
+            if let Some(Err(err)) = futures_util::future::FutureExt::now_or_never(prev) {
+                log::warn!("state save task failed: {err}");
+            }
+        }
+        *guard = Some(tokio::task::spawn_blocking(save));
+    }
+
+    /// Wait for the in-flight save, if any. Call at the terminal barrier
+    /// before the final save so an older snapshot cannot be the last write.
+    pub async fn drain(&self) {
+        let handle = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(handle) = handle
+            && let Err(err) = handle.await
+        {
+            log::warn!("state save task failed: {err}");
+        }
+    }
+}
+
 /// Previously persisted data used to reuse valid chunks and completed files.
 pub struct ResumeContext {
     pub prev_manifest_hash: String,
@@ -4935,6 +4995,5 @@ mod bench_legacy_tests {
 #[cfg(feature = "benchmark")]
 pub mod bench_internals {
     pub use super::bench_legacy::{legacy_plan_counts, positional_plan_counts};
-    pub use super::ChunkNameLookup;
-    pub use super::snapshot_downloaded_chunks;
+    pub use super::{snapshot_downloaded_chunks, ChunkNameLookup, SaveSlot};
 }

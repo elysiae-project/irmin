@@ -2325,3 +2325,83 @@ async fn save_assembly_state_gates_on_completion_interval() {
         "two interval saves plus the terminal save must be recorded"
     );
 }
+
+#[tokio::test]
+async fn save_slot_runs_save_on_the_blocking_pool_and_drains() {
+    let slot = SaveSlot::new();
+    let caller = std::thread::current().id();
+    let save_thread = Arc::new(std::sync::Mutex::new(None));
+    let recorded = Arc::clone(&save_thread);
+    slot.trigger(move || {
+        *recorded.lock().unwrap() = Some(std::thread::current().id());
+    });
+    slot.drain().await;
+    let save_thread = save_thread.lock().unwrap().take();
+    // The caller (a runtime worker) must never run the blocking save itself.
+    assert_ne!(save_thread.expect("save must have run"), caller);
+}
+
+#[tokio::test]
+async fn save_slot_coalesces_triggers_while_a_save_is_in_flight() {
+    let slot = SaveSlot::new();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let calls_in_save = Arc::clone(&calls);
+    slot.trigger(move || {
+        calls_in_save.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        started_tx.send(()).unwrap();
+        // Park the in-flight save so the skip window is deterministic.
+        release_rx.recv().unwrap();
+        calls_in_save.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    started_rx.recv().unwrap();
+
+    // A second trigger while the first is parked must be skipped entirely.
+    slot.trigger(|| panic!("skipped trigger must never run"));
+    assert!(started_rx.try_recv().is_err());
+
+    release_tx.send(()).unwrap();
+    slot.drain().await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "exactly one save ran: one start and one completion marker"
+    );
+
+    // With the slot idle again the next trigger is accepted.
+    let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorded_accept = Arc::clone(&accepted);
+    slot.trigger(move || {
+        recorded_accept.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    slot.drain().await;
+    assert!(accepted.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn save_slot_drain_returns_after_the_in_flight_save_completes() {
+    let slot = SaveSlot::new();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    slot.trigger(move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    started_rx.recv().unwrap();
+
+    // Drain blocks (asynchronously) until the parked save finishes; only then
+    // may the terminal save order itself after this one.
+    let drain = tokio::time::timeout(std::time::Duration::from_secs(10), slot.drain());
+    tokio::task::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release_tx.send(()).unwrap();
+    });
+    drain.await.expect("drain must complete once released");
+
+    // A second drain with nothing in flight returns immediately.
+    tokio::time::timeout(std::time::Duration::from_secs(10), slot.drain())
+        .await
+        .expect("idle drain must complete");
+}
