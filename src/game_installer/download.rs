@@ -1288,14 +1288,14 @@ mod tests {
                 expected_md5.update(&pattern[..count]);
                 expected_xxh64.update(&pattern[..count]);
             }
-            let md5 = md5_to_hex(&expected_md5.finalize());
-            let xxh64 = format!("{:016x}", expected_xxh64.digest());
+            let md5_raw = expected_md5.finalize();
+            let xxh64_raw = expected_xxh64.digest().to_be_bytes();
             let dir = tempfile::tempdir().unwrap();
             let dest = dir.path().join("payload");
 
             for (algorithm, expected_hash) in [
-                (DownloadHashAlgorithm::Md5, md5.as_str()),
-                (DownloadHashAlgorithm::Xxh64, xxh64.as_str()),
+                (DownloadHashAlgorithm::Md5, md5_raw.as_slice()),
+                (DownloadHashAlgorithm::Xxh64, xxh64_raw.as_slice()),
             ] {
                 let url = format!("http://{address}/payload");
                 let response = Client::new()
@@ -1345,8 +1345,8 @@ mod tests {
                     output_md5.update(&output_block[..count]);
                     output_xxh64.update(&output_block[..count]);
                 }
-                assert_eq!(md5_to_hex(&output_md5.finalize()), md5);
-                assert_eq!(format!("{:016x}", output_xxh64.digest()), xxh64);
+                assert_eq!(output_md5.finalize(), md5_raw);
+                assert_eq!(output_xxh64.digest(), u64::from_be_bytes(xxh64_raw));
                 assert_eq!(timings.bytes, size as u64);
                 assert!(timings.stream_chunks > 0);
                 assert_eq!(timings.hash_algorithm, algorithm);

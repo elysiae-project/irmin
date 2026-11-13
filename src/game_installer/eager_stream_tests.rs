@@ -368,7 +368,7 @@ fn benchmark_compressed_buffer_retention() {
                     0,
                     decoded_size,
                     None,
-                    &hex::encode(expected_hash),
+                    &expected_hash,
                     false,
                 )
                 .unwrap();
@@ -806,21 +806,21 @@ async fn benchmark_eager_loopback_inner() {
     let assets = (0..concurrency)
         .map(|index| {
             let chunk = SophonManifestAssetChunk {
-                chunk_name: format!("chunk-{index}"),
-                chunk_decompressed_hash_md5: decompressed_hash.clone(),
+                chunk_name: format!("chunk-{index}").into(),
+                chunk_decompressed_hash_md5: decompressed_hash.clone().into(),
                 chunk_on_file_offset: 0,
                 chunk_size: compressed.len() as u64,
                 chunk_size_decompressed: (size_mib * 1024 * 1024) as u64,
                 chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: compressed_hash.clone(),
+                chunk_compressed_hash_md5: compressed_hash.clone().into(),
                 chunk_old_offset: -1,
             };
             SophonManifestAssetProperty {
-                asset_name: format!("chunk-{index}.bin"),
+                asset_name: format!("chunk-{index}.bin").into(),
                 asset_chunks: vec![chunk],
                 asset_type: 0,
                 asset_size: (size_mib * 1024 * 1024) as u64,
-                asset_hash_md5: decompressed_hash.clone(),
+                asset_hash_md5: decompressed_hash.clone().into(),
             }
         })
         .collect::<Vec<_>>();
@@ -1188,20 +1188,20 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
     );
     let assets = (0..item_count)
         .map(|index| SophonManifestAssetProperty {
-            asset_name: format!("fixed-{index}.bin"),
+            asset_name: format!("fixed-{index}.bin").into(),
             asset_chunks: vec![SophonManifestAssetChunk {
-                chunk_name: format!("chunk-{index}"),
-                chunk_decompressed_hash_md5: decompressed_hash.clone(),
+                chunk_name: format!("chunk-{index}").into(),
+                chunk_decompressed_hash_md5: decompressed_hash.clone().into(),
                 chunk_on_file_offset: 0,
                 chunk_size: compressed.len() as u64,
                 chunk_size_decompressed: (size_mib * 1024 * 1024) as u64,
                 chunk_compressed_hash_xxh: 0,
-                chunk_compressed_hash_md5: compressed_hash.clone(),
+                chunk_compressed_hash_md5: compressed_hash.clone().into(),
                 chunk_old_offset: -1,
             }],
             asset_type: 0,
             asset_size: (size_mib * 1024 * 1024) as u64,
-            asset_hash_md5: decompressed_hash.clone(),
+            asset_hash_md5: decompressed_hash.clone().into(),
         })
         .collect::<Vec<_>>();
     let manifest = Arc::new(CompactManifest::from(assets));
@@ -1473,6 +1473,48 @@ fn stream_decompressor_rejects_decompressed_hash_mismatch() {
 
 #[cfg(feature = "bench-diagnostics")]
 #[test]
+fn eager_stream_timing_counters_record_real_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0usize..256 * 1024)
+        .map(|index| (index.wrapping_mul(29) >> 5) as u8)
+        .collect();
+    let compressed = zstd::encode_all(data.as_slice(), 3).unwrap();
+    let decompressed_hash = fast_md5::digest(&data);
+
+    let timings = Arc::new(super::super::eager_decompress::EagerStreamPhaseTimings::default());
+    let output = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("timed-output.bin"))
+        .unwrap();
+    output.set_len(data.len() as u64).unwrap();
+    super::super::eager_decompress::stream_decompress_to_file_with_timings(
+        std::io::Cursor::new(&compressed),
+        &output,
+        0,
+        data.len() as u64,
+        &decompressed_hash,
+        Arc::clone(&timings),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(dir.path().join("timed-output.bin")).unwrap(), data);
+
+    // The decoder-phase counters must observe the stream: they used to be
+    // threaded through but never recorded, so every diagnostic print was
+    // silently zero.
+    assert!(timings.decoder_read_count.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        timings.decoder_read_bytes.load(Ordering::Relaxed),
+        data.len() as u64
+    );
+    assert!(timings.decoder_read_ns.load(Ordering::Relaxed) > 0);
+    assert!(timings.output_hash_ns.load(Ordering::Relaxed) > 0);
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
 fn eager_decompress_prefault_and_demand_paths_match() {
     let dir = tempfile::tempdir().unwrap();
     let data = (0usize..256 * 1024)
@@ -1499,8 +1541,8 @@ fn eager_decompress_prefault_and_demand_paths_match() {
                 &output,
                 0,
                 data.len() as u64,
-                &compressed_hash,
-                &decompressed_hash,
+                &hex::decode(&compressed_hash).unwrap(),
+                &hex::decode(&decompressed_hash).unwrap(),
             )
         } else {
             super::super::eager_decompress::benchmark_eager_decompress_chunk_without_prefault(
@@ -1508,8 +1550,8 @@ fn eager_decompress_prefault_and_demand_paths_match() {
                 &output,
                 0,
                 data.len() as u64,
-                &compressed_hash,
-                &decompressed_hash,
+                &hex::decode(&compressed_hash).unwrap(),
+                &hex::decode(&decompressed_hash).unwrap(),
             )
         }
         .unwrap();
@@ -1535,8 +1577,8 @@ fn eager_decompress_prefault_and_demand_paths_match() {
                 &bad_output,
                 0,
                 data.len() as u64,
-                "",
-                "",
+                b"",
+                b"",
             )
         } else {
             super::super::eager_decompress::benchmark_eager_decompress_chunk_without_prefault(
@@ -1544,8 +1586,8 @@ fn eager_decompress_prefault_and_demand_paths_match() {
                 &bad_output,
                 0,
                 data.len() as u64,
-                "",
-                "",
+                b"",
+                b"",
             )
         };
         assert!(matches!(result, Err(SophonError::Io(_))));
@@ -1611,8 +1653,8 @@ fn benchmark_eager_decompression_rss() {
         _ => panic!("IRMIN_EAGER_BENCH_PATTERN must be random, low-alphabet, or repeated"),
     };
     let compressed = zstd::encode_all(data.as_slice(), 3).unwrap();
-    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
-    let decompressed_hash = hex::encode(fast_md5::digest(&data));
+    let compressed_hash = fast_md5::digest(&compressed).to_vec();
+    let decompressed_hash = fast_md5::digest(&data).to_vec();
     drop(data);
     let dir = match std::env::var_os("IRMIN_EAGER_BENCH_TEMP_DIR") {
         Some(path) => tempfile::tempdir_in(path).unwrap(),

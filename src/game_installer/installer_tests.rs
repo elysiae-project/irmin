@@ -198,11 +198,11 @@ fn benchmark_downloaded_chunk_snapshot_capacity() {
     let map = match strategy.as_str() {
         "production" => snapshot_downloaded_chunks(&values, &lookup),
         "empty" => {
-            let mut map = HashMap::new();
+            let mut map = Vec::new();
             for (index, value) in values.iter().enumerate() {
                 let value = value.load(Ordering::Relaxed);
                 if value > 0 {
-                    map.insert(lookup.get(index).to_owned(), value as u64);
+                    map.push((lookup.get(index), value as u64));
                 }
             }
             map
@@ -212,11 +212,11 @@ fn benchmark_downloaded_chunk_snapshot_capacity() {
                 .iter()
                 .filter(|value| value.load(Ordering::Relaxed) > 0)
                 .count();
-            let mut map = HashMap::with_capacity(count);
+            let mut map = Vec::with_capacity(count);
             for (index, value) in values.iter().enumerate() {
                 let value = value.load(Ordering::Relaxed);
                 if value > 0 {
-                    map.insert(lookup.get(index).to_owned(), value as u64);
+                    map.push((lookup.get(index), value as u64));
                 }
             }
             map
@@ -1296,7 +1296,7 @@ async fn benchmark_resume_chunk_check_dispatch() {
                 name,
                 VerificationEntry {
                     size: data.len() as u64,
-                    md5: { let mut m = [0u8; 16]; if md5.len() == 16 { m.copy_from_slice(&md5); } m },
+                    md5: { let mut m = [0u8; 16]; let raw = hex::decode(&md5).unwrap(); if raw.len() == 16 { m.copy_from_slice(&raw); } m },
                     mtime_secs,
                 },
             );
@@ -1307,7 +1307,7 @@ async fn benchmark_resume_chunk_check_dispatch() {
             &md5,
             (index * data.len()) as u64,
         );
-        chunk.chunk_compressed_hash_md5 = md5.clone();
+        chunk.chunk_compressed_hash_md5 = md5.clone().into();
         chunks.push(chunk);
     }
     let manifest = Arc::new(CompactManifest::from(vec![make_file(

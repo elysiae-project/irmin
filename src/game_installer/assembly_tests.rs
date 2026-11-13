@@ -66,7 +66,9 @@ fn benchmark_download_over_assembly_hash_strategy() {
         make_chunk_file(&chunks_dir, &name, &data);
         full_hasher.update(&data);
         let mut chunk = make_chunk(&name, (index * chunk_size) as u64, chunk_size as u64);
-        chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(&data));
+        // Manifest hash fields are hex strings; CompactManifest::from
+        // hex-decodes them into the raw digests it compares.
+        chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(&data)).into();
         names.push(name);
         chunks.push(chunk);
     }
@@ -77,7 +79,7 @@ fn benchmark_download_over_assembly_hash_strategy() {
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: total_size as u64,
-        asset_hash_md5: file_hash.clone(),
+        asset_hash_md5: file_hash.clone().into(),
     };
     let manifest = CompactManifest::from(vec![file.clone()]);
     let lookup = ChunkNameLookup::from_arena(StringArena::with_capacity(0, 0));
@@ -217,17 +219,19 @@ fn benchmark_repair_post_assembly_hash_reread() {
         make_chunk_file(&chunks_dir, &name, &data);
         file_hasher.update(&data);
         let mut chunk = make_chunk(&name, start as u64, len as u64);
-        chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(&data));
+        // Manifest hash fields are hex strings; CompactManifest::from
+        // hex-decodes them into the raw digests it compares.
+        chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(&data)).into();
         names.push(name);
         chunks.push(chunk);
     }
-    let expected_hash = hex::encode(file_hasher.finalize());
+    let expected_hash = file_hasher.finalize();
     let file = SophonManifestAssetProperty {
         asset_name: bytes::Bytes::from("repair-asset.bin"),
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: total_bytes as u64,
-        asset_hash_md5: expected_hash.clone().into(),
+        asset_hash_md5: hex::encode(expected_hash).into(),
     };
     let manifest = CompactManifest::from(vec![file]);
     let lookup = ChunkNameLookup::from_arena(StringArena::from(
@@ -300,7 +304,7 @@ fn benchmark_repair_post_assembly_hash_reread() {
         assembly_times.push(assembly_elapsed);
         reread_times.push(reread_elapsed);
         assert_eq!(
-            hex::encode(super::super::cache::file_md5_digest(&target).unwrap()),
+            super::super::cache::file_md5_digest(&target).unwrap(),
             expected_hash
         );
         let expected_mtime = target
@@ -314,7 +318,7 @@ fn benchmark_repair_post_assembly_hash_reread() {
         {
             let entry = verify_cache.get(path_key).unwrap();
             assert_eq!(entry.value().size, total_bytes as u64);
-            assert_eq!(entry.value().md5.as_slice(), expected_hash);
+            assert_eq!(entry.value().md5, expected_hash);
             assert_eq!(entry.value().mtime_secs, expected_mtime);
         }
         verify_cache.remove(path_key);
@@ -390,7 +394,10 @@ fn benchmark_cached_assembly_target_checks() {
     fs::create_dir_all(&game_dir).unwrap();
     fs::create_dir_all(&chunks_dir).unwrap();
     fs::create_dir_all(&temp_dir).unwrap();
-    let empty_hash = hex::encode(fast_md5::digest(b""));
+    // Manifest hash fields hold hex strings (see asset_hash_md5_str); the
+    // raw digest is only needed for cache entries, which compare bytes.
+    let empty_hash = fast_md5::digest(b"");
+    let empty_hash_hex = hex::encode(empty_hash);
     let mut assets = Vec::with_capacity(file_count);
     let cache = DashMap::new();
     for index in 0..file_count {
@@ -409,16 +416,16 @@ fn benchmark_cached_assembly_target_checks() {
             name.clone(),
             super::super::cache::VerificationEntry {
                 size: 0,
-                md5: { let mut m = [0u8; 16]; if empty_hash.len() == 16 { m.copy_from_slice(&empty_hash); } m },
+                md5: empty_hash,
                 mtime_secs,
             },
         );
         assets.push(SophonManifestAssetProperty {
-            asset_name: name,
+            asset_name: name.into(),
             asset_chunks: Vec::new(),
             asset_type: 0,
             asset_size: 0,
-            asset_hash_md5: empty_hash.clone(),
+            asset_hash_md5: empty_hash_hex.clone().into(),
         });
     }
     let manifest = CompactManifest::from(assets);

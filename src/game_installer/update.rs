@@ -818,7 +818,7 @@ mod tests {
             old_chunks: &rustc_hash::FxHashSet<&str>,
             manifests: &[crate::proto_parse::SophonManifestProto],
         ) -> ((u64, u64), usize) {
-            let mut owned = rustc_hash::FxHashSet::<String>::default();
+            let mut owned = rustc_hash::FxHashSet::<bytes::Bytes>::default();
             let mut compressed = 0u64;
             let mut decompressed = 0u64;
             for new in manifests {

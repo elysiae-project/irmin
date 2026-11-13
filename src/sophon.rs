@@ -800,6 +800,14 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.as_str(), *v))
                 .collect();
+            let owned_chunks: std::collections::HashMap<String, u64> = chunk_refs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect();
+            // chunk_refs is a 1:1 ordered view of downloaded_chunks, so the
+            // map must keep every entry; a collapse here would silently skew
+            // the serialization-size diagnostic below.
+            debug_assert_eq!(owned_chunks.len(), chunk_refs.len());
             let iterations = if entry_count == 1_000_000 { 5 } else { 20 };
             let dir = tempdir().unwrap();
             let path = dir.path().join("state.json");
@@ -810,7 +818,7 @@ mod tests {
                 download_type: DownloadType::Preinstall,
                 current_tag: None,
                 manifest_hash: String::new(),
-                downloaded_chunks: downloaded_chunks.into_iter().collect(),
+                downloaded_chunks: owned_chunks,
                 completed_files: CompletedFiles::default(),
             };
             let state_view = DownloadStateRef {

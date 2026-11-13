@@ -11,6 +11,9 @@ use std::os::unix::fs::FileExt;
 #[cfg(feature = "bench-diagnostics")]
 use std::sync::Arc;
 
+#[cfg(feature = "bench-diagnostics")]
+use std::sync::atomic::Ordering;
+
 use super::assembly_opt::{
     self, Md5, bytes_to_hex, chunk_hash_required, md5_bytes_eq, md5_hex_eq, md5_to_hex, return_md5,
     take_md5, xxh64_bytes_eq, xxh64_hex_eq,
@@ -311,22 +314,51 @@ fn stream_decompress_to_file_inner(
             if remaining == 0 {
                 break;
             }
+            #[cfg(feature = "bench-diagnostics")]
+            let read_started = std::time::Instant::now();
             let n = decoder
                 .read(&mut output_slice[bytes_written..bytes_written + remaining])
                 .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                // A terminal read of zero bytes still costs a decoder call,
+                // so the count naturally includes the EOF read.
+                timings
+                    .decoder_read_ns
+                    .fetch_add(read_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                timings.decoder_read_count.fetch_add(1, Ordering::Relaxed);
+                timings
+                    .decoder_read_bytes
+                    .fetch_add(n as u64, Ordering::Relaxed);
+            }
             if n == 0 {
                 break;
             }
             bytes_written += n;
         }
         if let Some(hasher) = decompressed_hasher.0.as_mut() {
+            #[cfg(feature = "bench-diagnostics")]
+            let hash_started = std::time::Instant::now();
             hasher.update(&output_slice[..bytes_written])?;
+            // Timings are recorded only on the success path: an `?` abort
+            // invalidates the whole stream, so a partially recorded batch
+            // would be misleading.
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                timings
+                    .output_hash_ns
+                    .fetch_add(hash_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         decoder
             .finish_frame()
             .map_err(|error| SophonError::Io(io::Error::other(error.to_string())))?;
         #[cfg(feature = "bench-diagnostics")]
-        let _ = decoder_thread_started;
+        if let Some(timings) = timings.as_ref() {
+            timings
+                .decoder_thread_cpu_ns
+                .fetch_add(thread_cpu_time_ns().saturating_sub(decoder_thread_started), Ordering::Relaxed);
+        }
         #[cfg(not(feature = "bench-diagnostics"))]
         let _ = decoder.finish();
         #[cfg(feature = "bench-diagnostics")]
