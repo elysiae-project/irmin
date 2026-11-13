@@ -1279,10 +1279,12 @@ fn make_assembly_params(
     ctx: &InstallContext,
     file_idx: usize,
     tmp_dir_idx: usize,
+    epochs: &Arc<super::assembly_epochs::AssemblyEpochs>,
 ) -> AssemblyTaskParams {
     AssemblyTaskParams {
         file_idx,
         tmp_dir_idx,
+        epochs: Arc::clone(epochs),
         all_files: Arc::clone(&ctx.all_files),
         all_tmp_dirs: Arc::clone(&ctx.all_tmp_dirs),
         game_dir: Arc::clone(&ctx.game_dir),
@@ -1397,12 +1399,14 @@ fn spawn_assembly_coordinator(
     ctx: &Arc<InstallContext>,
     assemble_rx: mpsc::UnboundedReceiver<(usize, usize)>,
     assembly_cancel: tokio_util::sync::CancellationToken,
+    assembly_epochs: Arc<super::assembly_epochs::AssemblyEpochs>,
 ) -> tokio::task::JoinHandle<SophonResult<()>> {
     let ctx = Arc::clone(ctx);
     ctx.adaptive_assembly
         .spawn_adjuster(assembly_cancel.clone());
     let task_cancel = assembly_cancel;
     let total_files = ctx.total_files;
+    let assembly_epochs = assembly_epochs;
 
     let handle = tokio::spawn(async move {
         let mut rx = assemble_rx;
@@ -1432,7 +1436,7 @@ fn spawn_assembly_coordinator(
                                 total_files,
                             });
                         }
-                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx);
+                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
                         let updater = Arc::clone(&ctx.updater);
                         join_set.spawn(spawn_assembly_task(params, move |p| updater(p)));
                     }
@@ -1464,7 +1468,7 @@ fn spawn_assembly_coordinator(
                                 total_files,
                             });
                         }
-                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx);
+                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
                         let updater = Arc::clone(&ctx.updater);
                         join_set.spawn(spawn_assembly_task(params, move |p| updater(p)));
                     }
@@ -1502,7 +1506,7 @@ fn spawn_assembly_coordinator(
                                 total_files,
                             });
                         }
-                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx);
+                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
                         let updater = Arc::clone(&ctx.updater);
                         join_set.spawn(spawn_assembly_task(params, move |p| updater(p)));
                     }
@@ -3125,12 +3129,21 @@ async fn finalize_install(
     is_preinstall: bool,
     assembly_task: tokio::task::JoinHandle<SophonResult<()>>,
     assembly_cancel_token: CancellationToken,
+    assembly_epochs: Arc<super::assembly_epochs::AssemblyEpochs>,
     game_code: &str,
     vo_langs: &[String],
 ) -> SophonResult<()> {
     if summary.cancelled || handle.is_cancelled() {
         assembly_cancel_token.cancel(); // stop assembly before deleting chunks
         let _ = assembly_task.await; // drain before cleanup
+        // Commit files the workers fully wrote before the cancellation:
+        // their data is complete, and committing keeps the pre-epoch
+        // semantics where finished files kept their renames. A commit
+        // failure is only logged — cancel cleanup must proceed and the
+        // leftover tmp files are swept on the next resume.
+        if let Err(err) = assembly_epochs.commit() {
+            log::warn!("assembly epoch commit on cancel failed: {err}");
+        }
         let cd = Arc::clone(&ctx.chunks_dir);
         #[allow(unused_must_use)]
         tokio::task::spawn_blocking(move || {
@@ -3151,6 +3164,16 @@ async fn finalize_install(
         return Err(err);
     }
     assembly_task.await??;
+
+    // Commit any staged files the last epoch did not flush; renames and
+    // chunk releases must complete before the verification cache below can
+    // claim file validity. syncfs can take seconds on a busy filesystem,
+    // so the commit runs on the blocking pool.
+    let commit_epochs = Arc::clone(&assembly_epochs);
+    if let Err(err) = tokio::task::spawn_blocking(move || commit_epochs.commit()).await? {
+        log::error!("Final assembly epoch commit failed: {err}");
+        return Err(err);
+    }
 
     {
         let total = ctx.total_files;
@@ -3846,8 +3869,29 @@ pub async fn install(
     // Shared cancellation token. Cancelling stops the RAM adjuster and
     // wakes any blocked recv().
     let assembly_cancel_token = tokio_util::sync::CancellationToken::new();
-    let assembly_task =
-        spawn_assembly_coordinator(&ctx, assemble_rx, assembly_cancel_token.clone());
+    // Batched assembly durability: staged files flush once per epoch
+    // instead of one fdatasync+rename each. Chunk files stay until the
+    // epoch commit deletes them (via the refcount decrements there).
+    let assembly_epochs = Arc::new(super::assembly_epochs::AssemblyEpochs::new(
+        Arc::clone(ctx.chunk_names.get().expect("chunk_names set before assembly")),
+        Arc::clone(
+            ctx.chunk_refcounts
+                .get()
+                .expect("chunk_refcounts set before assembly"),
+        ),
+        Arc::clone(&ctx.chunks_dir),
+        super::assembly_epochs::EPOCH_MAX_FILES,
+        super::assembly_epochs::EPOCH_MAX_BYTES,
+    ));
+    let assembly_task = spawn_assembly_coordinator(
+        &ctx,
+        assemble_rx,
+        assembly_cancel_token.clone(),
+        Arc::clone(&assembly_epochs),
+    );
+    // The coordinator drops its Arc clone when it exits; install keeps
+    // this one for the final commit below.
+    let assembly_epochs_for_commit = Arc::clone(&assembly_epochs);
 
     let (
         download_items,
@@ -3991,6 +4035,7 @@ pub async fn install(
         options.is_preinstall,
         assembly_task,
         assembly_cancel_token.clone(),
+        assembly_epochs_for_commit,
         game_code,
         vo_langs,
     )

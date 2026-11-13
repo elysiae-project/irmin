@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -21,7 +22,8 @@ use fast_md5;
 
 use irmin_rs::game_installer::{
     VerifyMode,
-    assembly::{assemble_file, chunk_filename},
+    assembly::{assemble_file, assemble_file_with_benchmark_epochs, chunk_filename},
+    assembly_epochs::{AssemblyEpochs, EPOCH_MAX_BYTES, EPOCH_MAX_FILES},
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
     installer::ChunkNameLookup,
@@ -698,6 +700,218 @@ fn bench_assembly_many_chunks(c: &mut Criterion) {
     group.finish();
 }
 
+
+/// Many-small-files fixture: `files` assets, each `chunks_per_file` zstd
+/// chunks of `chunk_kib` KiB — the shape where per-file durability barriers
+/// dominate assembly wall time. Returns the manifest plus file 0's raw bytes
+/// for a post-assembly content assert.
+fn build_small_files_fixture(
+    chunks_dir: &Path,
+    files: usize,
+    chunks_per_file: usize,
+    chunk_kib: usize,
+) -> (CompactManifest, Vec<u8>) {
+    let chunk_bytes = chunk_kib * 1024;
+    let mut assets = Vec::with_capacity(files);
+    let mut raw0 = Vec::new();
+    for fi in 0..files {
+        let mut raw = Vec::with_capacity(chunks_per_file * chunk_bytes);
+        let chunks = (0..chunks_per_file)
+            .map(|ci| {
+                let name = format!("sfc{fi:04}_{ci}");
+                let data = gen_prng_data((fi * 16 + ci) as u64, chunk_bytes);
+                let comp = zstd::encode_all(&data[..], 3).unwrap();
+                fs::write(chunks_dir.join(chunk_filename(&name)), &comp).unwrap();
+                let hash = hex::encode(fast_md5::digest(&data));
+                let offset = (ci * chunk_bytes) as u64;
+                raw.extend_from_slice(&data);
+                SophonManifestAssetChunk::from_parts(
+                    name.into(),
+                    hash.into(),
+                    offset,
+                    0,
+                    chunk_bytes as u64,
+                    0,
+                    bytes::Bytes::new(),
+                    -1,
+                )
+            })
+            .collect();
+        let file_md5 = hex::encode(fast_md5::digest(&raw));
+        if fi == 0 {
+            raw0 = raw;
+        }
+        assets.push(SophonManifestAssetProperty::from_parts(
+            format!("sfa{fi:04}.bin").into(),
+            chunks,
+            0,
+            (chunks_per_file * chunk_bytes) as u64,
+            file_md5.into(),
+        ));
+    }
+    (CompactManifest::from(assets), raw0)
+}
+
+/// Entire-batch durability barriers for small-file assembly, at the
+/// coordinator's four-strand concurrency. `per_file_sync` is the classic
+/// tail (one fdatasync + rename per file inside the worker); `staged_epochs`
+/// defers flush, rename, and chunk release to one epoch commit per 64 files
+/// (or 256 MiB) plus a final commit — the production install topology.
+fn bench_assembly_epoch_durability(c: &mut Criterion) {
+    const FILES: usize = 128;
+    const CHUNKS_PER_FILE: usize = 4;
+    const CHUNK_KIB: usize = 64;
+    const STRANDS: usize = 4;
+    let chunk_bytes = CHUNK_KIB * 1024;
+    let total_bytes = (FILES * CHUNKS_PER_FILE * chunk_bytes) as u64;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let tmp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let (manifest_raw, raw0) =
+        build_small_files_fixture(&chunks_dir, FILES, CHUNKS_PER_FILE, CHUNK_KIB);
+    let manifest = Arc::new(manifest_raw);
+    let names: Vec<Box<str>> = (0..FILES)
+        .flat_map(|fi| (0..CHUNKS_PER_FILE).map(move |ci| format!("sfc{fi:04}_{ci}")))
+        .map(|n| n.into_boxed_str())
+        .collect();
+    let name_refs: Vec<&str> = names.iter().map(|n| n.as_ref()).collect();
+    let lookup = Arc::new(ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice())));
+    let shared_refcounts: Arc<Vec<AtomicU32>> = Arc::new(
+        (0..FILES * CHUNKS_PER_FILE)
+            .map(|_| AtomicU32::new(1000))
+            .collect(),
+    );
+    let cache: VerificationCache<String, VerificationEntry> = VerificationCache::new();
+    let epochs = Arc::new(AssemblyEpochs::new(
+        Arc::clone(&lookup),
+        Arc::clone(&shared_refcounts),
+        Arc::new(chunks_dir.clone()),
+        EPOCH_MAX_FILES,
+        EPOCH_MAX_BYTES,
+    ));
+
+    // Warmup + correctness gate for the staged path: assemble everything
+    // once, commit, and confirm bytes and completeness.
+    {
+        std::thread::scope(|sc| {
+            for w in 0..STRANDS {
+                let manifest = &manifest;
+                let epochs = &epochs;
+                let game_dir = &game_dir;
+                let chunks_dir = &chunks_dir;
+                let tmp_dir = &tmp_dir;
+                let lookup = &lookup;
+                let shared_refcounts = &shared_refcounts;
+                let cache = &cache;
+                sc.spawn(move || {
+                    for fi in (w..FILES).step_by(STRANDS) {
+                        assemble_file_with_benchmark_epochs(
+                            manifest,
+                            fi,
+                            epochs,
+                            game_dir,
+                            chunks_dir,
+                            tmp_dir,
+                            lookup,
+                            shared_refcounts,
+                            cache,
+                        )
+                        .expect("warmup staged assemble");
+                    }
+                });
+            }
+        });
+        epochs.commit().expect("warmup final commit");
+        for fi in 0..FILES {
+            let path = game_dir.join(format!("sfa{fi:04}.bin"));
+            assert!(path.exists(), "staged file {fi} missing after final commit");
+        }
+        assert_eq!(
+            fs::read(game_dir.join("sfa0000.bin")).unwrap(),
+            raw0,
+            "staged assembly bytes must match raw input"
+        );
+    }
+
+    let mut group = c.benchmark_group("assembly_epoch_durability");
+    group.throughput(Throughput::Bytes(total_bytes));
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(20));
+
+    group.bench_function("per_file_sync", |b| {
+        b.iter(|| {
+            std::thread::scope(|sc| {
+                for w in 0..STRANDS {
+                    let manifest = &manifest;
+                    let game_dir = &game_dir;
+                    let chunks_dir = &chunks_dir;
+                    let tmp_dir = &tmp_dir;
+                    let lookup = &lookup;
+                    let shared_refcounts = &shared_refcounts;
+                    let cache = &cache;
+                    sc.spawn(move || {
+                        for fi in (w..FILES).step_by(STRANDS) {
+                            assemble_file(
+                                manifest,
+                                fi,
+                                game_dir,
+                                chunks_dir,
+                                tmp_dir,
+                                lookup,
+                                shared_refcounts,
+                                cache,
+                                true,
+                                VerifyMode::Full,
+                            )
+                            .expect("assemble");
+                        }
+                    });
+                }
+            });
+        });
+    });
+
+    group.bench_function("staged_epochs", |b| {
+        b.iter(|| {
+            std::thread::scope(|sc| {
+                for w in 0..STRANDS {
+                    let manifest = &manifest;
+                    let epochs = &epochs;
+                    let game_dir = &game_dir;
+                    let chunks_dir = &chunks_dir;
+                    let tmp_dir = &tmp_dir;
+                    let lookup = &lookup;
+                    let shared_refcounts = &shared_refcounts;
+                    let cache = &cache;
+                    sc.spawn(move || {
+                        for fi in (w..FILES).step_by(STRANDS) {
+                            assemble_file_with_benchmark_epochs(
+                                manifest,
+                                fi,
+                                epochs,
+                                game_dir,
+                                chunks_dir,
+                                tmp_dir,
+                                lookup,
+                                shared_refcounts,
+                                cache,
+                            )
+                            .expect("assemble");
+                        }
+                    });
+                }
+            });
+            epochs.commit().expect("final commit");
+        });
+    });
+    group.finish();
+}
 fn bench_assembly_old_chunk_reuse(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let game_dir = dir.path().join("game");
@@ -3109,6 +3323,7 @@ criterion_group!(
     bench_lz4_deflate_decompress,
     bench_assembly_e2e,
     bench_assembly_many_chunks,
+    bench_assembly_epoch_durability,
     bench_assembly_old_chunk_reuse,
     bench_verify_file_md5,
     bench_xxh64,

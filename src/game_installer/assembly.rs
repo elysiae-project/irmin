@@ -205,6 +205,41 @@ pub fn assemble_file(
     .map(|_| ())
 }
 
+/// Staged variant of [`assemble_file`] used by the assembly coordinator:
+/// assembled bytes are verified here but their durability barrier (fsync +
+/// rename + chunk release) is deferred to the epoch commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_file_in_epoch(
+    all_files: &Arc<CompactManifest>,
+    file_idx: usize,
+    game_dir: &Path,
+    chunks_dir: &Path,
+    temp_dir: &Path,
+    chunk_lookup: &ChunkNameLookup,
+    chunk_refcounts: &[AtomicU32],
+    verify_cache: &DashMap<String, VerificationEntry>,
+    skip_md5_check: bool,
+    verify_mode: super::VerifyMode,
+    epochs: &EpochStageCtx<'_>,
+) -> SophonResult<()> {
+    assemble_file_inner(
+        all_files,
+        file_idx,
+        game_dir,
+        chunks_dir,
+        temp_dir,
+        chunk_lookup,
+        chunk_refcounts,
+        verify_cache,
+        skip_md5_check,
+        verify_mode,
+        super::assembly_opt::SharedMmapAdvice::PopulateRead,
+        false,
+        Some(epochs),
+    )
+    .map(|_| ())
+}
+
 pub(crate) struct AssembleOutcome {
     pub(crate) file_hash_verified: bool,
 }
@@ -265,6 +300,39 @@ pub fn assemble_file_with_benchmark_file_hash(
 #[cfg(feature = "benchmark")]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
+pub fn assemble_file_with_benchmark_epochs(
+    all_files: &Arc<CompactManifest>,
+    file_idx: usize,
+    epochs: &Arc<super::assembly_epochs::AssemblyEpochs>,
+    game_dir: &Path,
+    chunks_dir: &Path,
+    temp_dir: &Path,
+    chunk_lookup: &ChunkNameLookup,
+    chunk_refcounts: &[AtomicU32],
+    verify_cache: &DashMap<String, VerificationEntry>,
+) -> SophonResult<()> {
+    let ctx = EpochStageCtx {
+        epochs,
+        manifest: Arc::clone(all_files),
+    };
+    assemble_file_in_epoch(
+        all_files,
+        file_idx,
+        game_dir,
+        chunks_dir,
+        temp_dir,
+        chunk_lookup,
+        chunk_refcounts,
+        verify_cache,
+        true,
+        super::VerifyMode::Full,
+        &ctx,
+    )
+}
+
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_file_with_benchmark_mmap_advice(
     all_files: &CompactManifest,
     file_idx: usize,
@@ -299,6 +367,14 @@ pub fn assemble_file_with_benchmark_mmap_advice(
     .map(|_| ())
 }
 
+/// Shared state for the coordinator's staged-assembly mode: assembled
+/// files are committed in durability epochs instead of one fsync+rename
+/// each (see [`super::assembly_epochs`]).
+pub(crate) struct EpochStageCtx<'a> {
+    pub(crate) epochs: &'a std::sync::Arc<super::assembly_epochs::AssemblyEpochs>,
+    pub(crate) manifest: Arc<CompactManifest>,
+}
+
 // Large function; keeping it out-of-line preserves hot-path code layout.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -315,6 +391,42 @@ fn assemble_file_with_options(
     verify_mode: super::VerifyMode,
     shared_mmap_advice: super::assembly_opt::SharedMmapAdvice,
     force_file_hash: bool,
+) -> SophonResult<AssembleOutcome> {
+    assemble_file_inner(
+        all_files,
+        file_idx,
+        game_dir,
+        chunks_dir,
+        temp_dir,
+        chunk_lookup,
+        chunk_refcounts,
+        verify_cache,
+        skip_md5_check,
+        verify_mode,
+        shared_mmap_advice,
+        force_file_hash,
+        None,
+    )
+}
+
+/// Epoch hookup for the coordinator path: when `epoch` is set the assembled
+/// bytes are staged (no per-file fsync, no rename yet) and the deferred
+/// chunk release moves into the epoch commit.
+#[allow(clippy::too_many_arguments)]
+fn assemble_file_inner(
+    all_files: &CompactManifest,
+    file_idx: usize,
+    game_dir: &Path,
+    chunks_dir: &Path,
+    temp_dir: &Path,
+    chunk_lookup: &ChunkNameLookup,
+    chunk_refcounts: &[AtomicU32],
+    verify_cache: &DashMap<String, VerificationEntry>,
+    skip_md5_check: bool,
+    verify_mode: super::VerifyMode,
+    shared_mmap_advice: super::assembly_opt::SharedMmapAdvice,
+    force_file_hash: bool,
+    epoch: Option<&EpochStageCtx<'_>>,
 ) -> SophonResult<AssembleOutcome> {
     let file_name = all_files.file_name(file_idx);
     let file_size = all_files.file_size(file_idx);
@@ -885,6 +997,82 @@ fn assemble_file_with_options(
     // Set permissions on the tmp file before syncing; avoids a stat after rename.
     let _ = unsafe { libc::fchmod(out_file.as_raw_fd(), 0o644) };
 
+    // Staged (epoch) mode: the assembled bytes get their correctness checks
+    // here, but the durability barrier (fdatasync + rename + chunk release)
+    // is deferred to the epoch commit so small files stop paying one
+    // synchronous flush each.
+    if let Some(epoch) = epoch {
+        if parallel_hashed_file {
+            let result = hasher_result.into_inner().unwrap();
+            let failed = match result {
+                Some(Ok(ref digest)) if !md5_bytes_eq(digest, file_hash_md5) => {
+                    Some(SophonError::Md5Mismatch {
+                        item: file_name.to_string(),
+                        expected: bytes_to_hex(file_hash_md5),
+                        actual: md5_to_hex(digest),
+                    })
+                }
+                Some(Ok(_)) => None,
+                Some(Err(e)) => Some(e),
+                None => None,
+            };
+            if let Some(err) = failed {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        }
+        if total_written != file_size {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(SophonError::SizeMismatch {
+                item: file_name.to_string(),
+                expected: file_size,
+                actual: total_written,
+            });
+        }
+        if let Some(mut hasher) = file_hasher {
+            let digest = match hasher.finish() {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(SophonError::Io(e));
+                }
+            };
+            return_md5(hasher);
+            if !md5_bytes_eq(&digest, file_hash_md5) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(SophonError::Md5Mismatch {
+                    item: file_name.to_string(),
+                    expected: bytes_to_hex(file_hash_md5),
+                    actual: md5_to_hex(&digest),
+                });
+            }
+        }
+        // Release is deferred to the epoch commit; drop the guard's claims
+        // only after staging succeeded (a failed stage keeps them so the
+        // normal drop housekeeping still runs for the failed file).
+        let stage_req = super::assembly_epochs::StageRequest {
+            tmp_path,
+            target_path,
+            manifest: Arc::clone(&epoch.manifest),
+            chunk_start: chunk_range.start,
+            chunk_end: chunk_range.end,
+            bytes: total_written,
+        };
+        let directive = match epoch.epochs.stage(out_file, stage_req) {
+            Ok(directive) => {
+                guard.chunks.clear();
+                directive
+            }
+            Err(err) => return Err(err),
+        };
+        let file_hash_verified = has_file_hash && (sequential_file_hash || parallel_hashed_file);
+        TRANSFER_BUF.with(|cell| cell.replace(transfer_buffer));
+        if directive.is_due() {
+            epoch.epochs.commit()?;
+        }
+        return Ok(AssembleOutcome { file_hash_verified });
+    }
+
     out_file.sync_data().map_err(|err| {
         let _ = fs::remove_file(&tmp_path);
         SophonError::Io(err)
@@ -1181,6 +1369,9 @@ pub struct AssemblyTaskParams {
     /// Per-file completion bitset indexed by `file_idx`.
     pub completion_flags: Arc<[AtomicBool]>,
     pub verify_mode: super::VerifyMode,
+    /// Batched durability for staged assembled files; every task shares one
+    /// manager so flushes are amortized across the whole install.
+    pub epochs: Arc<super::assembly_epochs::AssemblyEpochs>,
 }
 
 /// Run an assembly worker over queued file indices until the channel closes.
@@ -1206,6 +1397,7 @@ pub fn run_assembly_task(
         profiler,
         completion_flags,
         verify_mode,
+        epochs,
     } = params;
 
     let _assembly_timer = super::profiling::AssemblyTimer::new(&profiler);
@@ -1347,18 +1539,25 @@ pub fn run_assembly_task(
         return Ok(());
     }
 
-    let result = assemble_file(
-        &all_files,
-        file_idx,
-        &game_dir,
-        &chunks_dir,
-        tmp_dir,
-        &chunk_names,
-        &chunk_refcounts,
-        &verify_cache,
-        true,
-        verify_mode,
-    );
+    let result = {
+        let epoch_ctx = EpochStageCtx {
+            epochs: &epochs,
+            manifest: Arc::clone(&all_files),
+        };
+        assemble_file_in_epoch(
+            &all_files,
+            file_idx,
+            &game_dir,
+            &chunks_dir,
+            tmp_dir,
+            &chunk_names,
+            &chunk_refcounts,
+            &verify_cache,
+            true,
+            verify_mode,
+            &epoch_ctx,
+        )
+    };
     if let Err(err) = result {
         // Release the claim so a later retry can reprocess this file_idx.
         completion_flags[file_idx].store(false, Ordering::Release);

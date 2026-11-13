@@ -1198,6 +1198,15 @@ fn run_assembly_task_out_of_bounds_file_idx() {
         profiler: Arc::new(PipelineProfiler::new()),
         completion_flags: Arc::from(Vec::<AtomicBool>::new()),
         verify_mode: crate::game_installer::VerifyMode::Full,
+        epochs: Arc::new(super::super::assembly_epochs::AssemblyEpochs::new(
+            Arc::new(ChunkNameLookup::from_arena(StringArena::from(
+                [].as_slice(),
+            ))),
+            Arc::new(Vec::new()),
+            Arc::new(dir.path().to_path_buf()),
+            super::super::assembly_epochs::EPOCH_MAX_FILES,
+            super::super::assembly_epochs::EPOCH_MAX_BYTES,
+        )),
     };
 
     let result = run_assembly_task(params, |_| {});
@@ -1532,6 +1541,15 @@ fn run_assembly_task_out_of_bounds_tmp_dir_idx() {
         profiler: Arc::new(PipelineProfiler::new()),
         completion_flags: Arc::from((0..1).map(|_| AtomicBool::new(false)).collect::<Vec<_>>()),
         verify_mode: crate::game_installer::VerifyMode::Full,
+        epochs: Arc::new(super::super::assembly_epochs::AssemblyEpochs::new(
+            Arc::new(ChunkNameLookup::from_arena(StringArena::from(
+                [].as_slice(),
+            ))),
+            Arc::new(Vec::new()),
+            Arc::new(dir.path().to_path_buf()),
+            super::super::assembly_epochs::EPOCH_MAX_FILES,
+            super::super::assembly_epochs::EPOCH_MAX_BYTES,
+        )),
     };
 
     let result = run_assembly_task(params, |_| {});
@@ -2195,4 +2213,252 @@ fn assemble_file_prng_data_matches_expected_md5() {
     // Verify the file-level MD5 matches
     let result_md5 = compute_md5_hex(&result);
     assert_eq!(result_md5, file_md5);
+}
+
+// --- Durability epochs -------------------------------------------------------
+
+use super::super::assembly_epochs::{
+    AssemblyEpochs, CommitDirective, EPOCH_MAX_BYTES, EPOCH_MAX_FILES,
+};
+use super::EpochStageCtx;
+
+fn staged_file_fixture(dir: &Path, idx: usize, payload: &[u8]) -> SophonManifestAssetProperty {
+    let chunk_name = format!("e{idx}");
+    let comp = zstd::encode_all(payload, 1).unwrap();
+    let chunks_dir = dir.join("chunks");
+    fs::write(
+        chunks_dir.join(super::chunk_filename(&chunk_name)),
+        &comp,
+    )
+    .unwrap();
+    SophonManifestAssetProperty::from_parts(
+        format!("e{idx}.bin").into(),
+        vec![SophonManifestAssetChunk::from_parts(
+            chunk_name.into(),
+            hex::encode(fast_md5::digest(payload)).into(),
+            0,
+            comp.len() as u64,
+            payload.len() as u64,
+            0,
+            bytes::Bytes::new(),
+            -1,
+        )],
+        0,
+        payload.len() as u64,
+        hex::encode(fast_md5::digest(payload)).into(),
+    )
+}
+
+fn stage_req(
+    manifest: &Arc<CompactManifest>,
+    tmp_path: std::path::PathBuf,
+    target_path: std::path::PathBuf,
+) -> super::super::assembly_epochs::StageRequest {
+    super::super::assembly_epochs::StageRequest {
+        tmp_path,
+        target_path,
+        manifest: Arc::clone(manifest),
+        chunk_start: 0,
+        chunk_end: 0,
+        bytes: 1,
+    }
+}
+
+fn epoch_env(
+    dir: &Path,
+    names: &[&str],
+    refcounts: Vec<u32>,
+) -> Arc<AssemblyEpochs> {
+    Arc::new(AssemblyEpochs::new(
+        make_chunk_names(names),
+        Arc::new(refcounts.into_iter().map(AtomicU32::new).collect()),
+        Arc::new(dir.join("chunks")),
+        EPOCH_MAX_FILES,
+        EPOCH_MAX_BYTES,
+    ))
+}
+
+#[test]
+fn staged_file_not_renamed_until_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("game")).unwrap();
+    fs::create_dir_all(dir.path().join("chunks")).unwrap();
+    fs::create_dir_all(dir.path().join("tmp")).unwrap();
+
+    let file = staged_file_fixture(dir.path(), 0, b"epoch payload");
+    let manifest = Arc::new(CompactManifest::from(vec![file]));
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let tmp_dir = dir.path().join("tmp");
+    let lookup = make_chunk_names(&["e0"]);
+    let refcounts = vec![AtomicU32::new(1)];
+    let cache = DashMap::new();
+    let epochs = epoch_env(dir.path(), &["e0"], vec![1]);
+
+    let ctx = EpochStageCtx {
+        epochs: &epochs,
+        manifest: Arc::clone(&manifest),
+    };
+    assemble_file_in_epoch(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &tmp_dir,
+        &lookup,
+        &refcounts,
+        &cache,
+        true,
+        crate::game_installer::VerifyMode::Full,
+        &ctx,
+    )
+    .unwrap();
+
+    // Staged, not committed: no target yet, chunk file still present
+    // (its refcount decrement is deferred to the commit).
+    assert!(!game_dir.join("e0.bin").exists());
+    assert!(chunks_dir.join("e0.zstd").exists());
+
+    epochs.commit().unwrap();
+    assert!(game_dir.join("e0.bin").exists());
+    assert_eq!(fs::read(game_dir.join("e0.bin")).unwrap(), b"epoch payload");
+    // Commit releases the last chunk reference.
+    assert!(!chunks_dir.join("e0.zstd").exists());
+}
+
+#[test]
+fn epoch_commit_cadence_matches_thresholds() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("chunks")).unwrap();
+    let manifest = Arc::new(CompactManifest::from(vec![]));
+    let lookup = make_chunk_names(&[]);
+    let refcounts: Vec<AtomicU32> = vec![];
+    let chunks_dir = dir.path().join("chunks");
+    let epochs = AssemblyEpochs::new(
+        make_chunk_names(&[]),
+        Arc::new(Vec::new()),
+        Arc::new(chunks_dir.clone()),
+        2,
+        u64::MAX,
+    );
+    let mut due = 0;
+    for i in 0..5 {
+        let tmp = chunks_dir.join(format!("c{i}.tmp"));
+        let target = chunks_dir.join(format!("c{i}.out"));
+        fs::write(&tmp, b"x").unwrap();
+        let fd = fs::File::open(&tmp).unwrap();
+        if epochs
+            .stage(
+                fd,
+                stage_req(&manifest, tmp, target),
+            )
+            .unwrap()
+            .is_due()
+        {
+            due += 1;
+            epochs.commit().unwrap();
+        }
+    }
+    epochs.commit().unwrap();
+    assert_eq!(due, 2, "commit due exactly at each 2-file boundary");
+    let _ = lookup;
+    let _ = chunks_dir;
+}
+
+#[test]
+fn epoch_error_is_sticky_and_discards_new_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("chunks")).unwrap();
+    let manifest = Arc::new(CompactManifest::from(vec![]));
+    let epochs = AssemblyEpochs::new(
+        make_chunk_names(&[]),
+        Arc::new(Vec::new()),
+        Arc::new(dir.path().join("chunks")),
+        EPOCH_MAX_FILES,
+        EPOCH_MAX_BYTES,
+    );
+    // Force a commit failure: stage a file whose tmp path vanishes before
+    // the rename (open fd on a deleted file still fdatasyncs fine, but the
+    // rename must fail).
+    let tmp = dir.path().join("chunks").join("gone.tmp");
+    let target = dir.path().join("chunks").join("no-such-dir/out");
+    fs::write(&tmp, b"x").unwrap();
+    let fd = fs::File::open(&tmp).unwrap();
+    fs::remove_file(&tmp).unwrap();
+    epochs
+        .stage(fd, stage_req(&manifest, tmp.clone(), target))
+        .unwrap();
+    assert!(epochs.commit().is_err(), "rename of a deleted tmp must fail");
+
+    // Sticky: a later stage is discarded and reports the error.
+    let tmp2 = dir.path().join("chunks").join("later.tmp");
+    let target2 = dir.path().join("chunks").join("later.out");
+    fs::write(&tmp2, b"x").unwrap();
+    let fd2 = fs::File::open(&tmp2).unwrap();
+    assert!(epochs
+        .stage(fd2, stage_req(&manifest, tmp2, target2))
+        .is_err());
+    assert!(epochs.commit().is_err());
+}
+
+#[test]
+fn failed_commit_keeps_chunk_refcounts() {
+    // A rename failure inside commit must NOT release chunk refcounts:
+    // the chunks are the only recoverable copy until the resume sweep
+    // re-assembles the staged files.
+    let dir = tempfile::tempdir().unwrap();
+    let chunks_dir = dir.path().join("chunks");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    // staged_file_fixture writes chunk files named `e{idx}`; the lookup and
+    // assertions must use the same names.
+    let leaked: Vec<Box<str>> = (0..2).map(|i| format!("e{i}").into_boxed_str()).collect();
+    let mut names: Vec<&str> = Vec::new();
+    for b in &leaked {
+        names.push(b.as_ref());
+    }
+    let mut assets = Vec::new();
+    for i in 0..2 {
+        assets.push(staged_file_fixture(dir.path(), i, &[7u8; 512]));
+    }
+    let manifest = Arc::new(CompactManifest::from(assets));
+    let game_dir = dir.path().join("game");
+    fs::create_dir_all(&game_dir).unwrap();
+    let tmp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let lookup = make_chunk_names(&names);
+    let refcounts = vec![AtomicU32::new(1), AtomicU32::new(1)];
+    let cache = DashMap::new();
+    let epochs = epoch_env(dir.path(), &names, vec![1, 1]);
+
+    for i in 0..2 {
+        let ctx = EpochStageCtx {
+            epochs: &epochs,
+            manifest: Arc::clone(&manifest),
+        };
+        assemble_file_in_epoch(
+            &manifest,
+            i,
+            &game_dir,
+            &chunks_dir,
+            &tmp_dir,
+            &lookup,
+            &refcounts,
+            &cache,
+            true,
+            crate::game_installer::VerifyMode::Full,
+            &ctx,
+        )
+        .unwrap();
+    }
+    // Sabotage the second rename: remove the target's parent directory.
+    // (Both files stage into the same game dir; make the FIRST rename
+    // fail instead by removing the game dir entirely.)
+    fs::remove_dir_all(&game_dir).unwrap();
+    assert!(epochs.commit().is_err());
+
+    // Refcounts must be untouched: both chunk files still on disk.
+    assert!(chunks_dir.join("e0.zstd").exists());
+    assert!(chunks_dir.join("e1.zstd").exists());
+    assert_eq!(refcounts[0].load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(refcounts[1].load(std::sync::atomic::Ordering::SeqCst), 1);
 }
