@@ -1201,7 +1201,7 @@ fn read_single_file_header_success() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_ok(), "valid header should succeed");
     assert_eq!(header_info.new_data_size, 100);
     assert_eq!(header_info.old_data_size, 50);
@@ -1218,8 +1218,40 @@ fn read_single_file_header_truncated_fails() {
     let data = vec![0x64]; // only new_data_size, nothing else
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_err(), "truncated data should fail");
+}
+
+/// A patch embedded at a nonzero container offset parses with every
+/// recorded position rebased to file-absolute coordinates.
+#[test]
+fn read_header_positions_rebase_by_diff_offset() {
+    // A patch embedded at a nonzero container offset must parse with all
+    // recorded positions rebased to file-absolute coordinates.
+    let old = vec![3u8; 512];
+    let mut new = old.clone();
+    new[..16].copy_from_slice(&[5u8; 16]);
+    let patch = build_v20_nocomp_patch(&old, &new);
+
+    const CONTAINER_PREFIX: usize = 37;
+    let mut container = vec![0u8; CONTAINER_PREFIX];
+    container.extend_from_slice(&patch);
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let container_path = dir.path().join("container.bin");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&container_path, &container).unwrap();
+
+    let mut hdiff = HDiff::with_offset(
+        old_path.to_string_lossy().to_string(),
+        container_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+        CONTAINER_PREFIX as u64,
+    );
+    assert!(hdiff.apply(None), "embedded patch failed");
+    assert_eq!(fs::read(&out_path).unwrap(), new);
 }
 
 /// read_single_file_header sets diff_data_pos to the stream position after
@@ -1230,7 +1262,7 @@ fn read_single_file_header_sets_diff_data_pos() {
     let data = vec![0x64, 0x32, 0x00, 0x88, 0x00, 0x64, 0x00];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(
         header_info.single_chunk_info.diff_data_pos, 7,
         "diff_data_pos should be at end of header (7 bytes)"
@@ -1244,7 +1276,7 @@ fn read_single_file_header_compressed_count_zero() {
     let data = vec![0x64, 0x32, 0x00, 0x88, 0x00, 0x64, 0x00];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(header_info.compressed_count, 0);
 }
 
@@ -1255,7 +1287,7 @@ fn read_single_file_header_compressed_count_one() {
     let data = vec![0x64, 0x32, 0x00, 0x88, 0x00, 0x64, 0x01];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(header_info.compressed_count, 1);
 }
 
@@ -1273,7 +1305,7 @@ fn read_single_file_header_minimal_values() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_ok(), "minimal values should succeed");
     assert_eq!(header_info.new_data_size, 1);
     assert_eq!(header_info.old_data_size, 1);
@@ -1294,7 +1326,7 @@ fn read_non_single_file_header_success() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_non_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_ok(), "valid header should succeed");
     assert_eq!(header_info.new_data_size, 100);
     assert_eq!(header_info.old_data_size, 50);
@@ -1311,7 +1343,7 @@ fn read_non_single_file_header_truncated_fails() {
     let data = vec![0x64, 0x32]; // only sizes, no chunk info
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_non_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_err(), "truncated chunk info should fail");
 }
 
@@ -1325,7 +1357,7 @@ fn read_non_single_file_header_compressed_count_zero() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(header_info.compressed_count, 0);
 }
 
@@ -1349,7 +1381,7 @@ fn read_non_single_file_header_one_compressed_stream() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(
         header_info.compressed_count, 1,
         "one compress field > 1 should give count of 1"
@@ -1377,7 +1409,7 @@ fn read_non_single_file_header_one_byte_compressed_counts() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(
         header_info.compressed_count, 1,
         "compress_cover_buf_size == 1 must count as compressed"
@@ -1798,7 +1830,7 @@ fn patch_has_v13_covers(patch: &[u8]) -> bool {
     let header = input.read_string_to_null(512).unwrap();
     assert!(header.starts_with("HDIFF13&"));
     let mut info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut input, &mut info).unwrap();
+    HDiff::read_non_single_file_header(&mut input, 0, &mut info).unwrap();
     info.chunk_info.cover_count > 0
 }
 
@@ -1878,7 +1910,7 @@ fn hdiff_v13_zero_length_final_cover_flushes_tail_progress() {
     let mut header_reader = Cursor::new(patch.as_slice());
     header_reader.read_string_to_null(512).unwrap();
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut header_reader, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
     header_info.comp_mode = super::CompressionMode::Zstd;
     let patcher = PatchSingle::new(header_info);
     let mut source = fs::File::open(&old_path).unwrap();
@@ -1918,7 +1950,7 @@ fn hdiff_v13_chunked_regions_match_across_rle_and_cover_boundaries() {
     let mut header_reader = Cursor::new(patch.as_slice());
     header_reader.read_string_to_null(512).unwrap();
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut header_reader, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
     header_info.comp_mode = super::CompressionMode::Zstd;
     assert_eq!(header_info.old_data_size, old.len() as i64);
     assert_eq!(header_info.new_data_size, new.len() as i64);
@@ -2018,7 +2050,7 @@ fn hdiff_v13_chunked_large_cover_preserves_long_rle_state() {
     let mut header_reader = Cursor::new(patch.as_slice());
     header_reader.read_string_to_null(512).unwrap();
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut header_reader, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
     header_info.comp_mode = super::CompressionMode::Zstd;
     assert_eq!(header_info.old_data_size, old.len() as i64);
     assert_eq!(header_info.new_data_size, old.len() as i64);
@@ -2108,7 +2140,7 @@ fn hdiff_v13_chunked_large_tail_matches_expected_output() {
     let mut header_reader = Cursor::new(patch.as_slice());
     header_reader.read_string_to_null(512).unwrap();
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut header_reader, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
     header_info.comp_mode = super::CompressionMode::Zstd;
     let patcher = PatchSingle::new(header_info);
 
@@ -2153,7 +2185,7 @@ fn hdiff_v13_chunked_additive_and_literal_rle_runs_preserve_state() {
         let mut header_reader = Cursor::new(patch.as_slice());
         header_reader.read_string_to_null(512).unwrap();
         let mut header_info = HeaderInfo::default();
-        HDiff::read_non_single_file_header(&mut header_reader, &mut header_info).unwrap();
+        HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
         header_info.comp_mode = super::CompressionMode::Zstd;
         let patcher = PatchSingle::new(header_info);
 
@@ -2268,3 +2300,48 @@ fn hdiff_e2e_v13_zstd_applies_correctly() {
     let result = fs::read(&out_path).unwrap();
     assert_eq!(result, new, "v13 zstd output mismatch");
 }
+
+#[test]
+fn hdiff_header_parses_when_patch_shorter_than_header_limit() {
+    // A minimal valid patch is far shorter than the header slab; the slab
+    // fill loop must stop at EOF and the parse must still succeed.
+    // Two blocks: the first identical (becomes one cover), the second
+    // changed so the fixture has a nonzero step and stays slab-sized.
+    let old = vec![7u8; 512];
+    let mut new = old.clone();
+    new[256..264].copy_from_slice(&[9u8; 8]);
+    let patch = build_v20_nocomp_patch(&old, &new);
+    assert!(patch.len() < 512, "fixture must be smaller than the slab");
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().to_string(),
+        patch_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+    );
+    assert!(hdiff.apply(None), "tiny patch failed slab parse");
+    assert_eq!(fs::read(&out_path).unwrap(), new);
+}
+
+#[test]
+fn hdiff_header_rejects_header_without_null_terminator() {
+    // Bytes with no NUL terminator inside the string limit must fail with
+    // the same error the streaming parser produced.
+    let dir = tempfile::tempdir().unwrap();
+    let patch_path = dir.path().join("no-nul.hdiff");
+    fs::write(&patch_path, &[b'H'; 1024]).unwrap();
+    let out_path = dir.path().join("out.bin");
+    let mut hdiff = HDiff::new(
+        dir.path().join("missing-old.bin").to_string_lossy().to_string(),
+        patch_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+    );
+    assert!(!hdiff.apply(None), "runaway header must be rejected");
+}
+

@@ -140,7 +140,31 @@ impl HDiff {
             diff_file.seek(SeekFrom::Start(self.diff_offset))?;
         }
         let mut header_info = HeaderInfo::default();
-        let header_info_line = diff_file.read_string_to_null(512)?;
+        // Header parse: one bounded read covers the magic line (the parser
+        // limits it to 512 bytes) plus the varints that follow (at most 11,
+        // ten bytes each), so the file handle is dropped before body
+        // streams open. Positions recorded below are file-absolute, so the
+        // cursor is rebased by diff_offset.
+        const HEADER_STRING_LIMIT: usize = 512;
+        const HEADER_SLAB: usize = HEADER_STRING_LIMIT + 11 * 10;
+        let mut slab = [0u8; HEADER_SLAB];
+        let mut slab_len = 0usize;
+        while slab_len < HEADER_SLAB {
+            // Interrupted reads retry rather than surface a spurious error.
+            match diff_file.read(&mut slab[slab_len..]) {
+                Ok(0) => break,
+                Ok(n) => slab_len += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        // The slab covers the whole header. Dropping the handle is
+        // deliberate: every later section re-opens the file at an absolute
+        // offset, so reusing this handle would read from a stale position.
+        drop(diff_file);
+        let mut header_reader = Cursor::new(&slab[..slab_len]);
+        let header_info_line = header_reader.read_string_to_null(HEADER_STRING_LIMIT)?;
+        let header_base = self.diff_offset as i64;
 
         if header_info_line.len() > 64 || !header_info_line.starts_with("HDIFF") {
             return Err("not a HDiff file format".into());
@@ -183,9 +207,9 @@ impl HDiff {
         header_info.is_single_compressed_diff = p_file_ver == 20;
 
         if header_info.is_single_compressed_diff {
-            Self::read_single_file_header(&mut diff_file, &mut header_info)?;
+            Self::read_single_file_header(&mut header_reader, header_base, &mut header_info)?;
         } else {
-            Self::read_non_single_file_header(&mut diff_file, &mut header_info)?;
+            Self::read_non_single_file_header(&mut header_reader, header_base, &mut header_info)?;
         }
 
         // Newfile patch: old_data_size == 0 means source is optional.
@@ -405,8 +429,23 @@ impl HDiff {
             .map_err(|_| format!("invalid version string: {num_str} (raw: {str_val})").into())
     }
 
+    /// Convert a slab-relative stream position into a file-absolute offset.
+    /// The slab cursor starts at the header, so `base` (the diff offset
+    /// within a container, zero for plain files) rebases it.
+    fn rebase_position(
+        sr: &mut (impl Read + Seek),
+        base: i64,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        base.checked_add(sr.stream_position()? as i64)
+            .ok_or_else(|| "header position overflow".into())
+    }
+
+    /// `base` offsets every position recorded into `header_info` so clip
+    /// sections address the real file when the header starts at a nonzero
+    /// diff_offset.
     pub(crate) fn read_single_file_header(
         sr: &mut (impl Read + Seek),
+        base: i64,
         header_info: &mut HeaderInfo,
     ) -> Result<(), Box<dyn std::error::Error>> {
         header_info.single_chunk_info = DiffSingleChunkInfo::default();
@@ -433,8 +472,7 @@ impl HDiff {
             return Err("compressed_size is negative".into());
         }
 
-        let pos = sr.stream_position()? as i64;
-        header_info.single_chunk_info.diff_data_pos = pos;
+        header_info.single_chunk_info.diff_data_pos = Self::rebase_position(sr, base)?;
         header_info.compressed_count = if header_info.single_chunk_info.compressed_size > 0 {
             1
         } else {
@@ -445,16 +483,17 @@ impl HDiff {
 
     pub(crate) fn read_non_single_file_header(
         sr: &mut (impl Read + Seek),
+        base: i64,
         header_info: &mut HeaderInfo,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let type_end_pos = sr.stream_position()? as i64;
+        let type_end_pos = Self::rebase_position(sr, base)?;
         header_info.new_data_size = sr.read_long_7bit()?;
         header_info.old_data_size = sr.read_long_7bit()?;
         if header_info.new_data_size < 0 || header_info.old_data_size < 0 {
             return Err("new_data_size or old_data_size is negative".into());
         }
 
-        Self::get_diff_chunk_info(sr, &mut header_info.chunk_info, type_end_pos)?;
+        Self::get_diff_chunk_info(sr, base, &mut header_info.chunk_info, type_end_pos)?;
         header_info.compressed_count = ((header_info.chunk_info.compress_cover_buf_size > 0)
             as i64)
             + ((header_info.chunk_info.compress_rle_ctrl_buf_size > 0) as i64)
@@ -465,6 +504,7 @@ impl HDiff {
 
     pub(crate) fn get_diff_chunk_info(
         sr: &mut (impl Read + Seek),
+        base: i64,
         chunk_info: &mut DiffChunkInfo,
         type_end_pos: i64,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -508,7 +548,7 @@ impl HDiff {
             }
         }
 
-        chunk_info.head_end_pos = sr.stream_position()? as i64;
+        chunk_info.head_end_pos = Self::rebase_position(sr, base)?;
         chunk_info.cover_end_pos = chunk_info
             .head_end_pos
             .checked_add(if chunk_info.compress_cover_buf_size > 0 {

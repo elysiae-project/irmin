@@ -5,6 +5,19 @@ use super::compression::get_clip_stream;
 use super::patch_core::{write_cover_stream_to_output, write_cover_stream_to_output_with_slice};
 use super::{CompressionMode, HeaderInfo, SeekableRead};
 
+/// Buffer capacity for clip streams consumed one byte or one varint at a
+/// time. Bulk reads longer than this bypass the buffer (std's read_exact
+/// reads direct into the caller's buffer once the cached remnant is
+/// drained), so large sections pay nothing while per-varint reads stop
+/// costing a syscall each. 16 KiB sits well past the knee where further
+/// capacity stops reducing syscalls for step-heavy patches.
+pub(super) const CLIP_STREAM_BUF: usize = 16 * 1024;
+
+/// Add a small buffer to a byte-at-a-time clip stream.
+pub(super) fn buffered_clip(clip: Box<dyn Read>) -> Box<dyn Read> {
+    Box::new(std::io::BufReader::with_capacity(CLIP_STREAM_BUF, clip))
+}
+
 pub(crate) struct PatchSingle {
     header_info: HeaderInfo,
 }
@@ -156,6 +169,9 @@ impl PatchSingle {
         offset = rle_ctrl_start
             .checked_add(len1)
             .ok_or_else(|| std::io::Error::other("offset overflow after rle_ctrl"))?;
+        // The ctrl stream is consumed one sign byte + one varint per cover
+        // region; a small buffer collapses those to near-zero syscalls.
+        let clip1 = buffered_clip(clip1);
 
         let rle_code_padding = if ci.compress_rle_code_buf_size > 0 {
             padding
@@ -177,6 +193,8 @@ impl PatchSingle {
         offset = rle_code_start
             .checked_add(len2)
             .ok_or_else(|| std::io::Error::other("offset overflow after rle_code"))?;
+        // Same one-byte-at-a-time access pattern on the RLE code bytes.
+        let clip2 = buffered_clip(clip2);
 
         let new_data_diff_padding = if ci.compress_new_data_diff_size > 0 {
             padding

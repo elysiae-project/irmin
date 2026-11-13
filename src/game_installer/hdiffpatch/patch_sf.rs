@@ -100,7 +100,7 @@ impl PatchSF {
         } else {
             sci.compressed_size as u64
         };
-        let (mut diff, _) = get_clip_stream(
+        let (diff, _) = get_clip_stream(
             File::open(patch_path)?,
             self.header_info.comp_mode,
             diff_start,
@@ -108,6 +108,10 @@ impl PatchSF {
             diff_comp,
             false,
         )?;
+        // patch_loop reads two varints per cover step before the step
+        // body's bulk read; the shared clip buffer removes the per-step
+        // syscall (see its doc for the bypass behavior on large reads).
+        let mut diff: Box<dyn Read> = super::patch_single::buffered_clip(diff);
         if self.header_info.chunk_info.cover_count < 0 {
             return Err(std::io::Error::other("cover_count is negative"));
         }
