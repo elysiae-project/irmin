@@ -2190,7 +2190,7 @@ where
     let chunks_dir: Arc<std::path::Path> = Arc::from(chunks_dir);
     let total_files = state.patch_assets.len() as u64;
     let applied_files = Arc::new(AtomicU64::new(0u64));
-    let last_apply_update = AtomicU64::new(0);
+    let last_apply_update = Arc::new(AtomicU64::new(0));
 
     let game_dir_owned = game_dir.to_path_buf();
     let filter_cache = Arc::new(
@@ -2198,15 +2198,35 @@ where
     );
     filter_patch_assets_for_removed_features(&filter_cache, &mut state.patch_assets);
 
+    // State is immutable from here on; share it with in-flight patch
+    // tasks without cloning the (possibly large) asset vectors.
+    let state = Arc::new(state);
+
     let regenerate_pkg_version = if state.game_id == "hk4e" {
         Some(Arc::clone(&download_over_context))
     } else {
         None
     };
 
+    // Apply patches through a bounded sliding window so per-apply
+    // writeback stalls on one file overlap CPU work on the next. The
+    // window is intentionally small: btrfs fsync contention flattens and
+    // can regress past a few concurrent applies, and HDDs degrade badly
+    // under parallel random writes. On a single-threaded machine the
+    // loop collapses to one apply at a time.
+    let window = std::cmp::min(
+        PREINSTALL_PATCH_WINDOW,
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    );
+    let mut join_set: tokio::task::JoinSet<SophonResult<()>> = tokio::task::JoinSet::new();
+    let mut first_error: Option<SophonError> = None;
+
     for asset in &state.patch_assets {
         if handle.is_cancelled() {
-            return Err(SophonError::Cancelled);
+            first_error = first_error.or(Some(SophonError::Cancelled));
+            break;
         }
         if asset.patch_method == PatchMethod::Skip {
             applied_files.fetch_add(1, Ordering::Relaxed);
@@ -2227,184 +2247,74 @@ where
             continue;
         }
 
-        let target_path = validate_asset_path(&game_dir, &asset.target_file_path)?;
-        let already_patched = {
-            let tp = target_path.clone();
-            let sz = asset.target_file_size;
-            let md5 = super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec());
-            tokio::task::spawn_blocking(move || is_file_already_patched(&tp, sz, &md5)).await?
+        // Path validation fails the whole run eagerly, before any task
+        // is scheduled.
+        let target_path = match validate_asset_path(&game_dir, &asset.target_file_path) {
+            Ok(path) => path,
+            Err(err) => {
+                first_error = first_error.or(Some(err));
+                break;
+            }
         };
-        if already_patched {
-            applied_files.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
 
-        let is_filtered = is_filtered_asset(&filter_cache, asset);
-        let asset = Arc::new(asset.clone());
-
-        match asset.patch_method {
-            PatchMethod::CopyOver => {
-                const COPY_MAX_RETRIES: usize = 4;
-                let mut fallback_to_download = false;
-                let mut skip_progress = false;
-
-                for attempt in 0..=COPY_MAX_RETRIES {
-                    let gd = Arc::clone(&game_dir);
-                    let cd = Arc::clone(&chunks_dir);
-                    let a = Arc::clone(&asset);
-                    let result =
-                        tokio::task::spawn_blocking(move || apply_copy_over(&gd, &cd, a.as_ref()))
-                            .await?;
-
-                    match result {
-                        Ok(()) => break,
-                        Err(err) => {
-                            if is_filtered {
-                                log::warn!(
-                                    "CopyOver failed for filtered asset, skipping: {path} ({err})",
-                                    path = asset.target_file_path,
-                                );
-                                applied_files.fetch_add(1, Ordering::Relaxed);
-                                skip_progress = true;
-                                break;
-                            }
-                            if attempt == COPY_MAX_RETRIES || !err.is_retryable() {
-                                log::warn!(
-                                    "CopyOver failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
-                                    path = asset.target_file_path,
-                                    attempts = COPY_MAX_RETRIES + 1,
-                                );
-                                fallback_to_download = true;
-                            } else {
-                                if handle.is_cancelled() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                                let delay = retry_delay(attempt as u32);
-                                log::warn!(
-                                    "CopyOver failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
-                                    path = asset.target_file_path,
-                                    attempt_num = attempt + 1,
-                                    max_attempts = COPY_MAX_RETRIES + 1,
-                                    delay_ms = delay.as_millis()
-                                );
-                                if cancelable_sleep(handle, delay).await.is_err() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                            }
-                        }
+        // Backpressure: keep at most `window` assets in flight. Results
+        // are handled in completion order; the first error stops new
+        // scheduling but in-flight assets still finish (their atomic
+        // temp-file writes are safe) before the drain below.
+        while join_set.len() >= window {
+            match join_set.join_next().await {
+                Some(outcome) => {
+                    if !handle_asset_result(outcome, &mut first_error) {
+                        break;
                     }
                 }
-
-                if skip_progress {
-                    continue;
-                }
-                if fallback_to_download {
-                    apply_download_over_with_retry(
-                        client,
-                        &game_dir,
-                        &state,
-                        asset.as_ref(),
-                        &download_over_context,
-                        handle,
-                    )
-                    .await?;
-                }
+                None => break,
             }
-            PatchMethod::Patch => {
-                const PATCH_MAX_RETRIES: usize = 4;
-                let mut fallback_to_download = false;
-                let mut skip_progress = false;
-
-                for attempt in 0..=PATCH_MAX_RETRIES {
-                    let gd = std::sync::Arc::clone(&game_dir);
-                    let cd = std::sync::Arc::clone(&chunks_dir);
-                    let a = Arc::clone(&asset);
-                    let fc = Arc::clone(&filter_cache);
-                    let result = tokio::task::spawn_blocking(move || {
-                        apply_hdiff_patch(&gd, &cd, a.as_ref(), &fc)
-                    })
-                    .await?;
-
-                    match result {
-                        Ok(()) => break,
-                        Err(err) => {
-                            if is_filtered {
-                                log::warn!(
-                                    "HDiff patch failed for filtered asset, skipping: {path} ({err})",
-                                    path = asset.target_file_path,
-                                );
-                                applied_files.fetch_add(1, Ordering::Relaxed);
-                                skip_progress = true;
-                                break;
-                            }
-                            if attempt == PATCH_MAX_RETRIES || !err.is_retryable() {
-                                log::warn!(
-                                    "HDiff patch failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
-                                    path = asset.target_file_path,
-                                    attempts = PATCH_MAX_RETRIES + 1,
-                                );
-                                fallback_to_download = true;
-                            } else {
-                                if handle.is_cancelled() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                                let delay = retry_delay(attempt as u32);
-                                log::warn!(
-                                    "HDiff patch failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
-                                    path = asset.target_file_path,
-                                    attempt_num = attempt + 1,
-                                    max_attempts = PATCH_MAX_RETRIES + 1,
-                                    delay_ms = delay.as_millis()
-                                );
-                                if cancelable_sleep(handle, delay).await.is_err() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if skip_progress {
-                    continue;
-                }
-                if fallback_to_download {
-                    apply_download_over_with_retry(
-                        client,
-                        &game_dir,
-                        &state,
-                        asset.as_ref(),
-                        &download_over_context,
-                        handle,
-                    )
-                    .await?;
-                }
-            }
-            PatchMethod::DownloadOver => {
-                apply_download_over_with_retry(
-                    client,
-                    &game_dir,
-                    &state,
-                    asset.as_ref(),
-                    &download_over_context,
-                    handle,
-                )
-                .await?;
-            }
-            PatchMethod::Remove | PatchMethod::Skip => {}
+        }
+        if first_error.is_some() {
+            break;
         }
 
-        let count = applied_files.fetch_add(1, Ordering::Relaxed) + 1;
-        let now = now_nanos();
-        if now.saturating_sub(last_apply_update.load(Ordering::Relaxed))
-            >= super::PROGRESS_UPDATE_INTERVAL_MS * 1_000_000
-        {
-            updater(SophonProgress::ApplyingPreinstall {
-                applied_files: count,
-                total_files,
-            });
-            last_apply_update.store(now, Ordering::Relaxed);
-        }
+        let task = PatchTaskContext {
+            game_dir: Arc::clone(&game_dir),
+            chunks_dir: Arc::clone(&chunks_dir),
+            filter_cache: Arc::clone(&filter_cache),
+            download_over_context: Arc::clone(&download_over_context),
+            state: Arc::clone(&state),
+            client: client.clone(),
+            handle: handle.clone(),
+            asset: Arc::new(asset.clone()),
+            target_path,
+            applied_files: Arc::clone(&applied_files),
+            last_apply_update: Arc::clone(&last_apply_update),
+            updater: Arc::clone(&updater),
+            total_files,
+        };
+        join_set.spawn(process_patch_asset(task));
+    }
+
+    // Drain remaining tasks. spawn_blocking bodies cannot be interrupted;
+    // every in-flight apply must complete before the post-loop steps
+    // (pkg_version regeneration, deletions, tag write) observe the
+    // filesystem. A panicked task is recorded but never abandons the
+    // drain: dropping the JoinSet would detach still-running apply
+    // writers that the post-loop steps could then race.
+    while let Some(outcome) = join_set.join_next().await {
+        let _ = handle_asset_result(outcome, &mut first_error);
+    }
+    // Final progress tick is sent even when the throttle would suppress
+    // it: parallel completions cluster and would otherwise leave the UI
+    // stuck below 100%.
+    let count = applied_files.load(Ordering::Relaxed);
+    if count > 0 {
+        updater(SophonProgress::ApplyingPreinstall {
+            applied_files: count,
+            total_files,
+        });
+        last_apply_update.store(now_nanos(), Ordering::Relaxed);
+    }
+    if let Some(err) = first_error {
+        return Err(err);
     }
 
     if handle.is_cancelled() {
@@ -2852,6 +2762,282 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
 
     posix_advise(chunk_fd, 0, 0, libc::POSIX_FADV_DONTNEED);
     Ok(())
+}
+
+/// Upper bound on concurrently in-flight patch applies. btrfs fsync
+/// contention and HDD seek costs flatten or regress beyond a few
+/// concurrent applies, so this stays small; the effective window is also
+/// capped by CPU count at the call site.
+const PREINSTALL_PATCH_WINDOW: usize = 4;
+
+/// Shared context a single in-flight patch asset needs. Everything the
+/// JoinSet task touches is owned or Arc'd so the task is 'static.
+struct PatchTaskContext {
+    game_dir: Arc<std::path::Path>,
+    chunks_dir: Arc<std::path::Path>,
+    filter_cache: Arc<FilterCache>,
+    download_over_context: Arc<DownloadOverContext>,
+    state: Arc<PreinstallState>,
+    client: Client,
+    handle: DownloadHandle,
+    asset: Arc<PatchAssetInfo>,
+    target_path: std::path::PathBuf,
+    applied_files: Arc<AtomicU64>,
+    last_apply_update: Arc<AtomicU64>,
+    updater: ProgressUpdater,
+    total_files: u64,
+}
+
+/// Applies one patch asset through its full lifecycle: already-patched
+/// check, method dispatch with bounded retries, filtered-asset skip,
+/// DownloadOver fallback, and the throttled progress update.
+async fn process_patch_asset(ctx: PatchTaskContext) -> SophonResult<()> {
+    let PatchTaskContext {
+        game_dir,
+        chunks_dir,
+        filter_cache,
+        download_over_context,
+        state,
+        client,
+        handle,
+        asset,
+        target_path,
+        applied_files,
+        last_apply_update,
+        updater,
+        total_files,
+    } = ctx;
+
+    // Already-patched check runs inside the task: it is a full md5 read
+    // of the target and hiding it behind other applies is the point of
+    // the window.
+    let already_patched = {
+        let tp = target_path.clone();
+        let sz = asset.target_file_size;
+        let md5 = super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
+            .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec());
+        tokio::task::spawn_blocking(move || is_file_already_patched(&tp, sz, &md5))
+            .await
+            .map_err(SophonError::JoinError)?
+    };
+    if already_patched {
+        report_apply_progress(
+            &applied_files,
+            &last_apply_update,
+            &updater,
+            total_files,
+        );
+        return Ok(());
+    }
+
+    let is_filtered = is_filtered_asset(&filter_cache, &asset);
+
+    // The CopyOver and Patch retry ladders below are intentionally
+    // parallel copies: they differ only in the applied function, its
+    // retry ceiling label, and log wording. Sharing them through a
+    // closure would hide the retry/fallback control flow behind
+    // indirection in correctness-critical code.
+    let mut skip_progress = false;
+    match asset.patch_method {
+        PatchMethod::CopyOver => {
+            const COPY_MAX_RETRIES: usize = 4;
+            let mut fallback_to_download = false;
+
+            for attempt in 0..=COPY_MAX_RETRIES {
+                let gd = Arc::clone(&game_dir);
+                let cd = Arc::clone(&chunks_dir);
+                let a = Arc::clone(&asset);
+                let result =
+                    tokio::task::spawn_blocking(move || apply_copy_over(&gd, &cd, a.as_ref()))
+                        .await
+                        .map_err(SophonError::JoinError)?;
+
+                match result {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if is_filtered {
+                            log::warn!(
+                                "CopyOver failed for filtered asset, skipping: {path} ({err})",
+                                path = asset.target_file_path,
+                            );
+                            skip_progress = true;
+                            break;
+                        }
+                        if attempt == COPY_MAX_RETRIES || !err.is_retryable() {
+                            log::warn!(
+                                "CopyOver failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
+                                path = asset.target_file_path,
+                                attempts = COPY_MAX_RETRIES + 1,
+                            );
+                            fallback_to_download = true;
+                        } else {
+                            if handle.is_cancelled() {
+                                return Err(SophonError::Cancelled);
+                            }
+                            let delay = retry_delay(attempt as u32);
+                            log::warn!(
+                                "CopyOver failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
+                                path = asset.target_file_path,
+                                attempt_num = attempt + 1,
+                                max_attempts = COPY_MAX_RETRIES + 1,
+                                delay_ms = delay.as_millis()
+                            );
+                            if cancelable_sleep(&handle, delay).await.is_err() {
+                                return Err(SophonError::Cancelled);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !skip_progress && fallback_to_download {
+                if handle.is_cancelled() {
+                    return Err(SophonError::Cancelled);
+                }
+                apply_download_over_with_retry(
+                    &client,
+                    &game_dir,
+                    &state,
+                    &asset,
+                    &download_over_context,
+                    &handle,
+                )
+                .await?;
+            }
+        }
+        PatchMethod::Patch => {
+            const PATCH_MAX_RETRIES: usize = 4;
+            let mut fallback_to_download = false;
+
+            for attempt in 0..=PATCH_MAX_RETRIES {
+                let gd = Arc::clone(&game_dir);
+                let cd = Arc::clone(&chunks_dir);
+                let a = Arc::clone(&asset);
+                let fc = Arc::clone(&filter_cache);
+                let result = tokio::task::spawn_blocking(move || {
+                    apply_hdiff_patch(&gd, &cd, a.as_ref(), &fc)
+                })
+                .await
+                .map_err(SophonError::JoinError)?;
+
+                match result {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if is_filtered {
+                            log::warn!(
+                                "HDiff patch failed for filtered asset, skipping: {path} ({err})",
+                                path = asset.target_file_path,
+                            );
+                            skip_progress = true;
+                            break;
+                        }
+                        if attempt == PATCH_MAX_RETRIES || !err.is_retryable() {
+                            log::warn!(
+                                "HDiff patch failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
+                                path = asset.target_file_path,
+                                attempts = PATCH_MAX_RETRIES + 1,
+                            );
+                            fallback_to_download = true;
+                        } else {
+                            if handle.is_cancelled() {
+                                return Err(SophonError::Cancelled);
+                            }
+                            let delay = retry_delay(attempt as u32);
+                            log::warn!(
+                                "HDiff patch failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
+                                path = asset.target_file_path,
+                                attempt_num = attempt + 1,
+                                max_attempts = PATCH_MAX_RETRIES + 1,
+                                delay_ms = delay.as_millis()
+                            );
+                            if cancelable_sleep(&handle, delay).await.is_err() {
+                                return Err(SophonError::Cancelled);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !skip_progress && fallback_to_download {
+                if handle.is_cancelled() {
+                    return Err(SophonError::Cancelled);
+                }
+                apply_download_over_with_retry(
+                    &client,
+                    &game_dir,
+                    &state,
+                    &asset,
+                    &download_over_context,
+                    &handle,
+                )
+                .await?;
+            }
+        }
+        PatchMethod::DownloadOver => {
+            apply_download_over_with_retry(
+                &client,
+                &game_dir,
+                &state,
+                &asset,
+                &download_over_context,
+                &handle,
+            )
+            .await?;
+        }
+        PatchMethod::Remove | PatchMethod::Skip => {}
+    }
+
+    if !skip_progress {
+        report_apply_progress(&applied_files, &last_apply_update, &updater, total_files);
+    }
+    Ok(())
+}
+
+/// Throttled progress tick shared by every completion path of a patch
+/// asset.
+fn report_apply_progress(
+    applied_files: &AtomicU64,
+    last_apply_update: &AtomicU64,
+    updater: &ProgressUpdater,
+    total_files: u64,
+) {
+    let count = applied_files.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_nanos();
+    if now.saturating_sub(last_apply_update.load(Ordering::Relaxed))
+        >= super::PROGRESS_UPDATE_INTERVAL_MS * 1_000_000
+    {
+        updater(SophonProgress::ApplyingPreinstall {
+            applied_files: count,
+            total_files,
+        });
+        last_apply_update.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Handle one completed patch task: record the first error (failures
+/// abort the run after draining in-flight work). Returns false only for
+/// a panicked or cancelled task; callers must still drain the set.
+fn handle_asset_result(
+    outcome: Result<SophonResult<()>, tokio::task::JoinError>,
+    first_error: &mut Option<SophonError>,
+) -> bool {
+    match outcome {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            if first_error.is_none() {
+                log::warn!("Patch task failed: {err}");
+                *first_error = Some(err);
+            }
+            true
+        }
+        Err(join_err) => {
+            if first_error.is_none() {
+                log::error!("Patch task panicked or was cancelled: {join_err}");
+                *first_error = Some(SophonError::JoinError(join_err));
+            }
+            false
+        }
+    }
 }
 
 fn apply_hdiff_patch(
@@ -3407,6 +3593,16 @@ async fn apply_download_over_with_retry(
     }))
 }
 
+/// Unique suffix for per-apply staging directories. Combines the process
+/// id with an in-process counter: two concurrent DownloadOver applies
+/// can never share a staging dir, and a stale dir left by a crashed
+/// previous run cannot collide with this process's staging areas.
+fn assembly_temp_token() -> u64 {
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    let counter = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    (std::process::id() as u64) << 32 | counter
+}
+
 async fn apply_download_over(
     client: &Client,
     game_dir: &Path,
@@ -3456,7 +3652,13 @@ async fn apply_download_over(
         let target_file_path = asset.target_file_path.clone();
         let vc = Arc::new(dashmap::DashMap::new());
         tokio::task::spawn_blocking(move || {
-            let tmp_dir = gd.join("tmp-patch-downloadover");
+            // Unique temp directory per apply: parallel in-flight patch
+            // assets each get their own staging area so one task's
+            // cleanup cannot race another task's assembly.
+            let tmp_dir = gd.join(format!(
+                "tmp-patch-downloadover-{token}",
+                token = assembly_temp_token(),
+            ));
             fs::create_dir_all(&tmp_dir)?;
             let file_entry = target_manifest.assets.get(file_index).ok_or_else(|| {
                 SophonError::AssemblyFailed {

@@ -3637,3 +3637,120 @@ async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output
         expected
     );
 }
+
+/// More assets than the parallel apply window, end to end: the window cap
+/// engages the backpressure path (wait for a completion before scheduling
+/// the next task), and every asset still lands with the right content and
+/// progress reaches the full count.
+#[tokio::test]
+async fn backpressured_parallel_apply_drains_all_assets() {
+    use wiremock::MockServer;
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let fields: Vec<(&str, String, &'static [u8])> = vec![
+        ("game", "file0.bin".to_string(), b"asset zero"),
+        ("en-us", "file1.bin".to_string(), b"asset one"),
+        ("cutscenes", "file2.bin".to_string(), b"asset two"),
+        ("game2", "file3.bin".to_string(), b"asset three"),
+        ("en-us2", "file4.bin".to_string(), b"asset four"),
+        ("cutscenes2", "file5.bin".to_string(), b"asset five"),
+    ];
+    let field_refs: Vec<(&str, &str, &[u8])> = fields
+        .iter()
+        .map(|(f, p, d)| (*f, p.as_str(), *d))
+        .collect();
+    let mut state = snapshot_state(&field_refs, &server.uri());
+    serve_target_chunks(&server, &mut state, &field_refs).await;
+    preinstall_download(
+        &Client::new(),
+        plan_from_state(state, vec![]),
+        dir.path(),
+        "nap",
+        "en",
+        DownloadHandle::new(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = {
+        let recorded = std::sync::Arc::clone(&recorded);
+        Arc::new(move |progress: crate::progress::SophonProgress| {
+            if let crate::progress::SophonProgress::ApplyingPreinstall {
+                applied_files,
+                total_files,
+            } = progress
+            {
+                recorded.lock().unwrap().push((applied_files, total_files));
+            }
+        })
+    };
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        recorder,
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+
+    for (i, (_, path, data)) in fields.iter().enumerate() {
+        assert_eq!(
+            fs::read(dir.path().join(path)).unwrap(),
+            *data,
+            "asset {i} content"
+        );
+    }
+    let recorded = recorded.lock().unwrap();
+    assert!(
+        recorded.iter().all(|(applied, total)| *total == 6),
+        "all progress reports carry the asset total"
+    );
+    assert_eq!(recorded.last().copied(), Some((6, 6)));
+}
+
+/// Unit contract of the join-result handler: success passes through,
+/// the first task error is kept (later errors ignored), and a panicked
+/// task both records a JoinError and reports false so the caller knows
+/// the drain is abnormal.
+#[tokio::test]
+async fn handle_asset_result_keeps_first_error_and_flags_panics() {
+    use super::handle_asset_result;
+
+    // Success passes through without recording anything.
+    let mut first_error = None;
+    assert!(handle_asset_result(Ok(Ok(())), &mut first_error));
+    assert!(first_error.is_none());
+
+    // The first task error is recorded verbatim and later errors do not
+    // displace it.
+    let mut first_error = None;
+    assert!(handle_asset_result(
+        Ok(Err(SophonError::Io(std::io::Error::other("boom")))),
+        &mut first_error
+    ));
+    let message = first_error.as_ref().unwrap().to_string();
+    assert!(message.contains("boom"), "recorded: {message}");
+    assert!(handle_asset_result(
+        Ok(Err(SophonError::Io(std::io::Error::other("second")))),
+        &mut first_error
+    ));
+    let again = first_error.as_ref().unwrap().to_string();
+    assert!(
+        again.contains("boom") && !again.contains("second"),
+        "first error must win: {again}"
+    );
+
+    // Produce a real JoinError from a panicked task.
+    let join_err = tokio::spawn(async { panic!("intentional") })
+        .await
+        .unwrap_err();
+    let fresh = &mut Option::<SophonError>::None;
+    assert!(!handle_asset_result(Err(join_err), fresh));
+    assert!(matches!(fresh, Some(SophonError::JoinError(_))));
+}
