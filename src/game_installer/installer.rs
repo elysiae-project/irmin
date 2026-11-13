@@ -191,7 +191,12 @@ struct InstallContext {
     last_speed_time: AtomicU64,
     updater: ProgressUpdater,
     downloaded_chunks: Arc<OnceLock<Vec<AtomicU32>>>,
+    /// Download-path completions since the last state save; gates saves on
+    /// [`crate::CHUNK_STATE_SAVE_INTERVAL`] to bound per-save work.
     chunks_since_save: AtomicU64,
+    /// Assembly completions since the last state save; paced by
+    /// [`save_assembly_state_if_due`].
+    assemblies_since_save: AtomicU64,
     last_save: Mutex<Option<tokio::task::JoinHandle<()>>>,
     state_saver: StateSaver,
     /// Shares chunk names with the lookup used by assembly tasks.
@@ -1337,6 +1342,18 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
     }
 }
 
+/// Gate assembly-completion saves on the same interval used for chunk
+/// completions. Assembly completions only delete consumed chunk files (the
+/// persisted set shrinks), resume re-validates every persisted entry against
+/// disk, and the install end performs a terminal save regardless.
+async fn save_assembly_state_if_due(ctx: &Arc<InstallContext>) {
+    // Pacing only; the actual save synchronizes through `last_save`.
+    let count = ctx.assemblies_since_save.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
+        save_assembly_state(ctx).await;
+    }
+}
+
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 #[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
 pub fn snapshot_downloaded_chunks<'a>(
@@ -1441,7 +1458,7 @@ fn spawn_assembly_coordinator(
             } else if let Some(res) = join_set.try_join_next() {
                 match res {
                     Ok(Ok(())) => {
-                        save_assembly_state(&ctx).await;
+                        save_assembly_state_if_due(&ctx).await;
                     }
                     Ok(Err(err)) => {
                         log::error!("Assembly task failed: {err}");
@@ -1478,7 +1495,7 @@ fn spawn_assembly_coordinator(
                     res = join_set.join_next() => {
                         match res {
                             Some(Ok(Ok(()))) => {
-                                save_assembly_state(&ctx).await;
+                                save_assembly_state_if_due(&ctx).await;
                             }
                             Some(Ok(Err(err))) => {
                                 log::error!("Assembly task failed: {err}");
@@ -3652,6 +3669,7 @@ pub async fn install(
         updater: Arc::clone(&callbacks.updater),
         downloaded_chunks: Arc::new(OnceLock::new()),
         chunks_since_save: AtomicU64::new(0),
+        assemblies_since_save: AtomicU64::new(0),
         last_save: Mutex::new(None),
         state_saver: callbacks.state_saver,
         save_chunk_names: Arc::new(OnceLock::new()),

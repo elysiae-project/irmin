@@ -1472,6 +1472,7 @@ async fn download_chunk_with_retries_success_on_first() {
         updater: Arc::new(|_| {}),
         downloaded_chunks: Arc::new(OnceLock::new()),
         chunks_since_save: AtomicU64::new(0),
+        assemblies_since_save: AtomicU64::new(0),
         last_save: Mutex::new(None),
         state_saver: Arc::new(|_| {}),
         save_chunk_names: Arc::new(OnceLock::new()),
@@ -1595,6 +1596,7 @@ async fn download_chunk_with_retries_mismatch_discards_partial() {
         updater: Arc::new(|_| {}),
         downloaded_chunks: Arc::new(OnceLock::new()),
         chunks_since_save: AtomicU64::new(0),
+        assemblies_since_save: AtomicU64::new(0),
         last_save: Mutex::new(None),
         state_saver: Arc::new(|_| {}),
         save_chunk_names: Arc::new(OnceLock::new()),
@@ -2138,4 +2140,89 @@ fn chunk_still_valid_for_resume_invalid_name() {
     assert!(!chunk_still_valid_for_resume("", 0, &tmp));
     assert!(!chunk_still_valid_for_resume("name/with/slash", 2, &tmp));
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn save_assembly_state_gates_on_completion_interval() {
+    use std::sync::atomic::AtomicUsize;
+
+    let dir = tempfile::tempdir().unwrap();
+    let save_calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&save_calls);
+
+    let ctx = Arc::new(InstallContext {
+        installer_clients: Arc::new(Vec::new()),
+        installer_downloads: Arc::new(Vec::new()),
+        chunks_dir: Arc::new(dir.path().to_path_buf()),
+        game_dir: dir.path().to_path_buf().into(),
+        all_tmp_dirs: Arc::new(Vec::new()),
+        all_files: Arc::new(CompactManifest::from(Vec::new())),
+        downloaded_bytes: AtomicU64::new(0),
+        assembled_files: Arc::new(AtomicU64::new(0)),
+        checked_files: Arc::new(AtomicU64::new(0)),
+        total_bytes: 0,
+        total_files: 0,
+        resume_bytes_offset: AtomicU64::new(0),
+        verify_cache: Arc::new(DashMap::new()),
+        chunk_refcounts: Arc::new(OnceLock::new()),
+        chunk_names: Arc::new(OnceLock::new()),
+        last_assembly_update: Arc::new(Mutex::new(Instant::now())),
+        last_update: AtomicU64::new(now_nanos()),
+        smooth_speed_bps: AtomicU64::new(0),
+        eta_speed_history: Mutex::new(VecDeque::new()),
+        last_speed_bytes: AtomicU64::new(0),
+        last_speed_time: AtomicU64::new(now_nanos()),
+        updater: Arc::new(|_| {}),
+        downloaded_chunks: Arc::new(OnceLock::new()),
+        chunks_since_save: AtomicU64::new(0),
+        assemblies_since_save: AtomicU64::new(0),
+        last_save: Mutex::new(None),
+        state_saver: Arc::new(move |entries: &[(&str, u64)]| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(entries.is_empty(), "empty manifest snapshots no chunks");
+        }),
+        save_chunk_names: Arc::new(OnceLock::new()),
+        adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
+        profiler: Arc::new(super::profiling::PipelineProfiler::new()),
+        completion_flags: Arc::from(Vec::<AtomicBool>::new()),
+        output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
+        chunk_bitmap: Arc::new(
+            super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("gate.bitmap"), 1).unwrap(),
+        ),
+        verify_mode: super::VerifyMode::Full,
+    });
+
+    // Boundary checks: the save fires exactly on the interval, not before.
+    for _ in 0..(crate::CHUNK_STATE_SAVE_INTERVAL - 1) {
+        save_assembly_state_if_due(&ctx).await;
+    }
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "completions below the interval must not save"
+    );
+    save_assembly_state_if_due(&ctx).await;
+
+    // A second interval fires once more; the partial tail does not.
+    for _ in 0..(crate::CHUNK_STATE_SAVE_INTERVAL + 7) {
+        save_assembly_state_if_due(&ctx).await;
+    }
+
+    // The terminal save path (save_assembly_state) bypasses the gate.
+    save_assembly_state(&ctx).await;
+
+    // Interval saves run on spawn_blocking and chain through `last_save`;
+    // drain the final handle (bounded, so a stuck save fails the test rather
+    // than hanging it) before counting invocations.
+    if let Some(handle) = ctx.last_save.lock().unwrap().take() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("last state save should finish")
+            .expect("state save task must not panic");
+    }
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "two interval saves plus the terminal save must be recorded"
+    );
 }
