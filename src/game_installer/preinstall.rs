@@ -20,7 +20,6 @@ fn now_nanos() -> u64 {
     EPOCH.elapsed().as_nanos() as u64
 }
 
-use dashmap::DashMap;
 
 use futures_util::StreamExt;
 use futures_util::future::{Future, ready, try_join_all};
@@ -1189,6 +1188,46 @@ fn preinstall_workers_to_spawn_if_running(
     }
 }
 
+/// Dense per-chunk completion tracking, indexed by position in the plan's
+/// unique-chunk list. `PENDING` marks a chunk the download has not yet
+/// confirmed; any other value is its recorded size. Each index has exactly
+/// one writer, so Relaxed stores and loads are sufficient; a periodic save
+/// may miss the last few completions, and the terminal save catches them.
+pub struct ChunkSizes(Box<[AtomicU64]>);
+
+/// Sentinel for "not downloaded yet"; no real chunk file can be this large.
+const PENDING: u64 = u64::MAX;
+
+impl ChunkSizes {
+    pub fn new(len: usize) -> Self {
+        Self((0..len).map(|_| AtomicU64::new(PENDING)).collect())
+    }
+
+    /// Record the chunk at `idx` as downloaded with its size in bytes.
+    /// Relaxed ordering relies on each index having a single writer.
+    /// Idempotent: a retried chunk stores the same value twice.
+    pub fn mark(&self, idx: usize, size: u64) {
+        debug_assert_ne!(size, PENDING);
+        self.0[idx].store(size, Ordering::Relaxed);
+    }
+
+    /// The chunk's size once it has been confirmed downloaded.
+    fn get(&self, idx: usize) -> Option<u64> {
+        match self.0[idx].load(Ordering::Relaxed) {
+            PENDING => None,
+            size => Some(size),
+        }
+    }
+
+    /// How many chunks are confirmed downloaded.
+    fn completed(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|v| v.load(Ordering::Relaxed) != PENDING)
+            .count()
+    }
+}
+
 /// Shared state for preinstall download workers. Created once per worker,
 /// passed by reference to each chunk — eliminates per-chunk Arc clones.
 struct PreinstallWorkerCtx {
@@ -1200,33 +1239,53 @@ struct PreinstallWorkerCtx {
     downloaded_bytes: Arc<AtomicU64>,
     resume_offset: u64,
     total_bytes: u64,
-    chunk_bytes_map: Arc<DashMap<String, u64>>,
+    chunk_sizes: Arc<ChunkSizes>,
+    unique_chunks: Arc<[PatchChunkInfo]>,
     state_saver: super::installer::StateSaver,
     chunks_since_save: Arc<AtomicUsize>,
 }
 
-fn snapshot_downloaded_chunks(
-    chunk_bytes_map: Arc<DashMap<String, u64>>,
+/// Borrow the names and sizes of every confirmed chunk for the state saver.
+/// Names are borrowed from `unique_chunks`; entries are valid only for
+/// the duration of the `state_saver` call.
+pub fn save_state_snapshot(
+    chunk_sizes: &ChunkSizes,
+    unique_chunks: &[PatchChunkInfo],
     state_saver: &super::installer::StateSaver,
-) -> rustc_hash::FxHashSet<String> {
-    let snapshot: Vec<(String, u64)> = chunk_bytes_map
-        .iter()
-        .map(|entry| (entry.key().clone(), *entry.value()))
-        .collect();
-    let snapshot_refs: Vec<(&str, u64)> = snapshot.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    state_saver(&snapshot_refs);
-    drop(snapshot);
-
-    match Arc::try_unwrap(chunk_bytes_map) {
-        Ok(map) => map.into_iter().map(|(name, _)| name).collect(),
-        Err(map) => {
-            log::warn!("Preinstall chunk map still has references; cloning final chunk names");
-            map.iter().map(|entry| entry.key().clone()).collect()
+) {
+    let mut entries: Vec<(&str, u64)> = Vec::with_capacity(unique_chunks.len());
+    for (idx, chunk) in unique_chunks.iter().enumerate() {
+        if let Some(size) = chunk_sizes.get(idx) {
+            entries.push((chunk.patch_name.as_str(), size));
         }
     }
+    state_saver(&entries);
+}
+
+/// Final save plus the once-owned name set persisted in the preinstall
+/// state (resume validation looks chunks up by name).
+fn snapshot_downloaded_chunks(
+    chunk_sizes: Arc<ChunkSizes>,
+    unique_chunks: Arc<[PatchChunkInfo]>,
+    state_saver: &super::installer::StateSaver,
+) -> rustc_hash::FxHashSet<String> {
+    save_state_snapshot(&chunk_sizes, &unique_chunks, state_saver);
+
+    let count = chunk_sizes.completed();
+    let mut names = rustc_hash::FxHashSet::with_capacity_and_hasher(count, Default::default());
+    for (idx, chunk) in unique_chunks.iter().enumerate() {
+        if chunk_sizes.get(idx).is_some() {
+            names.insert(chunk.patch_name.clone());
+        }
+    }
+    // Plan-build dedup makes indices and names 1:1; if that invariant
+    // breaks, the count check above would pass while the state file lies.
+    debug_assert_eq!(names.len(), count);
+    names
 }
 
 async fn process_preinstall_chunk(
+    chunk_idx: usize,
     chunk_info: &PatchChunkInfo,
     ctx: &PreinstallWorkerCtx,
     diff_download: &Arc<DownloadInfo>,
@@ -1257,19 +1316,11 @@ async fn process_preinstall_chunk(
             actual,
         });
     }
-    ctx.chunk_bytes_map
-        .insert(chunk_info.patch_name.clone(), chunk_info.patch_size);
+    ctx.chunk_sizes.mark(chunk_idx, chunk_info.patch_size);
 
     let save_count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if save_count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL as usize) {
-        let entries: Vec<(String, u64)> = ctx
-            .chunk_bytes_map
-            .iter()
-            .map(|r| (r.key().clone(), *r.value()))
-            .collect();
-        let entries_refs: Vec<(&str, u64)> =
-            entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        (ctx.state_saver)(&entries_refs);
+        save_state_snapshot(&ctx.chunk_sizes, &ctx.unique_chunks, &ctx.state_saver);
     }
 
     Ok(())
@@ -1355,7 +1406,8 @@ pub async fn preinstall_download(
         .fold(0u64, |acc, x| acc.saturating_add(x));
     let downloaded_bytes = Arc::new(AtomicU64::new(0));
 
-    let chunk_bytes_map: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
+    let unique_chunks: Arc<[PatchChunkInfo]> = plan.unique_chunks.into();
+    let chunk_sizes: Arc<ChunkSizes> = Arc::new(ChunkSizes::new(unique_chunks.len()));
     // Generic progress state is only a hint. Populate readiness exclusively from
     // fresh on-disk size/hash checks, including on resumed downloads.
 
@@ -1363,7 +1415,7 @@ pub async fn preinstall_download(
     // matching hash are folded into the baseline offset, NOT into
     // `downloaded_bytes`, so the download phase only counts bytes actually
     // streamed over the network.
-    let total_files = plan.unique_chunks.len() as u64;
+    let total_files = unique_chunks.len() as u64;
     updater(SophonProgress::CalculatingDownloads {
         checked_files: 0,
         total_files,
@@ -1372,18 +1424,13 @@ pub async fn preinstall_download(
     let resume_offset_arc = Arc::new(AtomicU64::new(0));
     let last_check_emit = Arc::new(AtomicU64::new(now_nanos()));
     {
-        let map = Arc::clone(&chunk_bytes_map);
         let upd = Arc::clone(&updater);
-        // .cloned() makes `chunk` an owned PatchChunkInfo instead of
-        // &PatchChunkInfo, keeping the async move future 'static. Removing
-        // it triggers clippy::redundant_iter_cloned but breaks buffer_unordered
-        // with HRTB inference errors when the future is awaited inside
-        // tokio::spawn.
-        #[allow(clippy::redundant_iter_cloned)]
-        let futures = plan.unique_chunks.iter().cloned().map(|chunk| {
+        // Each future owns what it touches (name, md5, Arc clones) so the
+        // `async move` block stays 'static under buffer_unordered.
+        let futures = unique_chunks.iter().enumerate().map(|(chunk_idx, chunk)| {
             let checked = Arc::clone(&checked_arc);
             let offset = Arc::clone(&resume_offset_arc);
-            let map = Arc::clone(&map);
+            let sizes = Arc::clone(&chunk_sizes);
             let upd = Arc::clone(&upd);
             let last_emit = Arc::clone(&last_check_emit);
             let chunks_dir = chunks_dir.clone();
@@ -1398,7 +1445,7 @@ pub async fn preinstall_download(
                 })
                 .await?;
                 if ok {
-                    map.insert(patch_name.clone(), patch_size);
+                    sizes.mark(chunk_idx, patch_size);
                     offset.fetch_add(patch_size, Ordering::Relaxed);
                 }
                 let checked = checked.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1444,11 +1491,20 @@ pub async fn preinstall_download(
         return Err(SophonError::Cancelled);
     }
 
-    let total: usize = plan.unique_chunks.len();
-    let pending_chunks: Arc<Vec<PatchChunkInfo>> = Arc::new(
-        plan.unique_chunks
-            .into_iter()
-            .filter(|chunk| !chunk_bytes_map.contains_key(&chunk.patch_name))
+    let total: usize = unique_chunks.len();
+    if total > u32::MAX as usize {
+        return Err(invalid_state(
+            "preinstall chunk count exceeds u32 index space",
+        ));
+    }
+    // Pending work is a dense index list: workers borrow chunk metadata
+    // from unique_chunks and completion is recorded at the index.
+    let pending_chunks: Arc<Vec<u32>> = Arc::new(
+        unique_chunks
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| chunk_sizes.get(*idx).is_none())
+            .map(|(idx, _)| idx as u32)
             .collect(),
     );
     let next_chunk = Arc::new(AtomicUsize::new(0));
@@ -1539,7 +1595,8 @@ pub async fn preinstall_download(
             downloaded_bytes: Arc::clone(&downloaded_bytes),
             resume_offset,
             total_bytes,
-            chunk_bytes_map: Arc::clone(&chunk_bytes_map),
+            chunk_sizes: Arc::clone(&chunk_sizes),
+            unique_chunks: Arc::clone(&unique_chunks),
             state_saver: Arc::clone(&state_saver),
             chunks_since_save: Arc::clone(&chunks_since_save),
         };
@@ -1554,10 +1611,13 @@ pub async fn preinstall_download(
                 {
                     return;
                 }
-                let chunk_index = next_chunk.fetch_add(1, Ordering::Relaxed);
-                let Some(chunk_info) = pending_chunks.get(chunk_index) else {
+                let pending_pos = next_chunk.fetch_add(1, Ordering::Relaxed);
+                let Some(chunk_idx) = pending_chunks.get(pending_pos) else {
                     break;
                 };
+                // Direct indexing: a pending index that failed to address
+                // unique_chunks panics instead of silently stalling.
+                let chunk_info = &ctx.unique_chunks[*chunk_idx as usize];
                 let diff_download = ctx
                     .diff_downloads
                     .get(&chunk_info.matching_field)
@@ -1573,7 +1633,13 @@ pub async fn preinstall_download(
                             .cloned()
                             .expect("diff_downloads must not be empty")
                     });
-                let result = process_preinstall_chunk(chunk_info, &ctx, &diff_download).await;
+                let result = process_preinstall_chunk(
+                    *chunk_idx as usize,
+                    chunk_info,
+                    &ctx,
+                    &diff_download,
+                )
+                .await;
                 if let Err(err) = result {
                     if matches!(err, SophonError::Cancelled) {
                         cancelled.store(1, Ordering::Relaxed);
@@ -1677,14 +1743,23 @@ pub async fn preinstall_download(
         return Err(err);
     }
 
-    if chunk_bytes_map.len() != total {
-        return Err(invalid_state(
-            "Preinstall download ended with unverified patch chunks",
-        ));
+    let completed = chunk_sizes.completed();
+    if completed != total {
+        let missing: Vec<&str> = unique_chunks
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| chunk_sizes.get(*idx).is_none())
+            .map(|(_, chunk)| chunk.patch_name.as_str())
+            .take(8)
+            .collect();
+        return Err(invalid_state(format!(
+            "Preinstall download ended with {completed}/{total} verified patch chunks; first missing: {missing:?}",
+        )));
     }
 
     // Persist all downloaded chunks.
-    let downloaded_chunks = snapshot_downloaded_chunks(chunk_bytes_map, &state_saver);
+    let downloaded_chunks =
+        snapshot_downloaded_chunks(chunk_sizes, unique_chunks, &state_saver);
 
     updater(SophonProgress::Downloading {
         downloaded_bytes: total_bytes,
@@ -3883,7 +3958,17 @@ use crate::SophonProgress;
 #[path = "preinstall_tests.rs"]
 mod tests;
 
+/// Frozen replica of the DashMap-based periodic save for paired criterion
+/// comparison against [save_state_snapshot]: each save cloned every
+/// completed chunk's name out of the map. Safe to delete once its
+/// measurements are no longer needed.
 #[cfg(feature = "benchmark")]
+pub fn legacy_dashmap_snapshot(map: &dashmap::DashMap<String, u64>) -> Vec<(String, u64)> {
+    map.iter().map(|r| (r.key().clone(), *r.value())).collect()
+}
+
 pub mod bench_internals {
     pub use super::{verify_chunk_md5, verify_chunk_xxh64, verify_file_hash};
+    #[cfg(feature = "benchmark")]
+    pub use super::{ChunkSizes, legacy_dashmap_snapshot, save_state_snapshot};
 }

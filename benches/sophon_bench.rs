@@ -3338,6 +3338,111 @@ fn bench_planner_attribution(c: &mut Criterion) {
     group.finish();
 }
 
+/// Paired measurement of preinstall chunk-completion tracking: the frozen
+/// DashMap shape (String-keyed insert, full-map name clone on every
+/// periodic save) vs the dense ChunkSizes shape (atomic mark, borrowed-name
+/// snapshot). Map fullness grows over a download, so the save is measured
+/// at the terminal size where the legacy clone is most expensive. Both
+/// saves are timed including the drop of their output, which is the true
+/// per-save cost each shape pays in production (the legacy snapshot's
+/// 200k-String drop is real legacy cost, not bench noise).
+#[cfg(feature = "bench-internals")]
+fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
+    use dashmap::DashMap;
+    use irmin_rs::game_installer::preinstall::bench_internals::{
+        ChunkSizes, legacy_dashmap_snapshot, save_state_snapshot,
+    };
+    use irmin_rs::game_installer::installer::StateSaver;
+    use irmin_rs::game_installer::preinstall::PatchChunkInfo;
+
+    const COUNT: usize = 200_000;
+    let names: Vec<String> = (0..COUNT)
+        .map(|i| format!("patch-chunk-{i:08}.bin"))
+        .collect();
+    let saver: StateSaver = Arc::new(|_entries: &[(&str, u64)]| {});
+
+    let mut group = c.benchmark_group("preinstall_chunk_tracking");
+    group.throughput(Throughput::Elements(COUNT as u64));
+
+    group.bench_function("legacy_save", |b| {
+        b.iter_batched(
+            || {
+                let map: DashMap<String, u64> = DashMap::with_capacity(COUNT);
+                for (i, name) in names.iter().enumerate() {
+                    map.insert(name.clone(), 256 * 1024);
+                    let _ = i;
+                }
+                map
+            },
+            |map| {
+                let snapshot = legacy_dashmap_snapshot(&map);
+                std::hint::black_box(&snapshot);
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    group.bench_function("dense_save", |b| {
+        b.iter_batched(
+            || {
+                let sizes = ChunkSizes::new(COUNT);
+                for i in 0..COUNT {
+                    sizes.mark(i, 256 * 1024);
+                }
+                sizes
+            },
+            |sizes| {
+                save_state_snapshot(
+                    &sizes,
+                    &(0..COUNT)
+                        .map(|i| PatchChunkInfo {
+                            patch_name: names[i].clone(),
+                            patch_size: 256 * 1024,
+                            patch_md5: String::new(),
+                            matching_field: String::new(),
+                        })
+                        .collect::<Vec<_>>(),
+                    &saver,
+                );
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    group.bench_function("legacy_record", |b| {
+        b.iter_batched(
+            || DashMap::<String, u64>::with_capacity(COUNT),
+            |map| {
+                for name in &names {
+                    map.insert(name.clone(), 256 * 1024);
+                }
+                std::hint::black_box(&map);
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    group.bench_function("dense_record", |b| {
+        b.iter_batched(
+            || ChunkSizes::new(COUNT),
+            |sizes| {
+                for i in 0..COUNT {
+                    sizes.mark(i, 256 * 1024);
+                }
+                std::hint::black_box(&sizes);
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "bench-internals"))]
+fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
+    let _ = c;
+}
+
 #[cfg(feature = "bench-internals")]
 fn bench_update_diff_sizes(c: &mut Criterion) {
     use bytes::Bytes;
@@ -3458,6 +3563,7 @@ criterion_group!(
     bench_xxh64_hex_eq,
     bench_load_download_state,
     bench_planner_attribution,
+    bench_preinstall_chunk_tracking,
 );
 criterion_main!(benches);
 

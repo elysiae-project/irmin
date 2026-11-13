@@ -258,19 +258,38 @@ fn insert_unique_chunk_name_skips_duplicate_owned_key() {
     assert!(seen.contains("chunk-b"));
 }
 
-#[test]
-fn snapshot_downloaded_chunks_saves_sizes_and_moves_names() {
-    let map = Arc::new(DashMap::new());
-    map.insert("chunk-a".to_owned(), 11);
-    map.insert("chunk-b".to_owned(), 22);
+fn chunk_info(name: &str, size: u64) -> PatchChunkInfo {
+    PatchChunkInfo {
+        patch_name: name.to_owned(),
+        patch_size: size,
+        patch_md5: String::new(),
+        matching_field: String::new(),
+    }
+}
+
+fn capture_saver() -> (
+    Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+    super::super::installer::StateSaver,
+) {
     let saved = Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
     let saved_for_callback = Arc::clone(&saved);
     let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
         *saved_for_callback.lock().unwrap() =
             snapshot.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     });
+    (saved, saver)
+}
 
-    let names = snapshot_downloaded_chunks(map, &saver);
+#[test]
+fn snapshot_downloaded_chunks_saves_sizes_and_names() {
+    let unique_chunks: Arc<[PatchChunkInfo]> =
+        Arc::from(vec![chunk_info("chunk-a", 11), chunk_info("chunk-b", 22)]);
+    let sizes = Arc::new(ChunkSizes::new(2));
+    sizes.mark(0, 11);
+    sizes.mark(1, 22);
+    let (saved, saver) = capture_saver();
+
+    let names = snapshot_downloaded_chunks(sizes, Arc::clone(&unique_chunks), &saver);
 
     let saved = saved.lock().unwrap();
     assert_eq!(saved.len(), 2);
@@ -283,26 +302,43 @@ fn snapshot_downloaded_chunks_saves_sizes_and_moves_names() {
 }
 
 #[test]
-fn snapshot_downloaded_chunks_clones_names_when_map_is_shared() {
-    let map = Arc::new(DashMap::new());
-    map.insert("chunk-a".to_owned(), 11);
-    map.insert("chunk-b".to_owned(), 22);
-    let extra_owner = Arc::clone(&map);
-    let saved = Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
-    let saved_for_callback = Arc::clone(&saved);
-    let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
-        *saved_for_callback.lock().unwrap() =
-            snapshot.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-    });
+fn snapshot_downloaded_chunks_with_nothing_completed_saves_nothing() {
+    let unique_chunks: Arc<[PatchChunkInfo]> = Arc::from(vec![
+        chunk_info("chunk-a", 11),
+        chunk_info("chunk-b", 22),
+    ]);
+    let sizes = Arc::new(ChunkSizes::new(2));
+    let (saved, saver) = capture_saver();
 
-    let names = snapshot_downloaded_chunks(map, &saver);
+    let names = snapshot_downloaded_chunks(sizes, Arc::clone(&unique_chunks), &saver);
 
+    assert!(saved.lock().unwrap().is_empty());
+    assert!(names.is_empty());
+}
+
+#[test]
+fn snapshot_downloaded_chunks_skips_pending_and_counts_only_completed() {
+    let unique_chunks: Arc<[PatchChunkInfo]> = Arc::from(vec![
+        chunk_info("chunk-a", 11),
+        chunk_info("chunk-b", 22),
+        chunk_info("chunk-c", 33),
+    ]);
+    let sizes = Arc::new(ChunkSizes::new(3));
+    // Only the outer two are confirmed; the middle stays pending.
+    sizes.mark(0, 11);
+    sizes.mark(2, 33);
+    let (saved, saver) = capture_saver();
+
+    let names = snapshot_downloaded_chunks(sizes, Arc::clone(&unique_chunks), &saver);
+
+    let saved = saved.lock().unwrap();
+    assert_eq!(saved.len(), 2, "pending chunk must not be saved");
+    assert!(!saved.iter().any(|(k, _)| k == "chunk-b"));
+    assert_eq!(saved.iter().find(|(k, _)| k == "chunk-c").unwrap().1, 33);
     assert_eq!(
         names,
-        rustc_hash::FxHashSet::from_iter(["chunk-a".into(), "chunk-b".into()])
+        rustc_hash::FxHashSet::from_iter(["chunk-a".into(), "chunk-c".into()])
     );
-    assert_eq!(extra_owner.len(), 2);
-    assert_eq!(saved.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
