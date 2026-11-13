@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 #[cfg(all(feature = "benchmark", unix))]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd as _;
 use std::path::PathBuf;
 
 use super::header::{DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo};
@@ -309,7 +311,7 @@ impl HDiff {
             }
             let mut out_writer = CountingWriter::new(BufWriter::with_capacity(
                 super::super::FILE_WRITE_BUFFER_SIZE,
-                out_file.try_clone()?,
+                BackgroundFlushWriter::new(out_file.try_clone()?),
             ));
             let old_source: &mut dyn SeekableRead = if let Some(cursor) = source_cursor.as_mut() {
                 cursor
@@ -538,9 +540,81 @@ struct CountingWriter<W> {
     written: u64,
 }
 
+/// File wrapper that submits completed output ranges for writeback while
+/// the patcher keeps decoding, so the final durability fsync waits only
+/// for the in-flight tail instead of writing the whole output. Each
+/// `BACKGROUND_FLUSH_INTERVAL` bytes delivered to the kernel, the covered
+/// range is handed to `sync_file_range` with `SYNC_FILE_RANGE_WRITE`,
+/// which queues writeback without waiting for it to finish (it may still
+/// block briefly on device-queue congestion). Durability semantics are
+/// unchanged — the final `sync_all` before rename still flushes
+/// everything, including metadata and the unsubmitted tail — this only
+/// moves when the disk does the work, overlapping it with CPU-bound
+/// decode. Earlier submission also caps dirty-page accumulation, keeping
+/// the patcher under the kernel's dirty thresholds.
+struct BackgroundFlushWriter {
+    file: std::fs::File,
+    /// Offset of the first byte not yet submitted for writeback.
+    submitted_until: u64,
+    /// File offset of the next byte this handle will write. The handle is
+    /// the only writer, appends sequentially, and shares the fd's file
+    /// description, so this tracks the kernel position after each write.
+    next_offset: u64,
+}
+
+/// Bytes of output between background writeback submissions. The size
+/// trades writeback-queue granularity against syscall count; it matches
+/// the patcher's region cache flushes so submissions align with large
+/// writes the BufWriter already passes through.
+const BACKGROUND_FLUSH_INTERVAL: u64 = 4 << 20;
+
+impl BackgroundFlushWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            submitted_until: 0,
+            next_offset: 0,
+        }
+    }
+
+    /// Queue writeback for all complete intervals written so far. Errors
+    /// are non-fatal hints: the final sync_all re-covers the whole file.
+    fn submit_pending(&mut self) {
+        #[cfg(unix)]
+        {
+            let ready_end = self.next_offset / BACKGROUND_FLUSH_INTERVAL * BACKGROUND_FLUSH_INTERVAL;
+            if ready_end > self.submitted_until {
+                let len = ready_end - self.submitted_until;
+                unsafe {
+                    let _ = libc::sync_file_range(
+                        self.file.as_raw_fd(),
+                        self.submitted_until.try_into().unwrap_or(i64::MAX),
+                        len.try_into().unwrap_or(i64::MAX),
+                        libc::SYNC_FILE_RANGE_WRITE,
+                    );
+                }
+                self.submitted_until = ready_end;
+            }
+        }
+    }
+}
+
+impl std::io::Write for BackgroundFlushWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(buf)?;
+        self.next_offset += written as u64;
+        self.submit_pending();
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 #[cfg(test)]
 mod output_tests {
-    use super::CountingWriter;
+    use super::{BackgroundFlushWriter, CountingWriter, BACKGROUND_FLUSH_INTERVAL};
     use std::io::{Cursor, Write};
 
     #[test]
@@ -577,6 +651,102 @@ mod output_tests {
         writer.write_all(b"1234567").unwrap();
         assert_eq!(writer.written(), 7);
         assert_eq!(writer.inner.bytes, b"1234567");
+    }
+
+    /// The flush writer's submission accounting: only complete intervals
+    /// are submitted, a single large write crossing several interval
+    /// boundaries submits them in one batch, and the unaligned tail is
+    /// left for the final sync_all.
+    #[test]
+    fn background_flush_submits_only_complete_intervals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+
+        let mut writer = BackgroundFlushWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap(),
+        );
+        assert_eq!(writer.submitted_until, 0);
+
+        // 9 MiB in one write spans two full intervals plus a MiB tail.
+        let big = vec![0xA5u8; BACKGROUND_FLUSH_INTERVAL as usize * 2 + (1 << 20)];
+        writer.write_all(&big).unwrap();
+        assert_eq!(writer.next_offset, big.len() as u64);
+        assert_eq!(
+            writer.submitted_until,
+            BACKGROUND_FLUSH_INTERVAL * 2,
+            "two complete intervals submitted; 1 MiB tail must wait"
+        );
+
+        // Small writes below the next boundary submit nothing further.
+        writer.write_all(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(
+            writer.submitted_until, BACKGROUND_FLUSH_INTERVAL * 2,
+            "sub-interval writes must not advance the submitted range"
+        );
+        writer.flush().unwrap();
+
+        // Bytes are not corrupted by the wrapper.
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk.len(), big.len() + 4);
+        assert_eq!(&on_disk[..8], &[0xA5; 8]);
+        assert_eq!(&on_disk[big.len()..], &[1, 2, 3, 4]);
+    }
+
+    /// Sub-interval output never triggers a submission call and still
+    /// writes correctly (the small-patch fast path has zero overhead
+    /// beyond the offset counter).
+    #[test]
+    fn background_flush_small_output_never_submits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bin");
+        let mut writer = BackgroundFlushWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap(),
+        );
+        writer.write_all(b"tiny patch").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.submitted_until, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"tiny patch");
+    }
+
+    /// A boundary crossed by accumulated writes (not one big write)
+    /// submits exactly the complete interval that has formed.
+    #[test]
+    fn background_flush_accumulates_across_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accum.bin");
+        let mut writer = BackgroundFlushWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap(),
+        );
+        let half = (BACKGROUND_FLUSH_INTERVAL / 2) as usize;
+        writer.write_all(&vec![1u8; half]).unwrap();
+        assert_eq!(writer.submitted_until, 0, "half an interval submits nothing");
+        writer.write_all(&vec![2u8; half]).unwrap();
+        assert_eq!(
+            writer.submitted_until, BACKGROUND_FLUSH_INTERVAL,
+            "two halves complete one interval"
+        );
+        writer.write_all(&vec![3u8; half]).unwrap();
+        assert_eq!(
+            writer.submitted_until, BACKGROUND_FLUSH_INTERVAL,
+            "another half does not complete a second interval"
+        );
+        writer.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), half * 3);
     }
 }
 
