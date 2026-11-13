@@ -112,6 +112,8 @@ pub async fn cancelable_sleep(
 }
 /// Fixed assembly worker count while chunk downloads are active.
 pub const ASSEMBLY_CONCURRENCY: usize = 4;
+/// Parallelism for full-file or cached-chunk MD5 verification passes.
+pub const VERIFY_CONCURRENCY: usize = 16;
 /// Installed version marker filename.
 pub const VERSION_FILE_NAME: &str = ".sophon_version";
 /// MD5 verification cache filename.

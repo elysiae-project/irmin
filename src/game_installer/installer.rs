@@ -1991,8 +1991,15 @@ async fn process_eager_item_oneshot(
             Err(error) => return Err(error),
         }
     }
-    finish_eager_item(item_idx, chunk, ctx, chunk_entries, chunk_entry_offsets, pending_counts)
-        .await
+    finish_eager_item(
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2155,8 +2162,7 @@ async fn process_eager_item_streaming(
         let mut compressed_md5 =
             (verify_compressed && compressed_hash.len() == 16).then(fast_md5::Md5::new);
         let mut compressed_xxh64 =
-            (verify_compressed && compressed_hash.len() == 8)
-                .then(super::assembly_opt::take_xxh64);
+            (verify_compressed && compressed_hash.len() == 8).then(super::assembly_opt::take_xxh64);
         let mut bytes_received = 0u64;
         let mut stream_error = None;
         loop {
@@ -2354,8 +2360,15 @@ async fn process_eager_item_streaming(
         }
     }
 
-    finish_eager_item(item_idx, chunk, ctx, chunk_entries, chunk_entry_offsets, pending_counts)
-        .await
+    finish_eager_item(
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2586,13 +2599,15 @@ fn finalize_eager_file(ctx: &InstallContext, file_idx: usize) {
     let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
     let total = ctx.total_files;
     let force = checked == total || assembled == total;
-    if force || ctx.last_assembly_update.try_lock().is_ok_and(|mut lu| {
-        let due = lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS);
-        if due {
-            *lu = std::time::Instant::now();
-        }
-        due
-    }) {
+    if force
+        || ctx.last_assembly_update.try_lock().is_ok_and(|mut lu| {
+            let due = lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS);
+            if due {
+                *lu = std::time::Instant::now();
+            }
+            due
+        })
+    {
         (ctx.updater)(SophonProgress::CheckingFiles {
             checked_files: checked,
             total_files: total,
@@ -2603,7 +2618,6 @@ fn finalize_eager_file(ctx: &InstallContext, file_idx: usize) {
         });
     }
 }
-
 
 /// Durability tail for one completed eager file: fsync its output data,
 /// mark its chunks' resume bits, then finalize the bookkeeping.
@@ -2663,10 +2677,13 @@ fn spawn_eager_durability_task(ctx: &Arc<InstallContext>) -> tokio::task::JoinHa
             } = job;
             let ctx = Arc::clone(&task_ctx);
             let result = tokio::task::spawn_blocking(move || {
-                run_eager_durability_tail(ctx.as_ref(), EagerDurabilityJob {
-                    file_idx,
-                    chunk_range,
-                });
+                run_eager_durability_tail(
+                    ctx.as_ref(),
+                    EagerDurabilityJob {
+                        file_idx,
+                        chunk_range,
+                    },
+                );
             })
             .await;
             if let Err(err) = result {
@@ -4107,6 +4124,17 @@ async fn verify_installers(
     Ok(())
 }
 
+/// One unique chunk pending a cached-copy MD5 check in the repair path.
+struct PendingChunkCheck {
+    chunk: SophonManifestAssetChunk,
+    download: Arc<DownloadInfo>,
+    chunk_path: PathBuf,
+    expected_md5: [u8; 16],
+    chunk_size: u64,
+    /// Index in the unique-chunk list this item came from.
+    position: usize,
+}
+
 async fn repair_assets(
     client: &Client,
     mut all_assets: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)>,
@@ -4174,7 +4202,7 @@ async fn repair_assets(
     let verify_stopped = Arc::clone(&stopped);
     let mut verify_stream = bounded_stoppable_stream(
         all_assets,
-        16,
+        super::VERIFY_CONCURRENCY,
         Arc::clone(&stopped),
         move |(asset, chunk_download)| {
             let verify_cache = Arc::clone(&verify_cache_for_stream);
@@ -4272,14 +4300,17 @@ async fn repair_assets(
         });
     }
 
-    // Phase 2a: Collect unique chunks that need re-downloading across all
-    // failed files, then download them in parallel.
+    // Phase 2a: Collect unique chunks across all failed files, verify
+    // their cached copies in parallel, then download the rest.
     let total_chunks_upper: usize = failed_verifications
         .iter()
         .map(|(a, _, _)| a.asset_chunks.len())
         .sum();
     fs::create_dir_all(&chunks_dir)?;
-    let mut redownload_items: Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)> = Vec::new();
+    // Cheap serial pass: dedup chunks (first occurrence wins) and precompute
+    // each unique chunk's on-disk path and expected compressed MD5. No I/O
+    // here; the MD5 checks below run in parallel on the blocking pool.
+    let mut unique_chunks: Vec<PendingChunkCheck> = Vec::new();
     let mut seen_chunks: rustc_hash::FxHashSet<&str> =
         rustc_hash::FxHashSet::with_capacity_and_hasher(
             total_chunks_upper,
@@ -4292,24 +4323,26 @@ async fn repair_assets(
             }
             let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
             chunk_path.set_extension("zstd");
-            let needs_download = !chunk_path.exists() || {
-                let expected =
-                    super::assembly_opt::hex_to_bytes(chunk.chunk_compressed_hash_md5_str())
-                        .unwrap_or_default();
-                !cache::check_file_md5_cached(
-                    &chunk_path,
-                    chunk.chunk_size,
-                    &expected,
-                    game_dir,
-                    &verify_cache,
-                )
-                .unwrap_or(false)
-            };
-            if needs_download {
-                redownload_items.push((chunk.clone(), Arc::clone(chunk_download)));
-            }
+            // An unparseable manifest hash must not reject every chunk; an
+            // all-zero digest never matches, forcing a (safe) re-download.
+            let expected_md5 =
+                super::assembly_opt::hex_to_bytes(chunk.chunk_compressed_hash_md5_str())
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    .unwrap_or_default();
+            let position = unique_chunks.len();
+            unique_chunks.push(PendingChunkCheck {
+                chunk: chunk.clone(),
+                download: Arc::clone(chunk_download),
+                chunk_path,
+                expected_md5,
+                chunk_size: chunk.chunk_size,
+                position,
+            });
         }
     }
+
+    let redownload_items: Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)> =
+        precheck_cached_chunks(unique_chunks, &verify_cache, game_dir).await?;
 
     let needed_total = redownload_items.len();
     let redownload_total_bytes: u64 = redownload_items
@@ -4501,6 +4534,85 @@ async fn repair_assets(
         log::warn!("Failed to save verification cache after repair: {err}");
     }
     Ok(())
+}
+
+/// Verify cached compressed chunks in parallel and return the ones that
+/// need re-downloading, in first-occurrence order.
+///
+/// Missing, mismatched, or unreadable cache files all map to
+/// "needs download": re-downloading rewrites the file and surfaces any
+/// real I/O failure there, instead of failing the whole repair over one
+/// bad cache chunk.
+async fn precheck_cached_chunks(
+    unique_chunks: Vec<PendingChunkCheck>,
+    verify_cache: &Arc<DashMap<String, VerificationEntry>>,
+    game_dir: &Path,
+) -> SophonResult<Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)>> {
+    let unique_count = unique_chunks.len();
+    // One slot per unique chunk, filled out of completion order and read
+    // back in index order below to keep the re-download list deterministic.
+    let mut redownload_slots: Vec<Option<PendingChunkCheck>> =
+        (0..unique_count).map(|_| None).collect();
+    let verify_cache = Arc::clone(verify_cache);
+    let game_dir = game_dir.to_path_buf();
+    // Never set: the helper's signature requires a stop flag, and checks
+    // are fast enough to always run to completion (like the old loop).
+    let stopped = Arc::new(AtomicBool::new(false));
+    let mut check_stream = bounded_stoppable_stream(
+        unique_chunks,
+        super::VERIFY_CONCURRENCY,
+        Arc::clone(&stopped),
+        move |item| {
+            let verify_cache = Arc::clone(&verify_cache);
+            let game_dir = game_dir.clone();
+            async move {
+                let position = item.position;
+                let chunk_size = item.chunk_size;
+                let expected_md5 = item.expected_md5;
+                let chunk_path = item.chunk_path.clone();
+                let (is_valid, check_err) = match tokio::task::spawn_blocking(move || {
+                    cache::check_file_md5_cached(
+                        &chunk_path,
+                        chunk_size,
+                        &expected_md5,
+                        &game_dir,
+                        &verify_cache,
+                    )
+                })
+                .await?
+                {
+                    Ok(valid) => (valid, None),
+                    Err(err) => (false, Some(err)),
+                };
+                if let Some(err) = check_err {
+                    log::warn!(
+                        "Failed to verify cached chunk {}: {err}",
+                        item.chunk_path.display()
+                    );
+                }
+                Ok::<_, SophonError>((position, item, !is_valid))
+            }
+        },
+        "precheck",
+    )?;
+    // buffer_unordered yields completions out of order; slot each verdict
+    // back by its carried position. On a propagated JoinError the in-flight
+    // futures are dropped, but their spawn_blocking closures finish
+    // detached; any late verify-cache inserts are benign (they only cache
+    // confirmed digests) and chunk files are never mutated by checks.
+    while let Some(result) = check_stream.next().await {
+        let (position, item, needs_download) = result?;
+        if needs_download {
+            let entry = &mut redownload_slots[position];
+            debug_assert!(entry.is_none(), "duplicate chunk position {position}");
+            *entry = Some(item);
+        }
+    }
+    Ok(redownload_slots
+        .into_iter()
+        .flatten()
+        .map(|item| (item.chunk, item.download))
+        .collect())
 }
 
 /// Bounded blocking work: a failed/panicking task stops scheduling, but every
