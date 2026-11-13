@@ -10,67 +10,83 @@ const AUDIO_LANG_FILE: &str = "AudioLaucherRecord.txt";
 const GAME_DATA_DIR: &str = "\x53\x74\x61\x72\x52\x61\x69\x6c\x5f\x44\x61\x74\x61";
 const APP_VENDOR: &str = "\x43\x6f\x67\x6e\x6f\x73\x70\x68\x65\x72\x65";
 
+/// HKRPG blacklist configuration loaded once per install and applied to
+/// each installer's asset segment. An empty list filters nothing.
+pub struct HkrpgFilter {
+    blacklist_lower: Vec<String>,
+}
+
+impl HkrpgFilter {
+    /// Read and normalize the launcher-maintained download blacklist.
+    pub fn load(game_dir: &Path) -> Self {
+        let mut blacklist: Vec<String> = Vec::new();
+
+        let blacklist_path =
+            game_dir.join(format!("{GAME_DATA_DIR}/Persistent/DownloadBlacklist.json"));
+        if !blacklist_path.exists() {
+            return Self { blacklist_lower: blacklist };
+        }
+
+        let file = match File::open(&blacklist_path) {
+            Ok(f) => f,
+            Err(err) => {
+                log::warn!("Failed to open DownloadBlacklist.json: {err}");
+                return Self { blacklist_lower: blacklist };
+            }
+        };
+
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(err) => {
+                    log::warn!("Failed to read line from DownloadBlacklist.json: {err}");
+                    continue;
+                }
+            };
+
+            let file_name = match extract_filename(&line) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            let normalized = file_name.replace('\\', "/");
+            blacklist.push(normalized.clone());
+
+            add_both_persistent_or_streaming_assets(&normalized, &mut blacklist);
+        }
+
+        let blacklist_lower: Vec<String> = blacklist
+            .iter()
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect();
+        Self { blacklist_lower }
+    }
+
+    /// Drop blacklisted assets; returns how many were removed. Matching is
+    /// a case-insensitive substring test, so an empty blacklist is a no-op.
+    pub fn apply(&self, assets: &mut Vec<SophonManifestAssetProperty>) -> usize {
+        if self.blacklist_lower.is_empty() {
+            return 0;
+        }
+        let original_len = assets.len();
+        assets.retain(|asset| {
+            let asset_lower = asset.asset_name_str().to_ascii_lowercase();
+            for entry in &self.blacklist_lower {
+                if asset_lower.contains(entry) {
+                    log::warn!("Filtered blacklisted asset: {}", &asset.asset_name_str());
+                    return false;
+                }
+            }
+            true
+        });
+        original_len - assets.len()
+    }
+}
+
 /// Remove manifest entries excluded for the current HKRPG installation.
 pub fn filter_hkrpg_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestAssetProperty>) {
-    let blacklist_path =
-        game_dir.join(format!("{GAME_DATA_DIR}/Persistent/DownloadBlacklist.json"));
-    if !blacklist_path.exists() {
-        return;
-    }
-
-    let file = match File::open(&blacklist_path) {
-        Ok(f) => f,
-        Err(err) => {
-            log::warn!("Failed to open DownloadBlacklist.json: {err}");
-            return;
-        }
-    };
-
-    let mut blacklist: Vec<String> = Vec::new();
-
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(err) => {
-                log::warn!("Failed to read line from DownloadBlacklist.json: {err}");
-                continue;
-            }
-        };
-
-        let file_name = match extract_filename(&line) {
-            Some(name) => name,
-            None => continue,
-        };
-
-        let normalized = file_name.replace('\\', "/");
-        blacklist.push(normalized.clone());
-
-        add_both_persistent_or_streaming_assets(&normalized, &mut blacklist);
-    }
-
-    if blacklist.is_empty() {
-        return;
-    }
-
-    let blacklist_lower: Vec<String> = blacklist
-        .iter()
-        .map(|entry| entry.to_ascii_lowercase())
-        .collect();
-
-    let original_len = assets.len();
-    assets.retain(|asset| {
-        let asset_lower = asset.asset_name_str().to_ascii_lowercase();
-        for entry in &blacklist_lower {
-            if asset_lower.contains(entry) {
-                log::warn!("Filtered blacklisted asset: {}", &asset.asset_name_str());
-                return false;
-            }
-        }
-        true
-    });
-
-    let filtered = original_len - assets.len();
+    let filtered = HkrpgFilter::load(game_dir).apply(assets);
     if filtered > 0 {
         log::warn!("hkrpg blacklist filter removed {filtered} assets");
     }

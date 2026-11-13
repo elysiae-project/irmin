@@ -25,6 +25,7 @@ use super::assembly::{
 use super::cache::{self, VerificationEntry};
 use super::compact_manifest::{ChunkRef, CompactManifest};
 use super::error::{SophonError, SophonResult};
+use super::game_filters::{Hk4eFilter, HkrpgFilter};
 use super::handle::DownloadHandle;
 use super::*;
 use crate::SophonProgress;
@@ -235,9 +236,10 @@ fn now_nanos() -> u64 {
 }
 
 pub(crate) struct InstallerData {
-    chunk_download: Arc<DownloadInfo>,
-    file_count: usize,
-    label: String,
+    pub(crate) chunk_download: Arc<DownloadInfo>,
+    /// Number of this installer's assets that survived game filtering.
+    pub(crate) file_count: usize,
+    pub(crate) label: String,
     pub matching_field: String,
 }
 
@@ -1031,31 +1033,73 @@ async fn prepare_directories(game_dir: &Path, chunks_dir: &Path) -> SophonResult
     Ok(())
 }
 
+/// Game-code-specific manifest filtering applied while installer data is
+/// being built. The configuration (blacklists, installed audio languages)
+/// is loaded once up front and then applied to each installer's assets
+/// separately, so file counts come out positionally correct with no
+/// name-keyed attribution map.
+enum GameAssetFilter {
+    Unfiltered,
+    Hkrpg(HkrpgFilter),
+    Hk4e(Hk4eFilter),
+    Nap,
+}
+
+impl GameAssetFilter {
+    fn load(game_code: &str, game_dir: &Path, vo_langs: &[String]) -> Self {
+        match game_code {
+            "hkrpg" => Self::Hkrpg(HkrpgFilter::load(game_dir)),
+            "hk4e" => Self::Hk4e(Hk4eFilter::load(game_dir, vo_langs)),
+            // NAP filtering runs on whole installers
+            // (filter_nap_installers) before flattening.
+            "nap" => Self::Nap,
+            _ => Self::Unfiltered,
+        }
+    }
+
+    /// Drop assets this game excludes from the given segment. Returns the
+    /// number of assets removed.
+    fn apply(&self, assets: &mut Vec<SophonManifestAssetProperty>) -> usize {
+        match self {
+            Self::Unfiltered | Self::Nap => 0,
+            Self::Hkrpg(filter) => filter.apply(assets),
+            Self::Hk4e(filter) => filter.apply(assets),
+        }
+    }
+}
+
 fn build_installer_data(
     installers: Vec<SophonInstaller>,
+    game_code: &str,
+    game_dir: &Path,
+    vo_langs: &[String],
 ) -> (Vec<InstallerData>, Vec<SophonManifestAssetProperty>) {
+    let game_filter = GameAssetFilter::load(game_code, game_dir, vo_langs);
+    let mut removed_assets = 0usize;
     let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
     let mut all_files = Vec::with_capacity(total_assets);
     let mut data = Vec::with_capacity(installers.len());
     for inst in installers {
-        let file_count = inst
-            .manifest
-            .assets
-            .iter()
-            .filter(|a| !a.is_directory())
-            .count();
-        all_files.extend(
-            inst.manifest
-                .assets
-                .into_iter()
-                .filter(|a| !a.is_directory()),
-        );
+        // Retain reuses the decoded manifest's allocation; the segment is
+        // filtered before it joins the shared list, so each survivor belongs
+        // to exactly one installer and its count needs no name mapping.
+        let mut assets = inst.manifest.assets;
+        assets.retain(|a| !a.is_directory());
+        removed_assets += game_filter.apply(&mut assets);
+        let file_count = assets.len();
+        all_files.extend(assets);
         data.push(InstallerData {
             label: inst.label,
             matching_field: inst.matching_field,
             chunk_download: Arc::new(inst.chunk_download),
             file_count,
         });
+    }
+    if removed_assets > 0 {
+        let installer_count = data.len();
+        log::info!(
+            "{game_code} filter removed {removed_assets} assets across {installer_count} installers",
+        );
     }
     (data, all_files)
 }
@@ -3386,7 +3430,7 @@ pub async fn install(
     let ResumeContext {
         prev_manifest_hash,
         mut prev_downloaded_chunks,
-        resume_seed,
+        mut resume_seed,
     } = resume;
     let current_manifest_hash = combine_manifest_hashes(&installers);
     let manifest_changed = prev_manifest_hash != current_manifest_hash;
@@ -3443,41 +3487,31 @@ pub async fn install(
         }
     }
 
-    let (mut installer_data, mut all_files_vec) = build_installer_data(installers);
+    // NAP may drop whole installers (KDelResource); removing them before
+    // flattening keeps every surviving asset attached to the right
+    // installer and its download endpoint.
+    let mut installers = installers;
     if game_code == "nap" {
-        super::game_filters::filter_nap_installers(game_dir, &mut installer_data);
-    }
-    {
-        let file_installer_map: FxHashMap<String, usize> = {
-            let mut m: FxHashMap<String, usize> =
-                FxHashMap::with_capacity_and_hasher(all_files_vec.len(), Default::default());
-            let mut idx: usize = 0;
-            for (inst_idx, d) in installer_data.iter().enumerate() {
-                for _ in 0..d.file_count {
-                    if idx < all_files_vec.len() {
-                        m.insert(all_files_vec[idx].asset_name_str().to_string(), inst_idx);
-                    }
-                    idx += 1;
-                }
-            }
-            m
-        };
-        if game_code == "hkrpg" {
-            super::game_filters::filter_hkrpg_asset_list(game_dir, &mut all_files_vec);
-        } else if game_code == "hk4e" {
-            super::game_filters::filter_hk4e_asset_list(game_dir, &mut all_files_vec, vo_langs);
-        } else if game_code == "nap" {
-            super::game_filters::filter_nap_asset_list(game_dir, &mut all_files_vec);
-        }
-        for d in &mut installer_data {
-            d.file_count = 0;
-        }
-        for f in all_files_vec.iter() {
-            if let Some(&inst_idx) = file_installer_map.get(f.asset_name_str()) {
-                installer_data[inst_idx].file_count += 1;
+        let removed = super::game_filters::filter_nap_installers(game_dir, &mut installers);
+        if removed > 0 {
+            // Persisted completion indices are positional into the previous
+            // run's file list, and the combined manifest hash does not cover
+            // the local KDel set (a same-hash resume with a different
+            // removal set would mis-seed them). Demote the seed; the
+            // disk-verified resume scan still marks genuinely finished
+            // files. Name-keyed legacy seeds are layout-independent and
+            // stay untouched.
+            if let super::CompletedFiles::Indices(idxs) = &mut resume_seed {
+                log::warn!(
+                    "Discarding {count} persisted completion indices: the KDelResource removal set changed the file layout",
+                    count = idxs.len(),
+                );
+                idxs.clear();
             }
         }
     }
+    let (installer_data, all_files_vec) =
+        build_installer_data(installers, game_code, game_dir, vo_langs);
     let all_files: Arc<CompactManifest> =
         Arc::new(CompactManifest::try_from_properties(all_files_vec)?);
     super::reclaim_memory();
@@ -4082,21 +4116,7 @@ async fn verify_installers(
 ) -> SophonResult<()> {
     let vo_langs = vec![vo_lang.to_string()];
     if game_code == "nap" {
-        let mut selected: Vec<_> = installers
-            .iter()
-            .map(|i| InstallerData {
-                chunk_download: Arc::new(i.chunk_download.clone()),
-                file_count: i.manifest.assets.len(),
-                label: i.label.clone(),
-                matching_field: i.matching_field.clone(),
-            })
-            .collect();
-        super::game_filters::filter_nap_installers(game_dir, &mut selected);
-        installers.retain(|i| {
-            selected
-                .iter()
-                .any(|s| s.matching_field == i.matching_field)
-        });
+        super::game_filters::filter_nap_installers(game_dir, &mut installers);
     }
     let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
     let mut all_assets = Vec::with_capacity(total_assets);
@@ -4742,7 +4762,179 @@ mod repair_tests;
 #[path = "eager_stream_tests.rs"]
 mod eager_stream_tests;
 
+/// Frozen replica of the name-keyed planning flow (unfiltered flatten,
+/// name->installer attribution map, single whole-list filter pass, hash
+/// recount) kept for paired criterion comparison against the positional
+/// accounting in [build_installer_data]. Safe to delete once its
+/// measurements are no longer needed.
+#[cfg(feature = "benchmark")]
+mod bench_legacy {
+    use super::*;
+
+    pub(crate) fn legacy_plan(
+        installers: Vec<SophonInstaller>,
+        game_code: &str,
+        game_dir: &Path,
+        vo_langs: &[String],
+    ) -> (Vec<InstallerData>, Vec<SophonManifestAssetProperty>) {
+        let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
+        let mut all_files_vec = Vec::with_capacity(total_assets);
+        let mut installer_data = Vec::with_capacity(installers.len());
+        for inst in installers {
+            let file_count = inst
+                .manifest
+                .assets
+                .iter()
+                .filter(|a| !a.is_directory())
+                .count();
+            all_files_vec.extend(
+                inst.manifest
+                    .assets
+                    .into_iter()
+                    .filter(|a| !a.is_directory()),
+            );
+            installer_data.push(InstallerData {
+                label: inst.label,
+                matching_field: inst.matching_field,
+                chunk_download: Arc::new(inst.chunk_download),
+                file_count,
+            });
+        }
+        let file_installer_map: FxHashMap<String, usize> = {
+            let mut m: FxHashMap<String, usize> =
+                FxHashMap::with_capacity_and_hasher(all_files_vec.len(), Default::default());
+            let mut idx: usize = 0;
+            for (inst_idx, d) in installer_data.iter().enumerate() {
+                for _ in 0..d.file_count {
+                    if idx < all_files_vec.len() {
+                        m.insert(all_files_vec[idx].asset_name_str().to_string(), inst_idx);
+                    }
+                    idx += 1;
+                }
+            }
+            m
+        };
+        match game_code {
+            "hkrpg" => {
+                super::game_filters::filter_hkrpg_asset_list(game_dir, &mut all_files_vec)
+            }
+            "hk4e" => {
+                super::game_filters::filter_hk4e_asset_list(game_dir, &mut all_files_vec, vo_langs)
+            }
+            "nap" => super::game_filters::filter_nap_asset_list(game_dir, &mut all_files_vec),
+            _ => {}
+        }
+        for d in &mut installer_data {
+            d.file_count = 0;
+        }
+        for f in all_files_vec.iter() {
+            if let Some(&inst_idx) = file_installer_map.get(f.asset_name_str()) {
+                installer_data[inst_idx].file_count += 1;
+            }
+        }
+        (installer_data, all_files_vec)
+    }
+
+    /// Segment file counts and total surviving files from the frozen
+    /// legacy shape; the pair compared against the production planner in
+    /// the criterion group.
+    pub fn legacy_plan_counts(
+        installers: Vec<SophonInstaller>,
+        game_code: &str,
+        game_dir: &Path,
+        vo_langs: &[String],
+    ) -> (Vec<usize>, usize) {
+        let (data, files) = legacy_plan(installers, game_code, game_dir, vo_langs);
+        let counts = data.iter().map(|d| d.file_count).collect();
+        (counts, files.len())
+    }
+
+    /// Segment file counts and total surviving files from the production
+    /// positional planner, exposed with the same shape as
+    /// [legacy_plan_counts] for the paired measurement.
+    pub fn positional_plan_counts(
+        installers: Vec<SophonInstaller>,
+        game_code: &str,
+        game_dir: &Path,
+        vo_langs: &[String],
+    ) -> (Vec<usize>, usize) {
+        let (data, files) = build_installer_data(installers, game_code, game_dir, vo_langs);
+        let counts = data.iter().map(|d| d.file_count).collect();
+        (counts, files.len())
+    }
+}
+
+/// The frozen legacy shape must keep agreeing with the production planner
+/// on segment counts and total files for unfiltered and name-filtered game
+/// codes; drift here means the paired criterion comparison is measuring
+/// the wrong thing. `build_installer_data` is crate-private, so the count
+/// wrappers exist on both sides.
+#[cfg(all(test, feature = "benchmark"))]
+mod bench_legacy_tests {
+    use super::bench_legacy::{legacy_plan_counts, positional_plan_counts};
+    use super::SophonInstaller;
+    use crate::api_scrape::{Compression, DownloadInfo};
+    use crate::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
+    use std::path::Path;
+
+    fn fixture_installer(name_suffix: &str, count: usize) -> super::SophonInstaller {
+        super::SophonInstaller {
+            manifest: SophonManifestProto {
+                assets: (0..count)
+                    .map(|i| {
+                        SophonManifestAssetProperty::from_parts(
+                            format!("data/asset_{i}{name_suffix}.pak").into(),
+                            vec![],
+                            0,
+                            0,
+                            bytes::Bytes::from_static(b"d41d8cd98f00b204e9800998ecf8427e"),
+                        )
+                    })
+                    .collect(),
+            },
+            chunk_download: DownloadInfo {
+                encryption: 0,
+                password: String::new(),
+                compression: Compression::None,
+                url_prefix: String::new(),
+                url_suffix: String::new(),
+            },
+            label: String::new(),
+            matching_field: "game".into(),
+            manifest_hash: String::new(),
+        }
+    }
+
+    fn build_installers() -> Vec<SophonInstaller> {
+        vec![
+            fixture_installer("a", 12),
+            fixture_installer("b", 8),
+            fixture_installer("c", 15),
+        ]
+    }
+
+    #[test]
+    fn legacy_plan_matches_positional_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        for game_code in ["unknown", "hkrpg"] {
+            let legacy = legacy_plan_counts(build_installers(), game_code, dir.path(), &[]);
+            let positional = positional_plan_counts(build_installers(), game_code, dir.path(), &[]);
+            assert_eq!(legacy, positional, "shape mismatch for {game_code}");
+        }
+    }
+
+    #[test]
+    fn legacy_plan_counts_report_expected_totals() {
+        let (counts, total) =
+            legacy_plan_counts(build_installers(), "unknown", Path::new("/none"), &[]);
+        assert_eq!(counts, vec![12, 8, 15]);
+        assert_eq!(total, 35);
+    }
+}
+
 #[cfg(feature = "benchmark")]
 pub mod bench_internals {
-    pub use super::{ChunkNameLookup, snapshot_downloaded_chunks};
+    pub use super::bench_legacy::{legacy_plan_counts, positional_plan_counts};
+    pub use super::ChunkNameLookup;
+    pub use super::snapshot_downloaded_chunks;
 }

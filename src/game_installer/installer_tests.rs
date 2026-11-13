@@ -1712,11 +1712,107 @@ fn build_installer_data_filters_directories() {
         manifest_hash: "abc".into(),
     };
 
-    let (data, all_files) = build_installer_data(vec![installer]);
+    let game_dir = tempfile::tempdir().unwrap();
+    let (data, all_files) = build_installer_data(
+        vec![installer],
+        "unknown",
+        game_dir.path(),
+        &[],
+    );
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].file_count, 1);
     assert_eq!(all_files.len(), 1);
     assert_eq!(all_files[0].asset_name, "a.pak");
+}
+
+fn write_hkrpg_blacklist(game_dir: &std::path::Path, entry: &str) {
+    let blacklist_dir = game_dir.join("StarRail_Data/Persistent");
+    std::fs::create_dir_all(&blacklist_dir).unwrap();
+    std::fs::write(
+        blacklist_dir.join("DownloadBlacklist.json"),
+        format!("{{\"fileName\":\"{entry}\"}}"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn build_installer_data_counts_surviving_assets_per_installer() {
+    // Two installers with disjoint segments: counts must track each
+    // segment with no name-keyed mapping.
+    let first = SophonInstaller {
+        manifest: SophonManifestProto {
+            assets: vec![
+                make_file("keep_a.pak", "aa", vec![make_chunk("k1", 100)]),
+                make_file("keep_b.pak", "bb", vec![make_chunk("k2", 100)]),
+            ],
+        },
+        chunk_download: make_download_info(),
+        label: "first".into(),
+        matching_field: "game".into(),
+        manifest_hash: "h1".into(),
+    };
+    let second = SophonInstaller {
+        manifest: SophonManifestProto {
+            assets: vec![
+                make_file("mix_a.pak", "cc", vec![make_chunk("m1", 100)]),
+                make_file("mix_b.pak", "dd", vec![make_chunk("m2", 100)]),
+            ],
+        },
+        chunk_download: make_download_info(),
+        label: "second".into(),
+        matching_field: "game".into(),
+        manifest_hash: "h2".into(),
+    };
+    let game_dir = tempfile::tempdir().unwrap();
+    write_hkrpg_blacklist(game_dir.path(), "totally_unrelated_name");
+
+    let (data, all_files) = build_installer_data(
+        vec![first, second],
+        "hkrpg",
+        game_dir.path(),
+        &[],
+    );
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0].file_count, 2);
+    assert_eq!(data[1].file_count, 2, "non-matching blacklist removes nothing");
+    assert_eq!(all_files.len(), 4);
+
+    // A removal inside one segment must decrement only that segment.
+    write_hkrpg_blacklist(game_dir.path(), "mix_a.pak");
+    let first = SophonInstaller {
+        manifest: SophonManifestProto {
+            assets: vec![
+                make_file("keep_a.pak", "aa", vec![make_chunk("k1", 100)]),
+                make_file("keep_b.pak", "bb", vec![make_chunk("k2", 100)]),
+            ],
+        },
+        chunk_download: make_download_info(),
+        label: "first".into(),
+        matching_field: "game".into(),
+        manifest_hash: "h1".into(),
+    };
+    let second = SophonInstaller {
+        manifest: SophonManifestProto {
+            assets: vec![
+                make_file("mix_a.pak", "cc", vec![make_chunk("m1", 100)]),
+                make_file("mix_b.pak", "dd", vec![make_chunk("m2", 100)]),
+            ],
+        },
+        chunk_download: make_download_info(),
+        label: "second".into(),
+        matching_field: "game".into(),
+        manifest_hash: "h2".into(),
+    };
+    let (data, all_files) = build_installer_data(
+        vec![first, second],
+        "hkrpg",
+        game_dir.path(),
+        &[],
+    );
+    assert_eq!(data[0].file_count, 2, "first segment untouched");
+    assert_eq!(data[1].file_count, 1, "blacklisted asset must not be counted");
+    assert_eq!(all_files.len(), 3);
+    assert_eq!(all_files[2].asset_name, "mix_b.pak");
 }
 
 #[test]

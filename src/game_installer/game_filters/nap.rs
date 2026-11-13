@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::write_lang_file;
 use crate::game_installer::api::normalize_vo_locale;
-use crate::game_installer::installer::InstallerData;
+use crate::game_installer::installer::SophonInstaller;
 use crate::proto_parse::SophonManifestAssetProperty;
 
 const GAME_DATA_DIR: &str =
@@ -18,30 +18,35 @@ pub fn filter_nap_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestAss
     let _ = (game_dir, assets);
 }
 
-/// Apply NAP installer-specific filtering using the installation state.
-pub fn filter_nap_installers(game_dir: &Path, installer_data: &mut Vec<InstallerData>) {
+/// Apply NAP installer-specific KDelResource filtering using the
+/// installation state. Must run before asset flattening: removing an
+/// installer after its assets have entered the shared list would strand
+/// them against the wrong download endpoint and desynchronize the
+/// positional file-to-installer attribution.
+pub fn filter_nap_installers(game_dir: &Path, installers: &mut Vec<SophonInstaller>) -> usize {
     let kdel_fields = match read_kdel_resource_matching_fields(game_dir) {
         Some(fields) if !fields.is_empty() => fields,
-        _ => return,
+        _ => return 0,
     };
 
-    let original_len = installer_data.len();
-    installer_data.retain(|data| {
+    let original_len = installers.len();
+    installers.retain(|installer| {
         if kdel_fields
             .iter()
-            .any(|f| f.eq_ignore_ascii_case(&data.matching_field))
+            .any(|f| f.eq_ignore_ascii_case(&installer.matching_field))
         {
-            let matching_field = &data.matching_field;
+            let matching_field = &installer.matching_field;
             log::warn!("nap filter removing installer with matching_field: {matching_field}");
             return false;
         }
         true
     });
 
-    let filtered = original_len - installer_data.len();
+    let filtered = original_len - installers.len();
     if filtered > 0 {
         log::warn!("nap KDelResource filter removed {filtered} installers");
     }
+    filtered
 }
 
 fn read_kdel_resource_matching_fields(game_dir: &Path) -> Option<Vec<String>> {
@@ -108,6 +113,8 @@ fn locale_code_to_abbrev_lang_name(locale: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_scrape::DownloadInfo;
+    use crate::proto_parse::SophonManifestProto;
     use std::fs;
 
     fn persistent_dir(base: &std::path::Path) -> std::path::PathBuf {
@@ -331,11 +338,27 @@ mod tests {
     }
 
     // filter_nap_installers
+    fn make_nap_installer(matching_field: &str) -> SophonInstaller {
+        SophonInstaller {
+            manifest: SophonManifestProto { assets: vec![] },
+            chunk_download: DownloadInfo {
+                encryption: 0,
+                password: String::new(),
+                compression: crate::api_scrape::Compression::None,
+                url_prefix: String::new(),
+                url_suffix: String::new(),
+            },
+            label: "test".into(),
+            matching_field: matching_field.into(),
+            manifest_hash: String::new(),
+        }
+    }
+
     #[test]
     fn test_filter_nap_installers_empty_vec() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut installers: Vec<InstallerData> = Vec::new();
+        let mut installers: Vec<SophonInstaller> = Vec::new();
         filter_nap_installers(dir.path(), &mut installers);
         assert!(installers.is_empty());
     }
@@ -345,10 +368,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No KDelResource file.
 
-        let mut installers: Vec<InstallerData> = Vec::new();
+        let mut installers: Vec<SophonInstaller> = Vec::new();
         filter_nap_installers(dir.path(), &mut installers);
         // Should return early without crashing.
         assert!(installers.is_empty());
+    }
+
+    #[test]
+    fn test_filter_nap_installers_removes_only_matching_middle_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let kdel_dir = persistent_dir(dir.path());
+        fs::create_dir_all(&kdel_dir).unwrap();
+        fs::write(kdel_dir.join("KDelResource"), "korean").unwrap();
+
+        let mut installers = vec![
+            make_nap_installer("chinese"),
+            make_nap_installer("korean"),
+            make_nap_installer("english(us)"),
+        ];
+        let removed = filter_nap_installers(dir.path(), &mut installers);
+        assert_eq!(removed, 1);
+        assert_eq!(installers.len(), 2);
+        assert_eq!(installers[0].matching_field, "chinese");
+        assert_eq!(installers[1].matching_field, "english(us)");
+    }
+
+    #[test]
+    fn test_filter_nap_installers_keeps_everything_reports_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let kdel_dir = persistent_dir(dir.path());
+        fs::create_dir_all(&kdel_dir).unwrap();
+        fs::write(kdel_dir.join("KDelResource"), "japanese").unwrap();
+
+        let mut installers = vec![make_nap_installer("chinese")];
+        let removed = filter_nap_installers(dir.path(), &mut installers);
+        assert_eq!(removed, 0);
+        assert_eq!(installers.len(), 1);
     }
 
     // write_nap_audio_lang_records

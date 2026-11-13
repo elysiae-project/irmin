@@ -32,65 +32,84 @@ pub fn find_hk4e_persistent_dir(game_dir: &Path) -> std::path::PathBuf {
     game_dir.join(format!("{GAME_DATA_DIR}/Persistent"))
 }
 
+/// HK4E layout filtering: the audio-language patterns derived from the
+/// on-disk locale state, loaded once per install and applied to each
+/// installer's asset segment.
+pub struct Hk4eFilter {
+    patterns_lower: Vec<String>,
+}
+
+impl Hk4eFilter {
+    /// Derive the excluded audio-language path patterns for this install.
+    pub fn load(game_dir: &Path, vo_langs: &[String]) -> Self {
+        let persistent_dir = find_hk4e_persistent_dir(game_dir);
+
+        let installed_langs = read_installed_audio_langs(&persistent_dir, vo_langs);
+
+        let ignored_langs: Vec<&str> = ALL_AUDIO_LANGUAGES
+            .iter()
+            .filter(|lang| !installed_langs.iter().any(|installed| installed == **lang))
+            .copied()
+            .collect();
+
+        let patterns_lower: Vec<String> = ignored_langs
+            .iter()
+            .map(|lang| format!("/{lang}/").to_ascii_lowercase())
+            .collect();
+        Self { patterns_lower }
+    }
+
+    /// Drop assets excluded for the current HK4E layout; returns how many
+    /// were removed. `ctable_streaming.dat` is always removed; audio files
+    /// for uninstalled languages match the prepared `/lang/` patterns.
+    pub fn apply(&self, assets: &mut Vec<SophonManifestAssetProperty>) -> usize {
+        // Filter ctable_streaming.dat unconditionally (not language-dependent).
+        // Use ASCII case-insensitive comparison to avoid allocating a lowercased String.
+        assets.retain(|asset| {
+            let name = asset.asset_name();
+            if name.len() >= "ctable_streaming.dat".len()
+                && name.as_ref().ends_with(b"ctable_streaming.dat")
+                && name
+                    .as_ref()
+                    .iter()
+                    .rev()
+                    .take("ctable_streaming.dat".len())
+                    .all(|&b: &u8| b.is_ascii_lowercase() || !b.is_ascii_alphabetic())
+            {
+                log::warn!("Filtered ctable asset: {}", asset.asset_name_str());
+                return false;
+            }
+            true
+        });
+
+        let original_len = assets.len();
+        assets.retain(|asset| {
+            let asset_lower = asset.asset_name_str().to_ascii_lowercase();
+
+            for pattern in &self.patterns_lower {
+                if asset_lower.contains(pattern) {
+                    log::warn!(
+                        "Filtered unneeded audio asset: {}",
+                        &asset.asset_name_str()
+                    );
+                    return false;
+                }
+            }
+
+            true
+        });
+
+        original_len - assets.len()
+    }
+}
+
 /// Remove manifest entries that should not be installed for the current HK4E layout.
 pub fn filter_hk4e_asset_list(
     game_dir: &Path,
     assets: &mut Vec<SophonManifestAssetProperty>,
     vo_langs: &[String],
 ) {
-    let persistent_dir = find_hk4e_persistent_dir(game_dir);
-
-    let installed_langs = read_installed_audio_langs(&persistent_dir, vo_langs);
-
-    let ignored_langs: Vec<&str> = ALL_AUDIO_LANGUAGES
-        .iter()
-        .filter(|lang| !installed_langs.iter().any(|installed| installed == **lang))
-        .copied()
-        .collect();
-
-    // Filter ctable_streaming.dat unconditionally (not language-dependent).
-    // Use ASCII case-insensitive comparison to avoid allocating a lowercased String.
-    assets.retain(|asset| {
-        let name = asset.asset_name();
-        if name.len() >= "ctable_streaming.dat".len()
-            && name.as_ref().ends_with(b"ctable_streaming.dat")
-            && name
-                .as_ref()
-                .iter()
-                .rev()
-                .take("ctable_streaming.dat".len())
-                .all(|&b: &u8| b.is_ascii_lowercase() || !b.is_ascii_alphabetic())
-        {
-            log::warn!("Filtered ctable asset: {}", asset.asset_name_str());
-            return false;
-        }
-        true
-    });
-
-    if ignored_langs.is_empty() {
-        return;
-    }
-
-    let patterns_lower: Vec<String> = ignored_langs
-        .iter()
-        .map(|lang| format!("/{lang}/").to_ascii_lowercase())
-        .collect();
-
-    let original_len = assets.len();
-    assets.retain(|asset| {
-        let asset_lower = asset.asset_name_str().to_ascii_lowercase();
-
-        for pattern in &patterns_lower {
-            if asset_lower.contains(pattern) {
-                log::warn!("Filtered unneeded audio asset: {}", &asset.asset_name_str());
-                return false;
-            }
-        }
-
-        true
-    });
-
-    let filtered = original_len - assets.len();
+    let filtered = Hk4eFilter::load(game_dir, vo_langs).apply(assets);
     if filtered > 0 {
         log::warn!("hk4e filter removed {filtered} assets");
     }

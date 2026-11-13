@@ -26,7 +26,7 @@ use irmin_rs::game_installer::{
     assembly_epochs::{AssemblyEpochs, EPOCH_MAX_BYTES, EPOCH_MAX_FILES},
     cache::{VerificationCache, VerificationEntry},
     compact_manifest::{CompactManifest, StringArena},
-    installer::ChunkNameLookup,
+    installer::{ChunkNameLookup, SophonInstaller},
     sysio,
 };
 use irmin_rs::manifest::compute_content_manifest_hash;
@@ -3234,6 +3234,110 @@ fn bench_file_metadata_cost_optional(c: &mut Criterion) {
     let _ = c;
 }
 
+/// Planning fixtures: 8 installers x 25k assets with realistic (~95 byte)
+/// asset names, so the attribution cost mirrors a real manifest.
+fn planner_fixture_installers() -> Vec<SophonInstaller> {
+    use irmin_rs::api_scrape::{Compression, DownloadInfo};
+    use irmin_rs::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
+
+    let asset = |i: usize, j: usize| {
+        SophonManifestAssetProperty::from_parts(
+            format!(
+                "StarRail_Data/StreamingAssets/AssetBundles/characters/{i:02}/{j:06}/character_{j:06}_bundle_v2_win.pck"
+            )
+            .into(),
+            vec![],
+            0,
+            0,
+            bytes::Bytes::new(),
+        )
+    };
+    (0..8)
+        .map(|i| SophonInstaller {
+            manifest: SophonManifestProto {
+                assets: (0..25_000).map(|j| asset(i, j)).collect(),
+            },
+            chunk_download: DownloadInfo {
+                encryption: 0,
+                password: String::new(),
+                compression: Compression::None,
+                url_prefix: format!("https://cdn{i}.example.com/"),
+                url_suffix: "chunks".into(),
+            },
+            label: format!("inst{i}"),
+            matching_field: format!("field{i}"),
+            manifest_hash: format!("hash{i}"),
+        })
+        .collect()
+}
+
+/// Paired measurement of the two planning strategies on identical inputs:
+/// the legacy name-keyed attribution map vs the positional per-installer
+/// accounting now used in production. The legacy replica lives in the lib
+/// so both run in the same binary against the same fixture state.
+fn bench_planner_attribution(c: &mut Criterion) {
+    use irmin_rs::game_installer::installer::bench_internals;
+
+    const ASSETS: u64 = 8 * 25_000;
+    let game_dir = tempfile::tempdir().expect("tempdir");
+    let hkrpg_blacklist_dir = tempfile::tempdir().expect("tempdir");
+    {
+        let persistent = hkrpg_blacklist_dir.path().join("StarRail_Data/Persistent");
+        std::fs::create_dir_all(&persistent).expect("create persistent dir");
+        let blacklist: String = (0..300)
+            .map(|i| {
+                format!(
+                    "{{\"fileName\":\"StarRail_Data/StreamingAssets/AudioLaucher/voice_file_{i:03}.pck\"}}\n"
+                )
+            })
+            .collect();
+        std::fs::write(persistent.join("DownloadBlacklist.json"), blacklist)
+            .expect("write blacklist");
+    }
+    let mut group = c.benchmark_group("planner_attribution");
+    group.throughput(Throughput::Elements(ASSETS));
+
+    let plan_args = |installers: Vec<SophonInstaller>, game_code: &str, dir: &Path| {
+        (
+            installers,
+            game_code.to_string(),
+            dir.to_path_buf(),
+            Vec::<String>::new(),
+        )
+    };
+    for (label, game_code, dir) in [
+        ("unknown_game", "unknown", game_dir.path().to_path_buf()),
+        ("hkrpg_blacklist", "hkrpg", hkrpg_blacklist_dir.path().to_path_buf()),
+    ] {
+        group.bench_function(BenchmarkId::new("legacy_name_map", label), |b| {
+            b.iter_batched(
+                || plan_args(planner_fixture_installers(), game_code, &dir),
+                |(installers, game_code, dir, langs)| {
+                    let counts = bench_internals::legacy_plan_counts(
+                        installers, &game_code, &dir, &langs,
+                    );
+                    std::hint::black_box(counts);
+                },
+                BatchSize::PerIteration,
+            )
+        });
+        group.bench_function(BenchmarkId::new("positional_segments", label), |b| {
+            b.iter_batched(
+                || plan_args(planner_fixture_installers(), game_code, &dir),
+                |(installers, game_code, dir, langs)| {
+                    let counts = bench_internals::positional_plan_counts(
+                        installers, &game_code, &dir, &langs,
+                    );
+                    std::hint::black_box(counts);
+                },
+                BatchSize::PerIteration,
+            )
+        });
+    }
+
+    group.finish();
+}
+
 #[cfg(feature = "bench-internals")]
 fn bench_update_diff_sizes(c: &mut Criterion) {
     use bytes::Bytes;
@@ -3353,6 +3457,7 @@ criterion_group!(
     bench_md5_hex_eq,
     bench_xxh64_hex_eq,
     bench_load_download_state,
+    bench_planner_attribution,
 );
 criterion_main!(benches);
 
