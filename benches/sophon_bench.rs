@@ -3005,6 +3005,13 @@ fn bench_phase2a_chunk_verify_optional(c: &mut Criterion) {
     let _ = c;
 }
 
+fn bench_assembly_hash_gate_optional(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    bench_assembly_hash_gate(c);
+    #[cfg(not(feature = "bench-internals"))]
+    let _ = c;
+}
+
 fn bench_file_metadata_cost_optional(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
     bench_file_metadata_cost(c);
@@ -3096,6 +3103,7 @@ criterion_group!(
     bench_md5_resident,
     bench_md5_multibuffer_optional,
     bench_phase2a_chunk_verify_optional,
+    bench_assembly_hash_gate_optional,
     bench_zstd_decompress,
     bench_lz4_deflate_decompress,
     bench_assembly_e2e,
@@ -3437,6 +3445,108 @@ fn bench_state_save(c: &mut Criterion) {
             });
         }
     }
+
+    group.finish();
+}
+
+/// Assembly-pipeline gate: measures whether per-chunk decompressed MD5
+/// verification (VerifyMode::Full) is CPU-bound at the pipeline level. Six
+/// workers (one per core) decompress 8 chunks each through the production
+/// `decompress_chunk_optimized`; the only difference between variants is
+/// whether the chunk hash is computed. If `hash_on` ≈ `hash_off` in wall
+/// time the pipeline is disk-bound and hash batching cannot help; if it is
+/// materially slower, hashing is the CPU bottleneck and multi-buffer
+/// batching (see `md5_multibuffer`) is the lever.
+#[cfg(feature = "bench-internals")]
+fn bench_assembly_hash_gate(c: &mut Criterion) {
+    use irmin_rs::game_installer::assembly_opt::bench_internals::decompress_chunk_optimized;
+    use std::sync::Arc;
+
+    const CHUNK_MIB: usize = 8;
+    const CHUNKS_PER_WORKER: usize = 8;
+    const WORKERS: usize = 6;
+    const TOTAL_BYTES: u64 =
+        (CHUNK_MIB * CHUNKS_PER_WORKER * WORKERS) as u64 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let chunks_dir = dir.path().join("chunks");
+    fs::create_dir_all(&chunks_dir).unwrap();
+
+    // Unique per-worker chunk files so no worker's reads race another's
+    // eviction; equal sizes keep SIMD lanes comparable if promoted later.
+    let mut chunk_paths: Vec<Arc<Vec<std::path::PathBuf>>> = Vec::with_capacity(WORKERS);
+    let mut out_files: Vec<std::fs::File> = Vec::with_capacity(WORKERS);
+    let mut expected_digests: Vec<Vec<[u8; 16]>> = Vec::with_capacity(WORKERS);
+    for w in 0..WORKERS {
+        let mut paths = Vec::with_capacity(CHUNKS_PER_WORKER);
+        let mut digests = Vec::with_capacity(CHUNKS_PER_WORKER);
+        for i in 0..CHUNKS_PER_WORKER {
+            let raw = gen_prng_data(
+                0x6A6A + (w * CHUNKS_PER_WORKER + i) as u64,
+                CHUNK_MIB * 1024 * 1024,
+            );
+            let comp = zstd::encode_all(&raw[..], 3).unwrap();
+            let path = chunks_dir.join(format!("w{w}_c{i:02}.zstd"));
+            fs::write(&path, &comp).unwrap();
+            paths.push(path);
+            digests.push(fast_md5::digest(&raw));
+        }
+        chunk_paths.push(Arc::new(paths));
+        expected_digests.push(digests);
+
+        let out_path = dir.path().join(format!("out_{w}.bin"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&out_path)
+            .unwrap();
+        file.set_len((CHUNK_MIB * 1024 * 1024 * CHUNKS_PER_WORKER) as u64)
+            .unwrap();
+        out_files.push(file);
+    }
+
+    let mut group = c.benchmark_group("assembly_hash_gate");
+    group.throughput(Throughput::Bytes(TOTAL_BYTES));
+
+    // `hash_on`: workers hash each chunk (VerifyMode::Full shape). `hash_off`:
+    // an empty digest slice disables the chunk hash (chunk_hash_required).
+    let run_pipeline = |chunk_hashes: Option<&Vec<Vec<[u8; 16]>>>| {
+        std::thread::scope(|s| {
+            for w in 0..WORKERS {
+                let paths = Arc::clone(&chunk_paths[w]);
+                let out = &out_files[w];
+                let hashes = chunk_hashes.map(|h| &h[w]);
+                s.spawn(move || {
+                    for (i, path) in paths.iter().enumerate() {
+                        let hash: &[u8] = match hashes {
+                            Some(per_worker) => &per_worker[i],
+                            None => b"",
+                        };
+                        let written = decompress_chunk_optimized(
+                            path,
+                            out,
+                            (i * CHUNK_MIB * 1024 * 1024) as u64,
+                            (CHUNK_MIB * 1024 * 1024) as u64,
+                            None,
+                            hash,
+                        )
+                        .expect("decompress");
+                        debug_assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
+                    }
+                });
+            }
+        });
+    };
+
+    group.bench_function("hash_off", |b| {
+        b.iter(|| run_pipeline(None));
+    });
+
+    group.bench_function("hash_on", |b| {
+        b.iter(|| run_pipeline(Some(&expected_digests)));
+    });
 
     group.finish();
 }
