@@ -1,6 +1,8 @@
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
+use futures_util::StreamExt as _;
+use futures_util::TryStreamExt as _;
 use reqwest::Client;
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
@@ -147,6 +149,8 @@ pub async fn check_update(
 
 // Branch discovery is separate from optional size queries, so local completed
 // packages remain usable when historical build/manifest endpoints disappear.
+// `query_sizes` is `Fn` because the two size queries hold shared `&`
+// access to it while both are polled.
 pub(super) async fn check_update_with_branches<F, Fut>(
     game_id: &str,
     vo_lang: &str,
@@ -154,10 +158,10 @@ pub(super) async fn check_update_with_branches<F, Fut>(
     current_tag: Option<String>,
     main_branch: PackageBranch,
     pre_download_branch: Option<PackageBranch>,
-    mut query_sizes: F,
+    query_sizes: F,
 ) -> SophonResult<UpdateInfo>
 where
-    F: FnMut(PackageBranch, Option<String>) -> Fut,
+    F: Fn(PackageBranch, Option<String>) -> Fut,
     Fut: std::future::Future<Output = SophonResult<(u64, u64)>>,
 {
     let remote_tag = main_branch.tag.clone();
@@ -185,8 +189,15 @@ where
         })
     });
 
-    let (update_compressed_size, update_decompressed_size) = if update_available {
-        match query_sizes(main_branch, current_tag.clone()).await {
+    // The update-size query and the preinstall-size query hit the same API
+    // and each handles its own error, so they run concurrently; when a
+    // cached package or a quiet branch short-circuits one side, its future
+    // is already complete and the join! is free.
+    let update_sizes = async {
+        if !update_available {
+            return (0, 0);
+        }
+        match query_sizes(main_branch.clone(), current_tag.clone()).await {
             Ok(sizes) => sizes,
             Err(err) => {
                 log::warn!("Failed to estimate update sizes (availability is unchanged): {err}");
@@ -197,29 +208,31 @@ where
                     .unwrap_or((0, 0))
             }
         }
-    } else {
-        (0, 0)
     };
-
-    let preinstall_downloaded = cached.is_some();
-    let (
-        preinstall_available,
-        preinstall_tag,
-        preinstall_compressed_size,
-        preinstall_decompressed_size,
-    ) = if let Some(state) = cached {
-        let (cs, ds) = state.cached_sizes();
-        (true, Some(state.tag), cs, ds)
-    } else if let Some(pre) = pre_download_branch {
+    // (tag, compressed, decompressed); None means no preinstall package.
+    let preinstall_sizes = async {
+        if let Some(state) = &cached {
+            let (cs, ds) = state.cached_sizes();
+            return Some((state.tag.clone(), cs, ds));
+        }
+        let pre = pre_download_branch.clone()?;
         let tag = pre.tag.clone();
         let (cs, ds) = query_sizes(pre, None).await.unwrap_or_else(|err| {
             log::warn!("Failed to fetch preinstall sizes: {err}");
             (0, 0)
         });
-        (true, Some(tag), cs, ds)
-    } else {
-        (false, None, 0, 0)
+        Some((tag, cs, ds))
     };
+
+    let ((update_compressed_size, update_decompressed_size), preinstall) =
+        tokio::join!(update_sizes, preinstall_sizes);
+
+    let preinstall_downloaded = cached.is_some();
+    let (preinstall_available, preinstall_tag, preinstall_compressed_size, preinstall_decompressed_size) =
+        match preinstall {
+            Some((tag, cs, ds)) => (true, Some(tag), cs, ds),
+            None => (false, None, 0, 0),
+        };
 
     Ok(UpdateInfo {
         update_available,
@@ -291,8 +304,6 @@ pub async fn fetch_diff_sizes(
             "Update size metadata returned a different version".into(),
         ));
     }
-    let mut cs = 0u64;
-    let mut ds = 0u64;
     let mut seen_chunks = CompactChunkNameSet::new();
 
     let old_map: rustc_hash::FxHashMap<String, &SophonManifestMeta> = old_build
@@ -301,37 +312,73 @@ pub async fn fetch_diff_sizes(
         .map(|m| (m.matching_field.clone(), m))
         .collect();
 
-    for new_meta in &new_build.manifests {
-        if new_meta.matching_field != "game"
-            && !vo_lang_matches(&new_meta.matching_field, vo_lang)
-            && is_known_vo_locale(&new_meta.matching_field)
-        {
-            continue;
-        }
+    let qualifying: Vec<&SophonManifestMeta> = new_build
+        .manifests
+        .iter()
+        .filter(|m| {
+            m.matching_field == "game"
+                || vo_lang_matches(&m.matching_field, vo_lang)
+                || !is_known_vo_locale(&m.matching_field)
+        })
+        .collect();
 
-        let matching_field = new_meta.matching_field.clone();
+    let (cs, ds) =
+        fetch_and_accumulate_diff_sizes(client, &old_map, &qualifying, &mut seen_chunks).await?;
+    let _ = &seen_chunks;
+    Ok((cs, ds))
+}
 
-        let (new_manifest, old_manifest) = tokio::try_join!(
-            super::api::fetch_manifest_proto(
-                client,
-                &new_meta.manifest_download,
-                &new_meta.manifest.id,
-            ),
-            async {
-                match old_map.get(&matching_field) {
-                    Some(old_meta) => super::api::fetch_manifest_proto(
-                        client,
-                        &old_meta.manifest_download,
-                        &old_meta.manifest.id,
-                    )
-                    .await
-                    .map(Some),
-                    None => {
-                        Ok::<Option<crate::proto_parse::SophonManifestProto>, SophonError>(None)
+/// Fetch each (new, old) manifest pair and accumulate diff sizes.
+///
+/// The bounded stream overlaps several manifest round-trips while `buffered`
+/// preserves the original meta order, so cross-manifest chunk dedup
+/// produces byte-identical results to a sequential fetch.
+async fn fetch_and_accumulate_diff_sizes(
+    client: &Client,
+    old_map: &rustc_hash::FxHashMap<String, &SophonManifestMeta>,
+    qualifying: &[&SophonManifestMeta],
+    seen_chunks: &mut CompactChunkNameSet,
+) -> SophonResult<(u64, u64)> {
+    /// Concurrent (new, old) manifest fetch pairs in flight. Bounded so at
+    /// most this many decoded manifest pairs are resident; the wire side is
+    /// bandwidth-bound, so more in-flight fetches would not move wall time.
+    const DIFF_PAIR_CONCURRENCY: usize = 3;
+
+    let mut cs = 0u64;
+    let mut ds = 0u64;
+
+    let mut pairs = futures_util::stream::iter(qualifying.iter().map(|new_meta| {
+        async move {
+            // Both manifests of the pair fetch in parallel, matching the
+            // intra-pair parallelism of the original per-iteration
+            // try_join!.
+            let (new_manifest, old_manifest) = tokio::join!(
+                super::api::fetch_manifest_proto(
+                    client,
+                    &new_meta.manifest_download,
+                    &new_meta.manifest.id,
+                ),
+                async {
+                    match old_map.get(new_meta.matching_field.as_str()) {
+                        Some(old_meta) => super::api::fetch_manifest_proto(
+                            client,
+                            &old_meta.manifest_download,
+                            &old_meta.manifest.id,
+                        )
+                        .await
+                        .map(Some),
+                        None => Ok::<_, SophonError>(None),
                     }
                 }
-            }
-        )?;
+            );
+            // Left-to-right `?` evaluation prefers the new-manifest error
+            // when both fetches fail.
+            Ok::<_, SophonError>((new_manifest?, old_manifest?))
+        }
+    }))
+    .buffered(DIFF_PAIR_CONCURRENCY);
+
+    while let Some((new_manifest, old_manifest)) = pairs.try_next().await? {
         let old_files_md5: rustc_hash::FxHashMap<&str, &str> = old_manifest
             .as_ref()
             .into_iter()
@@ -352,7 +399,7 @@ pub async fn fetch_diff_sizes(
             &old_files_md5,
             &old_chunks,
             &new_manifest,
-            &mut seen_chunks,
+            seen_chunks,
             &mut cs,
             &mut ds,
         )?;
@@ -1018,5 +1065,231 @@ pub mod benchmark {
             compressed,
             decompressed,
         }
+    }
+}
+
+#[cfg(test)]
+mod diff_sizes_fetch_tests {
+    use super::*;
+    use crate::api_scrape::{
+        Compression, DownloadInfo, ManifestFileInfo, SophonBuildData, SophonManifestMeta, Stats,
+    };
+    use crate::proto_parse::{
+        SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
+    };
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use hyper::{Request, Response};
+    use http_body_util::Full;
+    use prost::Message;
+    use std::convert::Infallible;
+    use std::net::TcpListener as StdTcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn mock_meta(matching_field: &str, manifest_id: &str, prefix: String) -> SophonManifestMeta {
+        SophonManifestMeta {
+            category_id: manifest_id.into(),
+            category_name: manifest_id.into(),
+            matching_field: matching_field.into(),
+            manifest: ManifestFileInfo {
+                id: manifest_id.into(),
+                checksum: String::new(),
+                compressed_size: "1".into(),
+                uncompressed_size: "1".into(),
+            },
+            chunk_download: DownloadInfo {
+                encryption: 0,
+                password: String::new(),
+                compression: Compression::None,
+                url_prefix: prefix.clone(),
+                url_suffix: String::new(),
+            },
+            manifest_download: DownloadInfo {
+                encryption: 0,
+                password: String::new(),
+                compression: Compression::Zstd,
+                url_prefix: prefix,
+                url_suffix: String::new(),
+            },
+            stats: Stats {
+                compressed_size: "1".into(),
+                uncompressed_size: "1".into(),
+                file_count: "1".into(),
+                chunk_count: "1".into(),
+            },
+            deduplicated_stats: None,
+        }
+    }
+
+    fn mock_build(tag: &str, prefix: String) -> SophonBuildData {
+        let fields = ["game", "en-us", "en", "un_kr", "ja", "cutscene1"];
+        SophonBuildData {
+            build_id: tag.into(),
+            tag: tag.into(),
+            manifests: fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| mock_meta(f, &format!("{tag}-m{i}"), prefix.clone()))
+                .collect(),
+        }
+    }
+
+    fn mock_manifest_proto(unique: usize) -> SophonManifestProto {
+        let mut assets = vec![SophonManifestAssetProperty {
+            asset_name: "dir/".into(),
+            asset_chunks: vec![],
+            asset_type: 1,
+            asset_size: 0,
+            asset_hash_md5: String::new().into(),
+        }];
+        for f in 0..32 {
+            let chunks = (0..4)
+                .map(|c| SophonManifestAssetChunk {
+                    chunk_name: format!("c{unique:02}-{f:04}-{c:03}").into(),
+                    chunk_decompressed_hash_md5: format!("h{unique:02}-{f:04}-{c:03}").into(),
+                    chunk_on_file_offset: (c * 1024 * 1024) as u64,
+                    chunk_size: 300 * 1024,
+                    chunk_size_decompressed: 1024 * 1024,
+                    chunk_compressed_hash_xxh: Default::default(),
+                    chunk_compressed_hash_md5: Default::default(),
+                    chunk_old_offset: 0,
+                })
+                .collect();
+            assets.push(SophonManifestAssetProperty {
+                asset_name: format!("f{unique:02}/{f:04}.pak").into(),
+                asset_chunks: chunks,
+                asset_type: 0,
+                asset_size: 4 * 1024 * 1024,
+                asset_hash_md5: format!("md5-{unique:02}-{f:04}").into(),
+            });
+        }
+        SophonManifestProto { assets }
+    }
+
+    fn zstd_body(proto: &SophonManifestProto) -> Vec<u8> {
+        zstd::stream::encode_all(proto.encode_to_vec().as_slice(), 1).unwrap()
+    }
+
+    /// Serves the six manifests of each build over a local HTTP server with
+    /// a fixed per-request delay, tracking how many requests are being
+    /// served simultaneously so the test can assert the fetches overlap
+    /// without depending on wall-clock timings.
+    async fn serve_manifests(
+        bodies: Vec<(String, Vec<u8>)>,
+        delay: Duration,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        requests_served: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bind = tokio::net::TcpListener::from_std(listener).unwrap();
+        let bodies = Arc::new(bodies);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = bind.accept().await else { continue };
+                let bodies = Arc::clone(&bodies);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                let requests_served = Arc::clone(&requests_served);
+                let delay = delay;
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |req: Request<hyper::body::Incoming>| {
+                                let path = req.uri().path().to_string();
+                                let bodies = Arc::clone(&bodies);
+                                let in_flight = Arc::clone(&in_flight);
+                                let max_in_flight = Arc::clone(&max_in_flight);
+                                let requests_served = Arc::clone(&requests_served);
+                                async move {
+                                    requests_served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    // High-water mark: bump the observed max
+                                    // so the test can see overlap after the
+                                    // requests complete.
+                                    let now =
+                                        in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                    max_in_flight.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                                    tokio::time::sleep(delay).await;
+                                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                    let empty: hyper::body::Bytes = hyper::body::Bytes::new();
+                                    let body = bodies
+                                        .iter()
+                                        .find(|(name, _)| path.ends_with(name.as_str()))
+                                        .map(|(_, b)| b.clone().into())
+                                        .unwrap_or(empty);
+                                    Ok::<_, Infallible>(Response::new(Full::new(body)))
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn concurrent_pair_fetch_round_trips_overlap() {
+        let delay = Duration::from_millis(40);
+        let mut bodies = Vec::new();
+        for (tag, unique) in [("1.0", 0usize), ("2.0", 1usize)] {
+            let proto = mock_manifest_proto(unique);
+            let body = zstd_body(&proto);
+            for i in 0..6 {
+                bodies.push((format!("{tag}-m{i}"), body.clone()));
+            }
+        }
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_served: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prefix = serve_manifests(
+            bodies,
+            delay,
+            Arc::clone(&in_flight),
+            Arc::clone(&max_in_flight),
+            Arc::clone(&requests_served),
+        )
+        .await;
+        let old_build = mock_build("1.0", prefix.clone());
+        let new_build = mock_build("2.0", prefix);
+
+        let old_map: rustc_hash::FxHashMap<String, &SophonManifestMeta> = old_build
+            .manifests
+            .iter()
+            .map(|m| (m.matching_field.clone(), m))
+            .collect();
+        let qualifying: Vec<&SophonManifestMeta> = new_build.manifests.iter().collect();
+        let client = reqwest::Client::new();
+
+        let mut seen = CompactChunkNameSet::new();
+        let (cs, ds) =
+            fetch_and_accumulate_diff_sizes(&client, &old_map, &qualifying, &mut seen)
+                .await
+                .unwrap();
+
+        // Concurrency shape: while one pair waits out its round-trip,
+        // sibling pairs must be in flight too (a one-pair-at-a-time loop
+        // would keep this at exactly 1). Every one of the twelve manifests
+        // (six pairs, old + new) must still be fetched exactly once.
+        let max_in_flight = max_in_flight.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            max_in_flight > 1,
+            "manifest fetches never overlapped (max in flight: {max_in_flight})"
+        );
+        assert_eq!(
+            requests_served.load(std::sync::atomic::Ordering::SeqCst),
+            12
+        );
+        // All six new manifests share identical chunk names, so the
+        // cross-manifest dedup counts each chunk exactly once: the totals
+        // are one manifest's worth of changed files (32 x 4 chunks).
+        assert_eq!(cs, 32 * 4 * 300 * 1024);
+        assert_eq!(ds, 32 * 4 * 1024 * 1024);
     }
 }

@@ -2218,7 +2218,7 @@ fn assemble_file_prng_data_matches_expected_md5() {
 // --- Durability epochs -------------------------------------------------------
 
 use super::super::assembly_epochs::{
-    AssemblyEpochs, CommitDirective, EPOCH_MAX_BYTES, EPOCH_MAX_FILES,
+    AssemblyEpochs, EPOCH_MAX_BYTES, EPOCH_MAX_FILES,
 };
 use super::EpochStageCtx;
 
@@ -2331,8 +2331,6 @@ fn epoch_commit_cadence_matches_thresholds() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("chunks")).unwrap();
     let manifest = Arc::new(CompactManifest::from(vec![]));
-    let lookup = make_chunk_names(&[]);
-    let refcounts: Vec<AtomicU32> = vec![];
     let chunks_dir = dir.path().join("chunks");
     let epochs = AssemblyEpochs::new(
         make_chunk_names(&[]),
@@ -2361,8 +2359,6 @@ fn epoch_commit_cadence_matches_thresholds() {
     }
     epochs.commit().unwrap();
     assert_eq!(due, 2, "commit due exactly at each 2-file boundary");
-    let _ = lookup;
-    let _ = chunks_dir;
 }
 
 #[test]
