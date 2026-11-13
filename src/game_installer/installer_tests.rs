@@ -1484,6 +1484,7 @@ async fn download_chunk_with_retries_success_on_first() {
             super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap(),
         ),
         verify_mode: super::VerifyMode::Full,
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
     });
 
     let handle = DownloadHandle::new();
@@ -1608,6 +1609,7 @@ async fn download_chunk_with_retries_mismatch_discards_partial() {
             super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("test.bitmap"), 1).unwrap(),
         ),
         verify_mode: super::VerifyMode::Full,
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
     });
 
     let handle = DownloadHandle::new();
@@ -2190,6 +2192,7 @@ async fn save_assembly_state_gates_on_completion_interval() {
             super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("gate.bitmap"), 1).unwrap(),
         ),
         verify_mode: super::VerifyMode::Full,
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
     });
 
     // Boundary checks: the save fires exactly on the interval, not before.

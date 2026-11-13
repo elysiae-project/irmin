@@ -209,8 +209,22 @@ struct InstallContext {
     output_allocator: Arc<super::output_allocator::OutputAllocator>,
     /// Completion bitmap for eager decompression resume.
     chunk_bitmap: Arc<super::chunk_bitmap::ChunkBitmap>,
+    /// Sender for eager file-durability jobs (set once the consumer task is
+    /// spawned; see [`spawn_eager_durability_task`]). The mutex allows the
+    /// download phase to take (drop) the sender for a clean drain; the
+    /// drain's join must complete before the final `chunk_bitmap` persist.
+    durability_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<EagerDurabilityJob>>>>,
     /// Verification mode controlling hash overhead.
     verify_mode: super::VerifyMode,
+}
+
+/// Eager file whose data needs a durability tail: fsync the output file,
+/// then mark its chunks complete in the resume bitmap, then close the fd.
+/// The tail's ordering contract lives on [`run_eager_durability_tail`].
+struct EagerDurabilityJob {
+    file_idx: usize,
+    /// Chunk range within the file to mark complete after the fsync.
+    chunk_range: std::ops::Range<u32>,
 }
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -1841,7 +1855,8 @@ async fn process_eager_item_oneshot(
             chunk_entry_offsets,
             pending_counts,
             ctx,
-        );
+        )
+        .await;
         return Ok(());
     }
 
@@ -1976,17 +1991,8 @@ async fn process_eager_item_oneshot(
             Err(error) => return Err(error),
         }
     }
-    finish_eager_item(
-        item_idx,
-        chunk,
-        ctx,
-        chunk_entries,
-        chunk_entry_offsets,
-        pending_counts,
-        global_chunk_idx,
-        &out_file,
-    )
-    .await
+    finish_eager_item(item_idx, chunk, ctx, chunk_entries, chunk_entry_offsets, pending_counts)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2022,7 +2028,8 @@ async fn process_eager_item_streaming(
             chunk_entry_offsets,
             pending_counts,
             ctx,
-        );
+        )
+        .await;
         return Ok(());
     }
 
@@ -2347,17 +2354,8 @@ async fn process_eager_item_streaming(
         }
     }
 
-    finish_eager_item(
-        item_idx,
-        chunk,
-        ctx,
-        chunk_entries,
-        chunk_entry_offsets,
-        pending_counts,
-        global_chunk_idx,
-        &out_file,
-    )
-    .await
+    finish_eager_item(item_idx, chunk, ctx, chunk_entries, chunk_entry_offsets, pending_counts)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2368,24 +2366,20 @@ async fn finish_eager_item(
     chunk_entries: &[FileEntry],
     chunk_entry_offsets: &[u32],
     pending_counts: &[AtomicU32],
-    global_chunk_idx: usize,
-    out_file: &std::fs::File,
 ) -> SophonResult<()> {
     if ctx.verify_mode == super::VerifyMode::Full {
-        ctx.chunk_bitmap.mark_complete(global_chunk_idx);
         // Record in `downloaded_chunks` so the periodic state save tracks
-        // eager chunks the same way the non-eager path does.
+        // eager chunks the same way the non-eager path does. The bitmap bit
+        // is deferred to the file-durability tail (notify path below): that
+        // tail fsyncs the file before marking any of its bits, so bits only
+        // ever exist for durable data.
         if let Some(dc) = ctx.downloaded_chunks.get() {
             dc[item_idx].store(chunk.chunk_size as u32, Ordering::Relaxed);
         }
 
         let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-            let _ = out_file.sync_data();
             save_assembly_state(ctx).await;
-            if let Err(e) = ctx.chunk_bitmap.sync() {
-                log::warn!("Failed to sync chunk bitmap: {e}");
-            }
         }
     }
 
@@ -2404,7 +2398,8 @@ async fn finish_eager_item(
         chunk_entry_offsets,
         pending_counts,
         ctx,
-    );
+    )
+    .await;
 
     Ok(())
 }
@@ -2495,7 +2490,7 @@ impl std::io::Read for ChunkStreamReader {
 
 /// When all eager chunks for a file complete, mark the file done directly
 /// (no assembly needed since pwrite already placed decompressed data).
-fn notify_eager_file_complete(
+async fn notify_eager_file_complete(
     item_idx: usize,
     chunk_entries: &[FileEntry],
     chunk_entry_offsets: &[u32],
@@ -2512,73 +2507,173 @@ fn notify_eager_file_complete(
         let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             let file_idx = *file_idx as usize;
-            // Flush output data to disk before marking bitmap — prevents
-            // corruption if power is lost before kernel writeback.
-            // Skip in non-Full mode: crash-resume is disabled.
-            if ctx.verify_mode == super::VerifyMode::Full
-                && let Some(handle) = ctx.output_allocator.get_handle(file_idx)
-            {
-                let _ = handle.sync_data();
-            }
-            // Close the cached output FD.
-            ctx.output_allocator.close_file(file_idx);
-            // Mark file complete (idempotent).
-            ctx.completion_flags[file_idx].store(true, Ordering::Release);
-            // Populate verify_cache so resume skips expensive MD5 rehash.
-            // Skip in non-Full mode: no crash-resume benefit.
-            if ctx.verify_mode == super::VerifyMode::Full
-                && ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES
-            {
-                let file_name = ctx.all_files.file_name(file_idx);
-                let target_path = ctx.game_dir.join(file_name);
-                if let Ok(meta) = target_path.metadata() {
-                    let mtime_secs = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs());
-                    let hash = ctx.all_files.file_hash_md5(file_idx);
-                    if let Ok(md5) = <[u8; 16]>::try_from(hash) {
-                        ctx.verify_cache.insert(
-                            file_name.to_string(),
-                            super::cache::VerificationEntry {
-                                size: ctx.all_files.file_size(file_idx),
-                                md5,
-                                mtime_secs,
-                            },
-                        );
-                    }
+            // The pending count hit zero: this worker wrote the file's last
+            // chunk. Exactly one worker observes prev == 1 per file, so the
+            // durability tail below runs exactly once.
+            if ctx.verify_mode == super::VerifyMode::Full {
+                // Hand the fsync + bitmap-mark tail to the durability task
+                // so this worker never blocks on disk I/O itself; it only
+                // waits when the bounded queue is full (fsync backpressure).
+                let job = EagerDurabilityJob {
+                    file_idx,
+                    chunk_range: ctx.all_files.file_chunk_range(file_idx),
+                };
+                // unwrap_or_else(into_inner): a poisoned lock still holds a
+                // usable sender, and treating it as absent would silently
+                // change completion semantics.
+                let sender = ctx
+                    .durability_tx
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .clone();
+                let unsent = match sender {
+                    Some(tx) => match tx.send(job).await {
+                        Ok(()) => None,
+                        Err(err) => Some(err.0),
+                    },
+                    None => Some(job),
+                };
+                if let Some(job) = unsent {
+                    // Sender absent (unit-test contexts), drained (the
+                    // download phase already ended), or lock poisoned: run
+                    // the tail per completed file, inline.
+                    run_eager_durability_tail(ctx, job);
                 }
-            }
-            // Update counters + progress (mirrors assembly coordinator).
-            let checked = ctx.checked_files.fetch_add(1, Ordering::Relaxed) + 1;
-            let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
-            let total = ctx.total_files;
-            let force = checked == total || assembled == total;
-            if force {
-                (ctx.updater)(SophonProgress::CheckingFiles {
-                    checked_files: checked,
-                    total_files: total,
-                });
-                (ctx.updater)(SophonProgress::Assembling {
-                    assembled_files: assembled,
-                    total_files: total,
-                });
-            } else if let Ok(mut lu) = ctx.last_assembly_update.try_lock()
-                && lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS)
-            {
-                (ctx.updater)(SophonProgress::CheckingFiles {
-                    checked_files: checked,
-                    total_files: total,
-                });
-                (ctx.updater)(SophonProgress::Assembling {
-                    assembled_files: assembled,
-                    total_files: total,
-                });
-                *lu = std::time::Instant::now();
+            } else {
+                // Non-Full mode has no crash-resume: no bitmap, no fsync,
+                // so the tail is pure bookkeeping and can run inline.
+                finalize_eager_file(ctx, file_idx);
             }
         }
     }
+}
+
+/// Post-completion bookkeeping that does not touch disk: counters, progress
+/// emission, and the verify-cache entry. Called by the durability task in
+/// Full mode and directly in non-Full mode. Also closes the cached FD.
+fn finalize_eager_file(ctx: &InstallContext, file_idx: usize) {
+    // Close the cached output FD (it belongs to a finished file).
+    ctx.output_allocator.close_file(file_idx);
+    if ctx.verify_mode == super::VerifyMode::Full {
+        // Mark file complete (idempotent).
+        ctx.completion_flags[file_idx].store(true, Ordering::Release);
+        // Populate verify_cache so resume skips expensive MD5 rehash.
+        if ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES {
+            let file_name = ctx.all_files.file_name(file_idx);
+            let target_path = ctx.game_dir.join(file_name);
+            if let Ok(meta) = target_path.metadata() {
+                let mtime_secs = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                let hash = ctx.all_files.file_hash_md5(file_idx);
+                if let Ok(md5) = <[u8; 16]>::try_from(hash) {
+                    ctx.verify_cache.insert(
+                        file_name.to_string(),
+                        super::cache::VerificationEntry {
+                            size: ctx.all_files.file_size(file_idx),
+                            md5,
+                            mtime_secs,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    // Update counters + progress (mirrors assembly coordinator).
+    let checked = ctx.checked_files.fetch_add(1, Ordering::Relaxed) + 1;
+    let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = ctx.total_files;
+    let force = checked == total || assembled == total;
+    if force || ctx.last_assembly_update.try_lock().is_ok_and(|mut lu| {
+        let due = lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS);
+        if due {
+            *lu = std::time::Instant::now();
+        }
+        due
+    }) {
+        (ctx.updater)(SophonProgress::CheckingFiles {
+            checked_files: checked,
+            total_files: total,
+        });
+        (ctx.updater)(SophonProgress::Assembling {
+            assembled_files: assembled,
+            total_files: total,
+        });
+    }
+}
+
+
+/// Durability tail for one completed eager file: fsync its output data,
+/// mark its chunks' resume bits, then finalize the bookkeeping.
+///
+/// This is the single place enforcing the crash-ordering invariant required
+/// by [`super::chunk_bitmap::ChunkBitmap`]: the file's data must be durable
+/// before its bitmap bits are marked (and before any later bitmap persist).
+/// If the fsync fails or the output handle is gone, the bits stay unset so
+/// a later resume re-downloads the file instead of trusting data that may
+/// not be durable.
+fn run_eager_durability_tail(ctx: &InstallContext, job: EagerDurabilityJob) {
+    let EagerDurabilityJob {
+        file_idx,
+        chunk_range,
+    } = job;
+    let durable = match ctx.output_allocator.get_handle(file_idx) {
+        Some(handle) if handle.sync_data().is_ok() => true,
+        Some(_) => {
+            log::warn!("Eager durability fsync failed for file index {file_idx}");
+            false
+        }
+        None => {
+            log::warn!(
+                "Eager durability handle missing for file index {file_idx}; \
+                 leaving resume bits unset"
+            );
+            false
+        }
+    };
+    if durable {
+        for ci in chunk_range {
+            ctx.chunk_bitmap.mark_complete(ci as usize);
+        }
+        finalize_eager_file(ctx, file_idx);
+    }
+}
+
+/// Consumer for eager file-durability jobs. Runs the fsync + bitmap-mark
+/// tail on the blocking pool so download workers never stall on disk I/O,
+/// keeping the invariant that bitmap bits exist only for durable data.
+///
+/// The channel is bounded, so a backlog of unsynced files applies fsync
+/// backpressure to the finishing worker instead of growing without bound.
+/// The send side lives in `InstallContext`; the returned handle finishes
+/// once that sender is dropped and every queued job's fsync has completed.
+fn spawn_eager_durability_task(ctx: &Arc<InstallContext>) -> tokio::task::JoinHandle<()> {
+    const DURABILITY_QUEUE_DEPTH: usize = 64;
+    let (tx, mut rx) = mpsc::channel::<EagerDurabilityJob>(DURABILITY_QUEUE_DEPTH);
+    *ctx.durability_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+
+    let task_ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let EagerDurabilityJob {
+                file_idx,
+                chunk_range,
+            } = job;
+            let ctx = Arc::clone(&task_ctx);
+            let result = tokio::task::spawn_blocking(move || {
+                run_eager_durability_tail(ctx.as_ref(), EagerDurabilityJob {
+                    file_idx,
+                    chunk_range,
+                });
+            })
+            .await;
+            if let Err(err) = result {
+                log::error!("Eager durability task join error: {err}");
+            }
+        }
+    })
 }
 
 fn notify_assembly_ready(
@@ -3705,6 +3800,7 @@ pub async fn install(
             };
             Arc::new(bm)
         },
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
         verify_mode: options.verify_mode,
     });
 
@@ -3805,6 +3901,12 @@ pub async fn install(
         ctx.last_update.store(now_nanos(), Ordering::Relaxed);
     }
 
+    // Durability consumer for eager file completions. Spawned before the
+    // download phase so every eager completion can hand off its fsync tail;
+    // drained (sender dropped + handle awaited) before the final bitmap sync
+    // so no unsynced file can outlive the install's last bitmap persist.
+    let durability_handle = spawn_eager_durability_task(&ctx);
+
     let results = run_downloads(
         Arc::clone(&ctx),
         download_items,
@@ -3818,6 +3920,14 @@ pub async fn install(
 
     // Downloads are done — let assembly run at full speed.
     ctx.adaptive_assembly.set_download_active(false);
+
+    // Drop the durability sender and wait for queued jobs to finish fsyncing
+    // and marking their bitmap bits; only then is the final bitmap persist
+    // below guaranteed to cover durable data.
+    *ctx.durability_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Err(err) = durability_handle.await {
+        log::error!("Eager durability task join error: {err}");
+    }
 
     // Final bitmap flush — covers the tail that didn't hit the periodic interval.
     if let Err(e) = ctx.chunk_bitmap.sync() {

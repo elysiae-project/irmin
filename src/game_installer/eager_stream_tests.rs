@@ -54,6 +54,7 @@ fn eager_context(
             super::chunk_bitmap::ChunkBitmap::create(&root.join("bitmap"), 1).unwrap(),
         ),
         verify_mode: VerifyMode::Full,
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -874,6 +875,7 @@ async fn benchmark_eager_loopback_inner() {
         output_allocator: Arc::clone(&allocator),
         chunk_bitmap: Arc::clone(&bitmap),
         verify_mode: VerifyMode::Full,
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
     });
     let pending = Arc::new(
         (0..concurrency)
@@ -1260,6 +1262,7 @@ async fn benchmark_eager_loopback_fixed_work_inner() {
         output_allocator: Arc::clone(&allocator),
         chunk_bitmap: Arc::clone(&bitmap),
         verify_mode: VerifyMode::Full,
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
     });
     let chunk_entries = Arc::new(
         (0..item_count)
