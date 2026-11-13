@@ -153,7 +153,7 @@ const MD5_MIB: u64 = 50;
 /// MD5 throughput on N independent same-size messages: sequential fast_md5
 /// (per-message scalar) vs the md5-simd crate's AVX2 multi-buffer `hash_many`,
 /// one core each. Measures the ceiling of multi-buffer SIMD MD5 on this CPU.
-/// Gated on `bench-internals` because the md5-simd dependency is optional.
+/// Benchmark-only (not compiled into production paths).
 #[cfg(feature = "bench-internals")]
 fn bench_md5_multibuffer(c: &mut Criterion) {
     use md5_simd::{Md5Engine, digest as simd_digest};
@@ -1279,6 +1279,7 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
                     (CHUNK_MIB * 1024 * 1024) as u64,
                     Some(&mut hasher),
                     b"",
+                    false,
                 )
                 .expect("decompress");
                 assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
@@ -3531,6 +3532,7 @@ fn bench_assembly_hash_gate(c: &mut Criterion) {
                             (CHUNK_MIB * 1024 * 1024) as u64,
                             None,
                             hash,
+                            false,
                         )
                         .expect("decompress");
                         debug_assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
@@ -3598,7 +3600,7 @@ fn bench_load_download_state(c: &mut Criterion) {
 /// re-download. Baseline is the old serial scalar loop (cache miss per
 /// chunk, one fast_md5 stream); candidate is the SIMD multi-buffer batch
 /// (8 mmap lanes per dispatch through md5-simd's AVX2 kernel).
-/// Gated on `bench-internals` because the md5-simd dependency is optional.
+/// Benchmark-only (not compiled into production paths).
 #[cfg(feature = "bench-internals")]
 fn bench_phase2a_chunk_verify(c: &mut Criterion) {
     const CHUNK_MIB: usize = 8;

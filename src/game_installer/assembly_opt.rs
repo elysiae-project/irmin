@@ -586,6 +586,7 @@ fn decompress_chunk_oneshot(
     expected_size: u64,
     file_hasher: &mut Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
+    deferred_to_batch_hasher: bool,
 ) -> SophonResult<u64> {
     if expected_size == 0 {
         return Ok(0);
@@ -634,8 +635,12 @@ fn decompress_chunk_oneshot(
         let mut ctx = take_dctx();
         ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
             .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
-        // Only skip frame checksum when MD5 verification covers integrity.
-        if chunk_hash_required(chunk_decompressed_hash_md5) || file_hasher.is_some() {
+        // Only skip frame checksum when MD5 verification covers integrity:
+        // in-worker, file-level, or deferred to the per-file batch hasher.
+        if chunk_hash_required(chunk_decompressed_hash_md5)
+            || file_hasher.is_some()
+            || deferred_to_batch_hasher
+        {
             let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
         }
 
@@ -889,6 +894,7 @@ pub fn write_chunk_from_mmap(
 /// window buffer. If the frame's actual window exceeds the guess (the error
 /// surfaces on the first read, before any hashing), falls back to the full
 /// capacity cap.
+#[allow(clippy::too_many_arguments)]
 pub fn decompress_chunk_optimized(
     chunk_path: &Path,
     out_file: &File,
@@ -896,6 +902,7 @@ pub fn decompress_chunk_optimized(
     expected_size: u64,
     file_hasher: Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
+    deferred_to_batch_hasher: bool,
 ) -> SophonResult<u64> {
     let mut file_hasher = file_hasher;
 
@@ -907,6 +914,7 @@ pub fn decompress_chunk_optimized(
             expected_size,
             &mut file_hasher,
             chunk_decompressed_hash_md5,
+            deferred_to_batch_hasher,
         );
         match &result {
             Ok(_) => return result,
@@ -926,6 +934,7 @@ pub fn decompress_chunk_optimized(
         expected_size,
         &mut file_hasher,
         chunk_decompressed_hash_md5,
+        deferred_to_batch_hasher,
         dynamic_log,
     );
     if is_window_too_small(&result) {
@@ -936,6 +945,7 @@ pub fn decompress_chunk_optimized(
             expected_size,
             &mut file_hasher,
             chunk_decompressed_hash_md5,
+            deferred_to_batch_hasher,
             MAX_WINDOW_LOG,
         );
     }
@@ -952,6 +962,7 @@ pub(crate) fn is_window_too_small(r: &SophonResult<u64>) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decompress_chunk_with_window(
     chunk_path: &Path,
     out_file: &File,
@@ -959,6 +970,7 @@ fn decompress_chunk_with_window(
     expected_size: u64,
     file_hasher: &mut Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
+    deferred_to_batch_hasher: bool,
     window_log: u32,
 ) -> SophonResult<u64> {
     let f = File::open(chunk_path)?;
@@ -973,7 +985,10 @@ fn decompress_chunk_with_window(
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx reset")))?;
         ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
             .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax")))?;
-        if chunk_hash_required(chunk_decompressed_hash_md5) || file_hasher.is_some() {
+        if chunk_hash_required(chunk_decompressed_hash_md5)
+            || file_hasher.is_some()
+            || deferred_to_batch_hasher
+        {
             let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
         }
 
@@ -1185,7 +1200,7 @@ mod tests {
         let out = write_at_new(&dst_path);
         out.set_len(raw.len() as u64).unwrap();
         let bytes =
-            decompress_chunk_optimized(&chunk_path, &out, 0, raw.len() as u64, None, b"").unwrap();
+            decompress_chunk_optimized(&chunk_path, &out, 0, raw.len() as u64, None, b"", false).unwrap();
         drop(out);
         assert_eq!(bytes, raw.len() as u64);
         assert_eq!(std::fs::read(&dst_path).unwrap(), raw);

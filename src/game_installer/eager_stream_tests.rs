@@ -369,6 +369,7 @@ fn benchmark_compressed_buffer_retention() {
                     decoded_size,
                     None,
                     &hex::encode(expected_hash),
+                    false,
                 )
                 .unwrap();
                 decompression_time += started.elapsed();

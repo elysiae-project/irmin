@@ -11,6 +11,9 @@ pub mod assembly_opt;
 mod assembly_opt;
 /// Persistent and in-memory file verification cache.
 pub mod cache;
+/// Per-file SIMD batch hasher for deferred chunk-decompressed MD5 checks
+/// during parallel assembly (VerifyMode::Full).
+pub mod chunk_batch_hasher;
 /// Disk-backed completion bitmap used to resume eager decompression.
 pub mod chunk_bitmap;
 /// Memory-compact columnar manifest representation.
@@ -39,9 +42,8 @@ pub mod installer;
 /// Output-file preallocation and shared file-handle management.
 pub mod output_allocator;
 /// SIMD multi-buffer MD5 verification for batches of independent files.
-/// Gated on `bench-internals`: the md5-simd dependency is optional; the
-/// module carries the differential tests and benchmarks for the SIMD
-/// batch-verifier experiments pending a CPU-bound consumer.
+/// Benchmark-only (not compiled into production paths); the production
+/// consumer of the md5-simd kernel is the per-file chunk batch hasher.
 #[cfg(feature = "bench-internals")]
 pub mod md5_multibuffer;
 mod plugin_api;

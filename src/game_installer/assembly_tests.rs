@@ -1308,6 +1308,194 @@ fn assemble_file_chunk_md5_mismatch_fails() {
     ));
 }
 
+/// Builds a multi-chunk fixture (>= 4 chunks so the parallel path runs)
+/// where every chunk carries a real 16-byte decompressed MD5. With Full
+/// verify and no forced file hash, this drives `batch_hashes` true: the
+/// workers defer the chunk hashes to the per-file SIMD batch hasher
+/// instead of verifying in-worker.
+fn build_deferred_batch_fixture(
+    chunks_dir: &Path,
+    num_chunks: usize,
+    per_chunk: usize,
+    corrupt_chunk: Option<usize>,
+) -> (SophonManifestAssetProperty, Vec<u8>, String) {
+    let mut raw = Vec::with_capacity(num_chunks * per_chunk);
+    let mut chunks = Vec::with_capacity(num_chunks);
+    for i in 0..num_chunks {
+        let data: Vec<u8> = (0..per_chunk)
+            .map(|b| (i * 7 + b * 13) as u8)
+            .collect();
+        let chunk_hash = if corrupt_chunk == Some(i) {
+            // Digest of different bytes: guarantees a mismatch.
+            compute_md5_hex(&data.iter().map(|b| b ^ 0xff).collect::<Vec<_>>())
+        } else {
+            compute_md5_hex(&data)
+        };
+        make_chunk_file(chunks_dir, &format!("dck{i}"), &data);
+        chunks.push(SophonManifestAssetChunk {
+            chunk_name: bytes::Bytes::from(format!("dck{i}")),
+            chunk_decompressed_hash_md5: bytes::Bytes::from(chunk_hash),
+            chunk_on_file_offset: (i * per_chunk) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: per_chunk as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: -1,
+        });
+        raw.extend_from_slice(&data);
+    }
+    let file_md5 = compute_md5_hex(&raw);
+    let file = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("deferred.bin"),
+        asset_chunks: chunks,
+        asset_type: 0,
+        asset_size: raw.len() as u64,
+        asset_hash_md5: bytes::Bytes::from(file_md5.clone()),
+    };
+    (file, raw, file_md5)
+}
+
+fn deferred_chunk_names(num_chunks: usize) -> Arc<ChunkNameLookup> {
+    let names: Vec<String> = (0..num_chunks).map(|i| format!("dck{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    make_chunk_names(&refs)
+}
+
+#[test]
+fn assemble_file_deferred_batch_hash_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let (file, raw, _file_md5) = build_deferred_batch_fixture(&chunks_dir, 8, 256 * 1024, None);
+    let chunk_names = deferred_chunk_names(8);
+    let chunk_refcounts: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(1)).collect();
+    let verify_cache = DashMap::new();
+
+    assemble_test_file(
+        file,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &chunk_names,
+        &chunk_refcounts,
+        &verify_cache,
+    )
+    .unwrap();
+
+    let result = fs::read(game_dir.join("deferred.bin")).unwrap();
+    assert_eq!(result, raw);
+}
+
+#[test]
+fn assemble_file_deferred_batch_hash_mismatch_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let (file, _raw, _file_md5) = build_deferred_batch_fixture(&chunks_dir, 8, 256 * 1024, Some(3));
+    let chunk_names = deferred_chunk_names(8);
+    let chunk_refcounts: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(1)).collect();
+    let verify_cache = DashMap::new();
+
+    let result = assemble_test_file(
+        file,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &chunk_names,
+        &chunk_refcounts,
+        &verify_cache,
+    );
+
+    let err = result.unwrap_err();
+    let SophonError::Md5Mismatch { item, .. } = &err else {
+        panic!("expected Md5Mismatch, got {err:?}");
+    };
+    // The report must name the chunk file exactly as the in-worker
+    // verification did: the manifest chunk name with the .zstd extension.
+    assert!(
+        item.ends_with("dck3.zstd"),
+        "mismatch item '{item}' must end with the chunk file name 'dck3.zstd'"
+    );
+    // The tmp file must not survive a verification failure.
+    assert!(!game_dir.join("deferred.bin").exists());
+}
+
+#[test]
+fn assemble_file_eight_byte_hash_keeps_in_worker_path() {
+    // 8-byte (xxh64-style) hashes are never deferred; full chunks must
+    // still assemble through the in-worker comparison.
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let num_chunks = 8;
+    let per_chunk = 256 * 1024;
+    let mut raw = Vec::with_capacity(num_chunks * per_chunk);
+    let mut chunks = Vec::with_capacity(num_chunks);
+    for i in 0..num_chunks {
+        let data: Vec<u8> = (0..per_chunk).map(|b| (i * 7 + b * 13) as u8).collect();
+        make_chunk_file(&chunks_dir, &format!("dck{i}"), &data);
+        chunks.push(SophonManifestAssetChunk {
+            chunk_name: bytes::Bytes::from(format!("dck{i}")),
+            // 16 hex chars decode to 8 binary bytes (xxh64 style): never
+            // deferrable, so the worker passes it straight to the
+            // in-worker confirm path.
+            chunk_decompressed_hash_md5: bytes::Bytes::from("deadbeefcafebabe"),
+            chunk_on_file_offset: (i * per_chunk) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: per_chunk as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: -1,
+        });
+        raw.extend_from_slice(&data);
+    }
+    let file_md5 = compute_md5_hex(&raw);
+    let file = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("eightbyte.bin"),
+        asset_chunks: chunks,
+        asset_type: 0,
+        asset_size: raw.len() as u64,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
+    };
+
+    let chunk_names = deferred_chunk_names(num_chunks);
+    let chunk_refcounts: Vec<AtomicU32> = (0..num_chunks).map(|_| AtomicU32::new(1)).collect();
+    let verify_cache = DashMap::new();
+
+    let result = assemble_test_file(
+        file,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &chunk_names,
+        &chunk_refcounts,
+        &verify_cache,
+    );
+
+    // The 8-byte placeholder cannot match the computed decompressed
+    // digest; the in-worker path must reject it (never deferred).
+    assert!(
+        matches!(result, Err(SophonError::Md5Mismatch { .. })),
+        "expected in-worker Md5Mismatch, got {result:?}"
+    );
+    assert!(!game_dir.join("eightbyte.bin").exists());
+}
+
 #[test]
 fn run_assembly_task_out_of_bounds_tmp_dir_idx() {
     let dir = tempfile::tempdir().unwrap();

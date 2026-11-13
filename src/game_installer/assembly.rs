@@ -17,6 +17,7 @@ thread_local! {
 
 use super::assembly_opt::{Md5, bytes_to_hex, md5_bytes_eq, md5_to_hex, return_md5, take_md5};
 use super::cache::{VerificationEntry, file_md5_digest};
+use super::chunk_batch_hasher::{self, HashJob, QUEUE_CAP};
 use super::error::{SophonError, SophonResult};
 use super::installer::ChunkNameLookup;
 use super::{FILE_WRITE_BUFFER_SIZE, PROGRESS_UPDATE_INTERVAL_MS};
@@ -511,7 +512,52 @@ fn assemble_file_with_options(
             std::sync::OnceLock::new();
         debug_assert_eq!(chunk_offsets.len(), total_chunks);
 
+        // Deferred chunk-hash verification: eligible downloaded chunks are
+        // verified by one SIMD batch hasher thread instead of scalar streams
+        // inside each worker (a dominant share of Full-verify pipeline CPU;
+        // see the chunk_batch_hasher module docs and the
+        // assembly_hash_gate benchmark). The hasher shares this scope so
+        // error recording and queue lifetime match the workers exactly.
+        // Old-source chunks keep their in-worker copy-verify path; zero-size
+        // chunks are never deferred (size > 0 is in the predicate), so their
+        // write call keeps its original hash argument.
+        let batch_hashes = !skip_chunk_hash
+            && !parallel_hashed_file
+            && (chunk_range.start..chunk_range.end).any(|ci| {
+                let ci = ci as usize;
+                all_files.chunk_old_offset_at(ci) < 0
+                    && all_files.chunk_size_decompressed_at(ci) > 0
+                    && chunk_batch_hasher::defer_eligible(
+                        all_files.chunk_decompressed_hash_at(ci),
+                    )
+            });
         std::thread::scope(|s| {
+            // Channel lifetime: created inside this scope body; the
+            // original sender drops when the body ends, workers hold only
+            // cloned senders by value, so the channel disconnects at the
+            // last worker's exit. The hasher's recv() then returns
+            // Disconnected, it flushes its final batch, and the scope's
+            // implicit join never blocks.
+            let (hash_tx, hash_rx) = if batch_hashes {
+                let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_CAP);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            if let Some(rx) = hash_rx {
+                let tmp_path = &tmp_path;
+                let err_slot = &first_error;
+                let err_flag = &has_error;
+                s.spawn(move || {
+                    chunk_batch_hasher::run(
+                        tmp_path,
+                        file_size,
+                        rx,
+                        err_slot,
+                        err_flag,
+                    );
+                });
+            }
             if parallel_hashed_file {
                 let tmp_path = &tmp_path;
                 let chunk_done = &chunk_done;
@@ -608,6 +654,10 @@ fn assemble_file_with_options(
                 let chunk_done = &chunk_done;
                 let chunk_offsets = &chunk_offsets[..];
                 let ht = &hasher_thread_handle;
+                // Each worker owns a sender clone by value; the channel
+                // disconnects when the last worker exits, which is the
+                // batch hasher's drain signal.
+                let worker_tx = hash_tx.clone();
                 s.spawn(move || {
                     let mut transfer_buf = TRANSFER_BUF.with(|cell| {
                         let mut buf = cell.take();
@@ -624,9 +674,20 @@ fn assemble_file_with_options(
                         let offset = chunk_offsets[oi];
                         let chunk_old_offset = files.chunk_old_offset_at(ci);
                         let chunk_size_decompressed = files.chunk_size_decompressed_at(ci);
+                        // Deferrable to the batch hasher: downloaded,
+                        // non-zero-size chunks with a real 16-byte MD5.
+                        // Old-source chunks keep the in-worker copy-verify
+                        // path (copy_file_range cannot be deferred); zero-size
+                        // chunks keep the oneshot's early-return semantics.
+                        let defer_hash = chunk_old_offset < 0
+                            && chunk_size_decompressed > 0
+                            && worker_tx.is_some()
+                            && chunk_batch_hasher::defer_eligible(
+                                files.chunk_decompressed_hash_at(ci),
+                            );
                         let result = if chunk_old_offset >= 0 {
                             let old_file = old.expect("has_old_chunks guarantees old file");
-                            write_from_old_file(
+                            let r = write_from_old_file(
                                 old_file,
                                 target,
                                 out,
@@ -640,7 +701,8 @@ fn assemble_file_with_options(
                                 } else {
                                     files.chunk_decompressed_hash_at(ci)
                                 },
-                            )
+                            );
+                            (r, None)
                         } else {
                             let chunk_name = files.chunk_name_at(ci);
                             if !validate_chunk_name(chunk_name) {
@@ -660,19 +722,55 @@ fn assemble_file_with_options(
                                 offset,
                                 chunk_size_decompressed,
                                 None,
-                                if skip_chunk_hash {
+                                if skip_chunk_hash || defer_hash {
                                     b""
                                 } else {
                                     files.chunk_decompressed_hash_at(ci)
                                 },
+                                defer_hash,
                             );
+                            // Bundle the deferred job with the write result
+                            // so the job is submitted only when the write
+                            // succeeded; a failed write keeps the worker's
+                            // error precedence untouched by the hasher. The
+                            // name uses the same full chunk path (with
+                            // .zstd) the in-worker mismatch report shows.
+                            let deferred_job = defer_hash.then(|| {
+                                let expected: [u8; 16] = files
+                                    .chunk_decompressed_hash_at(ci)
+                                    .try_into()
+                                    .expect("defer_eligible implies 16 bytes");
+                                HashJob {
+                                    name: chunk_path.display().to_string(),
+                                    offset,
+                                    len: chunk_size_decompressed,
+                                    expected,
+                                }
+                            });
                             chunk_path.pop();
-                            result
+                            (result, deferred_job)
                         };
                         match result {
-                            Ok(bytes) => {
+                            (Ok(bytes), deferred_job) => {
                                 tw.fetch_add(bytes, Ordering::Relaxed);
-                                if !skip_evict {
+                                // The worker skips its per-range eviction
+                                // exactly when the range was deferred to
+                                // the hasher (which becomes its evictor).
+                                let deferred = deferred_job.is_some();
+                                // Queue verification only now that the write
+                                // is known-good. Send blocks only when the
+                                // queue is full, which the hasher drains
+                                // continuously; after an abort it keeps
+                                // draining, so this never deadlocks. A
+                                // failed send implies the hasher died after
+                                // recording its own error, so dropping the
+                                // job is safe: the assemble will fail.
+                                if let (Some(tx), Some(job)) =
+                                    (worker_tx.as_ref(), deferred_job)
+                                {
+                                    let _ = tx.send(job);
+                                }
+                                if !skip_evict && !deferred {
                                     super::assembly_opt::sync_and_evict_range(
                                         raw_fd,
                                         offset,
@@ -684,7 +782,7 @@ fn assemble_file_with_options(
                                     t.unpark();
                                 }
                             }
-                            Err(e) => {
+                            (Err(e), _) => {
                                 let mut guard = err.lock().unwrap();
                                 if guard.is_none() {
                                     *guard = Some(e);
@@ -764,6 +862,7 @@ fn assemble_file_with_options(
                     } else {
                         all_files.chunk_decompressed_hash_at(ci)
                     },
+                    false,
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -872,6 +971,7 @@ fn write_decompressed_chunk_at(
     expected_size: u64,
     file_hasher: Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
+    deferred_to_batch_hasher: bool,
 ) -> SophonResult<u64> {
     super::assembly_opt::decompress_chunk_optimized(
         chunk_path,
@@ -880,6 +980,7 @@ fn write_decompressed_chunk_at(
         expected_size,
         file_hasher,
         chunk_decompressed_hash_md5,
+        deferred_to_batch_hasher,
     )
 }
 
