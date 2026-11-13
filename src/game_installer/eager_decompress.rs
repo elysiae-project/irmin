@@ -116,6 +116,23 @@ pub(crate) fn benchmark_eager_decompress_chunk_without_prefault(
     )
 }
 
+/// True when the compressed hash must be verified in the eager path.
+///
+/// A verified decompressed digest subsumes the compressed one: transport
+/// corruption either breaks zstd framing or changes the decompressed
+/// bytes, and the decompressed MD5 catches both. Hashing the compressed
+/// stream on top of that is pure CPU for zero extra detection, so it is
+/// skipped whenever the decompressed hash will actually be checked
+/// (non-empty, real length). When the decompressed hash is absent — the
+/// zero placeholder, an unsupported length, or an empty manifest field —
+/// the compressed digest is the only integrity check and stays.
+#[inline]
+pub(crate) fn compressed_hash_needed(compressed_hash: &[u8], decompressed_hash: &[u8]) -> bool {
+    !compressed_hash.is_empty()
+        && !chunk_hash_required(decompressed_hash)
+        && matches!(compressed_hash.len(), 16 | 8)
+}
+
 fn eager_decompress_chunk_inner<const PREFAULT: bool>(
     compressed_data: &[u8],
     out_file: &File,
@@ -124,8 +141,9 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
     compressed_hash: &[u8],
     decompressed_hash: &[u8],
 ) -> SophonResult<u64> {
-    // Verify compressed hash first.
-    if !compressed_hash.is_empty() {
+    // Verify the compressed hash only when it is the sole integrity check
+    // for this chunk (`compressed_hash_needed` documents the rationale).
+    if compressed_hash_needed(compressed_hash, decompressed_hash) {
         match compressed_hash.len() {
             16 => {
                 let mut hasher = take_md5()?;
@@ -153,6 +171,8 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
                     });
                 }
             }
+            // `compressed_hash_needed` admits only 16- and 8-byte digests;
+            // other lengths fail before the attempt loop.
             _ => {}
         }
     }
@@ -461,6 +481,26 @@ mod tests {
     }
 
     #[test]
+    fn compressed_hash_needed_only_when_decompressed_check_absent() {
+        let real = [0x11u8; 16];
+        // A decompressed digest that will be verified subsumes the
+        // compressed check for both digest widths.
+        assert!(!compressed_hash_needed(&[0x22; 16], &real));
+        assert!(!compressed_hash_needed(&[0x22; 8], &real));
+        // Without a real decompressed digest the compressed hash is the
+        // sole integrity check…
+        assert!(compressed_hash_needed(&[0x22; 16], b""));
+        assert!(compressed_hash_needed(&[0x22; 8], b""));
+        assert!(compressed_hash_needed(&[0x22; 16], &[0u8; 16]));
+        // …unless it is itself absent or of an unsupported length. Note an
+        // 8-byte digest counts as "will be verified" because
+        // `chunk_hash_required` is shared with the xxh64-capable paths.
+        assert!(!compressed_hash_needed(b"", &real));
+        assert!(!compressed_hash_needed(&[0x22; 4], b""));
+        assert!(!compressed_hash_needed(&[0x22; 8], &[0u8; 8]));
+    }
+
+    #[test]
     fn eager_decompress_compressed_hash_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("output.bin");
@@ -477,18 +517,43 @@ mod tests {
             .unwrap();
         out_file.set_len(1024).unwrap();
 
+        // A verified decompressed digest subsumes the compressed check, so a
+        // wrong compressed hash is ignored when the decompressed hash is real.
         let result = eager_decompress_chunk(
             &compressed,
             &out_file,
             0,
             1024,
-            &[0; 16], // wrong hash
+            &[0; 16], // wrong compressed hash
             &super::assembly_opt::hex_to_bytes(&md5_hex(&original)).unwrap()[..],
         );
+        assert_eq!(result.unwrap(), 1024);
+        assert_eq!(std::fs::read(&out_path).unwrap(), original);
 
+        // Without a decompressed digest the compressed hash is the only
+        // integrity check and a mismatch must fail the chunk.
+        let out_file2 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("output2.bin"))
+            .unwrap();
+        out_file2.set_len(1024).unwrap();
+        let result = eager_decompress_chunk(
+            &compressed,
+            &out_file2,
+            0,
+            1024,
+            &[0; 16], // wrong compressed hash
+            b"",      // no decompressed digest to fall back on
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
-            SophonError::Md5Mismatch { .. } => {}
+            SophonError::Md5Mismatch { expected, .. } => {
+                // The report keeps the hex digest shape callers log.
+                assert_eq!(expected, "00000000000000000000000000000000");
+            }
             other => panic!("expected Md5Mismatch, got: {other:?}"),
         }
     }

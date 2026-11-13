@@ -217,9 +217,12 @@ fn eager_mixed_mode_coexistence() {
     assert!(f1[2 * chunk_size..].iter().all(|&b| b == 0xB5));
 }
 
-/// Hash mismatch triggers error and chunk is NOT marked in bitmap.
+/// A decompressed-hash mismatch is the check that guards an eager chunk;
+/// it must fail the chunk and leave the crash-resume bitmap unmarked,
+/// while a stale compressed hash no longer fails a chunk whose
+/// decompressed digest verifies.
 #[test]
-fn eager_hash_mismatch_no_bitmap_mark() {
+fn eager_decompressed_mismatch_leaves_bitmap_unmarked() {
     let dir = tempfile::tempdir().unwrap();
     let game_dir = dir.path().join("game");
     fs::create_dir_all(&game_dir).unwrap();
@@ -234,16 +237,29 @@ fn eager_hash_mismatch_no_bitmap_mark() {
     alloc.preallocate_file(0, "bad.bin", 1024).unwrap();
     let handle = alloc.get_handle(0).unwrap();
 
-    // Wrong compressed hash
+    // A verified decompressed digest subsumes the compressed check, so the
+    // chunk still succeeds with a wrong compressed hash.
+    let good_decompressed = fast_md5::digest(&data);
     let result = eager_decompress_chunk(
         &compressed,
         &handle,
         0,
         1024,
-        &[0; 16],
-        md5_hex(&data).as_bytes(),
+        &[0; 16], // wrong compressed hash
+        good_decompressed.as_slice(),
     );
-
+    assert!(result.is_ok());
+    // A decompressed-hash mismatch — the check that actually guards this
+    // chunk — must fail and leave the bitmap unmarked.
+    let bad_decompressed = fast_md5::digest(b"different bytes");
+    let result = eager_decompress_chunk(
+        &compressed,
+        &handle,
+        0,
+        1024,
+        b"",
+        bad_decompressed.as_slice(),
+    );
     assert!(result.is_err());
     assert!(!bitmap.is_complete(0));
 }

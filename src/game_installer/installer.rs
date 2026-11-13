@@ -2048,6 +2048,19 @@ async fn process_eager_item_streaming(
             "unsupported compressed chunk hash length",
         )));
     }
+    // Hash the compressed stream only when the decoder will not verify a
+    // real decompressed digest for this chunk — the decompressed check
+    // subsumes transport corruption detection, so the producer pass only
+    // costs CPU when that check is absent. Both inputs are chunk-scoped
+    // and never change across download attempts, so this is hoisted out
+    // of the retry loop.
+    let verify_compressed = super::eager_decompress::compressed_hash_needed(
+        compressed_hash,
+        all_files
+            .as_deref()
+            .map(|manifest| manifest.chunk_decompressed_hash_at(global_chunk_idx))
+            .unwrap_or(b""),
+    );
     let mut attempts = 0;
     loop {
         if handle.is_cancelled() {
@@ -2115,10 +2128,12 @@ async fn process_eager_item_streaming(
             )
         });
 
-        let mut bytes_received = 0u64;
-        let mut compressed_md5 = (compressed_hash.len() == 16).then(fast_md5::Md5::new);
+        let mut compressed_md5 =
+            (verify_compressed && compressed_hash.len() == 16).then(fast_md5::Md5::new);
         let mut compressed_xxh64 =
-            (compressed_hash.len() == 8).then(super::assembly_opt::take_xxh64);
+            (verify_compressed && compressed_hash.len() == 8)
+                .then(super::assembly_opt::take_xxh64);
+        let mut bytes_received = 0u64;
         let mut stream_error = None;
         loop {
             #[cfg(feature = "bench-diagnostics")]
@@ -2223,6 +2238,13 @@ async fn process_eager_item_streaming(
             });
         }
         let compressed_hash_mismatch = if stream_error.is_none() {
+            // When the compressed check is skipped the hashers stay None and
+            // this branch yields false; an empty-expected mismatch report is
+            // therefore impossible.
+            debug_assert_eq!(
+                verify_compressed,
+                compressed_md5.is_some() || compressed_xxh64.is_some()
+            );
             if let Some(hasher) = compressed_md5.take() {
                 let digest = hasher.finalize();
                 !super::assembly_opt::md5_bytes_eq(&digest, compressed_hash)
