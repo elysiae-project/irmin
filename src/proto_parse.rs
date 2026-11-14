@@ -262,23 +262,56 @@ pub(crate) fn normalize_full_download_manifest(manifest: &mut SophonManifestProt
 /// UTF-8. Returns a prost decode error on the first invalid field so a
 /// corrupt or tampered CDN response is rejected at decode time rather than
 /// silently producing empty strings from the `*_str()` accessor fallbacks.
+///
+/// Validates one asset per `from_utf8` call by concatenating its string
+/// fields into a scratch buffer separated by NUL bytes. The NUL separator
+/// makes batch validity equivalent to per-field validity: an ASCII byte
+/// resets the UTF-8 state machine, so a multi-byte sequence straddling two
+/// fields fails at the separator exactly as it would per-field. When a
+/// batch fails, the cold per-field path below re-derives the precise
+/// field-level error.
 #[allow(deprecated)]
 fn validate_manifest_utf8(manifest: &SophonManifestProto) -> Result<(), prost::DecodeError> {
+    let mut batch: Vec<u8> = Vec::new();
     for asset in &manifest.assets {
-        std::str::from_utf8(&asset.asset_name)
-            .map_err(|_| prost::DecodeError::new("asset_name is not valid UTF-8"))?;
-        std::str::from_utf8(&asset.asset_hash_md5)
-            .map_err(|_| prost::DecodeError::new("asset_hash_md5 is not valid UTF-8"))?;
+        batch.clear();
+        batch.extend_from_slice(&asset.asset_name);
+        batch.push(0);
+        batch.extend_from_slice(&asset.asset_hash_md5);
+        batch.push(0);
         for chunk in &asset.asset_chunks {
-            std::str::from_utf8(&chunk.chunk_name)
-                .map_err(|_| prost::DecodeError::new("chunk_name is not valid UTF-8"))?;
-            std::str::from_utf8(&chunk.chunk_decompressed_hash_md5).map_err(|_| {
-                prost::DecodeError::new("chunk_decompressed_hash_md5 is not valid UTF-8")
-            })?;
-            std::str::from_utf8(&chunk.chunk_compressed_hash_md5).map_err(|_| {
-                prost::DecodeError::new("chunk_compressed_hash_md5 is not valid UTF-8")
-            })?;
+            batch.extend_from_slice(&chunk.chunk_name);
+            batch.push(0);
+            batch.extend_from_slice(&chunk.chunk_decompressed_hash_md5);
+            batch.push(0);
+            batch.extend_from_slice(&chunk.chunk_compressed_hash_md5);
+            batch.push(0);
         }
+        if std::str::from_utf8(&batch).is_err() {
+            return validate_asset_fields(asset);
+        }
+    }
+    Ok(())
+}
+
+/// Cold path for a batch whose validation failed: re-check each field of a
+/// single asset in wire order and return the error naming the first invalid
+/// field. Only runs for corrupt or tampered manifests.
+#[allow(deprecated)]
+fn validate_asset_fields(asset: &SophonManifestAssetProperty) -> Result<(), prost::DecodeError> {
+    std::str::from_utf8(&asset.asset_name)
+        .map_err(|_| prost::DecodeError::new("asset_name is not valid UTF-8"))?;
+    std::str::from_utf8(&asset.asset_hash_md5)
+        .map_err(|_| prost::DecodeError::new("asset_hash_md5 is not valid UTF-8"))?;
+    for chunk in &asset.asset_chunks {
+        std::str::from_utf8(&chunk.chunk_name)
+            .map_err(|_| prost::DecodeError::new("chunk_name is not valid UTF-8"))?;
+        std::str::from_utf8(&chunk.chunk_decompressed_hash_md5).map_err(|_| {
+            prost::DecodeError::new("chunk_decompressed_hash_md5 is not valid UTF-8")
+        })?;
+        std::str::from_utf8(&chunk.chunk_compressed_hash_md5).map_err(|_| {
+            prost::DecodeError::new("chunk_compressed_hash_md5 is not valid UTF-8")
+        })?;
     }
     Ok(())
 }
@@ -888,6 +921,42 @@ mod tests {
         assert!(decode_manifest(&buf).is_err());
     }
 
+    /// Multi-byte UTF-8 fully contained in one field must pass the batched
+    /// validation, while a sequence split across two fields must be
+    /// rejected: "д" = D0 B4 split as asset_name ending in D0 and
+    /// asset_hash_md5 starting with B4 would form a valid sequence only if
+    /// concatenated. The NUL separator breaks the join, matching the
+    /// per-field verdicts.
+    #[test]
+    fn decode_manifest_multibyte_and_boundary_straddle() {
+        let make = |name: bytes::Bytes, hash: bytes::Bytes| SophonManifestProto {
+            assets: vec![SophonManifestAssetProperty {
+                asset_name: name,
+                asset_chunks: vec![],
+                asset_type: 0,
+                asset_size: 1,
+                asset_hash_md5: hash,
+            }],
+        };
+
+        // Valid multi-byte name passes.
+        let ok = make(
+            bytes::Bytes::from_static("pathд.pak".as_bytes()),
+            bytes::Bytes::from_static(b"0123456789abcdef0123456789abcdef"),
+        );
+        assert!(decode_manifest(&ok.encode_to_vec()).is_ok());
+
+        // Sequence straddling the two fields is rejected even though the
+        // raw concatenation of the fields decodes as valid UTF-8.
+        let straddle = make(
+            bytes::Bytes::from_static(b"path\xd0"),
+            bytes::Bytes::from_static(b"\xb4hash"),
+        );
+        let buf = straddle.encode_to_vec();
+        assert!(decode_manifest(&buf).is_err());
+        assert!(decode_manifest_from_bytes(bytes::Bytes::from(buf)).is_err());
+    }
+
     /// The custom serde helpers must round-trip a manifest with non-ASCII
     /// names through JSON without data loss.
     #[test]
@@ -943,4 +1012,5 @@ mod tests {
         let via_bytes = decode_manifest_from_bytes(bytes::Bytes::from(buf)).unwrap();
         assert_eq!(via_slice, via_bytes);
     }
+
 }

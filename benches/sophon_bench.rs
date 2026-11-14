@@ -30,7 +30,9 @@ use irmin_rs::game_installer::{
     sysio,
 };
 use irmin_rs::manifest::compute_content_manifest_hash;
-use irmin_rs::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
+use irmin_rs::proto_parse::{
+    SophonManifestAssetChunk, SophonManifestAssetProperty, decode_manifest_from_bytes,
+};
 
 /// Fill a file with `mib` MiB of byte `fill`.
 fn fill_file(path: &std::path::Path, mib: usize, fill: u8) {
@@ -2029,6 +2031,15 @@ fn bench_protobuf_decode(c: &mut Criterion) {
     group.bench_function("decode_bytes_5000x50", |b| {
         b.iter(|| {
             let manifest = SophonManifestProto::decode(encoded_bytes.clone()).unwrap();
+            std::hint::black_box(manifest.assets.len());
+        });
+    });
+
+    // Production path: zero-copy decode plus the mandatory UTF-8 validation
+    // pass over every string field. This is what install startup runs.
+    group.bench_function("decode_bytes_validated_5000x50", |b| {
+        b.iter(|| {
+            let manifest = decode_manifest_from_bytes(encoded_bytes.clone()).unwrap();
             std::hint::black_box(manifest.assets.len());
         });
     });
