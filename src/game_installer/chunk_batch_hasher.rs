@@ -169,15 +169,18 @@ fn flush(
     jobs.sort_by_key(|job| job.len);
 
     let bytes = map.as_slice();
-    let mut inputs: Vec<&[u8]> = Vec::with_capacity(jobs.len());
-    let mut hashable: Vec<usize> = Vec::with_capacity(jobs.len());
+    let mut inputs: [&[u8]; QUEUE_CAP] = [&[]; QUEUE_CAP];
+    let mut hashable: [usize; QUEUE_CAP] = [0; QUEUE_CAP];
+    let mut digests: [[u8; 16]; QUEUE_CAP] = [[0u8; 16]; QUEUE_CAP];
+    let mut n = 0usize;
     for (i, job) in jobs.iter().enumerate() {
         let start = job.offset as usize;
         // Offsets and lengths come from the manifest and the written
         // ranges; a range outside the file cannot verify.
         if let Some(range) = bytes.get(start..start + job.len as usize) {
-            inputs.push(range);
-            hashable.push(i);
+            inputs[n] = range;
+            hashable[n] = i;
+            n += 1;
         } else {
             // Offsets and lengths are manifest-derived; a range outside
             // the file is an inconsistent manifest, not a digest failure.
@@ -192,11 +195,10 @@ fn flush(
         }
     }
 
-    if !inputs.is_empty() {
-        let mut digests = vec![[0u8; 16]; inputs.len()];
-        engine.hash_many(&inputs, &mut digests);
-        for (slot, &job_index) in hashable.iter().enumerate() {
-            let job = &jobs[job_index];
+    if n > 0 {
+        engine.hash_many(&inputs[..n], &mut digests[..n]);
+        for slot in 0..n {
+            let job = &jobs[hashable[slot]];
             if digests[slot] != job.expected {
                 record(
                     first_error,
