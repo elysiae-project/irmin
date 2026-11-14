@@ -1473,7 +1473,7 @@ async fn download_chunk_with_retries_success_on_first() {
         downloaded_chunks: Arc::new(OnceLock::new()),
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
-        last_save: Mutex::new(None),
+        save_slot: SaveSlot::new(),
         state_saver: Arc::new(|_| {}),
         save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
@@ -1598,7 +1598,7 @@ async fn download_chunk_with_retries_mismatch_discards_partial() {
         downloaded_chunks: Arc::new(OnceLock::new()),
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
-        last_save: Mutex::new(None),
+        save_slot: SaveSlot::new(),
         state_saver: Arc::new(|_| {}),
         save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
@@ -2274,7 +2274,7 @@ async fn save_assembly_state_gates_on_completion_interval() {
         downloaded_chunks: Arc::new(OnceLock::new()),
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
-        last_save: Mutex::new(None),
+        save_slot: SaveSlot::new(),
         state_saver: Arc::new(move |entries: &[(&str, u64)]| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             assert!(entries.is_empty(), "empty manifest snapshots no chunks");
@@ -2291,38 +2291,77 @@ async fn save_assembly_state_gates_on_completion_interval() {
         durability_tx: Arc::new(std::sync::Mutex::new(None)),
     });
 
-    // Boundary checks: the save fires exactly on the interval, not before.
-    for _ in 0..(crate::CHUNK_STATE_SAVE_INTERVAL - 1) {
-        save_assembly_state_if_due(&ctx).await;
+    // Boundary checks: the save fires exactly on the interval — firing one
+    // call early or one call late must fail. Each step drives the
+    // completion counter to an exact multiple of the interval, drains,
+    // then asserts, so an off-by-one cannot hide inside a long loop.
+    let interval = crate::CHUNK_STATE_SAVE_INTERVAL;
+
+    // Stay below the first boundary: no saves.
+    for _ in 0..(interval - 1) {
+        save_assembly_state_if_due(&ctx);
     }
+    ctx.save_slot.drain().await;
     assert_eq!(
         save_calls.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "completions below the interval must not save"
     );
-    save_assembly_state_if_due(&ctx).await;
 
-    // A second interval fires once more; the partial tail does not.
-    for _ in 0..(crate::CHUNK_STATE_SAVE_INTERVAL + 7) {
-        save_assembly_state_if_due(&ctx).await;
+    // The exact first boundary saves once.
+    save_assembly_state_if_due(&ctx);
+    ctx.save_slot.drain().await;
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the first boundary must save exactly once"
+    );
+
+    // Calls past the boundary hold until the next exact boundary; this
+    // also proves a drained slot never owed a save it skipped.
+    for _ in 0..7 {
+        save_assembly_state_if_due(&ctx);
     }
+    ctx.save_slot.drain().await;
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "calls between boundaries must not save"
+    );
+
+    // The exact second boundary saves once more.
+    for _ in 0..(interval - 7) {
+        save_assembly_state_if_due(&ctx);
+    }
+    ctx.save_slot.drain().await;
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "the second boundary must save exactly once"
+    );
+
+    // The partial tail does not save.
+    for _ in 0..7 {
+        save_assembly_state_if_due(&ctx);
+    }
+    ctx.save_slot.drain().await;
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "the partial tail must not save"
+    );
 
     // The terminal save path (save_assembly_state) bypasses the gate.
-    save_assembly_state(&ctx).await;
-
-    // Interval saves run on spawn_blocking and chain through `last_save`;
-    // drain the final handle (bounded, so a stuck save fails the test rather
-    // than hanging it) before counting invocations.
-    if let Some(handle) = ctx.last_save.lock().unwrap().take() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
-            .await
-            .expect("last state save should finish")
-            .expect("state save task must not panic");
-    }
+    save_assembly_state(&ctx);
+    ctx.save_slot.drain().await;
     assert_eq!(
         save_calls.load(std::sync::atomic::Ordering::Relaxed),
         3,
         "two interval saves plus the terminal save must be recorded"
+    );
+    assert!(
+        !ctx.save_slot.is_in_flight(),
+        "the slot must be idle once drained"
     );
 }
 
@@ -2405,3 +2444,132 @@ async fn save_slot_drain_returns_after_the_in_flight_save_completes() {
         .await
         .expect("idle drain must complete");
 }
+
+#[tokio::test]
+async fn save_assembly_state_coalesces_triggers_while_a_save_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    // Gate for parking the first save: a (started, release) flag pair with
+    // a condvar. Both halves are Sync, so they can live in the Send+Sync
+    // state_saver closure; every trigger that arrives while the save is
+    // parked deterministically takes the coalescing skip branch.
+    let gate = Arc::new((
+        std::sync::Mutex::new((false, false)),
+        std::sync::Condvar::new(),
+    ));
+    let save_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let ctx = Arc::new(InstallContext {
+        installer_clients: Arc::new(Vec::new()),
+        installer_downloads: Arc::new(Vec::new()),
+        chunks_dir: Arc::new(dir.path().to_path_buf()),
+        game_dir: dir.path().to_path_buf().into(),
+        all_tmp_dirs: Arc::new(Vec::new()),
+        all_files: Arc::new(CompactManifest::from(Vec::new())),
+        downloaded_bytes: AtomicU64::new(0),
+        assembled_files: Arc::new(AtomicU64::new(0)),
+        checked_files: Arc::new(AtomicU64::new(0)),
+        total_bytes: 0,
+        total_files: 0,
+        resume_bytes_offset: AtomicU64::new(0),
+        verify_cache: Arc::new(DashMap::new()),
+        chunk_refcounts: Arc::new(OnceLock::new()),
+        chunk_names: Arc::new(OnceLock::new()),
+        last_assembly_update: Arc::new(Mutex::new(Instant::now())),
+        last_update: AtomicU64::new(now_nanos()),
+        smooth_speed_bps: AtomicU64::new(0),
+        eta_speed_history: Mutex::new(VecDeque::new()),
+        last_speed_bytes: AtomicU64::new(0),
+        last_speed_time: AtomicU64::new(now_nanos()),
+        updater: Arc::new(|_| {}),
+        downloaded_chunks: Arc::new(OnceLock::new()),
+        chunks_since_save: AtomicU64::new(0),
+        assemblies_since_save: AtomicU64::new(0),
+        save_slot: SaveSlot::new(),
+        state_saver: {
+            let counter = Arc::clone(&save_calls);
+            let gate = Arc::clone(&gate);
+            Arc::new(move |_entries: &[(&str, u64)]| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (lock, cvar) = &*gate;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                cvar.notify_all();
+                // Runs on the blocking pool inside the save, so parking
+                // here is legal.
+                while !state.1 {
+                    state = cvar.wait(state).unwrap();
+                }
+            })
+        },
+        save_chunk_names: Arc::new(OnceLock::new()),
+        adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
+        profiler: Arc::new(super::profiling::PipelineProfiler::new()),
+        completion_flags: Arc::from(Vec::<AtomicBool>::new()),
+        output_allocator: Arc::new(super::output_allocator::OutputAllocator::new(dir.path())),
+        chunk_bitmap: Arc::new(
+            super::chunk_bitmap::ChunkBitmap::create(&dir.path().join("gate.bitmap"), 1).unwrap(),
+        ),
+        verify_mode: super::VerifyMode::Full,
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
+    });
+
+    // The parked save is in flight; wait for it to signal. The condvar
+    // wait runs on the blocking pool (not the runtime thread) under a
+    // timeout, so a save that never starts fails the test instead of
+    // hanging it.
+    save_assembly_state(&ctx);
+    {
+        let gate = Arc::clone(&gate);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                let (lock, cvar) = &*gate;
+                let mut state = lock.lock().unwrap();
+                while !state.0 {
+                    state = cvar.wait(state).unwrap();
+                }
+            }),
+        )
+        .await
+        .expect("parked save must start within the timeout")
+        .expect("gate wait task must not panic");
+    }
+
+    // Many "workers" cross the save boundary while it runs — the overlap
+    // scenario that previously spawned redundant concurrent saves. Every
+    // one of these triggers must be coalesced away. Each call also
+    // contends on the slot lock against the parked save's unfinished
+    // handle, mirroring the concurrent worker overlap; the async-task
+    // form of that race is covered by the SaveSlot tests.
+    for _ in 0..16 {
+        save_assembly_state(&ctx);
+    }
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the in-flight save may run"
+    );
+
+    // Release the parked save; drain must then complete.
+    {
+        let (lock, cvar) = &*gate;
+        lock.lock().unwrap().1 = true;
+        cvar.notify_all();
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), ctx.save_slot.drain())
+            .await
+            .is_ok(),
+        "drain must finish once the parked save is released"
+    );
+
+    // Once idle, the next boundary saves again.
+    save_assembly_state(&ctx);
+    ctx.save_slot.drain().await;
+    assert_eq!(
+        save_calls.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "an idle slot must accept the next trigger"
+    );
+}
+

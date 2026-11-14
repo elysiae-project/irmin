@@ -199,6 +199,17 @@ impl SaveSlot {
         *guard = Some(tokio::task::spawn_blocking(save));
     }
 
+    /// Whether a triggered save is still running. Diagnostic aid for
+    /// ordering invariants; the answer is a snapshot that may be stale the
+    /// moment it is read, so it is only meaningful at quiescent points.
+    pub(crate) fn is_in_flight(&self) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
     /// Wait for the in-flight save, if any. Call at the terminal barrier
     /// before the final save so an older snapshot cannot be the last write.
     pub async fn drain(&self) {
@@ -258,7 +269,7 @@ struct InstallContext {
     /// Assembly completions since the last state save; paced by
     /// [`save_assembly_state_if_due`].
     assemblies_since_save: AtomicU64,
-    last_save: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    save_slot: SaveSlot,
     state_saver: StateSaver,
     /// Shares chunk names with the lookup used by assembly tasks.
     save_chunk_names: Arc<OnceLock<Arc<ChunkNameLookup>>>,
@@ -1431,21 +1442,14 @@ async fn drain_join_set(join_set: &mut tokio::task::JoinSet<SophonResult<()>>) -
     }
 }
 
-async fn save_assembly_state(ctx: &Arc<InstallContext>) {
+fn save_assembly_state(ctx: &Arc<InstallContext>) {
     let dc = Arc::clone(&ctx.downloaded_chunks);
     let names = Arc::clone(&ctx.save_chunk_names);
     let saver = Arc::clone(&ctx.state_saver);
-    let prev_handle = {
-        let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-            log::error!("last_save mutex poisoned, recovering");
-            err.into_inner()
-        });
-        guard.take()
-    };
-    if let Some(h) = prev_handle {
-        let _ = h.await;
-    }
-    let new_handle = tokio::task::spawn_blocking(move || {
+    // The snapshot is built inside the blocking task from live atomics, so
+    // a save delayed behind the blocking pool still captures current
+    // progress; concurrent boundary hits coalesce into one save.
+    ctx.save_slot.trigger(move || {
         let entries: Vec<(&str, u64)> = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
             snapshot_downloaded_chunks(dc, names)
         } else {
@@ -1453,24 +1457,17 @@ async fn save_assembly_state(ctx: &Arc<InstallContext>) {
         };
         saver(&entries);
     });
-    {
-        let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-            log::error!("last_save mutex poisoned, recovering");
-            err.into_inner()
-        });
-        *guard = Some(new_handle);
-    }
 }
 
 /// Gate assembly-completion saves on the same interval used for chunk
 /// completions. Assembly completions only delete consumed chunk files (the
 /// persisted set shrinks), resume re-validates every persisted entry against
 /// disk, and the install end performs a terminal save regardless.
-async fn save_assembly_state_if_due(ctx: &Arc<InstallContext>) {
-    // Pacing only; the actual save synchronizes through `last_save`.
+fn save_assembly_state_if_due(ctx: &Arc<InstallContext>) {
+    // Pacing only; the actual save coalesces through the save slot.
     let count = ctx.assemblies_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-        save_assembly_state(ctx).await;
+        save_assembly_state(ctx);
     }
 }
 
@@ -1580,7 +1577,7 @@ fn spawn_assembly_coordinator(
             } else if let Some(res) = join_set.try_join_next() {
                 match res {
                     Ok(Ok(())) => {
-                        save_assembly_state_if_due(&ctx).await;
+                        save_assembly_state_if_due(&ctx);
                     }
                     Ok(Err(err)) => {
                         log::error!("Assembly task failed: {err}");
@@ -1617,7 +1614,7 @@ fn spawn_assembly_coordinator(
                     res = join_set.join_next() => {
                         match res {
                             Some(Ok(Ok(()))) => {
-                                save_assembly_state_if_due(&ctx).await;
+                                save_assembly_state_if_due(&ctx);
                             }
                             Some(Ok(Err(err))) => {
                                 log::error!("Assembly task failed: {err}");
@@ -2500,7 +2497,7 @@ async fn finish_eager_item(
 
         let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-            save_assembly_state(ctx).await;
+            save_assembly_state(ctx);
         }
     }
 
@@ -3010,7 +3007,7 @@ async fn process_download_item(
 
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-        save_assembly_state(ctx).await;
+        save_assembly_state(ctx);
         if let Err(e) = ctx.chunk_bitmap.sync() {
             log::warn!("Failed to sync chunk bitmap: {e}");
         }
@@ -3301,6 +3298,10 @@ async fn finalize_install(
     }
 
     {
+        debug_assert!(
+            !ctx.save_slot.is_in_flight(),
+            "terminal save must run after the drain in install()"
+        );
         let dc = Arc::clone(&ctx.downloaded_chunks);
         let names = Arc::clone(&ctx.save_chunk_names);
         let saver = Arc::clone(&ctx.state_saver);
@@ -3899,7 +3900,7 @@ pub async fn install(
         downloaded_chunks: Arc::new(OnceLock::new()),
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
-        last_save: Mutex::new(None),
+        save_slot: SaveSlot::new(),
         state_saver: callbacks.state_saver,
         save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::clone(&adaptive_assembly),
@@ -4106,18 +4107,9 @@ pub async fn install(
 
     super::reclaim_memory();
 
-    {
-        let handle = {
-            let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-                log::error!("last_save mutex poisoned, recovering");
-                err.into_inner()
-            });
-            guard.take()
-        };
-        if let Some(h) = handle {
-            let _ = h.await;
-        }
-    }
+    // Workers are finished, so no further triggers can occur; drain any
+    // in-flight save so no state write outlives the install.
+    ctx.save_slot.drain().await;
 
     drop(assemble_tx);
     let result = finalize_install(
@@ -4831,6 +4823,42 @@ mod eager_stream_tests;
 mod bench_legacy {
     use super::*;
 
+    /// Frozen replica of the await-then-spawn `save_assembly_state` from
+    /// before the save-slot port (commit 82d0208), kept for paired
+    /// criterion comparison against the coalescing [`SaveSlot::trigger`].
+    /// Unlike the slot, a caller takes and awaits the previous handle and
+    /// then always spawns its own save, so concurrent callers can run
+    /// overlapping saves. Safe to delete once its measurements are no
+    /// longer needed.
+    pub async fn legacy_await_then_spawn_save(
+        last_save: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+        downloaded_chunks: &Arc<OnceLock<Vec<AtomicU32>>>,
+        save_chunk_names: &Arc<OnceLock<Arc<ChunkNameLookup>>>,
+        saver: &StateSaver,
+    ) {
+        let dc = Arc::clone(downloaded_chunks);
+        let names = Arc::clone(save_chunk_names);
+        let saver = Arc::clone(saver);
+        let prev_handle = {
+            let mut guard = last_save.lock().unwrap_or_else(|err| err.into_inner());
+            guard.take()
+        };
+        if let Some(h) = prev_handle {
+            let _ = h.await;
+        }
+        let new_handle = tokio::task::spawn_blocking(move || {
+            let entries: Vec<(&str, u64)> = if let (Some(dc), Some(names)) = (dc.get(), names.get())
+            {
+                snapshot_downloaded_chunks(dc, names)
+            } else {
+                Vec::new()
+            };
+            saver(&entries);
+        });
+        let mut guard = last_save.lock().unwrap_or_else(|err| err.into_inner());
+        *guard = Some(new_handle);
+    }
+
     pub(crate) fn legacy_plan(
         installers: Vec<SophonInstaller>,
         game_code: &str,
@@ -4994,6 +5022,8 @@ mod bench_legacy_tests {
 
 #[cfg(feature = "benchmark")]
 pub mod bench_internals {
-    pub use super::bench_legacy::{legacy_plan_counts, positional_plan_counts};
+    pub use super::bench_legacy::{
+        legacy_await_then_spawn_save, legacy_plan_counts, positional_plan_counts,
+    };
     pub use super::{snapshot_downloaded_chunks, ChunkNameLookup, SaveSlot};
 }

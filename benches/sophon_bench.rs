@@ -3537,6 +3537,230 @@ fn bench_preinstall_save_offload(c: &mut Criterion) {
 }
 
 #[cfg(feature = "bench-internals")]
+fn bench_installer_save_offload(c: &mut Criterion) {
+    use std::sync::OnceLock;
+
+    use irmin_rs::game_installer::compact_manifest::StringArena;
+    use irmin_rs::game_installer::installer::bench_internals::{
+        legacy_await_then_spawn_save, snapshot_downloaded_chunks, ChunkNameLookup, SaveSlot,
+    };
+    use irmin_rs::game_installer::installer::StateSaver;
+    use irmin_rs::sophon::bench_write_state_file;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+    // 50k entries keeps blocking-pool background work bounded while the
+    // caller-cost gap stays orders of magnitude wide.
+    const COUNT: usize = 50_000;
+    const WAVE_WORKERS: usize = 8;
+
+    let names: Vec<String> = (0..COUNT).map(|i| format!("chunk-{i:08}.zstd")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let arena = StringArena::from(name_refs.as_slice());
+    let lookup = Arc::new(ChunkNameLookup::from_arena(arena));
+    let downloaded: Arc<OnceLock<Vec<AtomicU32>>> = Arc::new(OnceLock::new());
+    assert!(
+        downloaded
+            .set((0..COUNT).map(|_| AtomicU32::new(256 * 1024)).collect())
+            .is_ok()
+    );
+    let save_chunk_names: Arc<OnceLock<Arc<ChunkNameLookup>>> = Arc::new(OnceLock::new());
+    // is_ok() avoids the Debug bound that ChunkNameLookup does not carry.
+    assert!(save_chunk_names.set(Arc::clone(&lookup)).is_ok());
+
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_file = state_dir.path().join("state.json");
+    let saves = Arc::new(AtomicUsize::new(0));
+    let saver: StateSaver = {
+        let state_file = state_file.clone();
+        let saves = Arc::clone(&saves);
+        Arc::new(move |entries: &[(&str, u64)]| {
+            saves.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            bench_write_state_file(&state_file, entries);
+        })
+    };
+
+    let mut group = c.benchmark_group("installer_save_offload");
+    group.throughput(Throughput::Elements(COUNT as u64));
+
+    // Sequential boundary hits: the legacy caller awaits the previous save
+    // (a full serialize-and-rename) before spawning its own, so its
+    // per-boundary cost is one whole save; the coalesced caller only hands
+    // off. Drains are untimed and keep the blocking pool quiescent.
+    group.bench_function("legacy_await_prev", |b| {
+        b.iter_custom(|iters| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("bench runtime");
+            runtime.block_on(async {
+                let last_save: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+                    std::sync::Mutex::new(None);
+                let mut total = std::time::Duration::ZERO;
+                let saves_at_start = saves.load(std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..iters {
+                    let start = std::time::Instant::now();
+                    legacy_await_then_spawn_save(&last_save, &downloaded, &save_chunk_names, &saver)
+                        .await;
+                    total += start.elapsed();
+                }
+                // Untimed final drain. Timed region = await of the
+                // previous iteration's real save + spawn of this one;
+                // this is the production caller stall, not the cost of
+                // a save.
+                if let Some(handle) = last_save.lock().unwrap().take() {
+                    let _ = handle.await;
+                }
+                // Each iteration awaits the previous save and the final
+                // drain completes the last one, so exactly one real save
+                // must have run per boundary.
+                assert_eq!(
+                    saves.load(std::sync::atomic::Ordering::Relaxed) - saves_at_start,
+                    iters as usize,
+                    "legacy arm must run one real save per boundary"
+                );
+                total
+            })
+        })
+    });
+
+    group.bench_function("coalesced_trigger", |b| {
+        b.iter_custom(|iters| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("bench runtime");
+            runtime.block_on(async {
+                let slot = SaveSlot::new();
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let saves_before = saves.load(std::sync::atomic::Ordering::Relaxed);
+                    let dc = Arc::clone(&downloaded);
+                    let names = Arc::clone(&save_chunk_names);
+                    let saver = Arc::clone(&saver);
+                    let start = std::time::Instant::now();
+                    slot.trigger(move || {
+                        let entries = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+                            snapshot_downloaded_chunks(dc, names)
+                        } else {
+                            Vec::new()
+                        };
+                        saver(&entries);
+                    });
+                    total += start.elapsed();
+                    // Untimed: quiesce the pool so every timed trigger
+                    // measures a real spawn, not a coalescing skip.
+                    slot.drain().await;
+                    // The quiesced save must have run for every sample.
+                    assert!(
+                        saves.load(std::sync::atomic::Ordering::Relaxed) > saves_before,
+                        "coalesced arm must run a real save per trigger"
+                    );
+                }
+                total
+            })
+        })
+    });
+
+    // A wave of concurrent boundary hits — the overlap scenario the slot
+    // removes. Each iteration times one full wave (spawn + await of all
+    // wave tasks) and then drains untimed; the save counter is consumed so
+    // criterion cannot optimize it away. The wall time shows the save work
+    // is moved off the caller, not hidden. The legacy arm drains only the
+    // last handle (matching production legacy semantics), so detached
+    // earlier saves may still run into the next wave — an overlap the
+    // legacy shape tolerated, at a ~500x gap that cannot mask it.
+    group.bench_function("legacy_concurrent_8", |b| {
+        b.iter_custom(|iters| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("bench runtime");
+            runtime.block_on(async {
+                let last_save: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let saves_before = saves.load(std::sync::atomic::Ordering::Relaxed);
+                    let start = std::time::Instant::now();
+                    let mut wave = tokio::task::JoinSet::new();
+                    for _ in 0..WAVE_WORKERS {
+                        let last_save = Arc::clone(&last_save);
+                        let dc = Arc::clone(&downloaded);
+                        let names = Arc::clone(&save_chunk_names);
+                        let saver = Arc::clone(&saver);
+                        wave.spawn(async move {
+                            legacy_await_then_spawn_save(&last_save, &dc, &names, &saver).await;
+                        });
+                    }
+                    while wave.join_next().await.is_some() {}
+                    total += start.elapsed();
+                    if let Some(handle) = last_save.lock().unwrap().take() {
+                        let _ = handle.await;
+                    }
+                    // The wave must have produced real saves.
+                    assert!(
+                        saves.load(std::sync::atomic::Ordering::Relaxed) > saves_before,
+                        "legacy concurrent arm must run real saves"
+                    );
+                }
+                total
+            })
+        })
+    });
+
+    group.bench_function("coalesced_concurrent_8", |b| {
+        b.iter_custom(|iters| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("bench runtime");
+            runtime.block_on(async {
+                let slot = Arc::new(SaveSlot::new());
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let saves_before = saves.load(std::sync::atomic::Ordering::Relaxed);
+                    let start = std::time::Instant::now();
+                    let mut wave = tokio::task::JoinSet::new();
+                    for _ in 0..WAVE_WORKERS {
+                        let slot = Arc::clone(&slot);
+                        let dc = Arc::clone(&downloaded);
+                        let names = Arc::clone(&save_chunk_names);
+                        let saver = Arc::clone(&saver);
+                        wave.spawn(async move {
+                            slot.trigger(move || {
+                                let entries =
+                                    if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+                                        snapshot_downloaded_chunks(dc, names)
+                                    } else {
+                                        Vec::new()
+                                    };
+                                saver(&entries);
+                            });
+                        });
+                    }
+                    while wave.join_next().await.is_some() {}
+                    total += start.elapsed();
+                    slot.drain().await;
+                    // The wave's coalesced save must have run.
+                    assert!(
+                        saves.load(std::sync::atomic::Ordering::Relaxed) > saves_before,
+                        "coalesced concurrent arm must run a real save per wave"
+                    );
+                }
+                total
+            })
+        })
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "bench-internals"))]
+fn bench_installer_save_offload(c: &mut Criterion) {
+    let _ = c;
+}
+
+#[cfg(feature = "bench-internals")]
 fn bench_update_diff_sizes(c: &mut Criterion) {
     use bytes::Bytes;
     use irmin_rs::game_installer::update::benchmark;
@@ -3658,6 +3882,7 @@ criterion_group!(
     bench_planner_attribution,
     bench_preinstall_chunk_tracking,
     bench_preinstall_save_offload,
+    bench_installer_save_offload,
 );
 criterion_main!(benches);
 
