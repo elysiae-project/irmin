@@ -16,7 +16,7 @@ thread_local! {
 }
 
 use super::assembly_opt::{Md5, bytes_to_hex, md5_bytes_eq, md5_to_hex, return_md5, take_md5};
-use super::cache::{VerificationEntry, file_md5_digest};
+use super::cache::{VerificationEntry, file_md5_digest_with_known_size};
 use super::chunk_batch_hasher::{self, HashJob, QUEUE_CAP};
 use super::error::{SophonError, SophonResult};
 use super::installer::ChunkNameLookup;
@@ -1576,7 +1576,7 @@ pub fn run_assembly_task(
             } else {
                 // No verify_cache entry — hash the file to check correctness
                 // (handles eager files that bypassed the cache).
-                match file_md5_digest(&target_path) {
+                match file_md5_digest_with_known_size(&target_path, file_size) {
                     Ok(ref digest) if md5_bytes_eq(digest, file_hash_md5) => {
                         for ci in chunk_range.start..chunk_range.end {
                             decrement_chunk_refcount(

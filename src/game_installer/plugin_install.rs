@@ -316,7 +316,7 @@ fn verify_validation(game_dir: &Path, validation: &[ValidationEntry]) -> bool {
         }
         // Verify MD5 hash if provided for stronger integrity guarantee
         if let Some(ref expected_md5) = entry.md5 {
-            let computed = match cache::file_md5_digest(&file_path) {
+            let computed = match cache::file_md5_digest_with_known_size(&file_path, meta.len()) {
                 Ok(d) => d,
                 Err(err) => {
                     let path = &entry.path;

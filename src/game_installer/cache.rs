@@ -347,7 +347,7 @@ pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
 /// Same as `file_md5_digest` but skips the `fstat` when the caller already
 /// knows the file length from a prior metadata call.
 #[inline]
-fn file_md5_digest_with_known_size(path: &Path, known_size: u64) -> io::Result<[u8; 16]> {
+pub fn file_md5_digest_with_known_size(path: &Path, known_size: u64) -> io::Result<[u8; 16]> {
     file_md5_digest_with_options_known(path, MD5_READ_BUFFER_SIZE, true, known_size)
 }
 
