@@ -1474,6 +1474,7 @@ async fn download_chunk_with_retries_success_on_first() {
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
         save_slot: SaveSlot::new(),
+        bitmap_save_slot: SaveSlot::new(),
         state_saver: Arc::new(|_| {}),
         save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
@@ -1599,6 +1600,7 @@ async fn download_chunk_with_retries_mismatch_discards_partial() {
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
         save_slot: SaveSlot::new(),
+        bitmap_save_slot: SaveSlot::new(),
         state_saver: Arc::new(|_| {}),
         save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::new(AdaptiveAssembly::new()),
@@ -2275,6 +2277,7 @@ async fn save_assembly_state_gates_on_completion_interval() {
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
         save_slot: SaveSlot::new(),
+        bitmap_save_slot: SaveSlot::new(),
         state_saver: Arc::new(move |entries: &[(&str, u64)]| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             assert!(entries.is_empty(), "empty manifest snapshots no chunks");
@@ -2485,6 +2488,7 @@ async fn save_assembly_state_coalesces_triggers_while_a_save_is_in_flight() {
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
         save_slot: SaveSlot::new(),
+        bitmap_save_slot: SaveSlot::new(),
         state_saver: {
             let counter = Arc::clone(&save_calls);
             let gate = Arc::clone(&gate);

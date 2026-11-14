@@ -281,6 +281,10 @@ struct InstallContext {
     output_allocator: Arc<super::output_allocator::OutputAllocator>,
     /// Completion bitmap for eager decompression resume.
     chunk_bitmap: Arc<super::chunk_bitmap::ChunkBitmap>,
+    /// Coalescing slot for periodic bitmap syncs, so download workers
+    /// never run the blocking flush inline. Separate from `save_slot` so
+    /// a state save cannot coalesce away a bitmap sync (or vice versa).
+    bitmap_save_slot: SaveSlot,
     /// Sender for eager file-durability jobs (set once the consumer task is
     /// spawned; see [`spawn_eager_durability_task`]). The mutex allows the
     /// download phase to take (drop) the sender for a clean drain; the
@@ -3008,9 +3012,12 @@ async fn process_download_item(
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
         save_assembly_state(ctx);
-        if let Err(e) = ctx.chunk_bitmap.sync() {
-            log::warn!("Failed to sync chunk bitmap: {e}");
-        }
+        let bitmap = Arc::clone(&ctx.chunk_bitmap);
+        ctx.bitmap_save_slot.trigger(move || {
+            if let Err(e) = bitmap.sync() {
+                log::warn!("Failed to sync chunk bitmap: {e}");
+            }
+        });
     }
 
     let db = if was_actually_downloaded {
@@ -3901,6 +3908,7 @@ pub async fn install(
         chunks_since_save: AtomicU64::new(0),
         assemblies_since_save: AtomicU64::new(0),
         save_slot: SaveSlot::new(),
+        bitmap_save_slot: SaveSlot::new(),
         state_saver: callbacks.state_saver,
         save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::clone(&adaptive_assembly),
@@ -4085,6 +4093,12 @@ pub async fn install(
         log::error!("Eager durability task join error: {err}");
     }
 
+    // Drain any in-flight periodic sync before the final flush. Download
+    // workers are joined above (run_downloads returned), so no trigger can
+    // fire after this drain — the final inline sync below is the last
+    // bitmap write of the install.
+    ctx.bitmap_save_slot.drain().await;
+    debug_assert!(!ctx.bitmap_save_slot.is_in_flight());
     // Final bitmap flush — covers the tail that didn't hit the periodic interval.
     if let Err(e) = ctx.chunk_bitmap.sync() {
         log::warn!("Failed final chunk bitmap sync: {e}");
