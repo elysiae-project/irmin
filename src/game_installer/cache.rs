@@ -308,7 +308,7 @@ fn check_file_md5_with_metadata(
         return Ok((true, Some(actual_size)));
     }
 
-    let actual = file_md5_digest(path)?;
+    let actual = file_md5_digest_with_known_size(path, actual_size)?;
     let matches = md5_bytes_eq(&actual, expected_md5);
 
     if matches {
@@ -344,6 +344,13 @@ pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     file_md5_digest_with_options(path, MD5_READ_BUFFER_SIZE, true)
 }
 
+/// Same as `file_md5_digest` but skips the `fstat` when the caller already
+/// knows the file length from a prior metadata call.
+#[inline]
+fn file_md5_digest_with_known_size(path: &Path, known_size: u64) -> io::Result<[u8; 16]> {
+    file_md5_digest_with_options_known(path, MD5_READ_BUFFER_SIZE, true, known_size)
+}
+
 #[inline]
 fn file_md5_digest_with_options(
     path: &Path,
@@ -358,13 +365,31 @@ fn file_md5_digest_with_options(
         ));
     }
     let file = File::open(path)?;
-    file_md5_digest_with_file(file, buffer_capacity, advise_page_cache)
+    file_md5_digest_with_file(file, buffer_capacity, advise_page_cache, None)
+}
+
+#[inline]
+fn file_md5_digest_with_options_known(
+    path: &Path,
+    buffer_capacity: usize,
+    advise_page_cache: bool,
+    known_size: u64,
+) -> io::Result<[u8; 16]> {
+    if buffer_capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MD5 read buffer capacity must be nonzero",
+        ));
+    }
+    let file = File::open(path)?;
+    file_md5_digest_with_file(file, buffer_capacity, advise_page_cache, Some(known_size))
 }
 
 fn file_md5_digest_with_file(
     mut file: File,
     buffer_capacity: usize,
     advise_page_cache: bool,
+    known_len: Option<u64>,
 ) -> io::Result<[u8; 16]> {
     // Validate independently because benchmark callers can pass a File directly.
     if buffer_capacity == 0 {
@@ -373,7 +398,10 @@ fn file_md5_digest_with_file(
             "MD5 read buffer capacity must be nonzero",
         ));
     }
-    let len = file.metadata()?.len();
+    let len = match known_len {
+        Some(len) => len,
+        None => file.metadata()?.len(),
+    };
     if len == 0 {
         return Ok([
             0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
@@ -433,9 +461,9 @@ pub mod benchmark {
         file: File,
         capacity: usize,
         advise_page_cache: bool,
+        known_len: Option<u64>,
     ) -> io::Result<[u8; 16]> {
-        // The file-consuming benchmark helper hashes from the current cursor.
-        super::file_md5_digest_with_file(file, capacity, advise_page_cache)
+        super::file_md5_digest_with_file(file, capacity, advise_page_cache, known_len)
     }
 }
 

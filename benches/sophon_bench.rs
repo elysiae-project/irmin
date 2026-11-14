@@ -1351,6 +1351,7 @@ fn bench_file_metadata_cost(c: &mut Criterion) {
             fs::File::open(&path).expect("open digest fixture"),
             READ_BUFFER_BYTES,
             false,
+            None,
         )
         .expect("open-file digest"),
         expected
@@ -1395,7 +1396,7 @@ fn bench_file_metadata_cost(c: &mut Criterion) {
         b.iter_batched(
             || fs::File::open(&path).expect("open digest fixture"),
             |file| {
-                let digest = file_md5_digest_with_file(file, READ_BUFFER_BYTES, false)
+                let digest = file_md5_digest_with_file(file, READ_BUFFER_BYTES, false, None)
                     .expect("open-file digest");
                 std::hint::black_box(digest);
             },
