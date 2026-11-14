@@ -926,7 +926,7 @@ async fn benchmark_eager_loopback_inner() {
         result.unwrap().unwrap();
     }
     println!(
-        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} frame_kib={} rtt_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} requests={} frames={} elapsed_ms={} cpu_ms={} producer_wait_ms={} compressed_hash_ms={} send_ms={} consumer_wait_ms={} decoder_read_including_wait_ms={} decoder_thread_cpu_ms={} decoder_read_calls={} decoder_read_mib={:.1} reader_calls={} reader_requested_mib={:.1} reader_bypass_calls={} output_write_ms={} decompressed_hash_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
+        "path=loopback-installer mode={mode} size_mib={size_mib} concurrency={concurrency} queue_capacity={queue_capacity} frame_kib={} rtt_ms={response_delay_ms} server_pace_mib_s={rate_mib_s} requests={} frames={} elapsed_ms={} cpu_ms={} producer_wait_ms={} compressed_hash_ms={} send_ms={} consumer_wait_ms={} decoder_read_including_wait_ms={} decoder_thread_cpu_ms={} decoder_read_calls={} decoder_read_mib={:.1} reader_calls={} reader_requested_mib={:.1} output_write_ms={} decompressed_hash_ms={} peak_before_kib={peak_before} peak_after_kib={} compressed_mib={:.1}",
         frame_size / 1024,
         response_count.load(Ordering::Relaxed),
         frame_count.load(Ordering::Relaxed),
@@ -942,7 +942,6 @@ async fn benchmark_eager_loopback_inner() {
         timings.decoder_read_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
         timings.input_read_calls.load(Ordering::Relaxed),
         timings.input_read_requested_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
-        timings.input_read_bypass_calls.load(Ordering::Relaxed),
         timings.output_write_ns.load(Ordering::Relaxed) / 1_000_000,
         timings.output_hash_ns.load(Ordering::Relaxed) / 1_000_000,
         rss_high_water_kib(),
@@ -1455,6 +1454,66 @@ fn chunk_stream_reader_requires_verified_completion() {
             .kind(),
         std::io::ErrorKind::UnexpectedEof
     );
+}
+
+#[test]
+fn chunk_stream_reader_skips_empty_frames() {
+    // Capacity must hold all three pre-sent messages: blocking_send from a
+    // test thread parks forever once the buffer is full.
+    let (sender, receiver) = tokio::sync::mpsc::channel(3);
+    // A zero-length frame must be skipped without surfacing an empty
+    // slice to the decoder mid-stream (fill_buf's empty slice means EOF).
+    sender
+        .blocking_send(Ok(StreamMessage::Data(bytes::Bytes::new())))
+        .unwrap();
+    sender
+        .blocking_send(Ok(StreamMessage::Data(bytes::Bytes::from_static(b"abc"))))
+        .unwrap();
+    sender.blocking_send(Ok(StreamMessage::Complete)).unwrap();
+    drop(sender);
+
+    let mut reader = ChunkStreamReader {
+        receiver,
+        current: None,
+        offset: 0,
+        complete: false,
+        #[cfg(feature = "bench-diagnostics")]
+        timings: None,
+    };
+    let mut output = [0u8; 8];
+    assert_eq!(std::io::Read::read(&mut reader, &mut output).unwrap(), 3);
+    assert_eq!(&output[..3], b"abc");
+    // Complete marker reached: clean EOF.
+    assert_eq!(std::io::Read::read(&mut reader, &mut output).unwrap(), 0);
+}
+
+#[test]
+fn chunk_stream_reader_fill_buf_serves_slices_without_copying() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    sender
+        .blocking_send(Ok(StreamMessage::Data(bytes::Bytes::from_static(
+            b"abcdef",
+        ))))
+        .unwrap();
+    sender.blocking_send(Ok(StreamMessage::Complete)).unwrap();
+    drop(sender);
+
+    let mut reader = ChunkStreamReader {
+        receiver,
+        current: None,
+        offset: 0,
+        complete: false,
+        #[cfg(feature = "bench-diagnostics")]
+        timings: None,
+    };
+    // fill_buf hands out the frame slice; consume advances within it —
+    // the zero-copy path the zstd zio loop drives.
+    assert_eq!(std::io::BufRead::fill_buf(&mut reader).unwrap(), b"abcdef");
+    std::io::BufRead::consume(&mut reader, 2);
+    assert_eq!(std::io::BufRead::fill_buf(&mut reader).unwrap(), b"cdef");
+    std::io::BufRead::consume(&mut reader, 4);
+    // Complete marker consumed; clean EOF drives an empty slice.
+    assert_eq!(std::io::BufRead::fill_buf(&mut reader).unwrap(), b"");
 }
 
 #[test]

@@ -31,9 +31,13 @@ pub(crate) struct EagerStreamPhaseTimings {
     pub(crate) compressed_hash_ns: std::sync::atomic::AtomicU64,
     pub(crate) channel_send_ns: std::sync::atomic::AtomicU64,
     pub(crate) consumer_wait_ns: std::sync::atomic::AtomicU64,
+    /// Frames pulled from the channel into the reader (distinct
+    /// receives; fill_buf re-offers of a partially consumed frame do not
+    /// count).
     pub(crate) input_read_calls: std::sync::atomic::AtomicU64,
+    /// Bytes the decoder actually ingested via `consume` (never counts a
+    /// byte twice, unlike a fill_buf-supplied tally).
     pub(crate) input_read_requested_bytes: std::sync::atomic::AtomicU64,
-    pub(crate) input_read_bypass_calls: std::sync::atomic::AtomicU64,
     pub(crate) decoder_read_ns: std::sync::atomic::AtomicU64,
     pub(crate) decoder_read_count: std::sync::atomic::AtomicU64,
     pub(crate) decoder_read_bytes: std::sync::atomic::AtomicU64,
@@ -241,9 +245,44 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
     Ok(written as u64)
 }
 
-/// Stream a compressed chunk into a file range while checking optional hashes.
-pub fn stream_decompress_to_file(
+/// Frozen replica of the pre-BufRead input chain (commit 5323491): the
+/// streaming entry point used to accept any `Read` and wrap it in an
+/// internal 256 KiB `BufReader`, which stacked with the installer-side
+/// outer 256 KiB `BufReader` around the channel reader — two extra copies
+/// of the compressed stream plus two transient allocations per chunk.
+/// Kept for paired criterion comparison against
+/// [`stream_decompress_to_file`]; safe to delete once its measurements
+/// are no longer needed.
+#[cfg(feature = "benchmark")]
+pub fn legacy_stream_decompress_double_buffered(
     reader: impl io::Read,
+    out_file: &File,
+    chunk_offset: u64,
+    expected_decompressed_size: u64,
+    decompressed_hash: &[u8],
+) -> SophonResult<u64> {
+    stream_decompress_to_file_inner(
+        io::BufReader::with_capacity(256 * 1024, reader),
+        out_file,
+        chunk_offset,
+        expected_decompressed_size,
+        decompressed_hash,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
+        #[cfg(feature = "bench-diagnostics")]
+        false,
+    )
+}
+
+/// Stream a compressed chunk into a file range while checking optional hashes.
+///
+/// The reader is consumed as a [`std::io::BufRead`] directly by the zstd
+/// decoder: pass a reader whose `fill_buf` yields the source's natural
+/// chunk slices (channel frames, buffer slices) and do NOT wrap it in
+/// another `BufReader` — that would only reintroduce a copy of the
+/// compressed stream.
+pub fn stream_decompress_to_file(
+    reader: impl io::BufRead,
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
@@ -264,7 +303,7 @@ pub fn stream_decompress_to_file(
 
 #[cfg(feature = "bench-diagnostics")]
 pub(crate) fn stream_decompress_to_file_with_timings(
-    reader: impl io::Read,
+    reader: impl io::BufRead,
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
@@ -284,7 +323,7 @@ pub(crate) fn stream_decompress_to_file_with_timings(
 
 #[allow(clippy::too_many_arguments)]
 fn stream_decompress_to_file_inner(
-    reader: impl io::Read,
+    reader: impl io::BufRead,
     out_file: &File,
     chunk_offset: u64,
     expected_decompressed_size: u64,
@@ -325,7 +364,7 @@ fn stream_decompress_to_file_inner(
         #[cfg(feature = "bench-diagnostics")]
         let decoder_thread_started = thread_cpu_time_ns();
         let mut decoder = zstd::Decoder::with_context(
-            io::BufReader::with_capacity(256 * 1024, &mut reader),
+            &mut reader,
             ctx.0.as_mut().expect("decoder context is present"),
         )
         .single_frame();

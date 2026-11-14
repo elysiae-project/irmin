@@ -3554,6 +3554,129 @@ fn bench_chunk_bitmap_sync(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "benchmark")]
+fn bench_eager_stream_input_chain(c: &mut Criterion) {
+    use irmin_rs::game_installer::eager_decompress::{
+        legacy_stream_decompress_double_buffered, stream_decompress_to_file,
+    };
+
+    // The streaming eager path used to feed zstd through TWO stacked
+    // 256 KiB BufReaders (installer-side outer + entry-point inner), at
+    // ~3 memcpys per compressed byte and two transient >mmap-threshold
+    // allocations per chunk. The paired arms below differ ONLY in that
+    // copy sandwich around identical zstd work. The source yields
+    // frame-sized slices (like the mpsc frames the production reader
+    // hands out) so zstd's internal input staging behaves realistically;
+    // a whole-buffer Cursor would hide the staging cost and overstate
+    // the difference.
+    const DATA_MIB: usize = 64;
+    const FRAME_KIB: usize = 64;
+
+    let mut data = vec![0u8; DATA_MIB * 1024 * 1024];
+    let mut seed: u64 = 0xF00D;
+    for b in data.iter_mut() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *b = (seed >> 33) as u8;
+    }
+    let compressed = zstd::encode_all(std::io::Cursor::new(&data), 3).unwrap();
+    drop(data);
+    let decompressed_hash = fast_md5::digest(
+        &zstd::decode_all(std::io::Cursor::new(&compressed)).unwrap(),
+    )
+    .to_vec();
+
+    /// Yields the compressed stream in FRAME_KIB slices, like the
+    /// channel frames production feeds the chunk reader.
+    struct FrameReader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+    }
+
+    impl std::io::BufRead for FrameReader<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            let end = (self.offset + FRAME_KIB * 1024).min(self.bytes.len());
+            Ok(&self.bytes[self.offset..end])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.offset += amt.min(self.bytes.len() - self.offset);
+        }
+    }
+
+    impl std::io::Read for FrameReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if output.is_empty() {
+                return Ok(0);
+            }
+            let filled = std::io::BufRead::fill_buf(self)?;
+            let count = output.len().min(filled.len());
+            output[..count].copy_from_slice(&filled[..count]);
+            std::io::BufRead::consume(self, count);
+            Ok(count)
+        }
+    }
+
+
+    let mut group = c.benchmark_group("eager_stream_input_chain");
+    group.throughput(Throughput::Bytes(DATA_MIB as u64 * 1024 * 1024));
+
+    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out_path = out_dir.path().join("out.bin");
+    let open_output = || {
+        let out_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&out_path)
+            .expect("open output");
+        out_file
+            .set_len(DATA_MIB as u64 * 1024 * 1024)
+            .expect("size output");
+        out_file
+    };
+
+    group.bench_function("legacy_double_buffered", |b| {
+        b.iter(|| {
+            // The old production shape minus the channel: outer 256 KiB
+            // BufReader + the replica's internal 256 KiB BufReader.
+            let reader = std::io::BufReader::with_capacity(
+                256 * 1024,
+                FrameReader {
+                    bytes: &compressed,
+                    offset: 0,
+                },
+            );
+            legacy_stream_decompress_double_buffered(
+                reader,
+                &open_output(),
+                0,
+                DATA_MIB as u64 * 1024 * 1024,
+                &decompressed_hash,
+            )
+            .expect("legacy decode")
+        });
+    });
+
+    group.bench_function("native_bufread", |b| {
+        b.iter(|| {
+            stream_decompress_to_file(
+                FrameReader {
+                    bytes: &compressed,
+                    offset: 0,
+                },
+                &open_output(),
+                0,
+                DATA_MIB as u64 * 1024 * 1024,
+                &decompressed_hash,
+            )
+            .expect("native decode")
+        });
+    });
+
+    group.finish();
+}
+
 #[cfg(feature = "bench-internals")]
 fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
     use dashmap::DashMap;
@@ -4079,6 +4202,7 @@ criterion_group!(
     bench_v20_step_buffer_stress,
     bench_v13_large_uncovered_prefix,
     bench_eager_decompress,
+    bench_eager_stream_input_chain,
     bench_file_md5_buffer_capacity_optional,
     bench_file_metadata_cost_optional,
     bench_update_diff_sizes,
@@ -4316,19 +4440,9 @@ impl<'a> HashingRead<'a> {
     }
 }
 
-impl std::io::Read for HashingRead<'_> {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        let count = output.len().min(self.bytes.len() - self.offset);
-        output[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
-        self.hasher
-            .as_mut()
-            .expect("hash context is available before EOF")
-            .update(&self.bytes[self.offset..self.offset + count]);
-        self.offset += count;
-        if count == 0 && !self.verified {
+impl std::io::BufRead for HashingRead<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.offset >= self.bytes.len() && !self.verified {
             self.verified = true;
             let digest = self
                 .hasher
@@ -4342,6 +4456,30 @@ impl std::io::Read for HashingRead<'_> {
                 ));
             }
         }
+        Ok(&self.bytes[self.offset..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        let remaining = self.bytes.len() - self.offset;
+        debug_assert!(amt <= remaining, "consumer over-consumed the slice");
+        self.hasher
+            .as_mut()
+            .expect("hash context is available before EOF")
+            .update(&self.bytes[self.offset..self.offset + amt.min(remaining)]);
+        self.offset += amt.min(remaining);
+    }
+}
+
+impl std::io::Read for HashingRead<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        // Standard BufRead blanket shape: one fill_buf, one copy out.
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let filled = std::io::BufRead::fill_buf(self)?;
+        let count = output.len().min(filled.len());
+        output[..count].copy_from_slice(&filled[..count]);
+        std::io::BufRead::consume(self, count);
         Ok(count)
     }
 }

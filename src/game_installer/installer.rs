@@ -2237,17 +2237,17 @@ async fn process_eager_item_streaming(
                 Some(manifest) => manifest.chunk_decompressed_hash_at(global_chunk_idx),
                 None => b"",
             };
-            let reader = std::io::BufReader::with_capacity(
-                256 * 1024,
-                ChunkStreamReader {
-                    receiver,
-                    current: None,
-                    offset: 0,
-                    complete: false,
-                    #[cfg(feature = "bench-diagnostics")]
-                    timings: decoder_timings.clone(),
-                },
-            );
+            // A plain BufRead chain: zstd's zio loop consumes the frame
+            // slices straight from the reader (no intermediate copies —
+            // wrapping it in a BufReader would reintroduce them).
+            let reader = ChunkStreamReader {
+                receiver,
+                current: None,
+                offset: 0,
+                complete: false,
+                #[cfg(feature = "bench-diagnostics")]
+                timings: decoder_timings.clone(),
+            };
             #[cfg(feature = "bench-diagnostics")]
             if let Some(timings) = decoder_timings {
                 return super::eager_decompress::stream_decompress_to_file_with_timings(
@@ -2552,37 +2552,18 @@ struct ChunkStreamReader {
     timings: Option<Arc<super::eager_decompress::EagerStreamPhaseTimings>>,
 }
 
-impl std::io::Read for ChunkStreamReader {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        #[cfg(feature = "bench-diagnostics")]
-        if let Some(timings) = self.timings.as_ref() {
-            timings.input_read_calls.fetch_add(1, Ordering::Relaxed);
-            timings
-                .input_read_requested_bytes
-                .fetch_add(output.len() as u64, Ordering::Relaxed);
-            if output.len() >= 256 * 1024 {
-                timings
-                    .input_read_bypass_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if output.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            if let Some(current) = self.current.as_ref() {
-                if self.offset < current.len() {
-                    let count = output.len().min(current.len() - self.offset);
-                    output[..count].copy_from_slice(&current[self.offset..self.offset + count]);
-                    self.offset += count;
-                    return Ok(count);
-                }
-                self.current = None;
-                self.offset = 0;
-            }
-            if self.complete {
-                return Ok(0);
-            }
+impl std::io::BufRead for ChunkStreamReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        // Refill with len() checks only: a &self borrow must not stay
+        // live across the channel receive below.
+        while !self.complete
+            && self
+                .current
+                .as_ref()
+                .is_none_or(|current| self.offset >= current.len())
+        {
+            self.current = None;
+            self.offset = 0;
             #[cfg(feature = "bench-diagnostics")]
             let wait_started = std::time::Instant::now();
             let message = self.receiver.blocking_recv();
@@ -2593,20 +2574,67 @@ impl std::io::Read for ChunkStreamReader {
                     .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             match message {
-                Some(Ok(StreamMessage::Data(bytes))) => self.current = Some(bytes),
+                // Zero-length frames carry no bytes; keep pulling instead
+                // of handing the decoder an empty slice mid-stream.
+                Some(Ok(StreamMessage::Data(bytes))) if !bytes.is_empty() => {
+                    #[cfg(feature = "bench-diagnostics")]
+                    if let Some(timings) = self.timings.as_ref() {
+                        timings.input_read_calls.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.current = Some(bytes);
+                }
+                Some(Ok(StreamMessage::Data(_))) => continue,
                 Some(Ok(StreamMessage::Complete)) => {
                     self.complete = true;
-                    return Ok(0);
                 }
                 Some(Err(error)) => return Err(error),
+                // The channel closed without a Complete marker — the
+                // producer died mid-stream. Surfacing an empty buffer here
+                // could let a cleanly frame-aligned truncation decode as a
+                // complete chunk, so it must be an error.
                 None => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "compressed stream ended before validation completed",
+                        "producer closed before Complete marker",
                     ));
                 }
             }
         }
+        let slice = match self.current.as_ref() {
+            Some(current) if self.offset < current.len() => &current[self.offset..],
+            _ => &[],
+        };
+        Ok(slice)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        let remaining = self
+            .current
+            .as_ref()
+            .map_or(0, |current| current.len() - self.offset);
+        debug_assert!(amt <= remaining, "consumer over-consumed the frame slice");
+        let amt = amt.min(remaining);
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = self.timings.as_ref() {
+            timings
+                .input_read_requested_bytes
+                .fetch_add(amt as u64, Ordering::Relaxed);
+        }
+        self.offset += amt;
+    }
+}
+
+impl std::io::Read for ChunkStreamReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        // Standard BufRead blanket shape: one fill_buf, one copy out.
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let filled = std::io::BufRead::fill_buf(self)?;
+        let count = output.len().min(filled.len());
+        output[..count].copy_from_slice(&filled[..count]);
+        std::io::BufRead::consume(self, count);
+        Ok(count)
     }
 }
 
