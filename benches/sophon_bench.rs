@@ -4179,6 +4179,55 @@ fn bench_update_diff_sizes(c: &mut Criterion) {
     let _ = c;
 }
 
+/// Paired comparison of the download worker's periodic-margin reclaim
+/// dispatch: the inline `reclaim_memory()` call (legacy) vs the coalesced
+/// `spawn_blocking` handoff. The trim work is identical in both arms; the
+/// metric is the runtime (async) thread's blocked time per boundary hit,
+/// i.e. scheduler-core stall removed from the download workers.
+#[cfg(feature = "bench-internals")]
+fn bench_reclaim_dispatch(c: &mut Criterion) {
+    use irmin_rs::game_installer::installer::bench_internals::run_reclaim_dispatch;
+
+    const BOUNDARY_HITS: usize = 50;
+    const RECLAIM_INTERVAL: usize = 100;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+
+    let mut group = c.benchmark_group("reclaim_dispatch");
+    group.throughput(Throughput::Elements(BOUNDARY_HITS as u64));
+
+    group.bench_function("inline_trim_on_runtime_thread", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                total += runtime
+                    .block_on(run_reclaim_dispatch(true, BOUNDARY_HITS, RECLAIM_INTERVAL));
+            }
+            total
+        })
+    });
+    group.bench_function("offload_handoff_blocking_pool", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                total += runtime
+                    .block_on(run_reclaim_dispatch(false, BOUNDARY_HITS, RECLAIM_INTERVAL));
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "bench-internals"))]
+fn bench_reclaim_dispatch(c: &mut Criterion) {
+    let _ = c;
+}
+
 criterion_group!(
     benches,
     bench_io_copy,
@@ -4226,6 +4275,7 @@ criterion_group!(
     bench_load_download_state,
     bench_planner_attribution,
     bench_preinstall_chunk_tracking,
+    bench_reclaim_dispatch,
     bench_preinstall_save_offload,
     bench_installer_save_offload,
 );

@@ -3098,6 +3098,10 @@ async fn run_downloads(
     let next_index = Arc::new(AtomicUsize::new(0));
     let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(total));
     let reclaim_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    // Coalescing flag for offloaded reclaims: at most one trim runs at a
+    // time, so a worker hitting the reclaim boundary while a trim is in
+    // flight skips it and lets the next boundary reclaim instead.
+    let reclaim_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let byte_semaphore = Arc::new(tokio::sync::Semaphore::new(max_inflight_compressed_bytes));
     let mut workers = tokio::task::JoinSet::new();
 
@@ -3117,6 +3121,7 @@ async fn run_downloads(
         let first_error = Arc::clone(&first_error);
         let remaining = Arc::clone(&remaining);
         let reclaim_count = Arc::clone(&reclaim_count);
+        let reclaim_in_flight = Arc::clone(&reclaim_in_flight);
         let byte_semaphore = Arc::clone(&byte_semaphore);
 
         workers.spawn(async move {
@@ -3172,7 +3177,18 @@ async fn run_downloads(
                 }
                 let processed = reclaim_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if processed.is_multiple_of(RECLAIM_INTERVAL) {
-                    super::reclaim_memory();
+                    // malloc_trim and the thread-local sweeps are blocking
+                    // work (arena locks, madvise); running them inline would
+                    // stall a runtime worker. Hand the trim to the blocking
+                    // pool, coalesced so overlapping boundary hits skip
+                    // instead of queueing behind a slow trim.
+                    if !reclaim_in_flight.swap(true, Ordering::AcqRel) {
+                        let in_flight = Arc::clone(&reclaim_in_flight);
+                        tokio::task::spawn_blocking(move || {
+                            super::reclaim_memory();
+                            in_flight.store(false, Ordering::Release);
+                        });
+                    }
                 }
                 if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                     break;
@@ -5064,8 +5080,47 @@ mod bench_legacy_tests {
 
 #[cfg(feature = "benchmark")]
 pub mod bench_internals {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     pub use super::bench_legacy::{
         legacy_await_then_spawn_save, legacy_plan_counts, positional_plan_counts,
     };
     pub use super::{snapshot_downloaded_chunks, ChunkNameLookup, SaveSlot};
+
+    /// Drive `boundary_hits` reclaim-boundary hits through a dispatch policy
+    /// on the calling (runtime) thread and return how long the runtime
+    /// thread itself spent blocked. `inline` runs `reclaim_memory` directly
+    /// on the caller; `false` goes through the coalesced `spawn_blocking`
+    /// handoff. The trim work is identical in both arms; this measures only
+    /// the async thread's stall per boundary.
+    pub async fn run_reclaim_dispatch(
+        inline: bool,
+        boundary_hits: usize,
+        reclaim_interval: usize,
+    ) -> std::time::Duration {
+        let reclaim_count = Arc::new(AtomicUsize::new(0));
+        let reclaim_in_flight = Arc::new(AtomicBool::new(false));
+        let mut blocked = std::time::Duration::ZERO;
+        for _ in 0..boundary_hits * reclaim_interval {
+            let n = reclaim_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(reclaim_interval) {
+                if inline {
+                    let start = std::time::Instant::now();
+                    super::super::reclaim_memory();
+                    blocked += start.elapsed();
+                } else if !reclaim_in_flight.swap(true, Ordering::AcqRel) {
+                    let in_flight = Arc::clone(&reclaim_in_flight);
+                    let start = std::time::Instant::now();
+                    let task = tokio::task::spawn_blocking(move || {
+                        super::super::reclaim_memory();
+                        in_flight.store(false, Ordering::Release);
+                    });
+                    blocked += start.elapsed();
+                    let _ = task.await;
+                }
+            }
+        }
+        blocked
+    }
 }
