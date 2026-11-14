@@ -23,12 +23,12 @@ impl HkrpgFilter {
 
         let blacklist_path =
             game_dir.join(format!("{GAME_DATA_DIR}/Persistent/DownloadBlacklist.json"));
-        if !blacklist_path.exists() {
-            return Self { blacklist_lower: blacklist };
-        }
 
         let file = match File::open(&blacklist_path) {
             Ok(f) => f,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Self { blacklist_lower: blacklist };
+            }
             Err(err) => {
                 log::warn!("Failed to open DownloadBlacklist.json: {err}");
                 return Self { blacklist_lower: blacklist };
@@ -161,16 +161,21 @@ pub fn write_binary_version_files(game_dir: &Path) -> std::io::Result<()> {
     let bv_path = game_dir.join(format!(
         "{GAME_DATA_DIR}/StreamingAssets/BinaryVersion.bytes"
     ));
-    if !bv_path.exists() {
-        log::error!("write_binary_version_files: BinaryVersion.bytes not found");
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "BinaryVersion.bytes not found",
-        ));
-    }
 
     let mut buf = Vec::new();
-    File::open(&bv_path)?.read_to_end(&mut buf)?;
+    match File::open(&bv_path) {
+        Ok(mut f) => {
+            f.read_to_end(&mut buf)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            log::error!("write_binary_version_files: BinaryVersion.bytes not found");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "BinaryVersion.bytes not found",
+            ));
+        }
+        Err(err) => return Err(err),
+    }
     let buf_len = buf.len();
     if buf_len < 16 {
         log::warn!(

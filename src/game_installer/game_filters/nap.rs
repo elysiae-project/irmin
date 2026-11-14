@@ -52,10 +52,6 @@ pub fn filter_nap_installers(game_dir: &Path, installers: &mut Vec<SophonInstall
 fn read_kdel_resource_matching_fields(game_dir: &Path) -> Option<Vec<String>> {
     let kdel_path = game_dir.join(format!("{GAME_DATA_DIR}/Persistent/{KDEL_RESOURCE_FILE}"));
 
-    if !kdel_path.exists() {
-        return None;
-    }
-
     let content = fs::read_to_string(&kdel_path).ok()?;
     let first_line = content.lines().next()?;
 

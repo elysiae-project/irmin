@@ -3677,13 +3677,9 @@ pub async fn install(
         let resume_bitmap: Option<Arc<super::chunk_bitmap::ChunkBitmap>> = {
             let bitmap_path =
                 game_dir.join(format!(".sophon_bitmap_{}", &current_manifest_hash[..16]));
-            if bitmap_path.exists() {
-                super::chunk_bitmap::ChunkBitmap::load(&bitmap_path)
-                    .ok()
-                    .map(Arc::new)
-            } else {
-                None
-            }
+            super::chunk_bitmap::ChunkBitmap::load(&bitmap_path)
+                .ok()
+                .map(Arc::new)
         };
 
         let calc_futures = (0..all_files.num_files()).map(|file_idx| {
@@ -3975,15 +3971,10 @@ pub async fn install(
                 }
             }
             let total = all_files.num_chunks();
-            let bm = if bitmap_path.exists() {
-                match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
-                    Ok(bm) if bm.total_chunks() == total => bm,
-                    _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
-                        .map_err(SophonError::Io)?,
-                }
-            } else {
-                super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
-                    .map_err(SophonError::Io)?
+            let bm = match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
+                Ok(bm) if bm.total_chunks() == total => bm,
+                _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
+                    .map_err(SophonError::Io)?,
             };
             Arc::new(bm)
         },
