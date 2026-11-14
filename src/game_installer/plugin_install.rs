@@ -63,11 +63,11 @@ fn plugin_needs_update(
 
     for entry in validation {
         let file_path = game_dir.join(&entry.path);
-        if !file_path.exists() {
+        // Metadata failure means the file is missing or inaccessible.
+        let Ok(meta) = fs::metadata(&file_path) else {
             return true;
-        }
+        };
         if let Some(expected_size) = entry.size
-            && let Ok(meta) = fs::metadata(&file_path)
             && meta.len() != expected_size
         {
             return true;
@@ -298,13 +298,13 @@ fn cleanup_dxsetup(game_dir: &Path) {
 fn verify_validation(game_dir: &Path, validation: &[ValidationEntry]) -> bool {
     for entry in validation {
         let file_path = game_dir.join(&entry.path);
-        if !file_path.exists() {
+        // Metadata failure means the file is missing or inaccessible.
+        let Ok(meta) = fs::metadata(&file_path) else {
             let path = &entry.path;
             log::warn!("Validation file missing: {path}");
             return false;
-        }
+        };
         if let Some(expected_size) = entry.size
-            && let Ok(meta) = fs::metadata(&file_path)
             && meta.len() != expected_size
         {
             log::warn!(
