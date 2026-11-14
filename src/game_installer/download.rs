@@ -717,22 +717,31 @@ async fn stream_and_verify(
     let total_started = std::time::Instant::now();
     let mut stream = resp.bytes_stream();
     let mut total_len = starting_len;
+    // One cancellation waiter per chunk, not per frame: the biased select
+    // polls the data arm first, and the atomic `is_cancelled` check
+    // preserves cancellation priority without re-registering the waiter.
+    let mut cancel_waiter = handle.map(|handle| Box::pin(handle.cancelled_future()));
 
     loop {
         #[cfg(feature = "bench-diagnostics")]
         let wait_started = std::time::Instant::now();
         let next_chunk = stream.next();
-        let result = if let Some(handle) = handle {
-            tokio::select! {
-                biased;
-                _ = handle.cancelled_future() => {
+        let result = match handle.zip(cancel_waiter.as_mut()) {
+            Some((handle, waiter)) => {
+                if handle.is_cancelled() {
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::Cancelled);
                 }
-                result = next_chunk => result,
+                tokio::select! {
+                    biased;
+                    result = next_chunk => result,
+                    _ = waiter => {
+                        let _ = tokio::fs::remove_file(dest).await;
+                        return Err(SophonError::Cancelled);
+                    }
+                }
             }
-        } else {
-            next_chunk.await
+            None => next_chunk.await,
         };
         #[cfg(feature = "bench-diagnostics")]
         if let Some(timings) = timings.as_deref_mut() {
@@ -1122,6 +1131,107 @@ mod tests {
         let mut md5 = None::<fast_md5::Md5>;
         update_download_hashes::<fast_md5::Md5>(b"ignored", md5.as_mut(), None).unwrap();
     }
+
+    /// Cancellation arriving while the stream is parked mid-body must surface
+    /// `Cancelled` and remove the partial file. The frame above the parked
+    /// stream was already delivered, so the loop is waiting on the response
+    /// stream when the handle is cancelled.
+    #[tokio::test]
+    async fn stream_cancellation_mid_download_removes_partial_file() {
+        use http_body_util::StreamBody;
+        use hyper::body::{Frame, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request as HyperRequest, Response as HyperResponse};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let service = service_fn(move |_: HyperRequest<Incoming>| {
+                    let first_frame = bytes::Bytes::from(vec![b'x'; 64 * 1024]);
+                    async move {
+                        // One 64 KiB frame, then a body that never resolves.
+                        let body = futures_util::stream::once(async move {
+                            Ok::<_, Infallible>(Frame::data(first_frame))
+                        })
+                        .chain(futures_util::stream::pending::<Result<_, Infallible>>());
+                        let mut response =
+                            HyperResponse::new(StreamBody::new(body));
+                        response.headers_mut().insert(
+                            hyper::header::CONTENT_LENGTH,
+                            "1048576".parse().unwrap(),
+                        );
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                let connection = http1::Builder::new()
+                    .serve_connection(TokioIo::new(socket), service);
+                let _ = connection.await;
+            }
+        });
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://{address}/payload"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload");
+        let chunk = ChunkRef {
+            chunk_name: "payload",
+            chunk_decompressed_hash_md5: b"",
+            chunk_size: 1024 * 1024,
+            chunk_size_decompressed: 1024 * 1024,
+            chunk_compressed_hash_md5: &[0; 16],
+            chunk_old_offset: -1,
+        };
+        let handle = DownloadHandle::new();
+        let cancel_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancel_handle.cancel();
+        });
+
+        let result = stream_and_verify_directly(resp, chunk, &dest, &handle).await;
+        assert!(matches!(result, Err(SophonError::Cancelled)));
+        assert!(!dest.exists());
+        drop(&handle);
+        server.abort();
+    }
+
+    /// Calls `download_full_file_with_response` with the feature-dependent
+    /// timings argument defaulted.
+    #[cfg(feature = "bench-diagnostics")]
+    async fn stream_and_verify_directly(
+        resp: reqwest::Response,
+        chunk: ChunkRef<'_>,
+        dest: &Path,
+        handle: &DownloadHandle,
+    ) -> SophonResult<()> {
+        download_full_file_with_response(resp, chunk, dest, Some(handle), false, None).await
+    }
+
+    #[cfg(not(feature = "bench-diagnostics"))]
+    async fn stream_and_verify_directly(
+        resp: reqwest::Response,
+        chunk: ChunkRef<'_>,
+        dest: &Path,
+        handle: &DownloadHandle,
+    ) -> SophonResult<()> {
+        download_full_file_with_response(resp, chunk, dest, Some(handle), false).await
+    }
+
 
     #[tokio::test]
     async fn create_preallocated_file_truncates_and_keeps_logical_length() {
@@ -1741,4 +1851,5 @@ mod tests {
         h.update(&data);
         assert_eq!(value, h.digest());
     }
+
 }
