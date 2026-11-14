@@ -5,7 +5,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::FileExt as _;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,15 +16,24 @@ const MAGIC: u32 = 0x49524D42; // "IRMB"
 ///
 /// `sync` persists the current bits, but callers must persist output bytes
 /// before syncing a corresponding completion bit to avoid false resume claims.
+///
+/// The file handle stays open for the bitmap's lifetime, and `sync` writes
+/// the body in place: the file is never truncated or resized. Production
+/// keeps a single live instance per path; multiple instances (tests only)
+/// are last-writer-wins per word. A cancelled install can leave a leaked
+/// periodic sync behind, which may then race a fresh instance's syncs —
+/// harmless for resume correctness because every written word is still a
+/// durable completion claim.
 pub struct ChunkBitmap {
     bits: Vec<AtomicU64>,
-    path: PathBuf,
+    file: File,
     total_chunks: usize,
     sync_lock: Mutex<Vec<u8>>,
 }
 
 impl ChunkBitmap {
     /// Creates a new empty bitmap file at `path` for `total_chunks` entries.
+    /// The write handle stays open and later serves every `sync`.
     pub fn create(path: &Path, total_chunks: usize) -> io::Result<Self> {
         let word_count = total_chunks.div_ceil(64);
         let byte_count = word_count * 8;
@@ -39,15 +49,16 @@ impl ChunkBitmap {
         let bits = (0..word_count).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             bits,
-            path: path.to_path_buf(),
+            file: f,
             total_chunks,
             sync_lock: Mutex::new(Vec::new()),
         })
     }
 
-    /// Loads an existing bitmap from disk.
+    /// Loads an existing bitmap from disk. The file is opened read+write so
+    /// later `sync` calls can reuse the handle.
     pub fn load(path: &Path) -> io::Result<Self> {
-        let mut file = File::open(path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
         if file_len < 8 {
             return Err(io::Error::other("bitmap file too short"));
@@ -106,7 +117,7 @@ impl ChunkBitmap {
 
         Ok(Self {
             bits,
-            path: path.to_path_buf(),
+            file,
             total_chunks,
             sync_lock: Mutex::new(Vec::new()),
         })
@@ -191,27 +202,35 @@ impl ChunkBitmap {
     }
 
     /// Flushes the bitmap to disk. Serialized: concurrent callers block.
+    ///
+    /// The body is written with a single in-place pwrite over the held
+    /// handle; the file is never truncated or resized. Bits only ever go
+    /// 0→1 (callers mark a bit only after its output data is durable), so
+    /// a crash mid-sync leaves each word at its old or new value — never
+    /// a lost or corrupted bit — assuming the 8-byte-aligned words are
+    /// not torn below sector granularity. No partial sync can lose bits
+    /// the previous sync already persisted.
     pub fn sync(&self) -> io::Result<()> {
         let mut buffer = self.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut f = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut header = [0u8; 8];
-        header[..4].copy_from_slice(&MAGIC.to_le_bytes());
-        header[4..].copy_from_slice(&(self.total_chunks as u32).to_le_bytes());
-        f.write_all(&header)?;
-
-        let words_per_block = (64 * 1024) / 8;
-        buffer.clear();
-        for words in self.bits.chunks(words_per_block) {
-            for word in words {
-                buffer.extend_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
-            }
-            f.write_all(&buffer)?;
-            buffer.clear();
+        // create sizes the file exactly; load guarantees >= header+body
+        // (trailing bytes are accepted and untouched). The cfg gates the
+        // fallible metadata `?`, without which debug_assert alone would
+        // already compile out in release.
+        #[cfg(debug_assertions)]
+        {
+            let file_len = self.file.metadata()?.len();
+            debug_assert!(
+                file_len >= 8 + self.bits.len() as u64 * 8,
+                "bitmap file must hold header plus body"
+            );
         }
-        f.sync_data()?;
+        buffer.clear();
+        buffer.reserve_exact(self.bits.len() * 8);
+        for word in &self.bits {
+            buffer.extend_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
+        }
+        self.file.write_all_at(&buffer, 8)?;
+        self.file.sync_data()?;
         Ok(())
     }
 
@@ -219,6 +238,21 @@ impl ChunkBitmap {
     #[inline]
     pub fn total_chunks(&self) -> usize {
         self.total_chunks
+    }
+
+    /// The raw completion words, for the frozen legacy-sync replica in
+    /// paired benchmarks.
+    #[cfg(feature = "benchmark")]
+    pub fn bits_for_benchmark(&self) -> &[std::sync::atomic::AtomicU64] {
+        &self.bits
+    }
+
+    /// The held write handle. Test-only: inode-stability assertions must
+    /// observe the handle itself rather than the path (which could have
+    /// been swapped to a different inode by a rename or recreate).
+    #[cfg(test)]
+    pub(crate) fn borrowed_file_for_tests(&self) -> &File {
+        &self.file
     }
 
     /// Counts the number of completed chunks.
@@ -230,11 +264,52 @@ impl ChunkBitmap {
     }
 }
 
+/// Frozen replica of the pre-in-place `sync` (commit bef6493): reopen the
+/// file by path with `O_TRUNC` per sync (deliberately ignoring any held
+/// handle — the reopen/truncate cycle is the legacy cost being measured;
+/// on copy-on-write filesystems the truncate drops the file's extents),
+/// rewrite the immutable header plus the body in 64 KiB blocks, fdatasync,
+/// and close. Kept for paired criterion comparison against the in-place
+/// [`ChunkBitmap::sync`]; safe to delete once its measurements are no
+/// longer needed.
+#[cfg(feature = "benchmark")]
+pub fn legacy_truncate_sync_replica(
+    path: &Path,
+    bits: &[std::sync::atomic::AtomicU64],
+    total_chunks: usize,
+) -> io::Result<()> {
+    let mut f = OpenOptions::new().write(true).truncate(true).open(path)?;
+    let mut header = [0u8; 8];
+    header[..4].copy_from_slice(&MAGIC.to_le_bytes());
+    header[4..].copy_from_slice(&(total_chunks as u32).to_le_bytes());
+    f.write_all(&header)?;
+
+    let words_per_block = (64 * 1024) / 8;
+    let mut buffer = Vec::new();
+    for words in bits.chunks(words_per_block) {
+        buffer.clear();
+        for word in words {
+            buffer.extend_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
+        }
+        f.write_all(&buffer)?;
+    }
+    f.sync_data()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "bench-diagnostics")]
     use std::fs;
+    #[cfg(feature = "bench-diagnostics")]
+    use std::path::PathBuf;
+
+    /// The held write handle. Tests assert the inode identity of the
+    /// handle itself, since the path could silently point elsewhere.
+    fn held_file(bm: &ChunkBitmap) -> &File {
+        bm.borrowed_file_for_tests()
+    }
 
     #[test]
     fn create_and_mark() {
@@ -355,6 +430,123 @@ mod tests {
         assert!(!bm.is_complete(19));
         assert!(bm.is_complete(9));
         assert!(bm.is_complete(20));
+    }
+
+    #[test]
+    fn sync_preserves_inode_and_size() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inode.bitmap");
+
+        let bm = ChunkBitmap::create(&path, 1000).unwrap();
+        bm.mark_complete(3);
+        bm.sync().unwrap();
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        let inode_before = held_file(&bm).metadata().unwrap().ino();
+
+        for round in 0..3 {
+            bm.mark_complete(round * 100);
+            bm.sync().unwrap();
+        }
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size_before,
+            "sync must never resize the bitmap file"
+        );
+        assert_eq!(
+            held_file(&bm).metadata().unwrap().ino(),
+            inode_before,
+            "sync must keep the same inode"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_before,
+            "sync must not rename or recreate the file"
+        );
+    }
+
+    #[test]
+    fn sync_after_load_persists_new_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reload.bitmap");
+
+        let first = ChunkBitmap::create(&path, 200).unwrap();
+        first.mark_complete(7);
+        first.sync().unwrap();
+        drop(first);
+
+        // A second instance loads through the read+write path and must be
+        // able to extend the persisted state.
+        let second = ChunkBitmap::load(&path).unwrap();
+        assert!(second.is_complete(7));
+        second.mark_complete(199);
+        second.sync().unwrap();
+        drop(second);
+
+        let third = ChunkBitmap::load(&path).unwrap();
+        assert!(third.is_complete(7));
+        assert!(third.is_complete(199));
+        assert!(!third.is_complete(8));
+    }
+
+    #[test]
+    fn sync_after_trailing_bytes_load_preserves_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.bitmap");
+
+        let first = ChunkBitmap::create(&path, 128).unwrap();
+        first.mark_complete(5);
+        first.sync().unwrap();
+        drop(first);
+
+        // Append trailing bytes; load still accepts the file.
+        let tail = b"TRAILING-JUNK".to_vec();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&tail).unwrap();
+        drop(f);
+
+        let second = ChunkBitmap::load(&path).unwrap();
+        second.mark_complete(100);
+        second.sync().unwrap();
+        drop(second);
+
+        let reloaded = ChunkBitmap::load(&path).unwrap();
+        assert!(reloaded.is_complete(5));
+        assert!(reloaded.is_complete(100));
+        assert!(!reloaded.is_complete(6));
+        // In-place syncs must never touch or truncate the tail.
+        assert!(std::fs::read(&path).unwrap().ends_with(&tail));
+    }
+
+    #[test]
+    fn concurrent_marks_with_syncs_persist_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-sync.bitmap");
+
+        let bm = std::sync::Arc::new(ChunkBitmap::create(&path, 4000).unwrap());
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let bm = std::sync::Arc::clone(&bm);
+                std::thread::spawn(move || {
+                    for i in (t..4000).step_by(4) {
+                        bm.mark_complete(i);
+                        if i % 500 == 0 {
+                            bm.sync().unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Final sync covers every remaining mark.
+        bm.sync().unwrap();
+
+        let reloaded = ChunkBitmap::load(&path).unwrap();
+        assert_eq!(reloaded.count_complete(), 4000);
     }
 
     #[test]

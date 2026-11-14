@@ -3477,6 +3477,83 @@ fn bench_assembly_small_old_chunk_hash(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "benchmark")]
+fn bench_chunk_bitmap_sync(c: &mut Criterion) {
+    use irmin_rs::game_installer::chunk_bitmap::{legacy_truncate_sync_replica, ChunkBitmap};
+
+    // 100k chunks = 12.5 KiB body. The periodic saver syncs every 500
+    // chunk completions, so each round marks 500 fresh bits then syncs
+    // once. Marks accumulate across rounds on the shared instance; both
+    // arms read the same live words, so body content evolves identically
+    // (and as in production). Body size is deliberately small: the
+    // legacy cost is dominated by the open+truncate+close cycle and the
+    // extent churn truncate causes on copy-on-write filesystems, not the
+    // data bytes.
+    const TOTAL_CHUNKS: usize = 100_000;
+    const MARKS_PER_ITER: usize = 500;
+    const SYNC_ROUNDS: usize = 8;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut group = c.benchmark_group("chunk_bitmap_sync");
+    group.throughput(Throughput::Elements(SYNC_ROUNDS as u64));
+
+    group.bench_function("legacy_truncate_reopen", |b| {
+        b.iter_batched(
+            || {
+                let path = dir.path().join(format!(
+                    "legacy-{}.bitmap",
+                    std::process::id()
+                ));
+                let bm = ChunkBitmap::create(&path, TOTAL_CHUNKS).unwrap();
+                (path, bm)
+            },
+            |(path, bm)| {
+                for round in 0..SYNC_ROUNDS {
+                    let base = round * MARKS_PER_ITER;
+                    for i in 0..MARKS_PER_ITER {
+                        bm.mark_complete(base + i);
+                    }
+                    // The replica reads the live words directly, matching
+                    // what the in-place arm syncs.
+                    legacy_truncate_sync_replica(&path, bm.bits_for_benchmark(), TOTAL_CHUNKS)
+                        .unwrap();
+                }
+                std::hint::black_box(&bm);
+                let _ = std::fs::remove_file(&path);
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    group.bench_function("in_place", |b| {
+        b.iter_batched(
+            || {
+                let path = dir.path().join(format!(
+                    "inplace-{}.bitmap",
+                    std::process::id()
+                ));
+                let bm = ChunkBitmap::create(&path, TOTAL_CHUNKS).unwrap();
+                (path, bm)
+            },
+            |(path, bm)| {
+                for round in 0..SYNC_ROUNDS {
+                    let base = round * MARKS_PER_ITER;
+                    for i in 0..MARKS_PER_ITER {
+                        bm.mark_complete(base + i);
+                    }
+                    bm.sync().unwrap();
+                }
+                std::hint::black_box(&bm);
+                let _ = std::fs::remove_file(&path);
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    group.finish();
+}
+
 #[cfg(feature = "bench-internals")]
 fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
     use dashmap::DashMap;
@@ -3983,6 +4060,7 @@ criterion_group!(
     bench_assembly_epoch_durability,
     bench_assembly_old_chunk_reuse,
     bench_assembly_small_old_chunk_hash,
+    bench_chunk_bitmap_sync,
     bench_verify_file_md5,
     bench_xxh64,
     bench_zstd_oneshot,
