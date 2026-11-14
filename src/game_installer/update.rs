@@ -126,9 +126,8 @@ pub async fn check_update(
         tokio::join!(super::api::fetch_front_door(client, game_id), async {
             read_installed_tag(game_dir)
         });
-    let (branch, pre_download_branch) = front_door?;
-
-    let main_branch = branch.main.ok_or(SophonError::NoGameManifest)?;
+    let (main_branch, pre_download_branch) = front_door?.take_branches();
+    let main_branch = main_branch.ok_or(SophonError::NoGameManifest)?;
     check_update_with_branches(
         game_id,
         vo_lang,

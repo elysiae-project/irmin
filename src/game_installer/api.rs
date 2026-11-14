@@ -68,10 +68,10 @@ async fn fetch_json_with_retry<T: serde::de::DeserializeOwned>(
 }
 
 /// Fetch a game's main and pre-download branch metadata.
-pub async fn fetch_front_door(
-    client: &Client,
-    game_id: &str,
-) -> SophonResult<(GameBranch, Option<PackageBranch>)> {
+///
+/// Returns the full owned branch; callers extract `main`/`pre_download`
+/// through [`GameBranch::take_branches`].
+pub async fn fetch_front_door(client: &Client, game_id: &str) -> SophonResult<GameBranch> {
     let resp: FrontDoorResponse = fetch_json_with_retry(client, FRONT_DOOR_URL, 35).await?;
 
     let branch = resp
@@ -81,8 +81,7 @@ pub async fn fetch_front_door(
         .find(|b| b.game.biz.starts_with(&format!("{game_id}_")))
         .ok_or_else(|| SophonError::UnknownGameId(game_id.into()))?;
 
-    let pre = branch.pre_download.clone();
-    Ok((branch, pre))
+    Ok(branch)
 }
 
 /// Download and decode a manifest object, returning its computed identity.
@@ -124,37 +123,10 @@ pub(crate) async fn fetch_manifest_proto(
                 && size <= MAX_ONESHOT_SIZE
                 && let Ok(size_usize) = usize::try_from(size)
             {
-                let mut ctx = zstd::zstd_safe::DCtx::create();
-                ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))
-                    .map_err(|_| {
-                        SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax"))
-                    })?;
-                let mut out = Vec::with_capacity(size_usize);
-                match ctx.decompress(&mut out, src) {
-                    Ok(written) => {
-                        if written != size_usize {
-                            return Err(SophonError::Io(std::io::Error::other(
-                                "zstd decompressed size mismatch",
-                            )));
-                        }
-                        Ok(out)
-                    }
-                    Err(_) => {
-                        // Fall back to streaming for multi-frame or other errors.
-                        let mut decoder = zstd::Decoder::new(src)?;
-                        decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
-                        let mut out = Vec::new();
-                        std::io::Read::read_to_end(&mut decoder, &mut out)?;
-                        Ok(out)
-                    }
-                }
+                decompress_known_size(src, size, size_usize)
             } else {
                 // Fallback: streaming decode for unknown or oversized content.
-                let mut decoder = zstd::Decoder::new(src)?;
-                decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
-                let mut out = Vec::new();
-                std::io::Read::read_to_end(&mut decoder, &mut out)?;
-                Ok(out)
+                decompress_manifest_zstd_streaming(src)
             }
         })
         .await??;
@@ -165,6 +137,40 @@ pub(crate) async fn fetch_manifest_proto(
         decode_manifest_from_bytes(bytes).map_err(SophonError::ManifestDecode)?
     };
     Ok(manifest)
+}
+
+/// One-shot zstd decompress into an exact-size buffer, falling back to the
+/// streaming decoder when the frame rejects one-shot decoding (multi-frame
+/// input and similar). Shared by the manifest and patch-manifest fetch paths.
+fn decompress_known_size(src: &[u8], _size: u64, size_usize: usize) -> SophonResult<Vec<u8>> {
+    let mut ctx = zstd::zstd_safe::DCtx::create();
+    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))
+        .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax")))?;
+    let mut out = Vec::with_capacity(size_usize);
+    match ctx.decompress(&mut out, src) {
+        Ok(written) => {
+            if written != size_usize {
+                return Err(SophonError::Io(std::io::Error::other(
+                    "zstd decompressed size mismatch",
+                )));
+            }
+            Ok(out)
+        }
+        Err(_) => {
+            // Fall back to streaming for multi-frame or other errors.
+            decompress_manifest_zstd_streaming(src)
+        }
+    }
+}
+
+/// Streaming zstd decode used for unknown or oversized frame content and as
+/// the fallback when one-shot decompression rejects the input.
+fn decompress_manifest_zstd_streaming(src: &[u8]) -> SophonResult<Vec<u8>> {
+    let mut decoder = zstd::Decoder::new(src)?;
+    decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -374,21 +380,26 @@ pub async fn fetch_patch_manifest(
         .await
         .map_err(|_| SophonError::Timeout(300))??;
 
-    let raw = if meta.manifest_download.is_compressed() {
-        tokio::task::spawn_blocking(move || {
-            let mut decoder = zstd::Decoder::new(bytes.as_ref())?;
-            decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok::<Vec<u8>, SophonError>(out)
+    let patch_manifest = if meta.manifest_download.is_compressed() {
+        let raw = tokio::task::spawn_blocking(move || {
+            const MAX_ONESHOT_SIZE: u64 = 256 * 1024 * 1024;
+            let src = bytes.as_ref();
+            let content_size = zstd::zstd_safe::get_frame_content_size(src).ok().flatten();
+            if let Some(size) = content_size
+                && size <= MAX_ONESHOT_SIZE
+                && let Ok(size_usize) = usize::try_from(size)
+            {
+                decompress_known_size(src, size, size_usize)
+            } else {
+                decompress_manifest_zstd_streaming(src)
+            }
         })
-        .await??
+        .await??;
+        decode_patch_manifest(raw)
     } else {
-        bytes.to_vec()
-    };
-
-    let patch_manifest = decode_patch_manifest(&raw)
-        .map_err(|err| SophonError::PatchManifestDecode(err.to_string()))?;
+        decode_patch_manifest(bytes)
+    }
+    .map_err(|err| SophonError::PatchManifestDecode(err.to_string()))?;
 
     Ok(PatchManifestWithMeta {
         patch_manifest,

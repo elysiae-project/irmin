@@ -7,7 +7,7 @@ use super::api::{fetch_build, fetch_front_door, fetch_manifest};
 #[ignore]
 async fn fetch_front_door_returns_valid_response() {
     let client = Client::new();
-    let (branch, _pre) = fetch_front_door(&client, "hk4e")
+    let branch = fetch_front_door(&client, "hk4e")
         .await
         .expect("fetch_front_door should succeed");
     let main = branch
@@ -28,7 +28,7 @@ async fn fetch_front_door_returns_valid_response() {
 #[ignore]
 async fn fetch_build_returns_manifests() {
     let client = Client::new();
-    let (branch, _) = fetch_front_door(&client, "hk4e")
+    let branch = fetch_front_door(&client, "hk4e")
         .await
         .expect("fetch_front_door should succeed");
     let build = fetch_build(
@@ -51,7 +51,7 @@ async fn fetch_build_returns_manifests() {
 #[ignore]
 async fn fetch_manifest_decodes_successfully() {
     let client = Client::new();
-    let (branch, _) = fetch_front_door(&client, "hk4e")
+    let branch = fetch_front_door(&client, "hk4e")
         .await
         .expect("fetch_front_door should succeed");
     let build = fetch_build(
@@ -78,7 +78,7 @@ async fn fetch_manifest_decodes_successfully() {
 #[ignore]
 async fn decode_manifest_with_real_data() {
     let client = Client::new();
-    let (branch, _) = fetch_front_door(&client, "hk4e")
+    let branch = fetch_front_door(&client, "hk4e")
         .await
         .expect("fetch_front_door should succeed");
     let build = fetch_build(
@@ -109,7 +109,7 @@ async fn decode_manifest_with_real_data() {
 #[ignore]
 async fn download_chunk_from_cdn() {
     let client = Client::new();
-    let (branch, _) = fetch_front_door(&client, "hk4e")
+    let branch = fetch_front_door(&client, "hk4e")
         .await
         .expect("fetch_front_door should succeed");
     let build = fetch_build(
@@ -155,7 +155,7 @@ async fn download_chunk_from_cdn() {
 #[ignore]
 async fn compute_content_manifest_hash_with_real_manifest() {
     let client = Client::new();
-    let (branch, _) = fetch_front_door(&client, "hk4e")
+    let branch = fetch_front_door(&client, "hk4e")
         .await
         .expect("fetch_front_door should succeed");
     let build = fetch_build(
@@ -190,7 +190,7 @@ async fn front_door_all_known_games() {
     let client = Client::new();
     let game_ids = ["nap", "hkrpg", "hk4e", "bh3"];
     for game_id in game_ids {
-        let (branch, _) = fetch_front_door(&client, game_id)
+        let branch = fetch_front_door(&client, game_id)
             .await
             .expect("fetch_front_door should succeed for {game_id}");
         let main = branch

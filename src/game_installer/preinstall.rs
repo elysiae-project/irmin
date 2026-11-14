@@ -823,8 +823,11 @@ pub async fn build_preinstall_plan(
     vo_lang: &str,
     game_dir: &Path,
 ) -> SophonResult<PreinstallPlan> {
-    let (_, pre_branch) = fetch_front_door(client, game_id).await?;
-    let pre_branch = pre_branch.ok_or(SophonError::NoPreinstallAvailable)?;
+    let pre_branch = fetch_front_door(client, game_id)
+        .await?
+        .take_branches()
+        .1
+        .ok_or(SophonError::NoPreinstallAvailable)?;
 
     let installed_tag = read_installed_tag(game_dir).ok_or(SophonError::NoInstalledVersion)?;
 
@@ -946,10 +949,7 @@ async fn build_preinstall_plan_from_builds(
         let patch_manifest = result.patch_manifest;
         let matching_field = result.matching_field;
 
-        diff_downloads.insert(
-            matching_field.clone(),
-            Arc::new(result.diff_download.clone()),
-        );
+        diff_downloads.insert(matching_field.clone(), Arc::new(result.diff_download));
 
         for asset_prop in &patch_manifest.patch_assets {
             let patch_info = asset_prop
@@ -3563,8 +3563,10 @@ async fn recover_legacy_snapshot(
     client: &Client,
     state: PreinstallState,
 ) -> SophonResult<TargetSnapshot> {
-    let (branch, pre) = fetch_front_door(client, &state.game_id).await?;
-    let branches = branch.main.into_iter().chain(pre).collect();
+    let (main_branch, pre) = fetch_front_door(client, &state.game_id)
+        .await?
+        .take_branches();
+    let branches = main_branch.into_iter().chain(pre).collect();
     recover_legacy_from_branches(client, &state, branches, |branch, tag| async move {
         fetch_build(client, &branch, Some(&tag)).await
     })
