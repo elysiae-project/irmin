@@ -744,6 +744,7 @@ pub fn write_chunk_from_mmap(
     expected_size: u64,
     mut file_hasher: Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
+    old_file_len: Option<u64>,
 ) -> SophonResult<u64> {
     let needs_chunk_hash = chunk_hash_required(chunk_decompressed_hash_md5);
     if file_hasher.is_none() && !needs_chunk_hash {
@@ -759,7 +760,10 @@ pub fn write_chunk_from_mmap(
         return Ok(copied);
     }
 
-    let file_len = old_file.metadata().map_err(SophonError::Io)?.len();
+    let file_len = match old_file_len {
+        Some(len) => len,
+        None => old_file.metadata().map_err(SophonError::Io)?.len(),
+    };
     if old_offset + expected_size > file_len {
         return Err(SophonError::SizeMismatch {
             item: old_file_path.display().to_string(),
@@ -1114,7 +1118,8 @@ mod tests {
         let dst_path = dir.path().join("out.bin");
         let out = write_at_new(&dst_path);
         let src_file = File::open(&src).unwrap();
-        let bytes = write_chunk_from_mmap(&src_file, &src, &out, 0, 0, 11, None, b"").unwrap();
+        let bytes =
+            write_chunk_from_mmap(&src_file, &src, &out, 0, 0, 11, None, b"", None).unwrap();
         drop(out);
         assert_eq!(bytes, 11);
         assert_eq!(std::fs::read(&dst_path).unwrap(), b"hello world");
@@ -1130,9 +1135,18 @@ mod tests {
         let dst_path = dir.path().join("out.bin");
         let out = write_at_new(&dst_path);
         let src_file = File::open(&src).unwrap();
-        let bytes =
-            write_chunk_from_mmap(&src_file, &src, &out, 0, 0, data.len() as u64, None, b"")
-                .unwrap();
+        let bytes = write_chunk_from_mmap(
+            &src_file,
+            &src,
+            &out,
+            0,
+            0,
+            data.len() as u64,
+            None,
+            b"",
+            None,
+        )
+        .unwrap();
         drop(out);
         assert_eq!(bytes, data.len() as u64);
         assert_eq!(std::fs::read(&dst_path).unwrap().len(), data.len());
@@ -1162,6 +1176,7 @@ mod tests {
             data.len() as u64,
             None,
             chunk_md5.as_bytes(),
+            None,
         )
         .unwrap();
         drop(out);
@@ -1189,6 +1204,7 @@ mod tests {
             data.len() as u64,
             None,
             &super::super::assembly_opt::hex_to_bytes(wrong).unwrap()[..],
+            None,
         );
         assert!(res.is_err());
     }
@@ -1208,8 +1224,17 @@ mod tests {
         let dst_path = dir.path().join("out.bin");
         let out = write_at_new(&dst_path);
         out.set_len(raw.len() as u64).unwrap();
-        let bytes =
-            decompress_chunk_optimized(&chunk_path, &out, 0, raw.len() as u64, None, b"", false, None).unwrap();
+        let bytes = decompress_chunk_optimized(
+            &chunk_path,
+            &out,
+            0,
+            raw.len() as u64,
+            None,
+            b"",
+            false,
+            None,
+        )
+        .unwrap();
         drop(out);
         assert_eq!(bytes, raw.len() as u64);
         assert_eq!(std::fs::read(&dst_path).unwrap(), raw);

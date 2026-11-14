@@ -387,14 +387,14 @@ pub fn legacy_small_chunk_hash_whole_file_mmap(
     chunk_decompressed_hash_md5: &[u8],
 ) -> SophonResult<u64> {
     let fd = old_file.as_raw_fd();
-    super::assembly_opt::posix_advise(
+    super::assembly_opt::posix_advise(fd, old_offset, expected_size, libc::POSIX_FADV_SEQUENTIAL);
+    let copied = super::sysio::copy_file_range(
         fd,
         old_offset,
+        out_file.as_raw_fd(),
+        new_offset,
         expected_size,
-        libc::POSIX_FADV_SEQUENTIAL,
-    );
-    let copied =
-        super::sysio::copy_file_range(fd, old_offset, out_file.as_raw_fd(), new_offset, expected_size)?;
+    )?;
     if copied != expected_size {
         return Err(SophonError::SizeMismatch {
             item: old_file_path.display().to_string(),
@@ -422,12 +422,7 @@ pub fn legacy_small_chunk_hash_whole_file_mmap(
         if let Some(ref mut ch) = chunk_hasher {
             ch.update(slice)?;
         }
-        super::assembly_opt::posix_advise(
-            fd,
-            old_offset,
-            expected_size,
-            libc::POSIX_FADV_DONTNEED,
-        );
+        super::assembly_opt::posix_advise(fd, old_offset, expected_size, libc::POSIX_FADV_DONTNEED);
         if let Some(ref mut ch) = chunk_hasher {
             let digest = ch.finish()?;
             return_md5(chunk_hasher.take().unwrap());
@@ -469,6 +464,7 @@ pub fn benchmark_write_from_old_file_hashed(
         None,
         buffer,
         chunk_decompressed_hash_md5,
+        None,
     )
 }
 
@@ -694,9 +690,12 @@ fn assemble_file_inner(
     // In non-Full mode, skip per-chunk decompressed hash verification.
     let skip_chunk_hash = verify_mode != super::VerifyMode::Full;
 
-    let old_file: Option<File> = if has_old_chunks {
+    let old_file: Option<(File, u64)> = if has_old_chunks {
         match File::open(&target_path) {
-            Ok(f) => Some(f),
+            Ok(f) => {
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                Some((f, len))
+            }
             Err(err) => {
                 log::warn!(
                     "assemble_file: old-source file missing for old-chunk reuse: {path} ({err}); continuing with downloaded chunks only",
@@ -744,9 +743,7 @@ fn assemble_file_inner(
                 let ci = ci as usize;
                 all_files.chunk_old_offset_at(ci) < 0
                     && all_files.chunk_size_decompressed_at(ci) > 0
-                    && chunk_batch_hasher::defer_eligible(
-                        all_files.chunk_decompressed_hash_at(ci),
-                    )
+                    && chunk_batch_hasher::defer_eligible(all_files.chunk_decompressed_hash_at(ci))
             });
         std::thread::scope(|s| {
             // Channel lifetime: created inside this scope body; the
@@ -766,13 +763,7 @@ fn assemble_file_inner(
                 let err_slot = &first_error;
                 let err_flag = &has_error;
                 s.spawn(move || {
-                    chunk_batch_hasher::run(
-                        tmp_path,
-                        file_size,
-                        rx,
-                        err_slot,
-                        err_flag,
-                    );
+                    chunk_batch_hasher::run(tmp_path, file_size, rx, err_slot, err_flag);
                 });
             }
             if parallel_hashed_file {
@@ -903,7 +894,8 @@ fn assemble_file_inner(
                                 files.chunk_decompressed_hash_at(ci),
                             );
                         let result = if chunk_old_offset >= 0 {
-                            let old_file = old.expect("has_old_chunks guarantees old file");
+                            let (old_file, old_len) =
+                                old.expect("has_old_chunks guarantees old file");
                             let r = write_from_old_file(
                                 old_file,
                                 target,
@@ -918,6 +910,7 @@ fn assemble_file_inner(
                                 } else {
                                     files.chunk_decompressed_hash_at(ci)
                                 },
+                                Some(*old_len),
                             );
                             (r, None)
                         } else {
@@ -925,8 +918,7 @@ fn assemble_file_inner(
                             if !validate_chunk_name(chunk_name) {
                                 let mut guard = err.lock().unwrap();
                                 if guard.is_none() {
-                                    *guard =
-                                        Some(SophonError::PathTraversal(chunk_name.into()));
+                                    *guard = Some(SophonError::PathTraversal(chunk_name.into()));
                                 }
                                 err_flag.store(true, Ordering::Relaxed);
                                 break;
@@ -983,9 +975,7 @@ fn assemble_file_inner(
                                 // failed send implies the hasher died after
                                 // recording its own error, so dropping the
                                 // job is safe: the assemble will fail.
-                                if let (Some(tx), Some(job)) =
-                                    (worker_tx.as_ref(), deferred_job)
-                                {
+                                if let (Some(tx), Some(job)) = (worker_tx.as_ref(), deferred_job) {
                                     let _ = tx.send(job);
                                 }
                                 if !skip_evict && !deferred {
@@ -1037,7 +1027,7 @@ fn assemble_file_inner(
             let chunk_offset = offset;
             offset += chunk_size_decompressed;
             if chunk_old_offset >= 0 {
-                let old_file = old_file
+                let (old_file, old_len) = old_file
                     .as_ref()
                     .expect("has_old_chunks guarantees old file");
                 let bytes_written = write_from_old_file(
@@ -1054,6 +1044,7 @@ fn assemble_file_inner(
                     } else {
                         all_files.chunk_decompressed_hash_at(ci)
                     },
+                    Some(*old_len),
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -1313,11 +1304,7 @@ impl Md5Guard {
     /// path only identifies the chunk for the error report. The hasher
     /// goes back to the pool whether the finish, the comparison, or the
     /// caller's later steps fail.
-    fn finish_and_verify(
-        &mut self,
-        expected: &[u8],
-        item: &std::path::Path,
-    ) -> SophonResult<()> {
+    fn finish_and_verify(&mut self, expected: &[u8], item: &std::path::Path) -> SophonResult<()> {
         let Some(mut ch) = self.0.take() else {
             return Ok(());
         };
@@ -1359,6 +1346,7 @@ pub(crate) fn write_from_old_file(
     mut file_hasher: Option<&mut Md5>,
     buffer: &mut [u8],
     chunk_decompressed_hash_md5: &[u8],
+    old_file_len: Option<u64>,
 ) -> SophonResult<u64> {
     const MMA_THRESHOLD: u64 = 1024 * 1024;
 
@@ -1372,6 +1360,7 @@ pub(crate) fn write_from_old_file(
             expected_size,
             file_hasher,
             chunk_decompressed_hash_md5,
+            old_file_len,
         )
     } else {
         // Fast path: when no hashing is needed, use kernel copy_file_range

@@ -1338,9 +1338,7 @@ fn build_deferred_batch_fixture(
     let mut raw = Vec::with_capacity(num_chunks * per_chunk);
     let mut chunks = Vec::with_capacity(num_chunks);
     for i in 0..num_chunks {
-        let data: Vec<u8> = (0..per_chunk)
-            .map(|b| (i * 7 + b * 13) as u8)
-            .collect();
+        let data: Vec<u8> = (0..per_chunk).map(|b| (i * 7 + b * 13) as u8).collect();
         let chunk_hash = if corrupt_chunk == Some(i) {
             // Digest of different bytes: guarantees a mismatch.
             compute_md5_hex(&data.iter().map(|b| b ^ 0xff).collect::<Vec<_>>())
@@ -1662,6 +1660,7 @@ fn write_from_old_file_reads_correct_offset() {
         None, // file_hasher
         &mut transfer_buf,
         b"", // hash_md5 (skip verification)
+        None,
     )
     .unwrap();
     drop(output_file);
@@ -1707,6 +1706,7 @@ fn write_from_old_file_verifies_chunk_hash() {
         None,
         &mut transfer_buf,
         expected_md5.as_bytes(),
+        None,
     );
 
     assert!(result.is_ok(), "should succeed with correct hash");
@@ -1724,7 +1724,9 @@ fn write_from_old_file_hashes_chunk_larger_than_buffer() {
     let mut data = vec![0u8; 512 * 1024];
     let mut state: u64 = 7;
     for b in &mut data {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *b = (state >> 33) as u8;
     }
     let expected_md5 = hex::encode(fast_md5::digest(&data));
@@ -1752,6 +1754,7 @@ fn write_from_old_file_hashes_chunk_larger_than_buffer() {
         None,
         &mut transfer_buf,
         expected_md5.as_bytes(),
+        None,
     )
     .unwrap();
     drop(output_file);
@@ -1792,6 +1795,7 @@ fn write_from_old_file_hash_mismatch_fails() {
         None,
         &mut transfer_buf,
         &super::super::assembly_opt::hex_to_bytes(wrong_md5).unwrap()[..],
+        None,
     );
 
     assert!(result.is_err(), "should fail with wrong hash");
@@ -1832,6 +1836,7 @@ fn write_from_old_file_too_short_fails() {
         None,
         &mut transfer_buf,
         b"",
+        None,
     );
 
     assert!(result.is_err(), "should fail when file is too short");
@@ -2265,20 +2270,14 @@ fn assemble_file_prng_data_matches_expected_md5() {
 
 // --- Durability epochs -------------------------------------------------------
 
-use super::super::assembly_epochs::{
-    AssemblyEpochs, EPOCH_MAX_BYTES, EPOCH_MAX_FILES,
-};
+use super::super::assembly_epochs::{AssemblyEpochs, EPOCH_MAX_BYTES, EPOCH_MAX_FILES};
 use super::EpochStageCtx;
 
 fn staged_file_fixture(dir: &Path, idx: usize, payload: &[u8]) -> SophonManifestAssetProperty {
     let chunk_name = format!("e{idx}");
     let comp = zstd::encode_all(payload, 1).unwrap();
     let chunks_dir = dir.join("chunks");
-    fs::write(
-        chunks_dir.join(super::chunk_filename(&chunk_name)),
-        &comp,
-    )
-    .unwrap();
+    fs::write(chunks_dir.join(super::chunk_filename(&chunk_name)), &comp).unwrap();
     SophonManifestAssetProperty::from_parts(
         format!("e{idx}.bin").into(),
         vec![SophonManifestAssetChunk::from_parts(
@@ -2312,11 +2311,7 @@ fn stage_req(
     }
 }
 
-fn epoch_env(
-    dir: &Path,
-    names: &[&str],
-    refcounts: Vec<u32>,
-) -> Arc<AssemblyEpochs> {
+fn epoch_env(dir: &Path, names: &[&str], refcounts: Vec<u32>) -> Arc<AssemblyEpochs> {
     Arc::new(AssemblyEpochs::new(
         make_chunk_names(names),
         Arc::new(refcounts.into_iter().map(AtomicU32::new).collect()),
@@ -2394,10 +2389,7 @@ fn epoch_commit_cadence_matches_thresholds() {
         fs::write(&tmp, b"x").unwrap();
         let fd = fs::File::open(&tmp).unwrap();
         if epochs
-            .stage(
-                fd,
-                stage_req(&manifest, tmp, target),
-            )
+            .stage(fd, stage_req(&manifest, tmp, target))
             .unwrap()
             .is_due()
         {
@@ -2432,16 +2424,21 @@ fn epoch_error_is_sticky_and_discards_new_stages() {
     epochs
         .stage(fd, stage_req(&manifest, tmp.clone(), target))
         .unwrap();
-    assert!(epochs.commit().is_err(), "rename of a deleted tmp must fail");
+    assert!(
+        epochs.commit().is_err(),
+        "rename of a deleted tmp must fail"
+    );
 
     // Sticky: a later stage is discarded and reports the error.
     let tmp2 = dir.path().join("chunks").join("later.tmp");
     let target2 = dir.path().join("chunks").join("later.out");
     fs::write(&tmp2, b"x").unwrap();
     let fd2 = fs::File::open(&tmp2).unwrap();
-    assert!(epochs
-        .stage(fd2, stage_req(&manifest, tmp2, target2))
-        .is_err());
+    assert!(
+        epochs
+            .stage(fd2, stage_req(&manifest, tmp2, target2))
+            .is_err()
+    );
     assert!(epochs.commit().is_err());
 }
 
