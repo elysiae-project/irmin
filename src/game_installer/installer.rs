@@ -4355,7 +4355,9 @@ async fn repair_assets(
     let all_assets = unique;
     let total_files = all_assets.len() as u64;
     // Explicit repair hashes bytes, never persisted size/mtime cache hits.
-    let verify_cache = Arc::new(DashMap::new());
+    let verify_cache = Arc::new(DashMap::with_capacity(
+        all_assets.len().min(super::cache::VERIFICATION_CACHE_MAX_ENTRIES),
+    ));
     let chunks_dir = game_dir.join("chunks");
     let mut last_emit = Instant::now();
 

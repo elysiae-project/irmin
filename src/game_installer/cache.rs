@@ -130,7 +130,8 @@ pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationE
         Vec::new()
     };
 
-    let cache: DashMap<String, VerificationEntry> = DashMap::new();
+    let cache: DashMap<String, VerificationEntry> =
+        DashMap::with_capacity(serializable.files.len());
     for (k, v) in serializable.files {
         cache.insert(k, v);
     }
