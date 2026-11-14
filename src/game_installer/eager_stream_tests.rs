@@ -373,6 +373,7 @@ fn benchmark_compressed_buffer_retention() {
                     None,
                     &expected_hash,
                     false,
+                    None,
                 )
                 .unwrap();
                 decompression_time += started.elapsed();

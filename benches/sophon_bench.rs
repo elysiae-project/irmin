@@ -1497,6 +1497,7 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
                     Some(&mut hasher),
                     b"",
                     false,
+                    None,
                 )
                 .expect("decompress");
                 assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
@@ -4688,6 +4689,7 @@ fn bench_assembly_hash_gate(c: &mut Criterion) {
                             None,
                             hash,
                             false,
+                            None,
                         )
                         .expect("decompress");
                         debug_assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);

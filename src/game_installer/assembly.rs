@@ -945,6 +945,7 @@ fn assemble_file_inner(
                                     files.chunk_decompressed_hash_at(ci)
                                 },
                                 defer_hash,
+                                Some(files.chunk_size_at(ci)),
                             );
                             // Bundle the deferred job with the write result
                             // so the job is submitted only when the write
@@ -1080,6 +1081,7 @@ fn assemble_file_inner(
                         all_files.chunk_decompressed_hash_at(ci)
                     },
                     false,
+                    Some(all_files.chunk_size_at(ci)),
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -1257,6 +1259,7 @@ fn assemble_file_inner(
     Ok(AssembleOutcome { file_hash_verified })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_decompressed_chunk_at(
     chunk_path: &Path,
     out_file: &File,
@@ -1265,6 +1268,7 @@ fn write_decompressed_chunk_at(
     file_hasher: Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
     deferred_to_batch_hasher: bool,
+    compressed_size: Option<u64>,
 ) -> SophonResult<u64> {
     super::assembly_opt::decompress_chunk_optimized(
         chunk_path,
@@ -1274,6 +1278,7 @@ fn write_decompressed_chunk_at(
         file_hasher,
         chunk_decompressed_hash_md5,
         deferred_to_batch_hasher,
+        compressed_size,
     )
 }
 

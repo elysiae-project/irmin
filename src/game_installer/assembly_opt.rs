@@ -579,6 +579,7 @@ pub(crate) fn compressed_buffer_capacity() -> usize {
     COMPRESSED_BUF.with(|cell| cell.borrow().capacity())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decompress_chunk_oneshot(
     chunk_path: &Path,
     out_file: &File,
@@ -587,6 +588,7 @@ fn decompress_chunk_oneshot(
     file_hasher: &mut Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
     deferred_to_batch_hasher: bool,
+    compressed_size: Option<u64>,
 ) -> SophonResult<u64> {
     if expected_size == 0 {
         return Ok(0);
@@ -594,7 +596,10 @@ fn decompress_chunk_oneshot(
     let expected_usize = expected_size as usize;
 
     let f = File::open(chunk_path)?;
-    let compressed_size = f.metadata()?.len() as usize;
+    let compressed_size = match compressed_size {
+        Some(s) => s as usize,
+        None => f.metadata()?.len() as usize,
+    };
     if compressed_size == 0 {
         return Err(SophonError::Io(io::Error::other("empty chunk")));
     }
@@ -903,6 +908,7 @@ pub fn decompress_chunk_optimized(
     file_hasher: Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
     deferred_to_batch_hasher: bool,
+    compressed_size: Option<u64>,
 ) -> SophonResult<u64> {
     let mut file_hasher = file_hasher;
 
@@ -915,13 +921,14 @@ pub fn decompress_chunk_optimized(
             &mut file_hasher,
             chunk_decompressed_hash_md5,
             deferred_to_batch_hasher,
+            compressed_size,
         );
         match &result {
             Ok(_) => return result,
-            // Hash mismatches indicate corrupt data; retrying with streaming won't help.
+            // Hash/size mismatches are data-integrity failures; streaming won't fix them.
             Err(SophonError::Md5Mismatch { .. }) => return result,
             Err(SophonError::SizeMismatch { .. }) => return result,
-            // Decompression/IO errors may succeed with streaming (different window, buffering).
+            // Decompression/IO errors may recover via streaming with a different window.
             Err(_) => {}
         }
     }
@@ -1196,14 +1203,35 @@ mod tests {
         std::io::Write::write_all(&mut enc, raw).unwrap();
         enc.finish().unwrap();
 
+        let compressed_size = std::fs::metadata(&chunk_path).unwrap().len();
+
         let dst_path = dir.path().join("out.bin");
         let out = write_at_new(&dst_path);
         out.set_len(raw.len() as u64).unwrap();
         let bytes =
-            decompress_chunk_optimized(&chunk_path, &out, 0, raw.len() as u64, None, b"", false).unwrap();
+            decompress_chunk_optimized(&chunk_path, &out, 0, raw.len() as u64, None, b"", false, None).unwrap();
         drop(out);
         assert_eq!(bytes, raw.len() as u64);
         assert_eq!(std::fs::read(&dst_path).unwrap(), raw);
+
+        // The Some(compressed_size) path skips the fstat and produces identical output.
+        let dst2 = dir.path().join("out2.bin");
+        let out2 = write_at_new(&dst2);
+        out2.set_len(raw.len() as u64).unwrap();
+        let bytes2 = decompress_chunk_optimized(
+            &chunk_path,
+            &out2,
+            0,
+            raw.len() as u64,
+            None,
+            b"",
+            false,
+            Some(compressed_size),
+        )
+        .unwrap();
+        drop(out2);
+        assert_eq!(bytes2, raw.len() as u64);
+        assert_eq!(std::fs::read(&dst2).unwrap(), raw);
     }
 
     #[test]
