@@ -1712,6 +1712,54 @@ fn write_from_old_file_verifies_chunk_hash() {
     assert!(result.is_ok(), "should succeed with correct hash");
 }
 
+/// A chunk larger than the transfer buffer must hash correctly across
+/// multiple readback passes.
+#[test]
+fn write_from_old_file_hashes_chunk_larger_than_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_file_path = dir.path().join("old_file.bin");
+
+    // 512 KiB source region (two 256 KiB buffer passes), filled with a
+    // simple deterministic LCG pattern.
+    let mut data = vec![0u8; 512 * 1024];
+    let mut state: u64 = 7;
+    for b in &mut data {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *b = (state >> 33) as u8;
+    }
+    let expected_md5 = hex::encode(fast_md5::digest(&data));
+    fs::write(&old_file_path, &data).unwrap();
+
+    let output_path = dir.path().join("output.bin");
+    let output_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_path)
+        .unwrap();
+    output_file.set_len(data.len() as u64).unwrap();
+
+    let mut transfer_buf = vec![0u8; super::FILE_WRITE_BUFFER_SIZE];
+    let old_file = File::open(&old_file_path).unwrap();
+    let bytes_written = write_from_old_file(
+        &old_file,
+        &old_file_path,
+        &output_file,
+        0,
+        0,
+        data.len() as u64,
+        None,
+        &mut transfer_buf,
+        expected_md5.as_bytes(),
+    )
+    .unwrap();
+    drop(output_file);
+
+    assert_eq!(bytes_written, data.len() as u64);
+    assert_eq!(fs::read(&output_path).unwrap(), data);
+}
+
 /// Test write_from_old_file fails on hash mismatch
 #[test]
 fn write_from_old_file_hash_mismatch_fails() {

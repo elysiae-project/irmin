@@ -3346,6 +3346,137 @@ fn bench_planner_attribution(c: &mut Criterion) {
 /// saves are timed including the drop of their output, which is the true
 /// per-save cost each shape pays in production (the legacy snapshot's
 /// 200k-String drop is real legacy cost, not bench noise).
+#[cfg(feature = "benchmark")]
+fn bench_assembly_small_old_chunk_hash(c: &mut Criterion) {
+    use irmin_rs::game_installer::assembly::{
+        benchmark_write_from_old_file_hashed, legacy_small_chunk_hash_whole_file_mmap,
+    };
+    use std::io::Write;
+
+    // The small-chunk hashing path (< 1 MiB) used to fstat + map the whole
+    // output file per chunk just to hash the region it wrote. The map cost
+    // scales with the output file's length, so the fixture uses a large
+    // sparse output (set_len) with real source data and rotates offsets
+    // so every iteration copies and hashes fresh bytes. Fixture caveats:
+    // on btrfs (this repo's bench TMPDIR, compress=zstd:1) copy_file_range
+    // may reflink instead of splicing, so the readback can fault in from
+    // the shared extent; both arms see this equally, so the comparison
+    // stays fair. The 64 MiB source is page-cache-warm after the first
+    // iteration for both arms.
+    const OUT_LEN: u64 = 1 << 30; // 1 GiB sparse output
+    const SRC_LEN: usize = 64 * 1024 * 1024; // 64 MiB real source
+    const CHUNKS_PER_SAMPLE: usize = 256;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old_path = dir.path().join("old.bin");
+    let out_path = dir.path().join("out.bin");
+    {
+        let mut old = fs::File::create(&old_path).expect("create old");
+        let block_len = 1024 * 1024;
+        // Deterministic LCG filler; each block is seeded from its index so
+        // the source has no cross-block repetition for hashing to window.
+        for block_idx in 0..(SRC_LEN / block_len) {
+            let mut seeded = vec![0u8; block_len];
+            let mut state: u64 = 42 + block_idx as u64;
+            for b in &mut seeded {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 33) as u8;
+            }
+            old.write_all(&seeded).expect("write old");
+        }
+        old.sync_all().expect("sync old");
+    }
+    let old_file = fs::File::open(&old_path).expect("open old");
+    let out_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&out_path)
+        .expect("open out");
+    out_file.set_len(OUT_LEN).expect("size out");
+
+    let mut buffer = vec![0u8; irmin_rs::game_installer::FILE_WRITE_BUFFER_SIZE];
+
+    let mut group = c.benchmark_group("assembly_small_old_chunk_hash");
+
+    for &chunk_kib in &[64usize, 512] {
+        let chunk_len = chunk_kib * 1024;
+        group.throughput(Throughput::Bytes((chunk_len * CHUNKS_PER_SAMPLE) as u64));
+        // Rotating destinations so each iteration covers a different region
+        // of the sparse output; sources rotate inside the real old file.
+        let dests: Vec<u64> = (0..CHUNKS_PER_SAMPLE)
+            .map(|i| {
+                ((i as u64) * chunk_len as u64 * 7 + 17) % (OUT_LEN - chunk_len as u64 * 8)
+            })
+            .collect();
+        let srcs: Vec<u64> = (0..CHUNKS_PER_SAMPLE)
+            .map(|i| ((i as u64) * chunk_len as u64 * 3) % (SRC_LEN as u64 - chunk_len as u64))
+            .collect();
+
+        // The chunk md5 must match the actual source bytes for the hash
+        // check to pass: recompute per source region.
+        let region: Vec<u8> = vec![0u8; chunk_len];
+        let mut md5s: Vec<Vec<u8>> = Vec::with_capacity(CHUNKS_PER_SAMPLE);
+        for &src in &srcs {
+            let mut r = region.clone();
+            old_file.read_exact_at(&mut r, src).expect("read region");
+            md5s.push(fast_md5::digest(&r).to_vec());
+        }
+
+        group.bench_function(BenchmarkId::new("legacy_whole_file_mmap", chunk_kib), |b| {
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let start = std::time::Instant::now();
+                    for i in 0..CHUNKS_PER_SAMPLE {
+                        legacy_small_chunk_hash_whole_file_mmap(
+                            &old_file,
+                            &old_path,
+                            &out_file,
+                            dests[i],
+                            srcs[i],
+                            chunk_len as u64,
+                            &md5s[i],
+                        )
+                        .expect("legacy copy+hash");
+                    }
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("readback_buffer", chunk_kib), |b| {
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let start = std::time::Instant::now();
+                    for i in 0..CHUNKS_PER_SAMPLE {
+                        benchmark_write_from_old_file_hashed(
+                            &old_file,
+                            &old_path,
+                            &out_file,
+                            dests[i],
+                            srcs[i],
+                            chunk_len as u64,
+                            &mut buffer,
+                            &md5s[i],
+                        )
+                        .expect("readback copy+hash");
+                    }
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+    }
+
+    group.finish();
+}
+
 #[cfg(feature = "bench-internals")]
 fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
     use dashmap::DashMap;
@@ -3851,6 +3982,7 @@ criterion_group!(
     bench_assembly_many_chunks,
     bench_assembly_epoch_durability,
     bench_assembly_old_chunk_reuse,
+    bench_assembly_small_old_chunk_hash,
     bench_verify_file_md5,
     bench_xxh64,
     bench_zstd_oneshot,

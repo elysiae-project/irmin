@@ -367,6 +367,111 @@ pub fn assemble_file_with_benchmark_mmap_advice(
     .map(|_| ())
 }
 
+/// Frozen replica of the small-chunk hashing path from before the
+/// transfer-buffer readback (commit fbf6837): kernel copy, per-chunk
+/// fstat, a whole-output-file read-only mmap plus whole-range madvise,
+/// and a per-chunk fadvise pair on the old-file region. The file hasher is
+/// intentionally elided to match the paired readback arm, which also runs
+/// without one. Kept for paired criterion comparison against
+/// [`benchmark_write_from_old_file_hashed`]; safe to delete once its
+/// measurements are no longer needed.
+#[cfg(feature = "benchmark")]
+#[allow(clippy::too_many_arguments)]
+pub fn legacy_small_chunk_hash_whole_file_mmap(
+    old_file: &File,
+    old_file_path: &Path,
+    out_file: &File,
+    new_offset: u64,
+    old_offset: u64,
+    expected_size: u64,
+    chunk_decompressed_hash_md5: &[u8],
+) -> SophonResult<u64> {
+    let fd = old_file.as_raw_fd();
+    super::assembly_opt::posix_advise(
+        fd,
+        old_offset,
+        expected_size,
+        libc::POSIX_FADV_SEQUENTIAL,
+    );
+    let copied =
+        super::sysio::copy_file_range(fd, old_offset, out_file.as_raw_fd(), new_offset, expected_size)?;
+    if copied != expected_size {
+        return Err(SophonError::SizeMismatch {
+            item: old_file_path.display().to_string(),
+            expected: expected_size,
+            actual: copied,
+        });
+    }
+    let need_chunk_hash = super::assembly_opt::chunk_hash_required(chunk_decompressed_hash_md5);
+    let mut chunk_hasher: Option<Md5> = if need_chunk_hash {
+        Some(take_md5()?)
+    } else {
+        None
+    };
+    let out_file_len = out_file.metadata().map_err(SophonError::Io)?.len();
+    if out_file_len >= new_offset + expected_size
+        && let Ok(out_mmap) = super::assembly_opt::mmap_shared_read_only(
+            out_file,
+            out_file_len as usize,
+            super::assembly_opt::SharedMmapAdvice::DemandSequential,
+        )
+    {
+        let off = new_offset as usize;
+        let end = off + expected_size as usize;
+        let slice = &out_mmap.as_slice()[off..end];
+        if let Some(ref mut ch) = chunk_hasher {
+            ch.update(slice)?;
+        }
+        super::assembly_opt::posix_advise(
+            fd,
+            old_offset,
+            expected_size,
+            libc::POSIX_FADV_DONTNEED,
+        );
+        if let Some(ref mut ch) = chunk_hasher {
+            let digest = ch.finish()?;
+            return_md5(chunk_hasher.take().unwrap());
+            if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
+                return Err(SophonError::Md5Mismatch {
+                    item: old_file_path.display().to_string(),
+                    expected: bytes_to_hex(chunk_decompressed_hash_md5),
+                    actual: md5_to_hex(&digest),
+                });
+            }
+        }
+        return Ok(expected_size);
+    }
+    Ok(expected_size)
+}
+
+/// Run the production small-chunk hashing path (kernel copy + transfer-
+/// buffer readback) for paired criterion comparison against the frozen
+/// legacy whole-file-mmap replica above.
+#[cfg(feature = "benchmark")]
+#[allow(clippy::too_many_arguments)]
+pub fn benchmark_write_from_old_file_hashed(
+    old_file: &File,
+    old_file_path: &Path,
+    out_file: &File,
+    new_offset: u64,
+    old_offset: u64,
+    expected_size: u64,
+    buffer: &mut [u8],
+    chunk_decompressed_hash_md5: &[u8],
+) -> SophonResult<u64> {
+    write_from_old_file(
+        old_file,
+        old_file_path,
+        out_file,
+        new_offset,
+        old_offset,
+        expected_size,
+        None,
+        buffer,
+        chunk_decompressed_hash_md5,
+    )
+}
+
 /// Shared state for the coordinator's staged-assembly mode: assembled
 /// files are committed in durability epochs instead of one fsync+rename
 /// each (see [`super::assembly_epochs`]).
@@ -1176,8 +1281,70 @@ fn write_decompressed_chunk_at(
 /// (>= 1 MiB) use the optimized path in `assembly_opt`; small chunks stream
 /// through a thread-local buffer. Writes use `write_all_at` so no seek is
 /// needed on the destination file.
+/// Pooled `Md5` holder that returns the hasher to the thread-local pool
+/// on every exit path: `Drop` covers `?` error returns, and the finish
+/// path returns it eagerly before the digest comparison.
+struct Md5Guard(Option<Md5>);
+
+impl Md5Guard {
+    fn take_pooled() -> SophonResult<Self> {
+        Ok(Self(Some(take_md5()?)))
+    }
+
+    fn skip() -> Self {
+        Self(None)
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> SophonResult<()> {
+        if let Some(ch) = self.0.as_mut() {
+            ch.update(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Finish and verify against the expected digest. The hashed bytes
+    /// are the ones WRITTEN to the output, so a mismatch means the
+    /// written region is wrong, not that `item`'s file is corrupt — that
+    /// path only identifies the chunk for the error report. The hasher
+    /// goes back to the pool whether the finish, the comparison, or the
+    /// caller's later steps fail.
+    fn finish_and_verify(
+        &mut self,
+        expected: &[u8],
+        item: &std::path::Path,
+    ) -> SophonResult<()> {
+        let Some(mut ch) = self.0.take() else {
+            return Ok(());
+        };
+        let digest = match ch.finish() {
+            Ok(digest) => digest,
+            Err(err) => {
+                return_md5(ch);
+                return Err(SophonError::Io(err));
+            }
+        };
+        return_md5(ch);
+        if !md5_bytes_eq(&digest, expected) {
+            return Err(SophonError::Md5Mismatch {
+                item: item.display().to_string(),
+                expected: bytes_to_hex(expected),
+                actual: md5_to_hex(&digest),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Md5Guard {
+    fn drop(&mut self) {
+        if let Some(ch) = self.0.take() {
+            return_md5(ch);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn write_from_old_file(
+pub(crate) fn write_from_old_file(
     old_file: &std::fs::File,
     old_file_path: &std::path::Path,
     out_file: &File,
@@ -1223,20 +1390,12 @@ fn write_from_old_file(
             return Ok(expected_size);
         }
 
-        // Hashing path: copy via kernel copy_file_range, then hash from
-        // the mmap'd output to avoid pread→pwrite double-copy through
-        // userspace.
-        let fd = old_file.as_raw_fd();
-        super::assembly_opt::posix_advise(
-            fd,
-            old_offset,
-            expected_size,
-            libc::POSIX_FADV_SEQUENTIAL,
-        );
-
-        let expected_size_u = expected_size as usize;
-
-        // Kernel-side copy first.
+        // Hashing path: kernel copy_file_range moves the bytes with no
+        // userspace copy, then the written region is read back through
+        // the transfer buffer for hashing. The fresh output pages are
+        // typically cache-hot (splice path; on reflink filesystems the
+        // readback may fault in from the shared extent instead). Old-file
+        // access is random-offset per chunk, so no per-chunk fadvise.
         let copied = super::sysio::copy_file_range(
             old_file.as_raw_fd(),
             old_offset,
@@ -1252,101 +1411,36 @@ fn write_from_old_file(
             });
         }
 
-        // Hash from the mmap'd output region.
-        let mut chunk_hasher: Option<Md5> = if need_chunk_hash {
-            Some(take_md5()?)
+        assert!(
+            !buffer.is_empty(),
+            "transfer buffer must not be empty for hashed old chunks"
+        );
+        let mut chunk_hasher = if need_chunk_hash {
+            Md5Guard::take_pooled()?
         } else {
-            None
+            Md5Guard::skip()
         };
-
-        // mmap the output to hash the written region without a pread copy.
-        let out_file_len = out_file.metadata().map_err(SophonError::Io)?.len();
-        if out_file_len >= new_offset + expected_size
-            && let Ok(out_mmap) = super::assembly_opt::mmap_shared_read_only(
-                out_file,
-                out_file_len as usize,
-                super::assembly_opt::SharedMmapAdvice::DemandSequential,
-            )
-        {
-            let off = new_offset as usize;
-            let end = off + expected_size_u;
-            let slice = &out_mmap.as_slice()[off..end];
-            if let Some(ref mut ch) = chunk_hasher {
-                ch.update(slice)?;
-            }
-            if let Some(hasher) = file_hasher.as_deref_mut() {
-                hasher.update(slice)?;
-            }
-            super::assembly_opt::posix_advise(
-                fd,
-                old_offset,
-                expected_size,
-                libc::POSIX_FADV_DONTNEED,
-            );
-            if let Some(ref mut ch) = chunk_hasher {
-                let digest = ch.finish()?;
-                return_md5(chunk_hasher.take().unwrap());
-                if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
-                    return Err(SophonError::Md5Mismatch {
-                        item: old_file_path.display().to_string(),
-                        expected: bytes_to_hex(chunk_decompressed_hash_md5),
-                        actual: md5_to_hex(&digest),
-                    });
-                }
-            }
-            return Ok(expected_size);
-        }
-
-        // Fallback: pread into a buffer for hashing when mmap fails.
-        let mut write_offset = new_offset;
-        let mut bytes_written: u64 = 0;
         let mut remaining = expected_size;
-        let mut read_offset = old_offset;
-
+        let mut read_offset = new_offset;
         while remaining > 0 {
+            // min(remaining, buffer.len()) always fits usize.
             let to_read = remaining.min(buffer.len() as u64) as usize;
-            let n = old_file
-                .read_at(&mut buffer[..to_read], read_offset)
-                .map_err(SophonError::Io)?;
-            if n == 0 {
-                break;
-            }
-            if let Some(ref mut ch) = chunk_hasher {
-                ch.update(&buffer[..n])?;
-            }
+            // read_exact rejects a short region (the temp file was sized
+            // to the asset, so this only fires on external interference;
+            // like the other I/O in this path the error surfaces bare).
+            out_file.read_exact_at(&mut buffer[..to_read], read_offset)?;
+            chunk_hasher.update(&buffer[..to_read])?;
             if let Some(hasher) = file_hasher.as_deref_mut() {
-                hasher.update(&buffer[..n])?;
+                hasher.update(&buffer[..to_read])?;
             }
-            out_file.write_all_at(&buffer[..n], write_offset)?;
-            write_offset += n as u64;
-            read_offset += n as u64;
-            bytes_written += n as u64;
-            remaining = remaining.saturating_sub(n as u64);
+            let n = to_read as u64;
+            read_offset += n;
+            remaining -= n;
         }
 
-        super::assembly_opt::posix_advise(fd, old_offset, expected_size, libc::POSIX_FADV_DONTNEED);
+        chunk_hasher.finish_and_verify(chunk_decompressed_hash_md5, old_file_path)?;
 
-        if bytes_written != expected_size {
-            return Err(SophonError::SizeMismatch {
-                item: old_file_path.display().to_string(),
-                expected: expected_size,
-                actual: bytes_written,
-            });
-        }
-
-        if let Some(ref mut ch) = chunk_hasher {
-            let digest = ch.finish()?;
-            return_md5(chunk_hasher.take().unwrap());
-            if !md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
-                return Err(SophonError::Md5Mismatch {
-                    item: old_file_path.display().to_string(),
-                    expected: bytes_to_hex(chunk_decompressed_hash_md5),
-                    actual: md5_to_hex(&digest),
-                });
-            }
-        }
-
-        Ok(bytes_written)
+        Ok(expected_size)
     }
 }
 
