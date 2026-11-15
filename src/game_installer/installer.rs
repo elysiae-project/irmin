@@ -4388,8 +4388,10 @@ async fn repair_assets(
 
                 let file_path = game_dir.join(asset.asset_name_str());
                 let asset_size = asset.asset_size;
-                let asset_md5 = super::assembly_opt::hex_to_bytes(asset.asset_hash_md5_str())
-                    .unwrap_or_default();
+                let mut asset_md5 = [0u8; 16];
+                super::assembly_opt::hex_decode_into(asset.asset_hash_md5_str(), &mut asset_md5)
+                    .filter(|&l| l == 16)
+                    .unwrap_or(0);
 
                 let is_valid = tokio::task::spawn_blocking({
                     let file_path = file_path.clone();
