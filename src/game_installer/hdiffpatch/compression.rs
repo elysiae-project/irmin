@@ -4,7 +4,7 @@ use flate2::read::DeflateDecoder;
 
 use super::CompressionMode;
 use crate::game_installer::assembly_opt::{
-    MAX_WINDOW_LOG, take_dctx, window_log_for_size,
+    MAX_WINDOW_LOG, return_dctx, take_dctx, window_log_for_size,
 };
 
 /// True when a zstd decode error indicates the `WindowLogMax` cap was
@@ -132,10 +132,10 @@ pub(crate) fn get_clip_stream(
                     Err(error) => return Err(error),
                 };
 
-                // Drop the DCtx instead of pooling: the buffered path may
-                // have allocated a window buffer up to MAX_WINDOW_LOG (64MiB)
-                // on retry, too large to retain in the TLS pool.
-                drop(ctx);
+                // Return the DCtx to the TLS pool. The pool accepts any
+                // window-log setting, so the MAX_WINDOW_LOG retry path's
+                // larger window buffer does not disqualify the context.
+                return_dctx(ctx);
                 Ok((Box::new(Cursor::new(out)), file_bytes))
             } else {
                 // Use a pooled DCtx via a self-referential wrapper that returns
@@ -250,12 +250,15 @@ impl std::io::Read for PooledZstdDecoder {
 
 impl Drop for PooledZstdDecoder {
     fn drop(&mut self) {
-        // Decoder drops first (field order), releasing the DCtx borrow.
-        // Drop the DCtx rather than returning it to the TLS pool: the
-        // streaming decoder allocates a window buffer up to MAX_WINDOW_LOG
-        // (64MiB) which is too large to retain across calls on the
-        // blocking-pool threads.
-        drop(std::mem::take(&mut self.ctx));
+        // Return the DCtx to the TLS pool for reuse. The pool accepts any
+        // window-log setting, so the MAX_WINDOW_LOG window buffer retained
+        // by the streaming decoder does not disqualify the context.
+        // `mem::take` swaps in a throwaway Default DCtx that this Drop then
+        // frees, yielding the real one for pooling. The throwaway costs one
+        // malloc+free per streaming decode; the pooled DCtx saves one
+        // malloc+free on the next decode, for a net win.
+        let ctx = std::mem::take(&mut self.ctx);
+        return_dctx(ctx);
     }
 }
 
