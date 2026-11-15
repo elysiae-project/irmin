@@ -4372,7 +4372,9 @@ fn bench_download_throughput(c: &mut Criterion) {
     }
     let expected_md5_hex = assembly_opt::md5_to_hex(&expected_md5.finalize());
 
-    let client = reqwest::Client::new();
+    // Use the production DownloadClient (HTTP/1.1 only, TCP_NODELAY, pool
+    // sized to CPU count) so the benchmark reflects the real download path.
+    let client = irmin_rs::DownloadClient::new().0;
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("payload");
 
