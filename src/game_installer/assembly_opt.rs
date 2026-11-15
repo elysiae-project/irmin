@@ -88,7 +88,7 @@ pub(crate) fn take_xxh64() -> xxhash_rust::xxh64::Xxh64 {
 pub(crate) fn return_xxh64(_hasher: xxhash_rust::xxh64::Xxh64) {}
 
 /// Upper bound on the per-thread read buffer retained for hashing.
-pub(crate) const HASH_READ_BUFFER_SIZE: usize = 256 * 1024;
+pub(crate) const HASH_READ_BUFFER_SIZE: usize = 512 * 1024;
 
 thread_local! {
     static HASH_READ_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
