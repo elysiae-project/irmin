@@ -12,8 +12,6 @@ use std::time::{Duration, Instant};
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Sentinel used when hex decoding fails — a value that cannot match any real MD5 digest, ensuring verification fails closed.
-const INVALID_HEX_SENTINEL: [u8; 16] = [0xFF; 16];
 
 #[inline]
 fn now_nanos() -> u64 {
@@ -1441,13 +1439,12 @@ pub async fn preinstall_download(
             let last_emit = Arc::clone(&last_check_emit);
             let chunks_dir = chunks_dir.clone();
             let patch_name = chunk.patch_name.clone();
-            let patch_md5 = super::assembly_opt::hex_to_bytes(&chunk.patch_md5)
-                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec());
+            let patch_md5_hex = chunk.patch_md5.clone();
             let patch_size = chunk.patch_size;
             async move {
                 let path = chunks_dir.join(&patch_name);
                 let ok = tokio::task::spawn_blocking(move || {
-                    is_file_already_patched(&path, patch_size, &patch_md5)
+                    is_file_already_patched_hex(&path, patch_size, &patch_md5_hex)
                 })
                 .await?;
                 if ok {
@@ -2089,6 +2086,16 @@ async fn download_patch_chunk_inner(
 
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
+    verify_chunk_md5_inner(path, |digest| super::assembly_opt::md5_bytes_eq(digest, expected_md5))
+}
+
+/// Verifies a file's MD5 against a hex-encoded expected hash,
+/// avoiding the `Vec<u8>` allocation from `hex_to_bytes`.
+pub fn verify_chunk_md5_hex(path: &Path, expected_hex: &str) -> bool {
+    verify_chunk_md5_inner(path, |digest| super::assembly_opt::md5_hex_eq(digest, expected_hex))
+}
+
+fn verify_chunk_md5_inner<F: Fn(&[u8; 16]) -> bool>(path: &Path, verify: F) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
@@ -2128,7 +2135,7 @@ pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
     };
     let result = if hashed {
         match hasher.finish() {
-            Ok(digest) => super::assembly_opt::md5_bytes_eq(&digest, expected_md5),
+            Ok(digest) => verify(&digest),
             Err(_) => false,
         }
     } else {
@@ -2140,6 +2147,20 @@ pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
 
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 pub fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
+    verify_chunk_xxh64_inner(path, |digest| {
+        super::assembly_opt::xxh64_bytes_eq(digest, expected_xxh64)
+    })
+}
+
+/// Verifies a file's XXH64 against a hex-encoded expected hash,
+/// avoiding the `Vec<u8>` allocation from `hex_to_bytes`.
+pub fn verify_chunk_xxh64_hex(path: &Path, expected_hex: &str) -> bool {
+    verify_chunk_xxh64_inner(path, |digest| {
+        super::assembly_opt::xxh64_hex_eq(digest, expected_hex)
+    })
+}
+
+fn verify_chunk_xxh64_inner<F: Fn(u64) -> bool>(path: &Path, verify: F) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         log::warn!(
             "Failed to open file for XXH64 verification: {path_display}",
@@ -2155,7 +2176,7 @@ pub fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
     let mut hasher = super::assembly_opt::take_xxh64();
     let result = if len == 0 {
         hasher.update(b"");
-        super::assembly_opt::xxh64_bytes_eq(hasher.digest(), expected_xxh64)
+        verify(hasher.digest())
     } else {
         posix_advise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
@@ -2174,7 +2195,7 @@ pub fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
         }
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         if ok {
-            super::assembly_opt::xxh64_bytes_eq(hasher.digest(), expected_xxh64)
+            verify(hasher.digest())
         } else {
             false
         }
@@ -2196,6 +2217,26 @@ pub fn verify_file_hash(path: &Path, expected_hash: &[u8]) -> bool {
             log::warn!(
                 "Unknown hash format (length={len})",
                 len = expected_hash.len()
+            );
+            false
+        }
+    }
+}
+
+/// Verifies a file's hash against a hex-encoded expected hash string,
+/// avoiding the `Vec<u8>` allocation from `hex_to_bytes`. Dispatches on
+/// hex string length: 32 chars = MD5, 16 chars = XXH64.
+pub fn verify_file_hash_hex(path: &Path, expected_hex: &str) -> bool {
+    if expected_hex.is_empty() {
+        return true;
+    }
+    match expected_hex.len() {
+        32 => verify_chunk_md5_hex(path, expected_hex),
+        16 => verify_chunk_xxh64_hex(path, expected_hex),
+        _ => {
+            log::warn!(
+                "Unknown hex hash format (length={len})",
+                len = expected_hex.len()
             );
             false
         }
@@ -2540,6 +2581,16 @@ fn is_file_already_patched(path: &Path, expected_size: u64, expected_md5: &[u8])
     verify_file_hash(path, expected_md5)
 }
 
+fn is_file_already_patched_hex(path: &Path, expected_size: u64, expected_hex: &str) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() != expected_size {
+        return false;
+    }
+    verify_file_hash_hex(path, expected_hex)
+}
+
 #[derive(Clone)]
 pub(super) struct FilterCache {
     pub(super) kdel_tokens: Option<Vec<String>>,
@@ -2765,11 +2816,7 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
         if !chunk_path.exists() {
             return Err(SophonError::PatchChunkNotFound(asset.patch_name.clone()));
         }
-    } else if !verify_file_hash(
-        &chunk_path,
-        &super::assembly_opt::hex_to_bytes(&asset.patch_hash)
-            .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
-    ) {
+    } else if !verify_file_hash_hex(&chunk_path, &asset.patch_hash) {
         return Err(SophonError::Md5Mismatch {
             item: asset.patch_name.clone(),
             expected: asset.patch_hash.clone(),
@@ -2842,11 +2889,7 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
         });
     }
     if !asset.target_file_hash.is_empty()
-        && !verify_file_hash(
-            &temp_path,
-            &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
-        )
+        && !verify_file_hash_hex(&temp_path, &asset.target_file_hash)
     {
         let _ = fs::remove_file(&temp_path);
         return Err(SophonError::Md5Mismatch {
@@ -2911,9 +2954,8 @@ async fn process_patch_asset(ctx: PatchTaskContext) -> SophonResult<()> {
     let already_patched = {
         let tp = target_path.clone();
         let sz = asset.target_file_size;
-        let md5 = super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-            .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec());
-        tokio::task::spawn_blocking(move || is_file_already_patched(&tp, sz, &md5))
+        let hex = asset.target_file_hash.clone();
+        tokio::task::spawn_blocking(move || is_file_already_patched_hex(&tp, sz, &hex))
             .await
             .map_err(SophonError::JoinError)?
     };
@@ -3235,10 +3277,9 @@ fn apply_hdiff_patch_impl(
                 fs::create_dir_all(parent)?;
             }
             fs::File::create(&diff_ref)?;
-            if !verify_file_hash(
+            if !verify_file_hash_hex(
                 &diff_ref,
-                &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5)
-                    .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
+                BLANK_FILE_MD5,
             ) {
                 return Err(SophonError::HDiffPatchFailed {
                     file: asset.target_file_path.clone(),
@@ -3306,10 +3347,9 @@ fn apply_hdiff_patch_impl(
         && diff_ref_guard.0.is_none()
         && original_path.exists()
         && !expected_md5.is_empty()
-        && !verify_file_hash(
+        && !verify_file_hash_hex(
             &original_path,
-            &super::assembly_opt::hex_to_bytes(expected_md5)
-                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
+            expected_md5,
         )
     {
         if is_filtered_asset(cache, asset) {
@@ -3393,10 +3433,9 @@ fn apply_hdiff_patch_impl(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash(
+                && !verify_file_hash_hex(
                     &temp_output,
-                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                        .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
+                    &asset.target_file_hash,
                 )
             {
                 let _ = fs::remove_file(&temp_output);
@@ -3455,10 +3494,9 @@ fn apply_hdiff_patch_from_files(
         }
         fs::File::create(&empty_original_path)?;
         // Verify the freshly-created diff_ref is empty before proceeding.
-        if !verify_file_hash(
+        if !verify_file_hash_hex(
             &empty_original_path,
-            &super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5)
-                .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
+            BLANK_FILE_MD5,
         ) {
             let _ = fs::remove_file(&empty_original_path);
             return Err(SophonError::HDiffPatchFailed {
@@ -3504,10 +3542,9 @@ fn apply_hdiff_patch_from_files(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash(
+                && !verify_file_hash_hex(
                     &temp_output,
-                    &super::assembly_opt::hex_to_bytes(&asset.target_file_hash)
-                        .unwrap_or_else(|| INVALID_HEX_SENTINEL.to_vec()),
+                    &asset.target_file_hash,
                 )
             {
                 let _ = fs::remove_file(&temp_output);
