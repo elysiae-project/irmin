@@ -272,7 +272,8 @@ pub(crate) fn normalize_full_download_manifest(manifest: &mut SophonManifestProt
 /// field-level error.
 #[allow(deprecated)]
 fn validate_manifest_utf8(manifest: &SophonManifestProto) -> Result<(), prost::DecodeError> {
-    let mut batch: Vec<u8> = Vec::new();
+    // Pre-size to a typical asset's batch size to avoid the first-iteration grow.
+    let mut batch: Vec<u8> = Vec::with_capacity(256);
     for asset in &manifest.assets {
         batch.clear();
         batch.extend_from_slice(&asset.asset_name);
