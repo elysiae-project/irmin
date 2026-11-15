@@ -1885,18 +1885,19 @@ async fn download_chunk_with_retries(
 ) -> SophonResult<()> {
     let mut last_err = String::new();
 
+    let decomp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+        chunk.chunk_decompressed_hash_md5_str(),
+    )
+    .unwrap_or_default();
+    let comp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+        chunk.chunk_compressed_hash_md5_str(),
+    )
+    .unwrap_or_default();
+
     for attempt in 0..MAX_RETRIES {
         if handle.is_cancelled() {
             return Err(SophonError::Cancelled);
         }
-        let decomp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
-            chunk.chunk_decompressed_hash_md5_str(),
-        )
-        .unwrap_or_default();
-        let comp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
-            chunk.chunk_compressed_hash_md5_str(),
-        )
-        .unwrap_or_default();
         match super::download::download_chunk(
             client,
             chunk_download,
