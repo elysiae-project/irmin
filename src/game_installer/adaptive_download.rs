@@ -13,7 +13,15 @@ use std::time::Instant;
 /// Minimum workers — ensures progress even on very slow links.
 pub const MIN_CONCURRENCY: usize = 2;
 /// Starting workers — low enough for slow links, high enough for fast links
-/// to ramp up via doubling within a few seconds.
+/// to ramp up via doubling within a few seconds. Scales with available
+/// CPUs so single-core machines don't oversubscribe.
+pub fn initial_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(4)
+}
+/// Backwards-compatible constant; runtime code should call
+/// [`initial_concurrency`].
 pub const INITIAL_CONCURRENCY: usize = 4;
 /// Hard ceiling on concurrent chunk download workers.
 /// Derived from available parallelism at runtime so fast multi-core machines
@@ -68,11 +76,11 @@ pub struct AdaptiveDownload {
 impl AdaptiveDownload {
     pub fn new() -> Self {
         Self {
-            target: AtomicUsize::new(INITIAL_CONCURRENCY),
+            target: AtomicUsize::new(initial_concurrency()),
             ewma: AtomicU64::new(0),
             last_bytes: AtomicU64::new(0),
             last_time: AtomicU64::new(now_nanos()),
-            prev_workers: AtomicUsize::new(INITIAL_CONCURRENCY),
+            prev_workers: AtomicUsize::new(initial_concurrency()),
             prev_throughput: AtomicU64::new(0),
             settle: AtomicU64::new(SETTLE_TICKS as u64),
             stable: AtomicU64::new(0),
@@ -211,8 +219,8 @@ mod tests {
     #[test]
     fn initial_target_is_small() {
         let ad = AdaptiveDownload::new();
-        assert_eq!(ad.current_target(), INITIAL_CONCURRENCY);
-        assert!(INITIAL_CONCURRENCY <= 8);
+        assert_eq!(ad.current_target(), initial_concurrency());
+        assert!(initial_concurrency() <= 8);
     }
 
     #[test]
@@ -231,7 +239,7 @@ mod tests {
             .store(1_000_000_000_000, Ordering::Relaxed);
         ad.ewma.store(1_000_000_000_000, Ordering::Relaxed);
         ad.prev_workers
-            .store(INITIAL_CONCURRENCY, Ordering::Relaxed);
+            .store(initial_concurrency(), Ordering::Relaxed);
         ad.last_bytes.store(0, Ordering::Relaxed);
         ad.last_time.store(0, Ordering::Relaxed);
         let result = ad.measure(10_000_000_000_000);
@@ -239,7 +247,7 @@ mod tests {
             result.is_some(),
             "expected scale-up, throughput went from 1GiB to 10GiB"
         );
-        assert!(ad.current_target() > INITIAL_CONCURRENCY);
+        assert!(ad.current_target() > initial_concurrency());
     }
 
     #[test]
