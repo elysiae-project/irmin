@@ -2472,7 +2472,7 @@ fn regenerate_hk4e_pkg_version(
     vo_lang: &[String],
 ) -> SophonResult<()> {
     let mut assets: Vec<SophonManifestAssetProperty> = Vec::new();
-    for (_, proto) in context.manifests.values() {
+    for (_, proto, _) in context.manifests.values() {
         for asset in &proto.assets {
             if !asset.is_directory() {
                 assets.push(asset.clone());
@@ -3535,9 +3535,10 @@ fn apply_hdiff_patch_from_files(
     }
 }
 
-#[derive(Debug)]
+type AssetIndex = rustc_hash::FxHashMap<String, usize>;
+
 struct DownloadOverContext {
-    manifests: rustc_hash::FxHashMap<String, (DownloadInfo, Arc<SophonManifestProto>)>,
+    manifests: rustc_hash::FxHashMap<String, (DownloadInfo, Arc<SophonManifestProto>, AssetIndex)>,
 }
 
 impl DownloadOverContext {
@@ -3549,9 +3550,19 @@ impl DownloadOverContext {
                 .map(|entry| {
                     let mut manifest = entry.manifest.clone();
                     normalize_full_download_manifest(&mut manifest);
+                    let mut asset_index: AssetIndex =
+                        rustc_hash::FxHashMap::with_capacity_and_hasher(
+                            manifest.assets.len(),
+                            Default::default(),
+                        );
+                    for (i, a) in manifest.assets.iter().enumerate() {
+                        asset_index
+                            .entry(a.asset_name_str().to_string())
+                            .or_insert(i);
+                    }
                     (
                         entry.matching_field.clone(),
-                        (entry.chunk_download.clone(), Arc::new(manifest)),
+                        (entry.chunk_download.clone(), Arc::new(manifest), asset_index),
                     )
                 })
                 .collect(),
@@ -3707,15 +3718,13 @@ async fn apply_download_over(
         fs::create_dir_all(parent)?;
     }
 
-    let (chunk_download, manifest) = context
+    let (chunk_download, manifest, asset_index) = context
         .manifests
         .get(&asset.matching_field)
         .ok_or_else(|| SophonError::NoVoiceManifest(asset.matching_field.clone()))?;
 
-    let file_index = manifest
-        .assets
-        .iter()
-        .position(|a| a.asset_name_str() == asset.target_file_path)
+    let file_index = *asset_index
+        .get(&asset.target_file_path)
         .ok_or_else(|| SophonError::AssemblyFailed {
             file: asset.target_file_path.clone(),
             error: "File not found in main manifest for DownloadOver".to_string(),

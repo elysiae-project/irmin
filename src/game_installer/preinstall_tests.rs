@@ -175,10 +175,14 @@ fn benchmark_download_over_context_clone() {
                 manifests: shared
                     .manifests
                     .iter()
-                    .map(|(key, (download, manifest))| {
+                    .map(|(key, (download, manifest, index))| {
                         (
                             key.clone(),
-                            (download.clone(), std::sync::Arc::new((**manifest).clone())),
+                            (
+                                download.clone(),
+                                std::sync::Arc::new((**manifest).clone()),
+                                index.clone(),
+                            ),
                         )
                     })
                     .collect(),
@@ -3625,10 +3629,15 @@ async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output
         url_suffix: "chunks".to_owned(),
         ..make_download_info()
     };
+    let mut asset_index: rustc_hash::FxHashMap<String, usize> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(manifest.assets.len(), Default::default());
+    for (i, a) in manifest.assets.iter().enumerate() {
+        asset_index.entry(a.asset_name_str().to_string()).or_insert(i);
+    }
     let context = DownloadOverContext {
         manifests: [(
             "game".to_owned(),
-            (download_info.clone(), Arc::new(manifest)),
+            (download_info.clone(), Arc::new(manifest), asset_index),
         )]
         .into_iter()
         .collect(),
