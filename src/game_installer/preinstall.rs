@@ -1885,14 +1885,18 @@ async fn download_chunk_with_retries(
 ) -> SophonResult<()> {
     let mut last_err = String::new();
 
-    let decomp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+    let mut decomp_hash = [0u8; 16];
+    let decomp_len = crate::game_installer::assembly_opt::hex_decode_into(
         chunk.chunk_decompressed_hash_md5_str(),
+        &mut decomp_hash,
     )
-    .unwrap_or_default();
-    let comp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+    .unwrap_or(0);
+    let mut comp_hash = [0u8; 16];
+    let comp_len = crate::game_installer::assembly_opt::hex_decode_into(
         chunk.chunk_compressed_hash_md5_str(),
+        &mut comp_hash,
     )
-    .unwrap_or_default();
+    .unwrap_or(0);
 
     for attempt in 0..MAX_RETRIES {
         if handle.is_cancelled() {
@@ -1903,10 +1907,10 @@ async fn download_chunk_with_retries(
             chunk_download,
             crate::game_installer::compact_manifest::ChunkRef {
                 chunk_name: chunk.chunk_name_str(),
-                chunk_decompressed_hash_md5: &decomp_hash_bytes,
+                chunk_decompressed_hash_md5: &decomp_hash[..decomp_len],
                 chunk_size: chunk.chunk_size,
                 chunk_size_decompressed: chunk.chunk_size_decompressed,
-                chunk_compressed_hash_md5: &comp_hash_bytes,
+                chunk_compressed_hash_md5: &comp_hash[..comp_len],
                 chunk_old_offset: chunk.chunk_old_offset,
             },
             dest,

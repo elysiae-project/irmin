@@ -287,6 +287,7 @@ pub(crate) fn hex_decode_into(hex: &str, out: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
+#[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
 pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     let bytes = hex.as_bytes();
     if !bytes.len().is_multiple_of(2) {
