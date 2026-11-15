@@ -237,7 +237,7 @@ pub(crate) struct EvictingWriter {
     last_evicted: u64,
 }
 
-const EVICT_INTERVAL: u64 = 4 * 1024 * 1024;
+const EVICT_INTERVAL: u64 = 8 * 1024 * 1024;
 
 impl EvictingWriter {
     pub(crate) fn new(file: tokio::fs::File) -> Self {
