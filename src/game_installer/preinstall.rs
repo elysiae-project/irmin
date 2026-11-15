@@ -2353,16 +2353,10 @@ where
 
     // Apply patches through a bounded sliding window so per-apply
     // writeback stalls on one file overlap CPU work on the next. The
-    // window is intentionally small: btrfs fsync contention flattens and
-    // can regress past a few concurrent applies, and HDDs degrade badly
-    // under parallel random writes. On a single-threaded machine the
-    // loop collapses to one apply at a time.
-    let window = std::cmp::min(
-        PREINSTALL_PATCH_WINDOW,
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    );
+    // window scales with available CPUs but stays bounded: btrfs fsync
+    // contention flattens past a few concurrent applies, and HDDs
+    // degrade badly under parallel random writes.
+    let window = preinstall_patch_window();
     let mut join_set: tokio::task::JoinSet<SophonResult<()>> = tokio::task::JoinSet::new();
     let mut first_error: Option<SophonError> = None;
 
@@ -2912,8 +2906,13 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
 /// Upper bound on concurrently in-flight patch applies. btrfs fsync
 /// contention and HDD seek costs flatten or regress beyond a few
 /// concurrent applies, so this stays small; the effective window is also
-/// capped by CPU count at the call site.
-const PREINSTALL_PATCH_WINDOW: usize = 4;
+/// capped by CPU count at the call site. Scales up to 8 on machines
+/// with enough cores to overlap I/O waits productively.
+fn preinstall_patch_window() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4)
+}
 
 /// Shared context a single in-flight patch asset needs. Everything the
 /// JoinSet task touches is owned or Arc'd so the task is 'static.
