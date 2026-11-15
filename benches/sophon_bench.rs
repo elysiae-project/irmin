@@ -407,6 +407,7 @@ fn build_assembly_fixture(
             let name = format!("ck{i:02}");
             let data = gen_prng_data(42 + i as u64, chunk_mib * 1024 * 1024);
             let comp = zstd::encode_all(&data[..], 3).unwrap();
+            let comp_len = comp.len() as u64;
             fs::write(chunks_dir.join(chunk_filename(&name)), &comp).unwrap();
             raw.extend_from_slice(&data);
             let offset = (i * chunk_mib * 1024 * 1024) as u64;
@@ -419,7 +420,7 @@ fn build_assembly_fixture(
                 name.into(),
                 chunk_hash.into(),
                 offset,
-                0,
+                comp_len,
                 (chunk_mib * 1024 * 1024) as u64,
                 0,
                 bytes::Bytes::new(),
@@ -723,6 +724,7 @@ fn build_small_files_fixture(
                 let name = format!("sfc{fi:04}_{ci}");
                 let data = gen_prng_data((fi * 16 + ci) as u64, chunk_bytes);
                 let comp = zstd::encode_all(&data[..], 3).unwrap();
+                let comp_len = comp.len() as u64;
                 fs::write(chunks_dir.join(chunk_filename(&name)), &comp).unwrap();
                 let hash = hex::encode(fast_md5::digest(&data));
                 let offset = (ci * chunk_bytes) as u64;
@@ -731,7 +733,7 @@ fn build_small_files_fixture(
                     name.into(),
                     hash.into(),
                     offset,
-                    0,
+                    comp_len,
                     chunk_bytes as u64,
                     0,
                     bytes::Bytes::new(),
