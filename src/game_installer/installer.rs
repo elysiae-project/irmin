@@ -4493,12 +4493,14 @@ async fn repair_assets(
             }
             let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
             chunk_path.set_extension("zstd");
-            // An unparseable manifest hash must not reject every chunk; an
-            // all-zero digest never matches, forcing a (safe) re-download.
-            let expected_md5 =
-                super::assembly_opt::hex_to_bytes(chunk.chunk_compressed_hash_md5_str())
-                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-                    .unwrap_or_default();
+            let mut expected_md5 = [0u8; 16];
+            if super::assembly_opt::hex_decode_into(
+                chunk.chunk_compressed_hash_md5_str(),
+                &mut expected_md5,
+            ) != Some(16)
+            {
+                expected_md5 = [0u8; 16];
+            }
             let position = unique_chunks.len();
             unique_chunks.push(PendingChunkCheck {
                 chunk: chunk.clone(),
@@ -4564,21 +4566,27 @@ async fn repair_assets(
                         if let Some(parent) = chunk_path.parent() {
                             fs::create_dir_all(parent)?;
                         }
-                        let decomp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+                        let mut decomp_hash = [0u8; 16];
+                        let decomp_len = crate::game_installer::assembly_opt::hex_decode_into(
                             chunk.chunk_decompressed_hash_md5_str(),
+                            &mut decomp_hash,
                         )
-                        .unwrap_or_default();
-                        let comp_hash_bytes = crate::game_installer::assembly_opt::hex_to_bytes(
+                        .filter(|&l| l == 16)
+                        .unwrap_or(0);
+                        let mut comp_hash = [0u8; 16];
+                        let comp_len = crate::game_installer::assembly_opt::hex_decode_into(
                             chunk.chunk_compressed_hash_md5_str(),
+                            &mut comp_hash,
                         )
-                        .unwrap_or_default();
+                        .filter(|&l| l == 16)
+                        .unwrap_or(0);
                         download_chunk_with_retry_policy(
                             ChunkRef {
                                 chunk_name: chunk.chunk_name_str(),
-                                chunk_decompressed_hash_md5: &decomp_hash_bytes,
+                                chunk_decompressed_hash_md5: &decomp_hash[..decomp_len],
                                 chunk_size: chunk.chunk_size,
                                 chunk_size_decompressed: chunk.chunk_size_decompressed,
-                                chunk_compressed_hash_md5: &comp_hash_bytes,
+                                chunk_compressed_hash_md5: &comp_hash[..comp_len],
                                 chunk_old_offset: chunk.chunk_old_offset,
                             },
                             &client,
