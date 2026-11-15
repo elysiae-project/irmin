@@ -137,7 +137,7 @@ pub enum VerifyMode {
 }
 
 /// File write buffer during assembly (zstd streaming input + output).
-pub const FILE_WRITE_BUFFER_SIZE: usize = 256 * 1024;
+pub const FILE_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 /// File write buffer during chunk downloads.
 pub const CHUNK_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 
