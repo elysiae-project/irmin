@@ -234,7 +234,12 @@ impl Drop for PooledMd5 {
 pub(crate) struct EvictingWriter {
     inner: BufWriter<tokio::fs::File>,
     written: u64,
-    last_evicted: u64,
+    /// Offset up to which writeback has been initiated.
+    writeback_until: u64,
+    /// Offset up to which pages have been fadvise'd DONTNEED. Lags
+    /// behind `writeback_until` by one interval so fadvise runs after
+    /// the kernel has had time to complete the previous writeback.
+    evicted_until: u64,
 }
 
 const EVICT_INTERVAL: u64 = 8 * 1024 * 1024;
@@ -244,7 +249,8 @@ impl EvictingWriter {
         Self {
             inner: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_SIZE, file),
             written: 0,
-            last_evicted: 0,
+            writeback_until: 0,
+            evicted_until: 0,
         }
     }
 
@@ -252,7 +258,8 @@ impl EvictingWriter {
         Self {
             inner: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_SIZE, file),
             written: offset,
-            last_evicted: offset,
+            writeback_until: offset,
+            evicted_until: offset,
         }
     }
 
@@ -260,24 +267,31 @@ impl EvictingWriter {
         self.inner.write_all(buf).await?;
         self.written += buf.len() as u64;
         // Periodically evict written pages to reduce page cache pressure.
-        if self.written - self.last_evicted >= EVICT_INTERVAL {
+        if self.written - self.writeback_until >= EVICT_INTERVAL {
             self.inner.flush().await?;
             let fd = self.inner.get_ref().as_raw_fd();
-            let evict_start = self.last_evicted;
-            let evict_len = self.written - self.last_evicted;
-            // Submit writeback without WAIT_BEFORE/WAIT_AFTER: never wait
-            // on writeback completion from the async thread. DONTNEED then
-            // evicts pages lazily once the kernel finishes writing them back.
+            let wb_start = self.writeback_until;
+            let wb_len = self.written - self.writeback_until;
+            // Initiate writeback for the current interval without waiting.
             let _ = unsafe {
                 libc::sync_file_range(
                     fd,
-                    evict_start as libc::off64_t,
-                    evict_len as libc::off64_t,
+                    wb_start as libc::off64_t,
+                    wb_len as libc::off64_t,
                     libc::SYNC_FILE_RANGE_WRITE,
                 )
             };
-            posix_advise(fd, evict_start, evict_len, libc::POSIX_FADV_DONTNEED);
-            self.last_evicted = self.written;
+            // Evict the previous interval: its writeback was initiated on
+            // the last cycle and is likely complete. Calling DONTNEED on
+            // still-dirty pages is a no-op, so this lag gives the kernel
+            // time to finish writeback before eviction.
+            if self.evicted_until < self.writeback_until {
+                let evict_start = self.evicted_until;
+                let evict_len = self.writeback_until - self.evicted_until;
+                posix_advise(fd, evict_start, evict_len, libc::POSIX_FADV_DONTNEED);
+                self.evicted_until = self.writeback_until;
+            }
+            self.writeback_until = self.written;
         }
         Ok(())
     }
@@ -292,6 +306,8 @@ impl EvictingWriter {
         // fdatasync ensures all dirty pages are written before eviction.
         let _ = unsafe { libc::fdatasync(fd) };
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+        self.evicted_until = self.written;
+        self.writeback_until = self.written;
         Ok(())
     }
 
