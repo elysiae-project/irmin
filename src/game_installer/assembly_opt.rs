@@ -645,16 +645,20 @@ fn decompress_chunk_oneshot(
 
     // Prefault output pages in a single kernel batch. Avoids per-page faults
     // during decompression. EINVAL means kernel < 5.14; silently degrade.
-    unsafe {
-        let ret = libc::madvise(
-            out_mmap.map_base,
-            out_mmap.map_len,
-            libc::MADV_POPULATE_WRITE,
-        );
-        if ret != 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EINVAL) {
-                return Err(SophonError::Io(e));
+    // Skip for small regions: the zstd decompress touches every page anyway,
+    // and the kernel batches small contiguous write faults efficiently.
+    if out_mmap.map_len >= 2 * 1024 * 1024 {
+        unsafe {
+            let ret = libc::madvise(
+                out_mmap.map_base,
+                out_mmap.map_len,
+                libc::MADV_POPULATE_WRITE,
+            );
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINVAL) {
+                    return Err(SophonError::Io(e));
+                }
             }
         }
     }
