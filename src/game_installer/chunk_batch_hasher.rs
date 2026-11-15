@@ -231,6 +231,7 @@ fn flush(
     jobs.clear();
 }
 
+#[cold]
 fn record(
     first_error: &Mutex<Option<SophonError>>,
     has_error: &AtomicBool,

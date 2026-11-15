@@ -189,6 +189,7 @@ impl AssemblyEpochs {
 /// The sticky error is boxed behind the Mutex, so re-exposing it to callers
 /// needs a copy; `io::Error` is cheaply cloneable via its string form and
 /// the SophonError variants involved are all cheap value types.
+#[cold]
 fn clone_sticky(err: &SophonError) -> SophonError {
     match err {
         SophonError::Io(e) => SophonError::Io(clone_io(e)),
@@ -203,6 +204,7 @@ fn clone_sticky(err: &SophonError) -> SophonError {
     }
 }
 
+#[cold]
 fn clone_io(e: &std::io::Error) -> std::io::Error {
     match e.raw_os_error() {
         Some(code) => std::io::Error::from_raw_os_error(code),
@@ -212,6 +214,7 @@ fn clone_io(e: &std::io::Error) -> std::io::Error {
 
 /// Attach the epoch context to an error reported by `commit`, unless the
 /// error already names a file.
+#[cold]
 fn annotate_epoch(err: SophonError, staged_count: usize) -> SophonError {
     match err {
         SophonError::AssemblyFailed { file, error } if file.is_empty() => {

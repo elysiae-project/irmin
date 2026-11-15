@@ -368,6 +368,7 @@ fn download_was_cancelled(recorded: &AtomicU8, handle: &DownloadHandle) -> bool 
     recorded.load(Ordering::Relaxed) != 0 || handle.is_cancelled()
 }
 
+#[cold]
 fn record_download_worker_error(first_error: &Mutex<Option<SophonError>>, error: SophonError) {
     let mut guard = first_error.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
