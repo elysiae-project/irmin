@@ -1461,13 +1461,14 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
     fs::create_dir_all(&chunks_dir).unwrap();
     let out_path = dir.path().join("out.bin");
 
-    let mut chunk_paths = Vec::with_capacity(NUM_CHUNKS);
+    let mut chunk_paths: Vec<(std::path::PathBuf, u64)> = Vec::with_capacity(NUM_CHUNKS);
     for i in 0..NUM_CHUNKS {
         let raw = gen_prng_data(0xBEEF + i as u64, CHUNK_MIB * 1024 * 1024);
         let comp = zstd::encode_all(&raw[..], 3).unwrap();
         let p = chunks_dir.join(format!("c{i}.zstd"));
+        let comp_size = comp.len() as u64;
         fs::write(&p, &comp).unwrap();
-        chunk_paths.push(p);
+        chunk_paths.push((p, comp_size));
     }
 
     let out_file = fs::OpenOptions::new()
@@ -1487,7 +1488,7 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
     group.bench_function(BenchmarkId::from_parameter(NUM_CHUNKS), |b| {
         b.iter(|| {
             let mut hasher = irmin_rs::game_installer::assembly_opt::Md5::new().unwrap();
-            for (i, path) in chunk_paths.iter().enumerate() {
+            for (i, (path, comp_size)) in chunk_paths.iter().enumerate() {
                 let offset = (i * CHUNK_MIB * 1024 * 1024) as u64;
                 let written = decompress_chunk_optimized(
                     path,
@@ -1497,7 +1498,7 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
                     Some(&mut hasher),
                     b"",
                     false,
-                    None,
+                    Some(*comp_size),
                 )
                 .expect("decompress");
                 assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
@@ -4631,7 +4632,7 @@ fn bench_assembly_hash_gate(c: &mut Criterion) {
 
     // Unique per-worker chunk files so no worker's reads race another's
     // eviction; equal sizes keep SIMD lanes comparable if promoted later.
-    let mut chunk_paths: Vec<Arc<Vec<std::path::PathBuf>>> = Vec::with_capacity(WORKERS);
+    let mut chunk_paths: Vec<Arc<Vec<(std::path::PathBuf, u64)>>> = Vec::with_capacity(WORKERS);
     let mut out_files: Vec<std::fs::File> = Vec::with_capacity(WORKERS);
     let mut expected_digests: Vec<Vec<[u8; 16]>> = Vec::with_capacity(WORKERS);
     for w in 0..WORKERS {
@@ -4643,9 +4644,10 @@ fn bench_assembly_hash_gate(c: &mut Criterion) {
                 CHUNK_MIB * 1024 * 1024,
             );
             let comp = zstd::encode_all(&raw[..], 3).unwrap();
+            let comp_size = comp.len() as u64;
             let path = chunks_dir.join(format!("w{w}_c{i:02}.zstd"));
             fs::write(&path, &comp).unwrap();
-            paths.push(path);
+            paths.push((path, comp_size));
             digests.push(fast_md5::digest(&raw));
         }
         chunk_paths.push(Arc::new(paths));
@@ -4676,7 +4678,7 @@ fn bench_assembly_hash_gate(c: &mut Criterion) {
                 let out = &out_files[w];
                 let hashes = chunk_hashes.map(|h| &h[w]);
                 s.spawn(move || {
-                    for (i, path) in paths.iter().enumerate() {
+                    for (i, (path, comp_size)) in paths.iter().enumerate() {
                         let hash: &[u8] = match hashes {
                             Some(per_worker) => &per_worker[i],
                             None => b"",
@@ -4689,7 +4691,7 @@ fn bench_assembly_hash_gate(c: &mut Criterion) {
                             None,
                             hash,
                             false,
-                            None,
+                            Some(*comp_size),
                         )
                         .expect("decompress");
                         debug_assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
