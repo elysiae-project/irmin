@@ -214,7 +214,7 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
     let written = ctx
         .decompress(output, compressed_data)
         .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
-    assembly_opt::return_dctx(ctx, window_log);
+    assembly_opt::return_dctx(ctx);
 
     if written != expected_usize {
         out_mmap.flush_and_evict();
@@ -454,9 +454,10 @@ struct DctxGuard(Option<zstd::zstd_safe::DCtx<'static>>);
 impl Drop for DctxGuard {
     #[inline]
     fn drop(&mut self) {
-        if let Some(ctx) = self.0.take() {
-            assembly_opt::return_dctx(ctx, assembly_opt::MAX_WINDOW_LOG);
-        }
+        // Drop the DCtx rather than returning it to the TLS pool: the
+        // retry path may have used MAX_WINDOW_LOG, retaining a window
+        // buffer too large for the pool.
+        drop(self.0.take());
     }
 }
 

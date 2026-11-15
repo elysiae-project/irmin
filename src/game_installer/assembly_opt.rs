@@ -367,10 +367,11 @@ pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
 }
 
 #[inline]
-pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>, window_log_used: u32) {
-    if window_log_used > 22 {
-        return;
-    }
+pub(crate) fn return_dctx(ctx: zstd::zstd_safe::DCtx<'static>) {
+    // Pools the DCtx for reuse on the next decompress, avoiding a
+    // malloc+free cycle per chunk. Memory cost: up to 2^window_log per
+    // thread; bounded by MAX_WINDOW_LOG worst case. Reclaim via
+    // trim_thread_local_buffers drops all pooled DCtxs across threads.
     ZSTD_DCTX.with(|cell| cell.borrow_mut().replace(ctx));
 }
 
@@ -676,7 +677,7 @@ fn decompress_chunk_oneshot(
         let written = ctx
             .decompress(output, compressed)
             .map_err(|e| SophonError::Io(io::Error::other(e.to_string())))?;
-        return_dctx(ctx, window_log_for_size(expected_size));
+        return_dctx(ctx);
 
         if written != expected_usize {
             return Err(SophonError::SizeMismatch {
@@ -1070,7 +1071,7 @@ fn decompress_chunk_with_window(
             (bytes as u64, chunk_hasher)
         }; // decoder dropped, ctx borrow released
 
-        return_dctx(ctx, window_log);
+        return_dctx(ctx);
         (bytes, chunk_hasher)
     };
 

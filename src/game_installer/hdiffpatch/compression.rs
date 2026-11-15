@@ -4,7 +4,7 @@ use flate2::read::DeflateDecoder;
 
 use super::CompressionMode;
 use crate::game_installer::assembly_opt::{
-    MAX_WINDOW_LOG, return_dctx, take_dctx, window_log_for_size,
+    MAX_WINDOW_LOG, take_dctx, window_log_for_size,
 };
 
 /// True when a zstd decode error indicates the `WindowLogMax` cap was
@@ -96,7 +96,6 @@ pub(crate) fn get_clip_stream(
                 }
                 let tight_log = window_log_for_size(length);
                 let mut ctx = take_dctx();
-                let mut used_window_log = tight_log;
 
                 let first_result = {
                     ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
@@ -113,7 +112,6 @@ pub(crate) fn get_clip_stream(
                 let out = match first_result {
                     Ok(output) => output,
                     Err(error) if is_window_too_small_err(&error) => {
-                        used_window_log = MAX_WINDOW_LOG;
                         ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
                             .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
                         ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
@@ -134,7 +132,10 @@ pub(crate) fn get_clip_stream(
                     Err(error) => return Err(error),
                 };
 
-                return_dctx(ctx, used_window_log);
+                // Drop the DCtx instead of pooling: the buffered path may
+                // have allocated a window buffer up to MAX_WINDOW_LOG (64MiB)
+                // on retry, too large to retain in the TLS pool.
+                drop(ctx);
                 Ok((Box::new(Cursor::new(out)), file_bytes))
             } else {
                 // Use a pooled DCtx via a self-referential wrapper that returns
@@ -250,7 +251,11 @@ impl std::io::Read for PooledZstdDecoder {
 impl Drop for PooledZstdDecoder {
     fn drop(&mut self) {
         // Decoder drops first (field order), releasing the DCtx borrow.
-        return_dctx(std::mem::take(&mut self.ctx), MAX_WINDOW_LOG);
+        // Drop the DCtx rather than returning it to the TLS pool: the
+        // streaming decoder allocates a window buffer up to MAX_WINDOW_LOG
+        // (64MiB) which is too large to retain across calls on the
+        // blocking-pool threads.
+        drop(std::mem::take(&mut self.ctx));
     }
 }
 
