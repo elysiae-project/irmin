@@ -264,6 +264,29 @@ static HEX_DECODE_LUT: [u8; 256] = {
 
 /// Decode a hex string to binary. Returns `None` on invalid hex or
 /// odd length. Uses a 256-entry lookup table for single-access nibble decode.
+/// Decode hex into a caller-provided buffer. Returns the number of bytes
+/// written, or `None` if `hex` is odd-length, contains non-hex chars, or
+/// doesn't fit in `out`.
+pub(crate) fn hex_decode_into(hex: &str, out: &mut [u8]) -> Option<usize> {
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let len = bytes.len() / 2;
+    if len > out.len() {
+        return None;
+    }
+    for i in 0..len {
+        let hi = HEX_DECODE_LUT[bytes[i * 2] as usize];
+        let lo = HEX_DECODE_LUT[bytes[i * 2 + 1] as usize];
+        if hi == 0xFF || lo == 0xFF {
+            return None;
+        }
+        out[i] = (hi << 4) | lo;
+    }
+    Some(len)
+}
+
 pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     let bytes = hex.as_bytes();
     if !bytes.len().is_multiple_of(2) {

@@ -843,11 +843,17 @@ fn intern_hash(arena: &mut ByteArena, hex: &str) -> Result<u32, CompactManifestL
     if hex.is_empty() {
         return Ok(arena.intern_dedup(&[]));
     }
-    let bytes = super::assembly_opt::hex_to_bytes(hex).unwrap_or_else(|| {
-        log::warn!("intern_hash: non-hex hash '{hex}' stored as raw bytes");
-        hex.as_bytes().to_vec()
-    });
-    Ok(arena.intern_dedup(&bytes))
+    // Decode hex into a stack buffer for hashes up to 32 bytes; longer
+    // inputs fall back to `hex_to_bytes` below.
+    const MAX_STACK_HASH_BYTES: usize = 32;
+    let mut buf = [0u8; MAX_STACK_HASH_BYTES];
+    match super::assembly_opt::hex_decode_into(hex, &mut buf) {
+        Some(len) => Ok(arena.intern_dedup(&buf[..len])),
+        None => {
+            log::warn!("intern_hash: non-hex hash '{hex}' stored as raw bytes");
+            Ok(arena.intern_dedup(hex.as_bytes()))
+        }
+    }
 }
 
 fn manifest_storage_estimates(
