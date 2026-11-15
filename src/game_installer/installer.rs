@@ -347,6 +347,7 @@ fn record_download_cancellation(cancelled: &AtomicU8) {
     cancelled.store(1, Ordering::Relaxed);
 }
 
+#[cold]
 fn record_download_cancelled_result(
     cancelled: &AtomicU8,
     first_error: &Mutex<Option<SophonError>>,

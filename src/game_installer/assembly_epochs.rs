@@ -362,6 +362,7 @@ fn syncfs(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     }
 }
 
+#[cold]
 fn exdev_copy_sync(tmp_path: &Path, target_path: &Path) -> SophonResult<()> {
     fs::copy(tmp_path, target_path)?;
     fs::File::open(target_path)?.sync_data()?;
