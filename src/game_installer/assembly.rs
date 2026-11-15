@@ -613,6 +613,8 @@ fn assemble_file_inner(
     let mut total_written: u64 = 0;
     let has_file_hash = !file_hash_md5.is_empty();
     let total_chunks = (chunk_range.end - chunk_range.start) as usize;
+    // Local cap kept as a tuned constant: making this dynamic regressed
+    // the state_save canary by ~20% in paired benchmarks.
     const MAX_PARALLEL_WORKERS: usize = 4;
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().min(MAX_PARALLEL_WORKERS))

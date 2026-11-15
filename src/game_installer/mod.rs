@@ -112,9 +112,27 @@ pub async fn cancelable_sleep(
         } => Err(()),
     }
 }
-/// Fixed assembly worker count while chunk downloads are active.
+/// Assembly worker count while chunk downloads are active. Capped at 4
+/// so assembly never starves download workers, regardless of CPU count.
+pub fn assembly_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(4)
+}
+/// Backwards-compatible constant; retained because installer.rs is
+/// codegen-sensitive and changing its call sites risks state_save
+/// canary regression. New code should call [`assembly_concurrency`].
 pub const ASSEMBLY_CONCURRENCY: usize = 4;
 /// Parallelism for full-file or cached-chunk MD5 verification passes.
+/// 2x CPU count because verification is I/O-bound; capped at 32 to
+/// avoid memory pressure from concurrent file reads.
+pub fn verify_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2).min(32))
+        .unwrap_or(16)
+}
+/// Backwards-compatible constant; retained because installer.rs is
+/// codegen-sensitive. New code should call [`verify_concurrency`].
 pub const VERIFY_CONCURRENCY: usize = 16;
 /// Installed version marker filename.
 pub const VERSION_FILE_NAME: &str = ".sophon_version";

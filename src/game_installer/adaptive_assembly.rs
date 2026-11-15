@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use super::*;
 
 /// Interval between adaptive scaling checks (milliseconds).
 const ADJUST_INTERVAL_MS: u64 = 500;
@@ -16,11 +15,11 @@ const SCALE_UP_FACTOR: f64 = 1.5;
 /// Scale-down multiplier when a bottleneck is detected.
 const SCALE_DOWN_FACTOR: f64 = 0.5;
 /// Minimum concurrency during adaptive phase (same as during download).
-const MIN_ADAPTIVE_TARGET: usize = ASSEMBLY_CONCURRENCY;
+fn min_adaptive_target() -> usize { super::assembly_concurrency() }
 
 /// Assembly concurrency controller.
 ///
-/// While downloads are active concurrency is capped at `ASSEMBLY_CONCURRENCY`
+/// While downloads are active concurrency is capped at `assembly_concurrency()`
 /// so assembly does not starve download workers. Once downloads finish the
 /// controller switches to adaptive scaling: it measures how many files are
 /// assembled per time window and slowly raises concurrency. If throughput
@@ -46,7 +45,7 @@ impl AdaptiveAssembly {
             .map(|n| n.get())
             .unwrap_or(4);
         Self {
-            target: AtomicUsize::new(ASSEMBLY_CONCURRENCY),
+            target: AtomicUsize::new(super::assembly_concurrency()),
             max_target: cpus * 2,
             download_active: AtomicBool::new(true),
             assembled_files: None,
@@ -63,7 +62,7 @@ impl AdaptiveAssembly {
             .map(|n| n.get())
             .unwrap_or(4);
         Self {
-            target: AtomicUsize::new(ASSEMBLY_CONCURRENCY),
+            target: AtomicUsize::new(super::assembly_concurrency()),
             max_target: cpus * 2,
             download_active: AtomicBool::new(true),
             assembled_files: Some(assembled_files),
@@ -78,9 +77,9 @@ impl AdaptiveAssembly {
     #[inline]
     pub fn current_target(&self) -> usize {
         if self.download_active.load(Ordering::Relaxed) {
-            ASSEMBLY_CONCURRENCY
+            super::assembly_concurrency()
         } else {
-            self.target.load(Ordering::Relaxed).max(MIN_ADAPTIVE_TARGET)
+            self.target.load(Ordering::Relaxed).max(min_adaptive_target())
         }
     }
 
@@ -160,7 +159,7 @@ impl AdaptiveAssembly {
                 } else {
                     // Bottleneck detected — scale down.
                     let scaled = (current_target as f64 * SCALE_DOWN_FACTOR) as usize;
-                    scaled.max(MIN_ADAPTIVE_TARGET)
+                    scaled.max(min_adaptive_target())
                 };
 
                 this.target.store(new_target, Ordering::Relaxed);
@@ -182,13 +181,13 @@ mod tests {
     #[test]
     fn new_has_initial_target() {
         let aa = AdaptiveAssembly::new();
-        assert_eq!(aa.current_target(), ASSEMBLY_CONCURRENCY);
+        assert_eq!(aa.current_target(), super::super::assembly_concurrency());
     }
 
     #[test]
     fn target_limited_during_download() {
         let aa = AdaptiveAssembly::new();
-        assert_eq!(aa.current_target(), ASSEMBLY_CONCURRENCY);
+        assert_eq!(aa.current_target(), super::super::assembly_concurrency());
     }
 
     #[test]
@@ -196,7 +195,7 @@ mod tests {
         let aa = AdaptiveAssembly::new();
         aa.set_download_active(false);
         // Before any adjustment the target is still the initial value.
-        assert_eq!(aa.current_target(), ASSEMBLY_CONCURRENCY);
+        assert_eq!(aa.current_target(), super::super::assembly_concurrency());
     }
 
     #[test]
@@ -205,13 +204,13 @@ mod tests {
         aa.set_download_active(false);
         aa.target.store(128, Ordering::Relaxed);
         aa.set_download_active(true);
-        assert_eq!(aa.current_target(), ASSEMBLY_CONCURRENCY);
+        assert_eq!(aa.current_target(), super::super::assembly_concurrency());
     }
 
     #[test]
     fn with_tracker_starts_at_concurrency() {
         let tracker = Arc::new(AtomicU64::new(0));
         let aa = AdaptiveAssembly::with_tracker(tracker);
-        assert_eq!(aa.current_target(), ASSEMBLY_CONCURRENCY);
+        assert_eq!(aa.current_target(), super::super::assembly_concurrency());
     }
 }
