@@ -1661,6 +1661,7 @@ fn write_from_old_file_reads_correct_offset() {
         &mut transfer_buf,
         b"", // hash_md5 (skip verification)
         None,
+    0,
     )
     .unwrap();
     drop(output_file);
@@ -1707,6 +1708,7 @@ fn write_from_old_file_verifies_chunk_hash() {
         &mut transfer_buf,
         expected_md5.as_bytes(),
         None,
+    0,
     );
 
     assert!(result.is_ok(), "should succeed with correct hash");
@@ -1755,6 +1757,7 @@ fn write_from_old_file_hashes_chunk_larger_than_buffer() {
         &mut transfer_buf,
         expected_md5.as_bytes(),
         None,
+    0,
     )
     .unwrap();
     drop(output_file);
@@ -1796,6 +1799,7 @@ fn write_from_old_file_hash_mismatch_fails() {
         &mut transfer_buf,
         &super::super::assembly_opt::hex_to_bytes(wrong_md5).unwrap()[..],
         None,
+    0,
     );
 
     assert!(result.is_err(), "should fail with wrong hash");
@@ -1837,6 +1841,7 @@ fn write_from_old_file_too_short_fails() {
         &mut transfer_buf,
         b"",
         None,
+    0,
     );
 
     assert!(result.is_err(), "should fail when file is too short");

@@ -465,6 +465,7 @@ pub fn benchmark_write_from_old_file_hashed(
         buffer,
         chunk_decompressed_hash_md5,
         None,
+        out_file.metadata().map(|m| m.len()).unwrap_or(0),
     )
 }
 
@@ -856,6 +857,7 @@ fn assemble_file_inner(
                 let target = &target_path;
                 let old = old_file.as_ref();
                 let out = &out_file;
+                let out_len = file_size;
                 let files = all_files;
                 let cdir = chunks_dir;
                 let skip_evict = parallel_hashed_file;
@@ -911,6 +913,7 @@ fn assemble_file_inner(
                                     files.chunk_decompressed_hash_at(ci)
                                 },
                                 Some(*old_len),
+                                out_len,
                             );
                             (r, None)
                         } else {
@@ -1045,6 +1048,7 @@ fn assemble_file_inner(
                         all_files.chunk_decompressed_hash_at(ci)
                     },
                     Some(*old_len),
+                    file_size,
                 )
                 .inspect_err(|_| {
                     let _ = fs::remove_file(&tmp_path);
@@ -1347,6 +1351,7 @@ pub(crate) fn write_from_old_file(
     buffer: &mut [u8],
     chunk_decompressed_hash_md5: &[u8],
     old_file_len: Option<u64>,
+    out_file_len: u64,
 ) -> SophonResult<u64> {
     const MMA_THRESHOLD: u64 = 1024 * 1024;
 
@@ -1361,6 +1366,7 @@ pub(crate) fn write_from_old_file(
             file_hasher,
             chunk_decompressed_hash_md5,
             old_file_len,
+            out_file_len,
         )
     } else {
         // Fast path: when no hashing is needed, use kernel copy_file_range

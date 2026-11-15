@@ -745,6 +745,7 @@ pub fn write_chunk_from_mmap(
     mut file_hasher: Option<&mut Md5>,
     chunk_decompressed_hash_md5: &[u8],
     old_file_len: Option<u64>,
+    out_file_len: u64,
 ) -> SophonResult<u64> {
     let needs_chunk_hash = chunk_hash_required(chunk_decompressed_hash_md5);
     if file_hasher.is_none() && !needs_chunk_hash {
@@ -792,9 +793,7 @@ pub fn write_chunk_from_mmap(
         buf
     });
 
-    // Try mmap for output to eliminate pwrite syscalls. Fall back to pwrite
-    // if mmap fails or the output file is not large enough.
-    let out_file_len = out_file.metadata().map_err(SophonError::Io)?.len();
+    // mmap requires the output region to be pre-sized; fall back to pwrite otherwise.
     let mmap_result = if out_file_len >= new_offset + expected_size {
         mmap_read_write(out_file, new_offset, expected_size_u)
     } else {
@@ -1119,7 +1118,7 @@ mod tests {
         let out = write_at_new(&dst_path);
         let src_file = File::open(&src).unwrap();
         let bytes =
-            write_chunk_from_mmap(&src_file, &src, &out, 0, 0, 11, None, b"", None).unwrap();
+            write_chunk_from_mmap(&src_file, &src, &out, 0, 0, 11, None, b"", None, 11).unwrap();
         drop(out);
         assert_eq!(bytes, 11);
         assert_eq!(std::fs::read(&dst_path).unwrap(), b"hello world");
@@ -1145,6 +1144,7 @@ mod tests {
             None,
             b"",
             None,
+            0,
         )
         .unwrap();
         drop(out);
@@ -1177,6 +1177,7 @@ mod tests {
             None,
             chunk_md5.as_bytes(),
             None,
+            0,
         )
         .unwrap();
         drop(out);
@@ -1205,6 +1206,7 @@ mod tests {
             None,
             &super::super::assembly_opt::hex_to_bytes(wrong).unwrap()[..],
             None,
+            0,
         );
         assert!(res.is_err());
     }
