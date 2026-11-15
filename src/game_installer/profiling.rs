@@ -14,11 +14,17 @@ pub struct PipelineProfiler {
     window_chunks: AtomicU64,
     #[cfg(feature = "sophon-profiling")]
     last_report_nanos: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub download_ns: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub download_count: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub verify_ns: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub verify_count: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub post_download_ns: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub post_download_count: AtomicU64,
     #[cfg(feature = "sophon-profiling")]
     active_downloads: AtomicUsize,
@@ -28,16 +34,24 @@ pub struct PipelineProfiler {
     idle_ns: AtomicU64,
     #[cfg(feature = "sophon-profiling")]
     window_idle_ns: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub assembly_decompress_ns: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub assembly_decompress_count: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub assembly_write_ns: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub assembly_write_count: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub assembly_total_ns: AtomicU64,
+    #[cfg(feature = "sophon-profiling")]
     pub assembly_total_count: AtomicU64,
     #[cfg(feature = "sophon-profiling")]
     total_bytes_downloaded: AtomicU64,
     #[cfg(feature = "sophon-profiling")]
     report_count: AtomicU64,
+    // Un-gated: written unconditionally by the installer to track
+    // overall download progress, independent of profiling.
     pub total_chunks: AtomicUsize,
 }
 
@@ -52,11 +66,17 @@ impl PipelineProfiler {
             window_chunks: AtomicU64::new(0),
             #[cfg(feature = "sophon-profiling")]
             last_report_nanos: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             download_ns: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             download_count: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             verify_ns: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             verify_count: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             post_download_ns: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             post_download_count: AtomicU64::new(0),
             #[cfg(feature = "sophon-profiling")]
             active_downloads: AtomicUsize::new(0),
@@ -66,11 +86,17 @@ impl PipelineProfiler {
             idle_ns: AtomicU64::new(0),
             #[cfg(feature = "sophon-profiling")]
             window_idle_ns: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             assembly_decompress_ns: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             assembly_decompress_count: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             assembly_write_ns: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             assembly_write_count: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             assembly_total_ns: AtomicU64::new(0),
+            #[cfg(feature = "sophon-profiling")]
             assembly_total_count: AtomicU64::new(0),
             #[cfg(feature = "sophon-profiling")]
             total_bytes_downloaded: AtomicU64::new(0),
