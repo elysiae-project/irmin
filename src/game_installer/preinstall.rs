@@ -1468,7 +1468,7 @@ pub async fn preinstall_download(
             }
         });
         let first_error =
-            first_stream_error(futures_util::stream::iter(futures).buffer_unordered(16)).await;
+            first_stream_error(futures_util::stream::iter(futures).buffer_unordered(super::verify_concurrency())).await;
         if let Some(err) = first_error {
             return Err(err);
         }
