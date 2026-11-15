@@ -1986,17 +1986,26 @@ async fn download_patch_chunk_inner(
         None
     };
     let mut total_len = 0u64;
+    // One cancellation waiter per chunk, not per frame: the biased select
+    // polls the data arm first, and the atomic `is_cancelled` check
+    // preserves cancellation priority without re-registering the waiter.
+    let mut cancel_waiter = std::pin::pin!(handle.cancelled_future());
 
     loop {
         let next_chunk = stream.next();
+        if handle.is_cancelled() {
+            progress.fetch_sub(total_len, Ordering::Relaxed);
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(SophonError::Cancelled);
+        }
         let result = tokio::select! {
             biased;
-            _ = handle.cancelled_future() => {
+            result = next_chunk => result,
+            _ = cancel_waiter.as_mut() => {
                 progress.fetch_sub(total_len, Ordering::Relaxed);
                 let _ = tokio::fs::remove_file(dest).await;
                 return Err(SophonError::Cancelled);
             }
-            result = next_chunk => result,
         };
 
         match result {
