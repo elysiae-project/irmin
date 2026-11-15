@@ -17,7 +17,7 @@ use fast_md5;
 use serde::{Deserialize, Serialize};
 
 use super::VERIFICATION_CACHE_FILE;
-use super::assembly_opt::{bytes_to_hex, hex_to_bytes, md5_bytes_eq};
+use super::assembly_opt::{bytes_to_hex, md5_bytes_eq};
 
 #[derive(Debug, Clone)]
 /// Cached proof that a file matched a manifest size and MD5 at a particular
@@ -72,10 +72,12 @@ impl<'de> Deserialize<'de> for VerificationEntry {
         // non-hex, or legacy raw-byte entries) maps to all zeros, which never
         // matches a real digest and forces a cache miss + re-hash.
         let mut md5 = [0u8; 16];
-        if let Some(bytes) = hex_to_bytes(&raw.md5)
-            && bytes.len() == 16
+        if let Some(len) = super::assembly_opt::hex_decode_into(&raw.md5, &mut md5)
+            && len == 16
         {
-            md5.copy_from_slice(&bytes);
+            // md5 is already filled by hex_decode_into
+        } else {
+            md5 = [0u8; 16];
         }
         Ok(VerificationEntry {
             size: raw.size,
