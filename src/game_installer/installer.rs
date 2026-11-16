@@ -3772,7 +3772,7 @@ pub async fn install(
         });
 
         futures_util::stream::iter(calc_futures)
-            .buffer_unordered(16)
+            .buffer_unordered(super::verify_concurrency())
             .for_each(|_| futures_util::future::ready(()))
             .await;
 
