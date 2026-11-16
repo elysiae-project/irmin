@@ -3643,7 +3643,6 @@ fn bench_eager_stream_input_chain(c: &mut Criterion) {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
             .open(&out_path)
             .expect("open output");
         out_file
