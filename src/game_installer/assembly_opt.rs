@@ -1110,6 +1110,151 @@ fn decompress_chunk_with_window(
 #[doc(hidden)]
 pub mod bench_internals {
     pub use super::decompress_chunk_optimized;
+
+    /// Per-phase timing breakdown for one chunk's decompress+verify cycle.
+    /// All fields are nanoseconds spent in that phase. Returned by
+    /// [`decompress_chunk_optimized_timed`].
+    #[cfg(feature = "bench-diagnostics")]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ChunkPhaseTimings {
+        /// File open + metadata + pread of compressed data.
+        pub read_ns: u64,
+        /// mmap of the output region.
+        pub mmap_ns: u64,
+        /// zstd DCtx take + reset + decompress.
+        pub decompress_ns: u64,
+        /// Chunk MD5 hash (when not deferred).
+        pub hash_ns: u64,
+        /// mmap flush + evict + munmap + compressed fadvise.
+        pub evict_ns: u64,
+        /// Total wall time of the call.
+        pub total_ns: u64,
+    }
+
+    /// Timed variant of [`decompress_chunk_optimized`] that reports per-phase
+    /// nanoseconds. Only the oneshot path is instrumented; the streaming
+    /// fallback returns zero timings (it is rarely hit in benchmarks).
+    #[cfg(feature = "bench-diagnostics")]
+    pub fn decompress_chunk_optimized_timed(
+        chunk_path: &std::path::Path,
+        out_file: &std::fs::File,
+        offset: u64,
+        expected_size: u64,
+        chunk_decompressed_hash_md5: &[u8],
+        compressed_size: Option<u64>,
+    ) -> super::SophonResult<(u64, ChunkPhaseTimings)> {
+        use std::time::Instant;
+
+        use std::os::unix::fs::FileExt;
+        use std::os::unix::io::AsRawFd;
+
+        let wall = Instant::now();
+        let mut timings = ChunkPhaseTimings::default();
+
+        if expected_size == 0 || expected_size > super::ONESHOT_MAX_SIZE as u64 {
+            let r = super::decompress_chunk_optimized(
+                chunk_path, out_file, offset, expected_size, None,
+                chunk_decompressed_hash_md5, false, compressed_size,
+            );
+            timings.total_ns = wall.elapsed().as_nanos() as u64;
+            return r.map(|b| (b, timings));
+        }
+
+        let expected_usize = expected_size as usize;
+
+        let t = Instant::now();
+        let f = std::fs::File::open(chunk_path)?;
+        let cs = match compressed_size {
+            Some(s) => s as usize,
+            None => f.metadata()?.len() as usize,
+        };
+        if cs == 0 {
+            return Err(super::SophonError::Io(std::io::Error::other("empty chunk")));
+        }
+        let mut compressed_buf = super::take_compressed_buf(cs);
+        let n = f.read_at(&mut compressed_buf[..cs], 0)?;
+        if n != cs {
+            super::return_compressed_buf(compressed_buf);
+            return Err(super::SophonError::Io(std::io::Error::other("short read")));
+        }
+        let compressed = &compressed_buf[..cs];
+        timings.read_ns = t.elapsed().as_nanos() as u64;
+
+        let t = Instant::now();
+        let mut out_mmap = super::mmap_read_write(out_file, offset, expected_usize)?;
+        if out_mmap.map_len >= 2 * 1024 * 1024 {
+            unsafe {
+                let ret = libc::madvise(
+                    out_mmap.map_base, out_mmap.map_len, libc::MADV_POPULATE_WRITE,
+                );
+                if ret != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EINVAL) {
+                        super::return_compressed_buf(compressed_buf);
+                        return Err(super::SophonError::Io(e));
+                    }
+                }
+            }
+        }
+        let output = out_mmap.as_mut_slice();
+        timings.mmap_ns = t.elapsed().as_nanos() as u64;
+
+        let t = Instant::now();
+        let result = (|| {
+            let mut ctx = super::take_dctx();
+            ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
+                .map_err(|_| super::SophonError::Io(std::io::Error::other("zstd DCtx reset")))?;
+            if super::chunk_hash_required(chunk_decompressed_hash_md5) {
+                let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+            }
+            let written = ctx
+                .decompress(output, compressed)
+                .map_err(|e| super::SophonError::Io(std::io::Error::other(e.to_string())))?;
+            super::return_dctx(ctx);
+            if written != expected_usize {
+                return Err(super::SophonError::SizeMismatch {
+                    item: chunk_path.display().to_string(),
+                    expected: expected_size,
+                    actual: written as u64,
+                });
+            }
+            Ok(written)
+        })();
+        timings.decompress_ns = t.elapsed().as_nanos() as u64;
+
+        let t = Instant::now();
+        if let Ok(written) = &result
+            && super::chunk_hash_required(chunk_decompressed_hash_md5)
+        {
+            let mut chunk_hasher = super::take_md5()?;
+            chunk_hasher.update(&output[..*written])?;
+            let digest = chunk_hasher.finish()?;
+            super::return_md5(chunk_hasher);
+            if !super::md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
+                super::return_compressed_buf(compressed_buf);
+                super::posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+                drop(f);
+                out_mmap.flush_and_evict();
+                return Err(super::SophonError::Md5Mismatch {
+                    item: chunk_path.display().to_string(),
+                    expected: super::bytes_to_hex(chunk_decompressed_hash_md5),
+                    actual: super::md5_to_hex(&digest),
+                });
+            }
+        }
+        timings.hash_ns = t.elapsed().as_nanos() as u64;
+
+        let t = Instant::now();
+        super::return_compressed_buf(compressed_buf);
+        super::posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        drop(f);
+        out_mmap.flush_and_evict();
+        drop(out_mmap);
+        timings.evict_ns = t.elapsed().as_nanos() as u64;
+
+        timings.total_ns = wall.elapsed().as_nanos() as u64;
+        result.map(|w| (w as u64, timings))
+    }
 }
 
 #[cfg(test)]
@@ -1387,5 +1532,94 @@ mod tests {
         return_md5(h2);
 
         assert_eq!(d1, d2, "pooled MD5 must reset after finish");
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[test]
+    #[ignore = "diagnostic assembly phase breakdown; run with --ignored"]
+    fn diagnose_assembly_phase_breakdown() {
+        use std::os::unix::fs::FileExt;
+
+        let chunk_mib = 1;
+        let num_chunks = 100;
+        let chunk_size = chunk_mib * 1024 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let chunks_dir = dir.path().join("chunks");
+        std::fs::create_dir_all(&chunks_dir).unwrap();
+        let out_path = dir.path().join("out.bin");
+
+        // Create compressed chunk fixtures.
+        let mut chunk_paths = Vec::with_capacity(num_chunks);
+        let mut hashes = Vec::with_capacity(num_chunks);
+        let mut total_decompressed = 0u64;
+        for i in 0..num_chunks {
+            let raw: Vec<u8> = (0..chunk_size)
+                .map(|j| ((j as u8).wrapping_mul(31)).wrapping_add(i as u8))
+                .collect();
+            let comp = zstd::encode_all(&raw[..], 3).unwrap();
+            let p = chunks_dir.join(format!("c{i}.zstd"));
+            let comp_size = comp.len() as u64;
+            std::fs::write(&p, &comp).unwrap();
+            let digest = fast_md5::digest(&raw);
+            chunk_paths.push((p, comp_size));
+            hashes.push(digest);
+            total_decompressed += chunk_size as u64;
+        }
+
+        // Create the output file preallocated to full size.
+        let out_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&out_path)
+            .unwrap();
+        out_file.set_len(total_decompressed).unwrap();
+
+        // Warmup: run once to fill TLS pools and warm caches.
+        for (i, (p, cs)) in chunk_paths.iter().enumerate() {
+            let offset = (i * chunk_size) as u64;
+            decompress_chunk_optimized(
+                p, &out_file, offset, chunk_size as u64, None,
+                &hashes[i], false, Some(*cs),
+            )
+            .unwrap();
+        }
+
+        // Measure: run all chunks and accumulate phase timings.
+        use bench_internals::decompress_chunk_optimized_timed;
+        let mut total_read = 0u64;
+        let mut total_mmap = 0u64;
+        let mut total_decompress = 0u64;
+        let mut total_hash = 0u64;
+        let mut total_evict = 0u64;
+        let mut total_wall = 0u64;
+
+        for (i, (p, cs)) in chunk_paths.iter().enumerate() {
+            let offset = (i * chunk_size) as u64;
+            let (_, t) = decompress_chunk_optimized_timed(
+                p, &out_file, offset, chunk_size as u64,
+                &hashes[i], Some(*cs),
+            )
+            .unwrap();
+            total_read += t.read_ns;
+            total_mmap += t.mmap_ns;
+            total_decompress += t.decompress_ns;
+            total_hash += t.hash_ns;
+            total_evict += t.evict_ns;
+            total_wall += t.total_ns;
+        }
+
+        let total_ms = total_wall as f64 / 1_000_000.0;
+        let pct = |ns: u64| ns as f64 / total_wall as f64 * 100.0;
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        println!("=== ASSEMBLY PHASE BREAKDOWN ({num_chunks}×{chunk_mib}MiB) ===");
+        println!("total:        {total_ms:.2} ms");
+        println!("read:         {:.2} ms ({:.0}%)", ms(total_read), pct(total_read));
+        println!("mmap:         {:.2} ms ({:.0}%)", ms(total_mmap), pct(total_mmap));
+        println!("decompress:   {:.2} ms ({:.0}%)", ms(total_decompress), pct(total_decompress));
+        println!("hash:         {:.2} ms ({:.0}%)", ms(total_hash), pct(total_hash));
+        println!("evict:        {:.2} ms ({:.0}%)", ms(total_evict), pct(total_evict));
     }
 }
