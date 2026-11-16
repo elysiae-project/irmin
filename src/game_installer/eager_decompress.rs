@@ -202,14 +202,14 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
     let output = out_mmap.as_mut_slice();
 
     let mut ctx = assembly_opt::take_dctx();
-    ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-        .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
+    // zstd DCtx parameters are sticky; set them explicitly instead of
+    // resetting. WindowLogMax is set to the tight window for this chunk;
+    // ForceIgnoreChecksum is set based on whether MD5 covers integrity.
     let window_log = assembly_opt::window_log_for_size(expected_decompressed_size);
-    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
-        .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx WindowLogMax")))?;
-    if need_decompressed_hash {
-        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
-    }
+    let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log));
+    let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(
+        need_decompressed_hash,
+    ));
 
     let written = ctx
         .decompress(output, compressed_data)
