@@ -922,6 +922,7 @@ enum CoverReader<'a> {
 }
 
 impl<'a> CoverHeaderIterator<'a> {
+    #[allow(clippy::uninit_vec)]
     pub(crate) fn new(
         cover_reader: &'a mut dyn Read,
         cover_size: i64,
@@ -939,7 +940,14 @@ impl<'a> CoverHeaderIterator<'a> {
             });
         }
         let reader = if cover_size < MAX_MEM_BUFFER_LEN {
-            let mut buffer = vec![0; cover_size as usize];
+            // Allocate without zeroing: read_exact fills every byte or
+            // returns an error that drops the buffer.
+            let mut buffer = Vec::with_capacity(cover_size as usize);
+            // SAFETY: read_exact fills all bytes or returns Err; on Err
+            // the uninitialized buffer is dropped without being read.
+            unsafe {
+                buffer.set_len(cover_size as usize);
+            }
             cover_reader.read_exact(&mut buffer).map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
