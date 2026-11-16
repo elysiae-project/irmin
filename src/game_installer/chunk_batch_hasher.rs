@@ -166,7 +166,7 @@ fn flush(
 
     // Stable group by exact length: equal-length jobs keep arrival order
     // within their group and the engine accelerates equal-length runs.
-    jobs.sort_by_key(|job| job.len);
+    jobs.sort_unstable_by_key(|job| job.len);
 
     let bytes = map.as_slice();
     let mut inputs: [&[u8]; QUEUE_CAP] = [&[]; QUEUE_CAP];
