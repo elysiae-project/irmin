@@ -786,7 +786,7 @@ impl HashPipeline {
         if let Some(md5) = md5 {
             // Bounded channel: backpressure stops the download loop if the
             // hash thread falls behind, bounding memory to a few frames.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(4);
             let join = std::thread::spawn(move || {
                 let mut md5 = md5;
                 for bytes in rx {
