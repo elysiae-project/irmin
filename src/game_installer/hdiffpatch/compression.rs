@@ -14,10 +14,18 @@ fn is_window_too_small_err(e: &std::io::Error) -> bool {
     msg.contains("out of bound") || msg.contains("too much memory for decoding")
 }
 
+#[allow(clippy::uninit_vec)]
 fn read_buffered_exact(mut reader: impl Read, length: u64) -> std::io::Result<Vec<u8>> {
     let length = usize::try_from(length)
         .map_err(|_| std::io::Error::other("buffered stream size does not fit memory"))?;
-    let mut output = vec![0; length];
+    // Allocate without zeroing: read_exact fills every byte or returns
+    // an error that drops the partially-initialized buffer.
+    let mut output = Vec::with_capacity(length);
+    // SAFETY: read_exact fills all bytes or returns Err; on Err the
+    // uninitialized buffer is dropped without being read.
+    unsafe {
+        output.set_len(length);
+    }
     reader.read_exact(&mut output)?;
     let mut probe = [0; 1];
     loop {
