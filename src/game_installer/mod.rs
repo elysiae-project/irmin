@@ -5,6 +5,7 @@ pub mod adaptive_download;
 mod api;
 /// Chunk validation, file assembly, and temporary-file cleanup.
 pub mod assembly;
+mod assembly_workers;
 /// Batched durability for assembled files (epoch flush + rename commit).
 pub mod assembly_epochs;
 #[cfg(feature = "benchmark")]
