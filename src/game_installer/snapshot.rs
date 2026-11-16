@@ -11,6 +11,7 @@ use super::installer::ChunkNameLookup;
 /// Over-allocates to the full slice length rather than counting first,
 /// trading a transient allocation for eliminating the counting pass's
 /// extra atomic loads.
+#[inline]
 pub fn snapshot_downloaded_chunks<'a>(
     downloaded_chunks: &[AtomicU32],
     chunk_names: &'a ChunkNameLookup,
