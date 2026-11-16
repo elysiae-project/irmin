@@ -6,6 +6,7 @@
 /// balance parallelism against per-worker overhead (DCtx pool, compressed
 /// buffer, MD5 pool per thread). Falls back to 1 when the CPU count is
 /// unavailable.
+#[inline]
 pub(super) fn assembly_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().min(8))
