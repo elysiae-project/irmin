@@ -426,6 +426,14 @@ fn stream_decompress_to_file_inner(
         }
     }
 
+    // Return the DCtx to the TLS pool now that the decoder has released its
+    // borrow. The pool accepts any window-log setting, so the
+    // MAX_WINDOW_LOG used by this streaming retry path does not disqualify
+    // the context for reuse by the next decompress.
+    if let Some(ctx) = ctx.0.take() {
+        assembly_opt::return_dctx(ctx);
+    }
+
     if bytes_written as u64 != expected_decompressed_size {
         return Err(SophonError::SizeMismatch {
             item: format!("stream chunk at offset {chunk_offset}"),
@@ -454,9 +462,10 @@ struct DctxGuard(Option<zstd::zstd_safe::DCtx<'static>>);
 impl Drop for DctxGuard {
     #[inline]
     fn drop(&mut self) {
-        // Drop the DCtx rather than returning it to the TLS pool: the
-        // retry path may have used MAX_WINDOW_LOG, retaining a window
-        // buffer too large for the pool.
+        // Fallback for early returns that skip the explicit pool return
+        // after the decoder block. The normal path takes the DCtx out
+        // and returns it to the TLS pool; this only runs on error paths
+        // where the decoder block was exited early.
         drop(self.0.take());
     }
 }
