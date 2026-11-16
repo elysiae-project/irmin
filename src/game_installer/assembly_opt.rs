@@ -636,6 +636,7 @@ pub(crate) fn sync_and_evict_range(fd: std::os::unix::io::RawFd, offset: u64, le
 
 /// Returns true when the chunk hash must be verified against the decompressed
 /// bytes. Accepts binary hash (16 bytes = MD5, 8 bytes = xxh64, 0 = none).
+#[inline]
 pub(crate) fn chunk_hash_required(chunk_decompressed_hash_md5: &[u8]) -> bool {
     !chunk_decompressed_hash_md5.is_empty()
         && chunk_decompressed_hash_md5 != &EMPTY_MD5_BYTES[..]
