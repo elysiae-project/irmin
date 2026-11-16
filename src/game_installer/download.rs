@@ -787,13 +787,16 @@ impl HashPipeline {
             // Bounded channel: backpressure stops the download loop if the
             // hash thread falls behind, bounding memory to a few frames.
             let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(4);
-            let join = std::thread::spawn(move || {
-                let mut md5 = md5;
-                for bytes in rx {
-                    md5.get_mut().update(&bytes)?;
-                }
-                Ok(Some(md5.finish()?))
-            });
+            let join = std::thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let mut md5 = md5;
+                    for bytes in rx {
+                        md5.get_mut().update(&bytes)?;
+                    }
+                    Ok(Some(md5.finish()?))
+                })
+                .expect("spawn hash thread");
             HashPipeline::Pipelined {
                 md5_sender: tx,
                 join,
