@@ -198,10 +198,50 @@ pub mod benchmark {
             &hash_bytes,
             dest,
             None,
+            #[cfg(feature = "bench-diagnostics")]
+            None,
         )
         .await?;
         writer.flush_and_evict_all().await.ok();
         Ok(())
+    }
+
+    /// Timed variant of [`download_and_verify_md5`] for benchmark diagnostics.
+    /// Returns the phase timings so benchmarks can decompose where time is spent.
+    #[cfg(feature = "bench-diagnostics")]
+    pub async fn download_and_verify_md5_timed(
+        client: &reqwest::Client,
+        url: &str,
+        dest: &Path,
+        expected_size: u64,
+        expected_md5: &str,
+    ) -> Result<super::DownloadPhaseTimings, super::SophonError> {
+        let resp = client.get(url).send().await?.error_for_status()?;
+        let file = super::create_preallocated_file(dest, expected_size).await?;
+        let mut writer = super::EvictingWriter::new(file);
+        let mut hasher = Some(super::PooledMd5::new(
+            super::super::assembly_opt::take_md5()?
+        ));
+        let mut xxh = None;
+        let hash_bytes = super::super::assembly_opt::hex_to_bytes(expected_md5)
+            .unwrap_or_default();
+        let mut timings = super::DownloadPhaseTimings::default();
+        super::stream_and_verify(
+            &mut writer,
+            resp,
+            &mut hasher,
+            &mut xxh,
+            expected_size,
+            0,
+            "bench",
+            &hash_bytes,
+            dest,
+            None,
+            Some(&mut timings),
+        )
+        .await?;
+        writer.flush_and_evict_all().await.ok();
+        Ok(timings)
     }
 }
 
@@ -1865,6 +1905,126 @@ mod tests {
         let mut h = xxhash_rust::xxh64::Xxh64::new(0);
         h.update(&data);
         assert_eq!(value, h.digest());
+    }
+
+    #[cfg(feature = "bench-diagnostics")]
+    #[tokio::test]
+    #[ignore = "diagnostic download phase breakdown; run with --ignored"]
+    async fn diagnose_download_phase_breakdown() {
+        use bytes::Bytes;
+        use futures_util::{StreamExt, stream};
+        use http_body_util::StreamBody;
+        use hyper::body::{Frame, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use std::net::TcpListener as StdTcpListener;
+
+        let total_bytes: usize = 16 * 1024 * 1024;
+        let pattern = Bytes::from(
+            (0..64 * 1024)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                .collect::<Vec<_>>(),
+        );
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_pattern = pattern.clone();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                address_tx.send(listener.local_addr().unwrap()).unwrap();
+                let mut shutdown = Box::pin(shutdown_rx);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown => break,
+                        accepted = listener.accept() => {
+                            let (socket, _) = accepted.unwrap();
+                            let p = server_pattern.clone();
+                            let service = service_fn(move |_req: Request<Incoming>| {
+                                let p = p.clone();
+                                async move {
+                                    let size = total_bytes;
+                                    let full = size / p.len();
+                                    let rem = size % p.len();
+                                    let rp = p.clone();
+                                    let body = stream::repeat_with(move || rp.clone())
+                                        .take(full)
+                                        .chain(stream::iter((rem > 0).then(|| p.slice(..rem))))
+                                        .map(|b| Ok::<_, Infallible>(Frame::data(b)));
+                                    let mut resp = Response::new(StreamBody::new(body));
+                                    resp.headers_mut().insert(
+                                        hyper::header::CONTENT_LENGTH,
+                                        size.to_string().parse().unwrap(),
+                                    );
+                                    Ok::<_, Infallible>(resp)
+                                }
+                            });
+                            let _ = http1::Builder::new()
+                                .serve_connection(TokioIo::new(socket), service)
+                                .await;
+                        }
+                    }
+                }
+            });
+        });
+        let address = address_rx.recv().unwrap();
+
+        let client = crate::DownloadClient::new().0;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload");
+
+        // Compute the expected MD5 of the repeated pattern.
+        let mut expected_hasher = fast_md5::Md5::new();
+        for offset in (0..total_bytes).step_by(pattern.len()) {
+            let count = pattern.len().min(total_bytes - offset);
+            expected_hasher.update(&pattern[..count]);
+        }
+        let expected_md5_hex = crate::game_installer::assembly_opt::md5_to_hex(&expected_hasher.finalize());
+
+        // warmup
+        super::benchmark::download_and_verify_md5_timed(
+            &client,
+            &format!("http://{address}/payload"),
+            &dest,
+            total_bytes as u64,
+            &expected_md5_hex,
+        )
+        .await
+        .ok();
+
+        let timings = super::benchmark::download_and_verify_md5_timed(
+            &client,
+            &format!("http://{address}/payload"),
+            &dest,
+            total_bytes as u64,
+            &expected_md5_hex,
+        )
+        .await
+        .unwrap();
+
+        let total_ms = timings.total.as_secs_f64() * 1000.0;
+        let pct = |d: std::time::Duration| d.as_secs_f64() / timings.total.as_secs_f64() * 100.0;
+        println!("=== DOWNLOAD PHASE BREAKDOWN (16MiB) ===");
+        println!("total:              {:.2} ms", total_ms);
+        println!("stream_wait:        {:.2} ms ({:.0}%)", timings.stream_wait.as_secs_f64() * 1000.0, pct(timings.stream_wait));
+        println!("write:              {:.2} ms ({:.0}%)", timings.write.as_secs_f64() * 1000.0, pct(timings.write));
+        println!("hash:               {:.2} ms ({:.0}%)", timings.hash.as_secs_f64() * 1000.0, pct(timings.hash));
+        println!("final_flush_evict:  {:.2} ms ({:.0}%)", timings.final_flush_and_evict.as_secs_f64() * 1000.0, pct(timings.final_flush_and_evict));
+        println!("stream_chunks:      {}", timings.stream_chunks);
+        println!("bytes:              {}", timings.bytes);
+        println!("chunk_size_buckets: {:?}", timings.chunk_size_buckets);
+
+        let _ = shutdown_tx.send(());
+        server.join().unwrap();
     }
 
 }
