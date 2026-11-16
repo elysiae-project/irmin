@@ -334,16 +334,16 @@ fn stream_decompress_to_file_inner(
     let mut reader = reader;
 
     let mut ctx = assembly_opt::take_dctx();
-    ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-        .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx reset")))?;
-    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+    // zstd DCtx parameters are sticky; set them explicitly instead of
+    // resetting. ForceIgnoreChecksum is set unconditionally (both true
+    // and false) to avoid stale values from prior pooled use.
+    let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
         assembly_opt::MAX_WINDOW_LOG,
-    ))
-    .map_err(|_| SophonError::Io(io::Error::other("zstd DCtx WindowLogMax")))?;
+    ));
     let need_decompressed_hash = chunk_hash_required(decompressed_hash);
-    if need_decompressed_hash {
-        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
-    }
+    let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(
+        need_decompressed_hash,
+    ));
 
     let decompressed_hasher = if need_decompressed_hash {
         Some(take_md5()?)
