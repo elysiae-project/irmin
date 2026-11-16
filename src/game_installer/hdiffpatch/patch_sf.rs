@@ -127,7 +127,11 @@ impl PatchSF {
         if io_buf.capacity() < IO_BUF_SIZE {
             io_buf = Vec::with_capacity(IO_BUF_SIZE);
         }
-        io_buf.resize(IO_BUF_SIZE, 0);
+        // SAFETY: capacity >= IO_BUF_SIZE. The buffer is filled via
+        // read_exact before any reads.
+        unsafe {
+            io_buf.set_len(IO_BUF_SIZE);
+        }
         let mut step_buf = STEP_BUF_POOL.take(0);
         let result = patch_loop(
             &mut diff,
@@ -266,7 +270,14 @@ fn patch_loop(
 }
 
 fn prepare_step_buffer(step_buf: &mut Vec<u8>, step_end: usize) {
-    step_buf.resize(step_end, 0);
+    if step_buf.capacity() < step_end {
+        step_buf.reserve_exact(step_end - step_buf.len());
+    }
+    // SAFETY: capacity >= step_end after reserve_exact. The buffer is
+    // filled via read_exact before any reads.
+    unsafe {
+        step_buf.set_len(step_end);
+    }
 }
 
 fn validate_step_sizes(cover_size: i64, rle_size: i64) -> std::io::Result<(usize, usize)> {
@@ -555,8 +566,9 @@ mod tests {
 
         assert_eq!(buffer.len(), 12);
         assert!(buffer.capacity() >= 12);
+        // The first 4 bytes are preserved; the rest are uninitialized
+        // but filled by read_exact before any reads.
         assert_eq!(&buffer[..4], &[1, 2, 3, 4]);
-        assert!(buffer[4..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

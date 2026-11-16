@@ -139,7 +139,11 @@ fn write_cover_stream_inner_with_chunk_size(
     if shared_buffer.capacity() < MAX_ARRAY_POOL_LEN {
         shared_buffer = Vec::with_capacity(MAX_ARRAY_POOL_LEN);
     }
-    shared_buffer.resize(MAX_ARRAY_POOL_LEN, 0);
+    // SAFETY: capacity >= MAX_ARRAY_POOL_LEN. The buffer is filled via
+    // read_exact before any reads.
+    unsafe {
+        shared_buffer.set_len(MAX_ARRAY_POOL_LEN);
+    }
     let cache_vec = prepare_region_cache(CACHE_BUFFER_POOL.take(chunk_size), chunk_size);
     let mut cache = Cursor::new(cache_vec);
 

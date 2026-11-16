@@ -126,9 +126,15 @@ impl HashReadBuffer {
             .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
             .unwrap_or_default();
         if buffer.len() < capacity {
-            // `resize` grows amortized and can overshoot the retention cap.
+            // `reserve_exact` grows to exact capacity without amortized
+            // overshoot, then set_len skips the zero-fill since read
+            // fills the buffer before any bytes are read.
             buffer.reserve_exact(capacity - buffer.len());
-            buffer.resize(capacity, 0);
+            // SAFETY: capacity is guaranteed by reserve_exact. The
+            // buffer is filled via file.read before any reads.
+            unsafe {
+                buffer.set_len(capacity);
+            }
         }
         Self {
             buffer,
@@ -719,7 +725,14 @@ pub fn write_chunk_from_mmap(
     };
     let mut buf = OPT_BUFFER.with(|cell| {
         let mut buf = cell.take();
-        buf.resize(ASSEMBLY_BUFFER_SIZE, 0);
+        if buf.capacity() < ASSEMBLY_BUFFER_SIZE {
+            buf.reserve(ASSEMBLY_BUFFER_SIZE);
+        }
+        // SAFETY: capacity >= ASSEMBLY_BUFFER_SIZE after reserve.
+        // The buffer is filled via read_at before any reads.
+        unsafe {
+            buf.set_len(ASSEMBLY_BUFFER_SIZE);
+        }
         buf
     });
 
