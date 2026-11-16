@@ -579,6 +579,7 @@ thread_local! {
 
 /// Takes the compressed-chunk buffer, growing it if needed. Caller must
 /// return it via [`return_compressed_buf`] when done.
+#[allow(clippy::uninit_vec)]
 #[inline]
 pub(super) fn take_compressed_buf(len: usize) -> Vec<u8> {
     COMPRESSED_BUF.with(|cell| {
@@ -586,7 +587,17 @@ pub(super) fn take_compressed_buf(len: usize) -> Vec<u8> {
             *cell.borrow_mut() = Vec::new();
         }
         let mut buf = std::mem::take(&mut *cell.borrow_mut());
-        buf.resize(len, 0);
+        // Reserve without zeroing: the caller fills the buffer via pread
+        // before reading any bytes, so the uninitialized tail is never
+        // observed. On error, the buffer is returned to the pool.
+        if buf.capacity() < len {
+            buf.reserve(len);
+        }
+        // SAFETY: capacity is >= len after reserve. The bytes are
+        // uninitialized but the caller writes before reading.
+        unsafe {
+            buf.set_len(len);
+        }
         buf
     })
 }
