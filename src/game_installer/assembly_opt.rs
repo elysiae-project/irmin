@@ -137,10 +137,12 @@ impl HashReadBuffer {
         }
     }
 
+    #[inline]
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buffer[..self.read_len]
     }
 
+    #[inline]
     pub(crate) fn filled(&self, len: usize) -> &[u8] {
         &self.buffer[..len]
     }
