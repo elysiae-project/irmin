@@ -626,7 +626,14 @@ fn assemble_file_inner(
 
     let mut transfer_buffer = TRANSFER_BUF.with(|cell| {
         let mut buf = cell.take();
-        buf.resize(FILE_WRITE_BUFFER_SIZE, 0);
+        if buf.capacity() < FILE_WRITE_BUFFER_SIZE {
+            buf.reserve(FILE_WRITE_BUFFER_SIZE);
+        }
+        // SAFETY: capacity >= FILE_WRITE_BUFFER_SIZE after reserve.
+        // The buffer is filled via read_at/read_exact_at before any reads.
+        unsafe {
+            buf.set_len(FILE_WRITE_BUFFER_SIZE);
+        }
         buf
     });
     let mut guard = DecrementGuard {
@@ -885,7 +892,15 @@ fn assemble_file_inner(
                 s.spawn(move || {
                     let mut transfer_buf = TRANSFER_BUF.with(|cell| {
                         let mut buf = cell.take();
-                        buf.resize(FILE_WRITE_BUFFER_SIZE, 0);
+                        if buf.capacity() < FILE_WRITE_BUFFER_SIZE {
+                            buf.reserve(FILE_WRITE_BUFFER_SIZE);
+                        }
+                        // SAFETY: capacity >= FILE_WRITE_BUFFER_SIZE after
+                        // reserve. The buffer is filled via read_at before
+                        // any reads.
+                        unsafe {
+                            buf.set_len(FILE_WRITE_BUFFER_SIZE);
+                        }
                         buf
                     });
                     let mut chunk_path = cdir.to_path_buf();
