@@ -1346,6 +1346,7 @@ impl Md5Guard {
 }
 
 impl Drop for Md5Guard {
+    #[inline]
     fn drop(&mut self) {
         if let Some(ch) = self.0.take() {
             return_md5(ch);
