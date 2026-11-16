@@ -1023,6 +1023,17 @@ async fn stream_and_verify(
         });
     }
 
+    // Flush and evict the file first, overlapping the fdatasync I/O with
+    // the hash pipeline's final computation. The flush and hash are
+    // independent: the flush writes data to disk, the hash verifies it.
+    #[cfg(feature = "bench-diagnostics")]
+    let final_flush_started = std::time::Instant::now();
+    let _ = file.flush_and_evict_all().await;
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.final_flush_and_evict += final_flush_started.elapsed();
+    }
+
     // Finalize the hash pipeline: drop the sender to signal the hash thread
     // that no more frames are coming, wait for the digest, and verify.
     let (md5_digest, xxh64_digest) = pipeline.finish().map_err(SophonError::Io)?;
@@ -1066,13 +1077,6 @@ async fn stream_and_verify(
         );
     }
 
-    #[cfg(feature = "bench-diagnostics")]
-    let final_flush_started = std::time::Instant::now();
-    file.flush_and_evict_all().await.ok();
-    #[cfg(feature = "bench-diagnostics")]
-    if let Some(timings) = timings.as_deref_mut() {
-        timings.final_flush_and_evict += final_flush_started.elapsed();
-    }
     // Hashers were moved into the pipeline at the start and consumed by
     // finish(): the MD5 hasher is finalized inside the hash thread (or
     // inline for the Sync path) and the PooledMd5 drops there, returning
