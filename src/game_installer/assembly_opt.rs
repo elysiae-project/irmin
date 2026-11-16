@@ -414,6 +414,7 @@ impl MmapGuard {
         }
     }
 
+    #[inline]
     pub(crate) fn evict_prefix(&self, start: usize, end: usize) -> usize {
         let page = page_size();
         let aligned_start = start.min(self.len).div_ceil(page) * page;
