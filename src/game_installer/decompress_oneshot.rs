@@ -77,8 +77,13 @@ pub(crate) fn decompress_chunk_oneshot(
     let result = (|| {
         let mut ctx = take_dctx();
         // zstd DCtx parameters are sticky across decompress calls, so a
-        // pooled DCtx only needs the checksum parameter toggled, not a
-        // full session+parameter reset after every completed frame.
+        // pooled DCtx only needs parameters toggled, not a full
+        // session+parameter reset after every completed frame. Set the
+        // window large enough for any chunk: a prior hdiffpatch clip on
+        // the same thread may have left a smaller WindowLogMax sticky.
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+            super::assembly_opt::MAX_WINDOW_LOG,
+        ));
         // Only skip frame checksum when MD5 verification covers integrity:
         // in-worker, file-level, or deferred to the per-file batch hasher.
         let skip_checksum = chunk_hash_required(chunk_decompressed_hash_md5)

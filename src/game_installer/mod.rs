@@ -36,6 +36,7 @@ pub mod eager_decompress;
 mod error;
 mod game_filters;
 mod handle;
+mod snapshot;
 #[cfg(feature = "benchmark")]
 pub mod hdiffpatch;
 #[cfg(not(feature = "benchmark"))]

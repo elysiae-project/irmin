@@ -43,8 +43,7 @@ use crate::proto_parse::SophonManifestAssetChunk;
 /// name for binary search.
 pub struct ChunkNameLookup {
     manifest: Arc<CompactManifest>,
-    /// (start offset, length) of each chunk name within the manifest arena data
-    name_locs: Box<[(u32, u32)]>,
+    pub(super) name_locs: Box<[(u32, u32)]>,
     /// dense indices ordered by name for binary search
     sorted: Box<[u32]>,
 }
@@ -1479,25 +1478,7 @@ fn save_assembly_state_if_due(ctx: &Arc<InstallContext>) {
 
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 #[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
-pub fn snapshot_downloaded_chunks<'a>(
-    downloaded_chunks: &[AtomicU32],
-    chunk_names: &'a ChunkNameLookup,
-) -> Vec<(&'a str, u64)> {
-    debug_assert_eq!(downloaded_chunks.len(), chunk_names.name_locs.len());
-    let completed_count = downloaded_chunks
-        .iter()
-        .filter(|value| value.load(Ordering::Relaxed) > 0)
-        .count();
-    // Concurrent updates can change the snapshot between passes; capacity is a hint.
-    let mut entries = Vec::with_capacity(completed_count);
-    for (i, value) in downloaded_chunks.iter().enumerate() {
-        let value = value.load(Ordering::Relaxed);
-        if value > 0 {
-            entries.push((chunk_names.get(i), value as u64));
-        }
-    }
-    entries
-}
+pub use super::snapshot::snapshot_downloaded_chunks;
 
 // Large function; keeping it out-of-line preserves hot-path code layout.
 #[inline(never)]
