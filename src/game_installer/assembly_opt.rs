@@ -394,18 +394,17 @@ impl MmapGuard {
     }
 
     pub(crate) fn flush_and_evict(&mut self) {
-        // Queues writeback of dirty pages without waiting for completion
-        // (no WAIT_AFTER). MADV_DONTNEED evicts clean pages immediately;
-        // dirty pages stay until writeback completes, then the kernel
-        // reclaims them.
-        // Only valid for guards from `mmap_read_write` (fd != -1).
+        // Queue writeback without waiting (no WAIT_BEFORE). The DONTNEED
+        // on still-dirty pages is a no-op — those pages stay until the
+        // kernel finishes writeback and reclaims them, or until the
+        // batch hasher's separate mapping reads and evicts them.
         debug_assert_ne!(self.fd, -1, "flush_and_evict requires a write mmap");
         unsafe {
             libc::sync_file_range(
                 self.fd,
                 self.file_offset as libc::off64_t,
                 self.len as libc::off64_t,
-                libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
+                libc::SYNC_FILE_RANGE_WRITE,
             );
         }
         unsafe {
