@@ -904,16 +904,16 @@ fn decompress_chunk_with_window(
 
     let (bytes_written, mut chunk_hasher) = {
         let mut ctx = take_dctx();
-        ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-            .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx reset")))?;
-        ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log))
-            .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax")))?;
-        if chunk_hash_required(chunk_decompressed_hash_md5)
+        // zstd DCtx parameters are sticky; set them explicitly instead of
+        // resetting. ForceIgnoreChecksum is set unconditionally to avoid
+        // stale values from prior pooled use.
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(window_log));
+        let skip_checksum = chunk_hash_required(chunk_decompressed_hash_md5)
             || file_hasher.is_some()
-            || deferred_to_batch_hasher
-        {
-            let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
-        }
+            || deferred_to_batch_hasher;
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(
+            skip_checksum,
+        ));
 
         let (bytes, chunk_hasher) = {
             let buf_reader = BufReader::with_capacity(FILE_WRITE_BUFFER_SIZE, f);

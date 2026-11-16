@@ -98,10 +98,11 @@ pub(crate) fn get_clip_stream(
                 let mut ctx = take_dctx();
 
                 let first_result = {
-                    ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-                        .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
-                    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(tight_log))
-                        .map_err(|_| std::io::Error::other("zstd DCtx WindowLogMax"))?;
+                    // zstd DCtx parameters are sticky; set them explicitly
+                    // instead of resetting. ForceIgnoreChecksum(true) skips
+                    // the zstd frame checksum — hdiffpatch data is trusted.
+                    let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(tight_log));
+                    let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
                     let mut decoder = zstd::stream::read::Decoder::with_context(
                         std::io::BufReader::with_capacity(256 * 1024, limited),
                         &mut ctx,
@@ -112,12 +113,14 @@ pub(crate) fn get_clip_stream(
                 let out = match first_result {
                     Ok(output) => output,
                     Err(error) if is_window_too_small_err(&error) => {
-                        ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-                            .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
-                        ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                        // Reset session state from the failed first attempt
+                        // so the retry decoder starts fresh. SessionOnly
+                        // keeps sticky parameters; WindowLogMax is overridden
+                        // below.
+                        let _ = ctx.reset(zstd::zstd_safe::ResetDirective::SessionOnly);
+                        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
                             MAX_WINDOW_LOG,
-                        ))
-                        .map_err(|_| std::io::Error::other("zstd DCtx WindowLogMax"))?;
+                        ));
                         retry_file.seek(SeekFrom::Start(start))?;
                         let retry_limited = LimitedFile {
                             file: retry_file,
@@ -214,10 +217,11 @@ struct PooledZstdDecoder {
 impl PooledZstdDecoder {
     fn new_boxed(limited: LimitedFile) -> std::io::Result<Box<Self>> {
         let mut ctx = take_dctx();
-        ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-            .map_err(|_| std::io::Error::other("zstd DCtx reset"))?;
-        ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(MAX_WINDOW_LOG))
-            .map_err(|_| std::io::Error::other("zstd DCtx WindowLogMax"))?;
+        // zstd DCtx parameters are sticky; set them explicitly instead of
+        // resetting. ForceIgnoreChecksum(true) skips the zstd frame
+        // checksum — hdiffpatch data is trusted.
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(MAX_WINDOW_LOG));
+        let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
 
         let buf_reader = std::io::BufReader::with_capacity(256 * 1024, limited);
 
