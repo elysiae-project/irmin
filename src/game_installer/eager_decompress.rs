@@ -189,7 +189,7 @@ fn eager_decompress_chunk_inner<const PREFAULT: bool>(
     let mut out_mmap = assembly_opt::mmap_read_write(out_file, chunk_offset, expected_usize)
         .map_err(SophonError::Io)?;
 
-    if PREFAULT {
+    if PREFAULT && out_mmap.map_len >= 2 * 1024 * 1024 {
         unsafe {
             libc::madvise(
                 out_mmap.map_base,
