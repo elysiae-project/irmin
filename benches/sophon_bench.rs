@@ -4448,7 +4448,6 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .read(true)
                 .write(true)
                 .create(true)
-                .truncate(true)
                 .open(&out_path)
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
@@ -4470,7 +4469,6 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .read(true)
                 .write(true)
                 .create(true)
-                .truncate(true)
                 .open(&out_path)
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
