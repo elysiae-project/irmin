@@ -769,8 +769,16 @@ fn assemble_file_inner(
                 let tmp_path = &tmp_path;
                 let err_slot = &first_error;
                 let err_flag = &has_error;
+                let files = all_files;
                 s.spawn(move || {
-                    chunk_batch_hasher::run(tmp_path, file_size, rx, err_slot, err_flag);
+                    chunk_batch_hasher::run(
+                        tmp_path,
+                        file_size,
+                        rx,
+                        err_slot,
+                        err_flag,
+                        |ci| files.chunk_name_at(ci as usize).to_string(),
+                    );
                 });
             }
             if parallel_hashed_file {
@@ -960,7 +968,7 @@ fn assemble_file_inner(
                                     .try_into()
                                     .expect("defer_eligible implies 16 bytes");
                                 HashJob {
-                                    name: chunk_path.display().to_string(),
+                                    chunk_idx: ci as u32,
                                     offset,
                                     len: chunk_size_decompressed,
                                     expected,

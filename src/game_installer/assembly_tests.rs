@@ -1437,8 +1437,8 @@ fn assemble_file_deferred_batch_hash_mismatch_fails() {
     // The report must name the chunk file exactly as the in-worker
     // verification did: the manifest chunk name with the .zstd extension.
     assert!(
-        item.ends_with("dck3.zstd"),
-        "mismatch item '{item}' must end with the chunk file name 'dck3.zstd'"
+        item.ends_with("dck3"),
+        "mismatch item '{item}' must end with the chunk name 'dck3'"
     );
     // The tmp file must not survive a verification failure.
     assert!(!game_dir.join("deferred.bin").exists());

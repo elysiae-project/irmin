@@ -53,9 +53,8 @@ pub(crate) const QUEUE_CAP: usize = 16;
 /// One deferred chunk verification: the decompressed bytes live at
 /// `offset..offset+len` of the output file and must match `expected`.
 pub(crate) struct HashJob {
-    /// Chunk path (with `.zstd` extension), matching the in-worker
-    /// mismatch report.
-    pub(crate) name: String,
+    /// Chunk index in the manifest, used to resolve the chunk name on error.
+    pub(crate) chunk_idx: u32,
     pub(crate) offset: u64,
     pub(crate) len: u64,
     pub(crate) expected: [u8; 16],
@@ -73,13 +72,16 @@ pub(crate) fn defer_eligible(chunk_decompressed_hash_md5: &[u8]) -> bool {
 /// Hasher thread body. Spawn inside the workers' scope; `receiver`
 /// disconnects when every producer (each worker's cloned sender, dropped
 /// at worker exit) has closed, which drains and flushes the final batch.
-pub(crate) fn run(
+pub(crate) fn run<F>(
     output_path: &Path,
     file_len: u64,
     receiver: Receiver<HashJob>,
     first_error: &Mutex<Option<SophonError>>,
     has_error: &AtomicBool,
-) {
+    name_fn: F,
+) where
+    F: Fn(u32) -> String + Send,
+{
     let file = match File::open(output_path) {
         Ok(f) => f,
         Err(e) => {
@@ -101,7 +103,7 @@ pub(crate) fn run(
                 has_error,
                 SophonError::Io(std::io::Error::other(format!(
                     "chunk {} range outside zero-length output file; manifest inconsistent",
-                    job.name
+                    name_fn(job.chunk_idx)
                 ))),
             );
         }
@@ -132,30 +134,33 @@ pub(crate) fn run(
                 Ok(job) => pending.push(job),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    flush(&map, fd, &engine, &mut pending, first_error, has_error);
+                    flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
                     return;
                 }
             }
             if pending.len() >= QUEUE_CAP {
-                flush(&map, fd, &engine, &mut pending, first_error, has_error);
+                flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
             }
         }
-        flush(&map, fd, &engine, &mut pending, first_error, has_error);
+        flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
     }
-    flush(&map, fd, &engine, &mut pending, first_error, has_error);
+    flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
 }
 
 /// Verify one batch of jobs through the SIMD engine, then release each
 /// verified range's page-cache residency. After an abort is flagged, jobs
 /// drain without further work: the output file is discarded anyway.
-fn flush(
+fn flush<F>(
     map: &assembly_opt::MmapGuard,
     fd: std::os::unix::io::RawFd,
     engine: &Md5Engine,
     jobs: &mut Vec<HashJob>,
     first_error: &Mutex<Option<SophonError>>,
     has_error: &AtomicBool,
-) {
+    name_fn: &F,
+) where
+    F: Fn(u32) -> String + Send,
+{
     if jobs.is_empty() {
         return;
     }
@@ -189,7 +194,7 @@ fn flush(
                 has_error,
                 SophonError::Io(std::io::Error::other(format!(
                     "chunk {} range outside output file; manifest inconsistent",
-                    job.name
+                    name_fn(job.chunk_idx)
                 ))),
             );
         }
@@ -204,7 +209,7 @@ fn flush(
                     first_error,
                     has_error,
                     SophonError::Md5Mismatch {
-                        item: job.name.clone(),
+                        item: name_fn(job.chunk_idx),
                         expected: assembly_opt::bytes_to_hex(&job.expected),
                         actual: assembly_opt::md5_to_hex(&digests[slot]),
                     },
@@ -289,6 +294,16 @@ mod tests {
         jobs: impl FnOnce(std::sync::mpsc::SyncSender<HashJob>),
         pre_flagged: bool,
     ) -> Option<SophonError> {
+        drive_with_name(path, file_len, jobs, pre_flagged, |_| String::new())
+    }
+
+    fn drive_with_name(
+        path: &Path,
+        file_len: u64,
+        jobs: impl FnOnce(std::sync::mpsc::SyncSender<HashJob>),
+        pre_flagged: bool,
+        name_fn: impl Fn(u32) -> String + Send,
+    ) -> Option<SophonError> {
         let (tx, rx) = sync_channel(QUEUE_CAP);
         let first_error = Mutex::new(None);
         let has_error = AtomicBool::new(pre_flagged);
@@ -297,7 +312,7 @@ mod tests {
                 let path = path.to_path_buf();
                 let slot = &first_error;
                 let flag = &has_error;
-                move || run(&path, file_len, rx, slot, flag)
+                move || run(&path, file_len, rx, slot, flag, name_fn)
             });
             // The original sender drops here at scope-body end…
             jobs(tx);
@@ -325,7 +340,7 @@ mod tests {
             let mut offset = 0u64;
             for (i, &len) in lens.iter().enumerate() {
                 tx.send(HashJob {
-                    name: format!("chunk_{i}.zstd"),
+                    chunk_idx: i as u32,
                     offset,
                     len: len as u64,
                     expected: expected[i],
@@ -344,15 +359,15 @@ mod tests {
         let bytes = fake_bytes(7, 3 * 4096);
         let (path, _dir) = temp_file(&bytes);
 
-        let err = drive(&path, bytes.len() as u64, |tx| {
+        let err = drive_with_name(&path, bytes.len() as u64, |tx| {
             tx.send(HashJob {
-                name: "evil.zstd".into(),
+                chunk_idx: 0,
                 offset: 0,
                 len: bytes.len() as u64,
                 expected: [0x42; 16],
             })
             .unwrap();
-        }, false);
+        }, false, |_| "evil.zstd".to_string());
         match err {
             Some(SophonError::Md5Mismatch { item, .. }) => assert_eq!(item, "evil.zstd"),
             other => panic!("expected Md5Mismatch, got {other:?}"),
@@ -377,7 +392,7 @@ mod tests {
             let mut offset = 0u64;
             for (i, &len) in lens.iter().enumerate() {
                 tx.send(HashJob {
-                    name: format!("c{i}.zstd"),
+                    chunk_idx: i as u32,
                     offset,
                     len: len as u64,
                     expected: expected[i],
@@ -396,17 +411,17 @@ mod tests {
         let bytes = fake_bytes(3, 8192);
         let (path, _dir) = temp_file(&bytes);
 
-        let err = drive(&path, 8192, |tx| {
+        let err = drive_with_name(&path, 8192, |tx| {
             for i in 0..QUEUE_CAP + 4 {
                 tx.send(HashJob {
-                    name: format!("bad{i}.zstd"),
+                    chunk_idx: i as u32,
                     offset: 0,
                     len: 8192,
                     expected: [i as u8; 16],
                 })
                 .unwrap();
             }
-        }, false);
+        }, false, |ci| format!("bad{ci}.zstd"));
         let SophonError::Md5Mismatch { item, .. } = err.unwrap() else {
             panic!("expected Md5Mismatch")
         };
@@ -422,7 +437,7 @@ mod tests {
 
         let err = drive(&path, 4096, |tx| {
             tx.send(HashJob {
-                name: "oob.zstd".into(),
+                chunk_idx: 0,
                 offset: 4096,
                 len: 4096,
                 expected: [0; 16],
@@ -459,7 +474,7 @@ mod tests {
         let err = drive(&path, content.len() as u64, |tx| {
             for (i, e) in expected.iter().enumerate() {
                 tx.send(HashJob {
-                    name: format!("m{i}.zstd"),
+                    chunk_idx: i as u32,
                     offset: (i * per) as u64,
                     len: per as u64,
                     expected: *e,
@@ -489,11 +504,11 @@ mod tests {
                 let path = path.clone();
                 let slot = &first_error;
                 let flag = &has_error;
-                move || run(&path, 2048, rx, slot, flag)
+                move || run(&path, 2048, rx, slot, flag, |_| String::new())
             });
             for i in 0..6 {
                 tx.send(HashJob {
-                    name: format!("d{i}.zstd"),
+                    chunk_idx: i as u32,
                     offset: 0,
                     len: 2048,
                     expected: [9; 16],
@@ -534,13 +549,13 @@ mod tests {
                 let path = path.clone();
                 let slot = &first_error;
                 let flag = &has_error;
-                move || run(&path, (per * 2) as u64, rx, slot, flag)
+                move || run(&path, (per * 2) as u64, rx, slot, flag, |_| String::new())
             });
             // Concurrent "worker" write and submit.
             let tail = fake_bytes(99, per);
             f.write_all_at(&tail, per as u64).unwrap();
             tx.send(HashJob {
-                name: "tail.zstd".into(),
+                chunk_idx: 0,
                 offset: per as u64,
                 len: per as u64,
                 expected: scalar_md5(&tail),
