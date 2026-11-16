@@ -15,6 +15,15 @@ thread_local! {
     static TRANSFER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Release the thread-local transfer buffer, called by
+/// [`super::reclaim_memory`] on pause or cancel.
+pub(crate) fn trim_transfer_buffer() {
+    TRANSFER_BUF.with(|cell| {
+        cell.borrow_mut().clear();
+        cell.borrow_mut().shrink_to_fit();
+    });
+}
+
 use super::assembly_opt::{Md5, bytes_to_hex, md5_bytes_eq, md5_to_hex, return_md5, take_md5};
 use super::cache::{VerificationEntry, file_md5_digest_with_known_size};
 use super::chunk_batch_hasher::{self, HashJob, QUEUE_CAP};

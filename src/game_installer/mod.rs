@@ -289,6 +289,7 @@ pub fn reclaim_memory() {
     }
     hdiffpatch::trim_idle_buffers();
     assembly_opt::trim_thread_local_buffers();
+    assembly::trim_transfer_buffer();
     // Return freed glibc arena memory to the OS. Without this, freed
     // allocations stay in per-thread arenas and never get unmapped.
     unsafe {
