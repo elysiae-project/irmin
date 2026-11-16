@@ -10,7 +10,7 @@ use dashmap::DashMap;
 pub use dashmap::DashMap as VerificationCache;
 
 pub(crate) const VERIFICATION_CACHE_MAX_ENTRIES: usize = 5_000;
-const MD5_READ_BUFFER_SIZE: usize = 256 * 1024;
+const MD5_READ_BUFFER_SIZE: usize = 512 * 1024;
 
 #[cfg(test)]
 use fast_md5;
