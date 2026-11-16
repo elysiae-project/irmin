@@ -751,6 +751,117 @@ pub async fn benchmark_download_chunk_with_timings(
     Ok(timings)
 }
 
+/// Hash pipeline: offloads MD5 updates to a dedicated blocking thread
+/// so the download loop can receive the next frame while the previous frame
+/// is being hashed. The hash is chained (state depends on frame order), so
+/// frames are hashed strictly in arrival order via a bounded channel.
+///
+/// When no hasher is present (skip_hash or empty compressed_hash), the
+/// pipeline is a no-op: [`HashPipeline::None`] skips all hashing.
+enum HashPipeline {
+    /// No hashing needed; frames are dropped.
+    None,
+    /// Synchronous in-loop hashing (no pipeline). Used when the hash thread
+    /// cannot be spawned or for the xxh64-only path.
+    Sync {
+        md5: Option<PooledMd5>,
+        xxh64: Option<xxhash_rust::xxh64::Xxh64>,
+    },
+    /// Pipelined MD5 on a dedicated thread. Only the MD5 path is pipelined;
+    /// xxh64 (if present) stays synchronous because it is negligible.
+    Pipelined {
+        md5_sender: std::sync::mpsc::SyncSender<bytes::Bytes>,
+        join: std::thread::JoinHandle<std::io::Result<Option<[u8; 16]>>>,
+        xxh64: Option<xxhash_rust::xxh64::Xxh64>,
+    },
+}
+
+impl HashPipeline {
+    /// Build a pipeline for the given hashers. When an MD5 hasher is present,
+    /// spawns a dedicated hash thread; otherwise uses the sync path.
+    fn new(
+        md5: Option<PooledMd5>,
+        xxh64: Option<xxhash_rust::xxh64::Xxh64>,
+    ) -> Self {
+        if let Some(md5) = md5 {
+            // Bounded channel: backpressure stops the download loop if the
+            // hash thread falls behind, bounding memory to a few frames.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
+            let join = std::thread::spawn(move || {
+                let mut md5 = md5;
+                for bytes in rx {
+                    md5.get_mut().update(&bytes)?;
+                }
+                Ok(Some(md5.finish()?))
+            });
+            HashPipeline::Pipelined {
+                md5_sender: tx,
+                join,
+                xxh64,
+            }
+        } else if xxh64.is_some() {
+            HashPipeline::Sync { md5: None, xxh64 }
+        } else {
+            HashPipeline::None
+        }
+    }
+
+    /// Send a frame to the hash thread (pipelined) or hash synchronously.
+    #[inline]
+    fn update(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
+        match self {
+            HashPipeline::None => Ok(()),
+            HashPipeline::Sync { md5, xxh64 } => {
+                update_download_hashes(bytes, md5.as_mut(), xxh64.as_mut())
+            }
+            HashPipeline::Pipelined {
+                md5_sender,
+                xxh64,
+                ..
+            } => {
+                // Send clones the Bytes refcount (cheap, no data copy).
+                md5_sender
+                    .send(bytes.clone())
+                    .map_err(|_| std::io::Error::other("hash thread died"))?;
+                if let Some(xxh64) = xxh64 {
+                    xxh64.update(bytes);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Finalize: drop the sender (signals EOF to the hash thread), wait for
+    /// the digest, and return the MD5 digest and xxh64 digest.
+    fn finish(self) -> std::io::Result<(Option<[u8; 16]>, Option<u64>)> {
+        match self {
+            HashPipeline::None => Ok((None, None)),
+            HashPipeline::Sync { mut md5, xxh64 } => {
+                let md5_digest = match &mut md5 {
+                    Some(md5) => Some(md5.finish()?),
+                    None => None,
+                };
+                let xxh64_digest = xxh64.map(|h| h.digest());
+                Ok((md5_digest, xxh64_digest))
+            }
+            HashPipeline::Pipelined {
+                md5_sender,
+                join,
+                xxh64,
+            } => {
+                // Drop the sender to signal the hash thread that no more
+                // frames are coming.
+                drop(md5_sender);
+                let md5_digest = join
+                    .join()
+                    .map_err(|_| std::io::Error::other("hash thread panicked"))??;
+                let xxh64_digest = xxh64.map(|h| h.digest());
+                Ok((md5_digest, xxh64_digest))
+            }
+        }
+    }
+}
+
 /// Shared streaming loop: reads bytes from a response stream, writes to an
 /// EvictingWriter, updates hashers, checks size, handles cancellation.
 /// Returns Ok(()) after verifying the final hash matches.
@@ -776,6 +887,13 @@ async fn stream_and_verify(
     // polls the data arm first, and the atomic `is_cancelled` check
     // preserves cancellation priority without re-registering the waiter.
     let mut cancel_waiter = handle.map(|handle| Box::pin(handle.cancelled_future()));
+
+    // Move hashers into the pipeline. The pipelined path offloads MD5
+    // updates to a dedicated thread so the download loop can receive the
+    // next frame while the previous frame is hashed, overlapping MD5 CPU
+    // with network I/O. The hashers are returned to the caller's Option
+    // slots after the pipeline finishes, preserving the existing contract.
+    let mut pipeline = HashPipeline::new(hasher.take(), xxh64_hasher.take());
 
     loop {
         #[cfg(feature = "bench-diagnostics")]
@@ -861,8 +979,7 @@ async fn stream_and_verify(
                 }
                 #[cfg(feature = "bench-diagnostics")]
                 let hash_started = std::time::Instant::now();
-                let hash_result =
-                    update_download_hashes(&bytes, hasher.as_mut(), xxh64_hasher.as_mut());
+                let hash_result = pipeline.update(&bytes);
                 #[cfg(feature = "bench-diagnostics")]
                 if let Some(timings) = timings.as_deref_mut() {
                     let elapsed = hash_started.elapsed();
@@ -903,14 +1020,14 @@ async fn stream_and_verify(
         });
     }
 
+    // Finalize the hash pipeline: drop the sender to signal the hash thread
+    // that no more frames are coming, wait for the digest, and verify.
+    let (md5_digest, xxh64_digest) = pipeline.finish().map_err(SophonError::Io)?;
+
     if !compressed_hash.is_empty() {
         match compressed_hash.len() {
             16 => {
-                let digest: [u8; 16] = hasher
-                    .as_mut()
-                    .expect("hasher present when compressed hash is non-empty")
-                    .finish()
-                    .map_err(SophonError::Io)?;
+                let digest = md5_digest.expect("md5 digest present when hash len == 16");
                 if !md5_bytes_eq(&digest, compressed_hash) {
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::Md5Mismatch {
@@ -921,10 +1038,7 @@ async fn stream_and_verify(
                 }
             }
             8 => {
-                let digest = xxh64_hasher
-                    .as_ref()
-                    .expect("xxh64_hasher present when hash len == 16")
-                    .digest();
+                let digest = xxh64_digest.expect("xxh64 digest present when hash len == 8");
                 if !xxh64_bytes_eq(digest, compressed_hash) {
                     let _ = tokio::fs::remove_file(dest).await;
                     return Err(SophonError::Md5Mismatch {
@@ -956,10 +1070,11 @@ async fn stream_and_verify(
     if let Some(timings) = timings.as_deref_mut() {
         timings.final_flush_and_evict += final_flush_started.elapsed();
     }
-    hasher.take();
-    if let Some(h) = xxh64_hasher.take() {
-        super::assembly_opt::return_xxh64(h);
-    }
+    // Hashers were moved into the pipeline at the start and consumed by
+    // finish(): the MD5 hasher is finalized inside the hash thread (or
+    // inline for the Sync path) and the PooledMd5 drops there, returning
+    // the Md5 to that thread's TLS pool. The xxh64 hasher is consumed by
+    // digest() and dropped in place.
     #[cfg(feature = "bench-diagnostics")]
     if let Some(timings) = timings {
         timings.total = total_started.elapsed();
