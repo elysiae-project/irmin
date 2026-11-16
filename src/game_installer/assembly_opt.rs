@@ -387,14 +387,17 @@ pub(crate) struct MmapGuard {
 }
 
 impl MmapGuard {
+    #[inline]
     pub(crate) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 
+    #[inline]
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
     }
 
+    #[inline]
     pub(crate) fn flush_and_evict(&mut self) {
         // Queue writeback without waiting (no WAIT_BEFORE). The DONTNEED
         // on still-dirty pages is a no-op — those pages stay until the
