@@ -2149,4 +2149,36 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// `check_available_space` returns `NoSpaceAvailable` (not panic) when the
+    /// requested size exceeds the available space on the destination filesystem.
+    /// Guards the disk-full / resource-exhaustion integration-error class: the
+    /// download path calls this before each chunk write and must surface a clean
+    /// error, not a crash, when the disk fills during assembly.
+    #[test]
+    fn check_available_space_returns_error_not_panic_when_disk_full() {
+        let dir = tempfile::tempdir().unwrap();
+        // Request an absurdly large size (1 TiB) that no normal test filesystem
+        // has available. This exercises the NoSpaceAvailable path without
+        // needing a mounted tiny tmpfs/loopback (which requires root).
+        let huge = 1024u64 * 1024 * 1024 * 1024;
+        let result = check_available_space(dir.path(), huge);
+        assert!(
+            matches!(result, Err(SophonError::NoSpaceAvailable { .. })),
+            "check_available_space with huge request should return NoSpaceAvailable, got: {result:?}"
+        );
+    }
+
+    /// `check_available_space` returns `Ok(())` when the destination has no
+    /// parent (e.g. root). Guards against a crash on the `dest.parent() == None`
+    /// edge case.
+    #[test]
+    fn check_available_space_ok_when_dest_has_no_parent() {
+        // A path with no parent component.
+        let result = check_available_space(std::path::Path::new("/"), 1);
+        assert!(
+            result.is_ok(),
+            "check_available_space with root dest should return Ok, got: {result:?}"
+        );
+    }
+
 }
