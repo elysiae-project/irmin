@@ -3021,3 +3021,81 @@ async fn install_resume_phase1_checking_files_does_not_panic_with_matching_state
     );
 }
 
+/// End-to-end test of `Sophon::download` against the real Sophon API,
+/// confirming the OnceLock panic fix holds at the actual public API level
+/// (not just at the `install()` function called directly).
+///
+/// Uses the real `nap_global` game id (the Zenless Zone Zero global branch)
+/// and a pre-cancelled `DownloadHandle`. `Sophon::download` fetches the real
+/// manifest via `build_installers` (front-door → build → manifest protobuf
+/// decode), then enters `install()`, passing through the OnceLock setup
+/// and `assembly_epochs` construction that previously panicked. With the
+/// handle pre-cancelled, the download workers exit immediately and
+/// `install()` returns `Err(SophonError::Cancelled)`.
+///
+/// This test requires network access to the live Sophon API and is
+/// `#[ignore]`'d so it does not run in CI by default. Run with:
+///   cargo test --lib -- --ignored sophon_download_live_api_reaches_install_without_panic
+///
+/// DO NOT delete: this is the only test that exercises the full
+/// `Sophon::download` → `build_installers` → `install()` path with a real
+/// manifest, which is where the user's crash occurred. If the OnceLock
+/// ordering regresses, this test panics instead of returning
+/// `Err(Cancelled)`.
+#[tokio::test]
+#[ignore = "requires network access to the live Sophon API"]
+async fn sophon_download_live_api_reaches_install_without_panic() {
+    use crate::game_installer::SophonError;
+    use crate::sophon::ProgressFn;
+    use crate::{DownloadHandle, Sophon, SophonProgress, VerifyMode};
+
+    // nap game id (matches biz "nap_global" via starts_with("nap_")).
+    // elysiae passes Game::Nap.code() = "nap" to Sophon::builder.
+    let game_id = "nap";
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    let sophon = Sophon::builder(game_id, game_dir)
+        .vo_lang("en-US")
+        .verify_mode(VerifyMode::None)
+        .build();
+
+    let handle = DownloadHandle::new();
+    // Pre-cancel so the download workers exit immediately after install()
+    // reaches the OnceLock setup (the former panic site) and run_downloads.
+    handle.cancel();
+
+    let progress_events: std::sync::Arc<std::sync::Mutex<Vec<SophonProgress>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pe = std::sync::Arc::clone(&progress_events);
+    let on_progress = move |p: SophonProgress| {
+        pe.lock().unwrap().push(p);
+    };
+
+    let result = sophon.download(&handle, on_progress).await;
+
+    // With the fix, download() must return Err(Cancelled) — NOT panic.
+    // If the OnceLock ordering regresses, this test panics at
+    // "chunk_names set before assembly" before reaching this assert.
+    assert!(
+        result.is_err(),
+        "pre-cancelled download should return an error, not Ok"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, SophonError::Cancelled),
+        "pre-cancelled download should return Cancelled, got: {err:?}"
+    );
+
+    // The FetchingManifest event must have been emitted (proving we got
+    // past the Sophon::download entry point into build_installers).
+    let events = progress_events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SophonProgress::FetchingManifest)),
+        "FetchingManifest event must be emitted; got: {events:?}"
+    );
+}
+
