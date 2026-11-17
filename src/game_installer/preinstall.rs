@@ -1429,13 +1429,12 @@ pub async fn preinstall_download(
     let last_check_emit = Arc::new(AtomicU64::new(now_nanos()));
     {
         let upd = Arc::clone(&updater);
-        // Collect into owned `PatchChunkInfo` up front so the stream of
-        // futures is `'static` (no borrow of `unique_chunks`) and `Send` for
-        // any caller lifetime. Each future still owns what it touches
-        // (name, md5, Arc clones); the upfront clone is cheap relative to
-        // the per-chunk spawn_blocking work it gates.
-        let chunks_owned: Vec<PatchChunkInfo> = unique_chunks.iter().as_ref().to_vec();
-        let futures = chunks_owned.into_iter().enumerate().map(|(chunk_idx, chunk)| {
+        // Clone the Arc so each future can access chunks by index without
+        // cloning the entire Vec upfront. Only the two strings (name + md5)
+        // are cloned per chunk, moved into spawn_blocking.
+        let chunks_ref = Arc::clone(&unique_chunks);
+        let futures = (0..unique_chunks.len()).map(|chunk_idx| {
+            let chunk = &chunks_ref[chunk_idx];
             let checked = Arc::clone(&checked_arc);
             let offset = Arc::clone(&resume_offset_arc);
             let sizes = Arc::clone(&chunk_sizes);
