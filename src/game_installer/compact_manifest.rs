@@ -93,7 +93,6 @@ impl StringArena {
             .expect("string exceeds compact u32 index limits")
     }
 
-    #[inline(never)]
     pub fn try_intern(&mut self, s: &str) -> Result<u32, CompactManifestLimitError> {
         let index = u32::try_from(self.offsets.len())
             .map_err(|_| CompactManifestLimitError("string index count"))?;
