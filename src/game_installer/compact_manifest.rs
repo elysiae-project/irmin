@@ -9,6 +9,46 @@ use crate::proto_parse::SophonManifestAssetProperty;
 use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
 
+/// Compute a dedup key for a byte slice. Fast paths for the common hash
+/// sizes (16-byte MD5, 32-byte MD5 hex-decoded, 8-byte XXH64) read the
+/// bytes directly as unaligned integers and FxHash-combine them, avoiding
+/// the `Hash` trait's length write and per-chunk slice iteration. Falls
+/// back to the generic `Hash` impl for other lengths.
+#[inline]
+fn byte_arena_hash(bytes: &[u8]) -> u64 {
+    match bytes.len() {
+        16 => {
+            let mut h = rustc_hash::FxHasher::default();
+            let (a, b) = bytes.split_at(8);
+            h.write_u64(u64::from_ne_bytes(a.try_into().unwrap()));
+            h.write_u64(u64::from_ne_bytes(b.try_into().unwrap()));
+            h.finish()
+        }
+        32 => {
+            let mut h = rustc_hash::FxHasher::default();
+            for c in bytes.chunks_exact(8) {
+                h.write_u64(u64::from_ne_bytes(c.try_into().unwrap()));
+            }
+            h.finish()
+        }
+        8 => {
+            let mut h = rustc_hash::FxHasher::default();
+            h.write_u64(u64::from_ne_bytes(bytes.try_into().unwrap()));
+            h.finish()
+        }
+        0 => {
+            let mut h = rustc_hash::FxHasher::default();
+            h.write_u64(0);
+            h.finish()
+        }
+        _ => {
+            let mut h = rustc_hash::FxHasher::default();
+            bytes.hash(&mut h);
+            h.finish()
+        }
+    }
+}
+
 const INITIAL_STRING_INDEX_CAPACITY: usize = 1 << 20;
 const INITIAL_STRING_ARENA_CAPACITY: usize = 16 * 1024 * 1024;
 
@@ -202,9 +242,7 @@ impl ByteArena {
     /// Intern binary data, returning an existing index if identical data was
     /// already stored. Handles hash collisions by comparing the stored bytes.
     pub fn intern_dedup(&mut self, bytes: &[u8]) -> u32 {
-        let mut h = rustc_hash::FxHasher::default();
-        bytes.hash(&mut h);
-        let key = h.finish();
+        let key = byte_arena_hash(bytes);
         if let Some(&idx) = self.dedup.get(&key)
             && self.get_unsealed(idx) == bytes
         {
@@ -215,7 +253,7 @@ impl ByteArena {
         idx
     }
 
-    fn try_intern(&mut self, bytes: &[u8]) -> Result<u32, CompactManifestLimitError> {
+    pub(crate) fn try_intern(&mut self, bytes: &[u8]) -> Result<u32, CompactManifestLimitError> {
         let index = u32::try_from(self.offsets.len())
             .map_err(|_| CompactManifestLimitError("byte index count"))?;
         let offset =
