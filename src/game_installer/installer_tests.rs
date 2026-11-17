@@ -2659,3 +2659,148 @@ async fn install_does_not_panic_on_empty_fresh_download_epoch_construction() {
     );
 }
 
+/// Full `install()` integration test with a single eager chunk: mocks the
+/// chunk CDN with wiremock, builds a one-file manifest, preallocates the
+/// output, and runs the whole install pipeline (download → eager
+/// decompression → assembly → epoch commit → finalize).
+///
+/// This guards against deep integration regressions in the download/assembly
+/// pipeline that the empty-manifest test cannot reach: OnceLock init
+/// ordering, chunk download hash verification, eager decompression, the
+/// assembly coordinator, epoch durability commit, and final file integrity.
+/// DO NOT weaken or delete when restructuring `install()` or the assembly
+/// pipeline. If the pipeline's internal contracts change, update the test
+/// fixtures to match — the goal is that a real consumer driving `install()`
+/// (via `Sophon::download`) succeeds end-to-end.
+#[tokio::test]
+async fn install_downloads_assembles_and_commits_single_eager_chunk() {
+    use std::io::Write as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Small incompressible payload so zstd frames are realistic but the
+    // test stays fast. 64 KiB is above the small-chunk fast path threshold
+    // and exercises the eager mmap writeback path.
+    let data: Vec<u8> = (0..64 * 1024)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .collect();
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.window_log(20).unwrap();
+    encoder.write_all(&data).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let decompressed_hash = hex::encode(fast_md5::digest(&data));
+    let file_md5 = decompressed_hash.clone();
+
+    Mock::given(method("GET"))
+        .and(path("chunks/eager"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(compressed.clone())
+                .insert_header("content-length", compressed.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    let chunk = SophonManifestAssetChunk {
+        chunk_name: bytes::Bytes::from("eager"),
+        chunk_decompressed_hash_md5: decompressed_hash.clone().into(),
+        chunk_on_file_offset: 0,
+        chunk_size: compressed.len() as u64,
+        chunk_size_decompressed: data.len() as u64,
+        chunk_compressed_hash_xxh: 0,
+        chunk_compressed_hash_md5: compressed_hash.into(),
+        chunk_old_offset: -1,
+    };
+    let asset = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("output.bin"),
+        asset_chunks: vec![chunk],
+        asset_type: 0,
+        asset_size: data.len() as u64,
+        asset_hash_md5: file_md5.clone().into(),
+    };
+    let installer = SophonInstaller {
+        manifest: SophonManifestProto { assets: vec![asset] },
+        chunk_download: DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: format!("{}/", server.uri()),
+            url_suffix: "chunks".into(),
+        },
+        label: "test".into(),
+        matching_field: "game".into(),
+        manifest_hash: "singlechunkhash".into(),
+    };
+
+    let resume = ResumeContext {
+        prev_manifest_hash: String::new(),
+        prev_downloaded_chunks: FxHashMap::default(),
+        resume_seed: super::super::CompletedFiles::default(),
+    };
+    let options = InstallOptions {
+        is_preinstall: false,
+        is_resume: false,
+        handle: DownloadHandle::new(),
+        verify_mode: super::VerifyMode::Full,
+    };
+    let callbacks = InstallCallbacks {
+        updater: Arc::new(|_p| {}),
+        state_saver: Arc::new(|_entries| {}),
+        completion_state: Arc::new(std::sync::OnceLock::new()),
+    };
+
+    let result = install(
+        vec![installer],
+        &game_dir,
+        vec![],
+        "tag-single",
+        resume,
+        options,
+        callbacks,
+        "test",
+        &[std::string::String::from("en-US")],
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "install with single eager chunk failed: {:?}",
+        result.err()
+    );
+
+    // The assembled output file must exist, match the expected size, and
+    // hash to the manifest's asset_hash_md5. This catches any silent
+    // corruption from the download/assembly/commit pipeline.
+    let out_path = game_dir.join("output.bin");
+    assert!(out_path.exists(), "assembled output file must exist");
+    let written = std::fs::read(&out_path).unwrap();
+    assert_eq!(written.len(), data.len(), "output size must match manifest");
+    let written_md5 = hex::encode(fast_md5::digest(&written));
+    assert_eq!(
+        written_md5, file_md5,
+        "output MD5 must match manifest asset_hash_md5"
+    );
+    assert_eq!(written, data, "output bytes must match the input payload");
+
+    // The chunks dir should be cleaned up after a successful epoch commit
+    // (chunk refcount drops to zero → chunk file removed). This catches
+    // regressions in the epoch commit / refcount cleanup path.
+    let chunks_dir = game_dir.join("chunks");
+    if chunks_dir.exists() {
+        let leftovers: Vec<_> = std::fs::read_dir(&chunks_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "chunks dir must be empty after successful install, found: {leftovers:?}"
+        );
+    }
+}
+
