@@ -2,6 +2,7 @@
 //! verify mode, and resume state, hiding the internal installer plumbing.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,140 +127,201 @@ impl Sophon {
     /// Fresh download with automatic resume. Reuses on-disk chunks when the
     /// persisted manifest hash matches the remote; otherwise discards stale
     /// state and downloads fresh. Removes the resume state on success.
-    pub async fn download(
+    pub fn download(
         &self,
         handle: &DownloadHandle,
         on_progress: impl ProgressFn,
-    ) -> Result<(), SophonError> {
+    ) -> impl Future<Output = Result<(), SophonError>> + Send + 'static {
         let progress = Arc::new(on_progress);
         progress(SophonProgress::FetchingManifest);
 
-        let (installers, tag, manifest_hash) =
-            game_installer::build_installers(&self.client, &self.game_id, &self.vo_lang).await?;
+        let client = self.client.clone();
+        let game_id = self.game_id.clone();
+        let vo_lang = self.vo_lang.clone();
+        let game_dir = self.game_dir.clone();
+        let state_dir = self.state_dir.clone();
+        let state_file = self.state_file();
+        let verify_mode = self.verify_mode;
+        let handle = handle.clone();
 
-        let (resume, options) = self.resolve_resume(handle, DownloadType::Fresh, &manifest_hash);
-        let callbacks =
-            self.build_callbacks(progress.clone(), DownloadType::Fresh, None, manifest_hash);
-        let vo_langs = vec![self.vo_lang.clone()];
+        async move {
+            let (installers, tag, manifest_hash) =
+                game_installer::build_installers(&client, &game_id, &vo_lang).await?;
 
-        let result = game_installer::install(
-            installers,
-            &self.game_dir,
-            vec![],
-            &tag,
-            resume,
-            options,
-            callbacks,
-            &self.game_id,
-            &vo_langs,
-        )
-        .await;
+            let (resume, options) = Self::resolve_resume_owned(
+                &state_dir,
+                &game_dir,
+                &game_id,
+                &vo_lang,
+                verify_mode,
+                &handle,
+                DownloadType::Fresh,
+                &manifest_hash,
+            );
+            let callbacks = Self::build_callbacks_owned(
+                state_file.clone(),
+                game_id.clone(),
+                vo_lang.clone(),
+                game_dir.clone(),
+                progress.clone(),
+                DownloadType::Fresh,
+                None,
+                manifest_hash,
+            );
+            let vo_langs = vec![vo_lang.clone()];
 
-        if result.is_ok() {
-            let _ = std::fs::remove_file(self.state_file());
+            let result = game_installer::install(
+                installers,
+                &game_dir,
+                vec![],
+                &tag,
+                resume,
+                options,
+                callbacks,
+                &game_id,
+                &vo_langs,
+            )
+            .await;
+
+            if result.is_ok() {
+                let _ = std::fs::remove_file(&state_file);
+            }
+            progress(SophonProgress::Finished);
+            result
         }
-        progress(SophonProgress::Finished);
-        result
     }
 
     /// Update an existing installation to the latest remote tag. Reads the
     /// installed tag, builds an update plan, and installs. Returns
     /// [`SophonError::NoInstalledVersion`] when no installation is present.
-    pub async fn update(
+    pub fn update(
         &self,
         handle: &DownloadHandle,
         on_progress: impl ProgressFn,
-    ) -> Result<(), SophonError> {
+    ) -> impl Future<Output = Result<(), SophonError>> + Send + 'static {
         let progress = Arc::new(on_progress);
-        let current_tag = game_installer::read_installed_tag(&self.game_dir)
-            .ok_or(SophonError::NoInstalledVersion)?;
+        let client = self.client.clone();
+        let game_id = self.game_id.clone();
+        let vo_lang = self.vo_lang.clone();
+        let game_dir = self.game_dir.clone();
+        let state_dir = self.state_dir.clone();
+        let state_file = self.state_file();
+        let verify_mode = self.verify_mode;
+        let handle = handle.clone();
 
-        progress(SophonProgress::FetchingManifest);
+        async move {
+            let current_tag = game_installer::read_installed_tag(&game_dir)
+                .ok_or(SophonError::NoInstalledVersion)?;
 
-        let (installers, deleted_files, new_tag, manifest_hash) =
-            game_installer::build_update_installers(
-                &self.client,
-                &self.game_id,
-                &self.vo_lang,
-                &current_tag,
-                &self.game_dir,
+            progress(SophonProgress::FetchingManifest);
+
+            let (installers, deleted_files, new_tag, manifest_hash) =
+                game_installer::build_update_installers(
+                    &client,
+                    &game_id,
+                    &vo_lang,
+                    &current_tag,
+                    &game_dir,
+                )
+                .await?;
+
+            let (resume, options) = Self::resolve_resume_owned(
+                &state_dir,
+                &game_dir,
+                &game_id,
+                &vo_lang,
+                verify_mode,
+                &handle,
+                DownloadType::Update,
+                &manifest_hash,
+            );
+            let callbacks = Self::build_callbacks_owned(
+                state_file.clone(),
+                game_id.clone(),
+                vo_lang.clone(),
+                game_dir.clone(),
+                progress.clone(),
+                DownloadType::Update,
+                Some(current_tag),
+                manifest_hash,
+            );
+            let vo_langs = vec![vo_lang.clone()];
+
+            let result = game_installer::install(
+                installers,
+                &game_dir,
+                deleted_files,
+                &new_tag,
+                resume,
+                options,
+                callbacks,
+                &game_id,
+                &vo_langs,
             )
-            .await?;
+            .await;
 
-        let (resume, options) = self.resolve_resume(handle, DownloadType::Update, &manifest_hash);
-        let callbacks = self.build_callbacks(
-            progress.clone(),
-            DownloadType::Update,
-            Some(current_tag),
-            manifest_hash,
-        );
-        let vo_langs = vec![self.vo_lang.clone()];
-
-        let result = game_installer::install(
-            installers,
-            &self.game_dir,
-            deleted_files,
-            &new_tag,
-            resume,
-            options,
-            callbacks,
-            &self.game_id,
-            &vo_langs,
-        )
-        .await;
-
-        if result.is_ok() {
-            let _ = std::fs::remove_file(self.state_file());
+            if result.is_ok() {
+                let _ = std::fs::remove_file(&state_file);
+            }
+            progress(SophonProgress::Finished);
+            result
         }
-        progress(SophonProgress::Finished);
-        result
     }
 
     /// Pre-download an upcoming version's patch package into `game_dir`,
     /// persisting chunk progress for resume. Completed packages retain their
     /// exact target metadata for release-day application. Returns
     /// [`SophonError::NoPreinstallAvailable`] when no preinstall exists.
-    pub async fn preinstall(
+    pub fn preinstall(
         &self,
         handle: &DownloadHandle,
         on_progress: impl ProgressFn,
-    ) -> Result<(), SophonError> {
+    ) -> impl Future<Output = Result<(), SophonError>> + Send + 'static {
         let progress = Arc::new(on_progress);
         progress(SophonProgress::FetchingManifest);
 
-        let plan = game_installer::build_preinstall_plan(
-            &self.client,
-            &self.game_id,
-            &self.vo_lang,
-            &self.game_dir,
-        )
-        .await?;
-
+        let client = self.client.clone();
+        let game_id = self.game_id.clone();
+        let vo_lang = self.vo_lang.clone();
+        let game_dir = self.game_dir.clone();
+        let state_dir = self.state_dir.clone();
         let state_file = self.state_file();
-        let prev_chunks: HashMap<String, u64> = self
-            .load_state()
-            .filter(|s| s.game_id == self.game_id && s.download_type == DownloadType::Preinstall)
-            .map(|s| s.downloaded_chunks)
-            .unwrap_or_default();
+        let handle = handle.clone();
 
-        let state_saver = self.build_preinstall_saver(state_file.clone());
+        async move {
+            let plan = game_installer::build_preinstall_plan(
+                &client,
+                &game_id,
+                &vo_lang,
+                &game_dir,
+            )
+            .await?;
 
-        game_installer::preinstall_download(
-            &self.client,
-            plan,
-            &self.game_dir,
-            &self.game_id,
-            &self.vo_lang,
-            handle.clone(),
-            progress.clone(),
-            state_saver,
-            prev_chunks.clone(),
-        )
-        .await?;
+            let prev_chunks: HashMap<String, u64> = Self::load_state_owned(&state_dir, &game_id)
+                .filter(|s| s.game_id == game_id && s.download_type == DownloadType::Preinstall)
+                .map(|s| s.downloaded_chunks)
+                .unwrap_or_default();
 
-        let _ = std::fs::remove_file(&state_file);
-        progress(SophonProgress::Finished);
-        Ok(())
+            let state_saver =
+                Self::build_preinstall_saver_owned(state_file.clone(), game_id.clone(), vo_lang.clone(), game_dir.clone());
+
+            game_installer::preinstall_download(
+                &client,
+                plan,
+                &game_dir,
+                &game_id,
+                &vo_lang,
+                handle,
+                progress.clone(),
+                state_saver,
+                prev_chunks,
+            )
+            .await?;
+
+            let _ = std::fs::remove_file(&state_file);
+            progress(SophonProgress::Finished);
+            Ok(())
+        }
     }
 
     /// Apply a previously downloaded preinstall package identified by
@@ -267,27 +329,44 @@ impl Sophon {
     /// metadata even after upstream pre-download metadata disappears. Payload
     /// chunks may still require the CDN. Legacy packages require exact-target
     /// metadata recovery; failure preserves their cached state and payloads.
-    pub async fn apply_preinstall(
+    pub fn apply_preinstall(
         &self,
         preinstall_tag: &str,
         handle: &DownloadHandle,
         on_progress: impl ProgressFn,
-    ) -> Result<(), SophonError> {
+    ) -> impl Future<Output = Result<(), SophonError>> + Send + 'static {
         let progress = Arc::new(on_progress);
-        game_installer::apply_preinstall(
-            &self.client,
-            &self.game_dir,
-            preinstall_tag,
-            progress,
-            handle,
-        )
-        .await
+        let client = self.client.clone();
+        let game_dir = self.game_dir.clone();
+        let preinstall_tag = preinstall_tag.to_string();
+        let handle = handle.clone();
+
+        async move {
+            game_installer::apply_preinstall(
+                &client,
+                &game_dir,
+                &preinstall_tag,
+                progress,
+                &handle,
+            )
+            .await
+        }
     }
 
     /// Query update and preinstall availability and sizes without mutating disk.
-    pub async fn check_update(&self) -> Result<UpdateInfo, SophonError> {
-        game_installer::check_update(&self.client, &self.game_id, &self.vo_lang, &self.game_dir)
-            .await
+    ///
+    /// The returned future is `Send` and owns its data, so it can be spawned on
+    /// a multi-threaded runtime. The borrow of `&self` ends at the call site.
+    pub fn check_update(
+        &self,
+    ) -> impl Future<Output = Result<UpdateInfo, SophonError>> + Send + 'static {
+        let client = self.client.clone();
+        let game_id = self.game_id.clone();
+        let vo_lang = self.vo_lang.clone();
+        let game_dir = self.game_dir.clone();
+        async move {
+            game_installer::check_update(&client, &game_id, &vo_lang, &game_dir).await
+        }
     }
 
     /// Hash installed files and re-download missing or damaged files.
@@ -296,15 +375,24 @@ impl Sophon {
     /// the selected voice language and game resource exclusions, and regenerates
     /// launcher-owned metadata. `Ok(())` and `Finished` are emitted only after
     /// successful repair and regeneration. Plugins/SDKs are outside this scope.
-    pub async fn verify_integrity(&self, on_progress: impl ProgressFn) -> Result<(), SophonError> {
-        game_installer::verify_integrity(
-            &self.client,
-            &self.game_id,
-            &self.vo_lang,
-            &self.game_dir,
-            on_progress,
-        )
-        .await
+    pub fn verify_integrity(
+        &self,
+        on_progress: impl ProgressFn,
+    ) -> impl Future<Output = Result<(), SophonError>> + Send + 'static {
+        let client = self.client.clone();
+        let game_id = self.game_id.clone();
+        let vo_lang = self.vo_lang.clone();
+        let game_dir = self.game_dir.clone();
+        async move {
+            game_installer::verify_integrity(
+                &client,
+                &game_id,
+                &vo_lang,
+                &game_dir,
+                on_progress,
+            )
+            .await
+        }
     }
 
     /// `true` iff a parseable resume state for this game exists in `state_dir`.
@@ -329,24 +417,59 @@ impl Sophon {
         state_file_path(&self.state_dir, &self.game_id)
     }
 
+    #[cfg(test)]
     fn load_state(&self) -> Option<DownloadState> {
         load_download_state(&self.state_dir, &self.game_id)
+    }
+
+    /// Static variant of [`load_state`](Self::load_state) taking the fields
+    /// that drive it. Used by `Send`-returning public methods that have moved
+    /// `&self` fields into owned locals before the first `await`.
+    fn load_state_owned(state_dir: &Path, game_id: &str) -> Option<DownloadState> {
+        load_download_state(state_dir, game_id)
     }
 
     /// Decide whether the persisted state can resume the fresh manifest. Reuses
     /// chunks when game id, vo language, install path, download type, and
     /// manifest hash all match; otherwise discards the stale `chunks/` dir.
+    #[cfg(test)]
     fn resolve_resume(
         &self,
         handle: &DownloadHandle,
         download_type: DownloadType,
         manifest_hash: &str,
     ) -> (ResumeContext, InstallOptions) {
-        let prev = self.load_state();
+        Self::resolve_resume_owned(
+            &self.state_dir,
+            &self.game_dir,
+            &self.game_id,
+            &self.vo_lang,
+            self.verify_mode,
+            handle,
+            download_type,
+            manifest_hash,
+        )
+    }
+
+    /// Static variant of [`resolve_resume`](Self::resolve_resume) taking the
+    /// `Sophon` fields by reference so the public `Send`-returning methods can
+    /// call it from inside an `async move` block after cloning `&self` fields.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_resume_owned(
+        state_dir: &Path,
+        game_dir: &Path,
+        game_id: &str,
+        vo_lang: &str,
+        verify_mode: VerifyMode,
+        handle: &DownloadHandle,
+        download_type: DownloadType,
+        manifest_hash: &str,
+    ) -> (ResumeContext, InstallOptions) {
+        let prev = Self::load_state_owned(state_dir, game_id);
         let matches = prev.as_ref().is_some_and(|s| {
-            s.game_id == self.game_id
-                && s.vo_lang == self.vo_lang
-                && s.output_path == self.game_dir.to_string_lossy()
+            s.game_id == game_id
+                && s.vo_lang == vo_lang
+                && s.output_path == game_dir.to_string_lossy()
                 && s.download_type == download_type
                 && s.manifest_hash == manifest_hash
         });
@@ -366,7 +489,7 @@ impl Sophon {
         } else {
             if prev.is_some() {
                 // ponytail: removes whole chunks dir on hash mismatch; tolerates missing dir
-                let _ = std::fs::remove_dir_all(self.game_dir.join("chunks"));
+                let _ = std::fs::remove_dir_all(game_dir.join("chunks"));
             }
             (empty_resume(), false)
         };
@@ -375,22 +498,26 @@ impl Sophon {
             is_preinstall: false,
             is_resume,
             handle: handle.clone(),
-            verify_mode: self.verify_mode,
+            verify_mode,
         };
         (resume, options)
     }
 
-    fn build_callbacks(
-        &self,
+    /// Static variant of [`build_callbacks`](Self::build_callbacks) taking the
+    /// `Sophon` fields by value/clone so the public `Send`-returning methods can
+    /// call it from inside an `async move` block.
+    #[allow(clippy::too_many_arguments)]
+    fn build_callbacks_owned(
+        state_file: PathBuf,
+        game_id: String,
+        vo_lang: String,
+        game_dir: PathBuf,
         progress: Arc<dyn Fn(SophonProgress) + Send + Sync>,
         download_type: DownloadType,
         current_tag: Option<String>,
         manifest_hash: String,
     ) -> InstallCallbacks {
-        let state_file = self.state_file();
-        let game_id = self.game_id.clone();
-        let vo_lang = self.vo_lang.clone();
-        let output_path = self.game_dir.to_string_lossy().into_owned();
+        let output_path = game_dir.to_string_lossy().into_owned();
 
         let state_saver: StateSaver = Arc::new(move |entries: &[(&str, u64)]| {
             let state = DownloadStateRef {
@@ -413,10 +540,14 @@ impl Sophon {
         }
     }
 
-    fn build_preinstall_saver(&self, state_file: PathBuf) -> StateSaver {
-        let game_id = self.game_id.clone();
-        let vo_lang = self.vo_lang.clone();
-        let output_path = self.game_dir.to_string_lossy().into_owned();
+    /// Static variant of [`build_preinstall_saver`](Self::build_preinstall_saver).
+    fn build_preinstall_saver_owned(
+        state_file: PathBuf,
+        game_id: String,
+        vo_lang: String,
+        game_dir: PathBuf,
+    ) -> StateSaver {
+        let output_path = game_dir.to_string_lossy().into_owned();
 
         Arc::new(move |entries: &[(&str, u64)]| {
             let state = DownloadStateRef {

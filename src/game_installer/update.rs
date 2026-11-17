@@ -160,8 +160,8 @@ pub(super) async fn check_update_with_branches<F, Fut>(
     query_sizes: F,
 ) -> SophonResult<UpdateInfo>
 where
-    F: Fn(PackageBranch, Option<String>) -> Fut,
-    Fut: std::future::Future<Output = SophonResult<(u64, u64)>>,
+    F: Fn(PackageBranch, Option<String>) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = SophonResult<(u64, u64)>> + Send,
 {
     let remote_tag = main_branch.tag.clone();
     let update_available = current_tag.as_deref().is_some_and(|tag| tag != remote_tag);
@@ -346,10 +346,16 @@ async fn fetch_and_accumulate_diff_sizes(
     let mut cs = 0u64;
     let mut ds = 0u64;
 
-    let mut pairs = futures_util::stream::iter(qualifying.iter().map(|new_meta| {
+    // Collect into owned `SophonManifestMeta` up front so the stream of
+    // futures is `'static` (no borrow of `qualifying`) and `Send` for any
+    // caller lifetime. The clones are cheap relative to the network fetches
+    // they gate.
+    let qualifying_owned: Vec<SophonManifestMeta> =
+        qualifying.iter().map(|m| (*m).clone()).collect();
+    let mut pairs = futures_util::stream::iter(qualifying_owned.into_iter().map(|new_meta| {
         async move {
-            // Both manifests of the pair fetch in parallel, matching the
-            // intra-pair parallelism of the original per-iteration
+            // Both manifests of the pair fetch in parallel, matching
+            // the intra-pair parallelism of the original per-iteration
             // try_join!.
             let (new_manifest, old_manifest) = tokio::join!(
                 super::api::fetch_manifest_proto(
@@ -370,8 +376,8 @@ async fn fetch_and_accumulate_diff_sizes(
                     }
                 }
             );
-            // Left-to-right `?` evaluation prefers the new-manifest error
-            // when both fetches fail.
+            // Left-to-right `?` evaluation prefers the new-manifest
+            // error when both fetches fail.
             Ok::<_, SophonError>((new_manifest?, old_manifest?))
         }
     }))
