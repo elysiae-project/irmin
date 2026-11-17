@@ -229,6 +229,93 @@ pub const SOPHON_BUILD_URL_BASE: &str = concat!(
     "/downloader/sophon_chunk/api/getBuild"
 );
 
+/// Test/bench-only endpoint overrides. When set, `front_door_url()`,
+/// `sophon_build_url_base()`, and `sophon_patch_build_url_base()` return the
+/// override instead of the production constant. This lets end-to-end tests
+/// drive the full `Sophon` public API against a wiremock server without
+/// changing the public API surface. Production builds compile this out.
+#[cfg(any(test, feature = "bench-internals"))]
+pub(crate) mod test_endpoints {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FRONT_DOOR: RefCell<Option<String>> = const { RefCell::new(None) };
+        static BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
+        static PATCH_BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub fn set_front_door(url: Option<String>) {
+        FRONT_DOOR.with(|c| *c.borrow_mut() = url);
+    }
+    pub fn set_build_base(url: Option<String>) {
+        BUILD_BASE.with(|c| *c.borrow_mut() = url);
+    }
+    pub fn set_patch_build_base(url: Option<String>) {
+        PATCH_BUILD_BASE.with(|c| *c.borrow_mut() = url);
+    }
+
+    pub fn front_door() -> Option<String> {
+        FRONT_DOOR.with(|c| c.borrow().clone())
+    }
+    pub fn build_base() -> Option<String> {
+        BUILD_BASE.with(|c| c.borrow().clone())
+    }
+    pub fn patch_build_base() -> Option<String> {
+        PATCH_BUILD_BASE.with(|c| c.borrow().clone())
+    }
+}
+
+/// Re-export the test endpoint setters for integration tests under
+/// `tests/`, gated the same way as the override mechanism itself.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_test_endpoints {
+    pub use super::test_endpoints::{set_build_base, set_front_door, set_patch_build_base};
+}
+
+/// Resolve the front-door URL, honoring test overrides when present.
+pub(crate) fn front_door_url() -> String {
+    #[cfg(any(test, feature = "bench-internals"))]
+    {
+        test_endpoints::front_door().unwrap_or_else(|| FRONT_DOOR_URL.to_string())
+    }
+    #[cfg(not(any(test, feature = "bench-internals")))]
+    {
+        FRONT_DOOR_URL.to_string()
+    }
+}
+
+/// Resolve the build URL base, honoring test overrides when present.
+pub(crate) fn sophon_build_url_base() -> String {
+    #[cfg(any(test, feature = "bench-internals"))]
+    {
+        test_endpoints::build_base().unwrap_or_else(|| SOPHON_BUILD_URL_BASE.to_string())
+    }
+    #[cfg(not(any(test, feature = "bench-internals")))]
+    {
+        SOPHON_BUILD_URL_BASE.to_string()
+    }
+}
+
+/// Base endpoint for patch-build metadata requests.
+pub const SOPHON_PATCH_BUILD_URL_BASE: &str = concat!(
+    "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
+    "/downloader/sophon_chunk/api/getPatchBuild"
+);
+
+/// Resolve the patch-build URL base, honoring test overrides when present.
+pub(crate) fn sophon_patch_build_url_base() -> String {
+    #[cfg(any(test, feature = "bench-internals"))]
+    {
+        test_endpoints::patch_build_base()
+            .unwrap_or_else(|| SOPHON_PATCH_BUILD_URL_BASE.to_string())
+    }
+    #[cfg(not(any(test, feature = "bench-internals")))]
+    {
+        SOPHON_PATCH_BUILD_URL_BASE.to_string()
+    }
+}
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

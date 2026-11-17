@@ -11,7 +11,7 @@ use crate::proto_parse::{
 };
 
 use super::error::{SophonError, SophonResult};
-use super::{FRONT_DOOR_URL, SOPHON_BUILD_URL_BASE};
+use super::{front_door_url, sophon_build_url_base, sophon_patch_build_url_base};
 use crate::api_scrape::DownloadInfo;
 use crate::compute_content_manifest_hash;
 
@@ -72,7 +72,7 @@ async fn fetch_json_with_retry<T: serde::de::DeserializeOwned>(
 /// Returns the full owned branch; callers extract `main`/`pre_download`
 /// through [`GameBranch::take_branches`].
 pub async fn fetch_front_door(client: &Client, game_id: &str) -> SophonResult<GameBranch> {
-    let resp: FrontDoorResponse = fetch_json_with_retry(client, FRONT_DOOR_URL, 35).await?;
+    let resp: FrontDoorResponse = fetch_json_with_retry(client, &front_door_url(), 35).await?;
 
     let branch = resp
         .data
@@ -268,7 +268,7 @@ pub async fn fetch_build(
     let url = if let Some(tag_str) = tag {
         format!(
             "{base}?branch={branch}&package_id={package_id}&password={password}&tag={tag_str}",
-            base = SOPHON_BUILD_URL_BASE,
+            base = sophon_build_url_base(),
             branch = branch.branch,
             package_id = branch.package_id,
             password = branch.password,
@@ -276,7 +276,7 @@ pub async fn fetch_build(
     } else {
         format!(
             "{base}?branch={branch}&package_id={package_id}&password={password}",
-            base = SOPHON_BUILD_URL_BASE,
+            base = sophon_build_url_base(),
             branch = branch.branch,
             package_id = branch.package_id,
             password = branch.password,
@@ -293,12 +293,6 @@ pub async fn fetch_build(
     Ok(data)
 }
 
-/// Base endpoint for patch-build metadata requests.
-pub const SOPHON_PATCH_BUILD_URL_BASE: &str = concat!(
-    "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
-    "/downloader/sophon_chunk/api/getPatchBuild"
-);
-
 /// Fetch metadata describing the available patch build.
 pub async fn fetch_patch_build(
     client: &Client,
@@ -306,7 +300,7 @@ pub async fn fetch_patch_build(
 ) -> SophonResult<SophonPatchBuildData> {
     let url = format!(
         "{base}?branch={branch}&package_id={package_id}&password={password}&tag={tag}",
-        base = SOPHON_PATCH_BUILD_URL_BASE,
+        base = sophon_patch_build_url_base(),
         branch = branch.branch,
         package_id = branch.package_id,
         password = branch.password,
