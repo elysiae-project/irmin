@@ -65,6 +65,11 @@ criterion = "0.8.2"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# tokio is needed as a dev-dependency for the send-bounds integration tests
+# in `tests/send_bounds.rs`, which spawn `Sophon` futures on a multi-thread
+# runtime to guard against `Send + 'static` regressions when integrating
+# irmin into real multi-threaded consumers (e.g. elysiae).
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [features]
 sophon-profiling = [
