@@ -504,6 +504,39 @@ fn from_arena_empty_lookup_returns_none() {
     assert!(lookup.lookup("anything").is_none());
 }
 
+/// Verify the eytzinger-layout lookup returns the same results as a
+/// brute-force linear scan across a range of sizes, including edge cases
+/// (empty, single, power-of-two, off-by-one) and both hits and misses.
+#[test]
+fn eytzinger_lookup_matches_brute_force_across_sizes() {
+    use super::super::compact_manifest::StringArena;
+    for n in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 127, 128, 129] {
+        let names: Vec<String> = (0..n).map(|i| format!("chunk_{i:04}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let arena = StringArena::from(name_refs.as_slice());
+        let lookup = ChunkNameLookup::from_arena(arena);
+        // Every name should be found at its index.
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(
+                lookup.lookup(name),
+                Some(i),
+                "n={n}: lookup('{name}') should be Some({i})",
+            );
+        }
+        // Misses should return None.
+        assert_eq!(lookup.lookup("chunk_9999"), None, "n={n}: miss should be None");
+        assert_eq!(lookup.lookup(""), None, "n={n}: empty miss should be None");
+        // Boundary misses near existing names.
+        if n > 0 {
+            assert_eq!(
+                lookup.lookup("chunk_0000a"),
+                None,
+                "n={n}: boundary miss should be None",
+            );
+        }
+    }
+}
+
 #[test]
 fn download_cancellation_is_recorded_for_finalization() {
     let cancelled = AtomicU8::new(0);

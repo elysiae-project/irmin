@@ -44,7 +44,8 @@ use crate::proto_parse::SophonManifestAssetChunk;
 pub struct ChunkNameLookup {
     manifest: Arc<CompactManifest>,
     pub(super) name_locs: Box<[(u32, u32)]>,
-    /// dense indices ordered by name for binary search
+    /// Dense indices in eytzinger order for cache-friendly binary search.
+    /// Root at index 0, left child at 2i+1, right child at 2i+2.
     sorted: Box<[u32]>,
 }
 
@@ -68,6 +69,20 @@ fn span(loc: (u32, u32), arena_len: usize) -> std::ops::Range<usize> {
     start..end
 }
 
+/// Write a sorted slice into an eytzinger-layout array at `node`.
+/// Root at index 0; left child at 2*node+1; right child at 2*node+2.
+/// Produces a cache-friendly implicit BST: the hot path near the root
+/// lives at the array's start, staying in L1 across consecutive lookups.
+fn write_eytzinger(sorted: &[u32], layout: &mut [u32], source: &mut usize, node: usize) {
+    if node >= layout.len() {
+        return;
+    }
+    write_eytzinger(sorted, layout, source, node * 2 + 1);
+    layout[node] = sorted[*source];
+    *source += 1;
+    write_eytzinger(sorted, layout, source, node * 2 + 2);
+}
+
 impl ChunkNameLookup {
     /// Wrap a bare `StringArena` as the name source; arena indices become
     /// dense indices one-to-one. Used by tests and the repair path that own
@@ -83,10 +98,13 @@ impl ChunkNameLookup {
         sorted.sort_unstable_by(|&a, &b| {
             name_cmp(bytes, name_locs[a as usize], name_locs[b as usize])
         });
+        let mut eytzinger = vec![0u32; sorted.len()];
+        let mut source = 0usize;
+        write_eytzinger(&sorted, &mut eytzinger, &mut source, 0);
         Self {
             manifest,
             name_locs: name_locs.into_boxed_slice(),
-            sorted: sorted.into_boxed_slice(),
+            sorted: eytzinger.into_boxed_slice(),
         }
     }
 
@@ -118,10 +136,16 @@ impl ChunkNameLookup {
         sorted.sort_unstable_by(|&a, &b| {
             name_cmp(arena_bytes, name_locs[a as usize], name_locs[b as usize])
         });
+        // Convert the sorted indices to eytzinger layout for cache-friendly
+        // binary search: the hot path near the root lives at the array start,
+        // staying in L1 across consecutive lookups.
+        let mut eytzinger = vec![0u32; sorted.len()];
+        let mut source = 0usize;
+        write_eytzinger(&sorted, &mut eytzinger, &mut source, 0);
         Self {
             manifest,
             name_locs: name_locs.into_boxed_slice(),
-            sorted: sorted.into_boxed_slice(),
+            sorted: eytzinger.into_boxed_slice(),
         }
     }
 
@@ -135,18 +159,28 @@ impl ChunkNameLookup {
     }
 
     /// Find a name and return its dense index, or `None` if absent.
+    /// Uses the eytzinger-layout implicit BST: root at 0, left child at
+    /// 2*node+1, right child at 2*node+2. Each step touches a cache line
+    /// near the array start (the hot root path), reducing L1 misses vs
+    /// the conventional sorted-array binary search.
     #[inline]
     pub fn lookup(&self, name: &str) -> Option<usize> {
         let arena = self.manifest.arena_str().as_bytes();
         let name_locs = &self.name_locs;
-        match self.sorted.binary_search_by(|&i| {
-            let loc = name_locs[i as usize];
+        let layout = &self.sorted;
+        let query = name.as_bytes();
+        let mut node = 0usize;
+        while node < layout.len() {
+            let i = layout[node] as usize;
+            let loc = name_locs[i];
             let range = span(loc, arena.len());
-            arena[range].cmp(name.as_bytes())
-        }) {
-            Ok(pos) => Some(self.sorted[pos] as usize),
-            Err(_) => None,
+            match arena[range].cmp(query) {
+                std::cmp::Ordering::Equal => return Some(i),
+                std::cmp::Ordering::Less => node = node * 2 + 2,
+                std::cmp::Ordering::Greater => node = node * 2 + 1,
+            }
         }
+        None
     }
 }
 
