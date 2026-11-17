@@ -837,7 +837,12 @@ fn assemble_file_inner(
                             if chunk_done[i].load(Ordering::Acquire) {
                                 break;
                             }
-                            std::thread::park_timeout(std::time::Duration::from_millis(1));
+                            // Workers unpark this thread after setting
+                            // chunk_done[i]; park() returns immediately if an
+                            // unpark was called before park, so no wakeup is
+                            // lost. The 1ms park_timeout was a safety net that
+                            // caused ~1000 unnecessary wakeups per second.
+                            std::thread::park();
                         }
                         let off = offset as usize;
                         let end = off + size as usize;
@@ -1028,6 +1033,11 @@ fn assemble_file_inner(
                                     *guard = Some(e);
                                 }
                                 err_flag.store(true, Ordering::Relaxed);
+                                // Wake the hasher so it sees the error flag
+                                // and exits instead of parking forever.
+                                if let Some(t) = ht.get() {
+                                    t.unpark();
+                                }
                             }
                         }
                     }
