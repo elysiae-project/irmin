@@ -1020,6 +1020,55 @@ fn assign_chunk_offsets_same_hash_different_offsets_per_file() {
     assert_eq!(diff[1].asset_chunks[0].chunk_old_offset, 5000);
 }
 
+/// Guard against the `off as i64` cast in `assign_chunk_offsets` silently
+/// wrapping when the old chunk's `chunk_on_file_offset` (u64) exceeds
+/// `i64::MAX`. A wrapped-to-negative value is interpreted as "no old
+/// chunk" (since `chunk_old_offset >= 0` means reuse), so the chunk is
+/// re-downloaded instead of reused — a silent correctness issue, not a
+/// crash. This test documents and locks that behavior: a u64 offset > i64::MAX
+/// must NOT produce a misleading positive `chunk_old_offset` (which would
+/// point at the wrong old-file range and could corrupt the output). The
+/// cast must yield a negative value (treated as "no reuse") or the code must
+/// be changed to reject/validate the offset.
+///
+/// DO NOT weaken: this guards the `off as i64` overflow path in
+/// `assign_chunk_offsets` (installer.rs line ~958). If someone changes the
+/// cast to use `i64::try_from(off).unwrap_or(-1)` or similar, this test
+/// must still pass; if they change it to produce a positive value for
+/// `u64::MAX`, this test catches the regression.
+#[test]
+fn assign_chunk_offsets_u64_max_offset_does_not_produce_misleading_positive() {
+    // Old manifest with a chunk whose offset is u64::MAX (exabytes — not
+    // realistic for real games, but guards the cast).
+    let old_manifest = SophonManifestProto {
+        assets: vec![make_file(
+            "big.pak",
+            "m",
+            vec![make_chunk_with_hash("c0", 100, "hash0", u64::MAX)],
+        )],
+    };
+    let (offsets, name_to_id, hash_to_id) = intern_old_chunk_offsets(&old_manifest);
+
+    let mut diff = vec![make_file(
+        "big.pak",
+        "m_new",
+        vec![make_chunk_with_hash("c0", 100, "hash0", 0)],
+    )];
+
+    assign_chunk_offsets(&mut diff, &offsets, &name_to_id, &hash_to_id);
+
+    // The cast `u64::MAX as i64` yields -1 in Rust (wrapping). -1 is
+    // negative, so the assembly path treats it as "no old chunk" and
+    // re-downloads. This is the safe fallback. The test asserts the
+    // result is negative (not a misleading positive offset into the old
+    // file, which would read garbage).
+    assert!(
+        diff[0].asset_chunks[0].chunk_old_offset < 0,
+        "u64::MAX offset must not produce a misleading positive chunk_old_offset (would corrupt output); got {}",
+        diff[0].asset_chunks[0].chunk_old_offset
+    );
+}
+
 #[test]
 fn collect_deleted_files_basic() {
     let old = SophonManifestProto {
