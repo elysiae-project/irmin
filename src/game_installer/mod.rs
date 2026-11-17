@@ -117,6 +117,7 @@ pub async fn cancelable_sleep(
 }
 /// Assembly worker count while chunk downloads are active. Capped at 4
 /// so assembly never starves download workers, regardless of CPU count.
+#[inline]
 pub fn assembly_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().min(4))
@@ -169,6 +170,7 @@ pub const PROGRESS_UPDATE_INTERVAL_MS: u64 = 1000;
 pub const SPEED_SMOOTH_WINDOW_SECS: f64 = 5.0;
 
 /// Update an EWMA-smoothed value stored as a scaled u64.
+#[inline]
 pub fn ewma_update(atomic: &std::sync::atomic::AtomicU64, raw_value: f64, alpha: f64) -> f64 {
     const SCALE: f64 = 1000.0;
     use std::sync::atomic::Ordering;
