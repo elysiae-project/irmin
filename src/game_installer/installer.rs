@@ -363,11 +363,15 @@ struct DownloadItem {
 
 impl DownloadItem {
     fn claim_index(next_index: &AtomicUsize, item_count: usize) -> Option<usize> {
-        next_index
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
-                (index < item_count).then_some(index + 1)
-            })
-            .ok()
+        // fetch_add is a single atomic op (no CAS retry loop). Overshoot
+        // wastes at most one index per worker, which is negligible for
+        // 250k+ items and avoids cache-line bouncing under contention.
+        let index = next_index.fetch_add(1, Ordering::Relaxed);
+        if index < item_count {
+            Some(index)
+        } else {
+            None
+        }
     }
 }
 

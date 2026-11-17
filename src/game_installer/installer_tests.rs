@@ -273,7 +273,9 @@ fn download_item_claims_are_unique_and_stop_at_item_count() {
         let mut claims = Arc::try_unwrap(claims).unwrap().into_inner().unwrap();
         claims.sort_unstable();
         assert_eq!(claims, (0..item_count).collect::<Vec<_>>());
-        assert_eq!(next_index.load(Ordering::Relaxed), item_count);
+        // fetch_add may overshoot item_count by up to (worker_count - 1);
+        // the claims are still unique and bounded by item_count.
+        assert!(next_index.load(Ordering::Relaxed) >= item_count);
     }
 }
 
