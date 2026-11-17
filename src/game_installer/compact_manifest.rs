@@ -722,9 +722,31 @@ impl CompactManifestBuilder {
         estimated_string_bytes: usize,
     ) -> Self {
         let estimated_hash_bytes = estimated_string_bytes / 2;
+        // The arena's internal cap (INITIAL_STRING_INDEX_CAPACITY) prevents
+        // over-allocation for the from_arena path where the span count is
+        // unknown. For the builder path, we know the exact span count, so
+        // bypass the cap by allocating the full estimate directly.
+        let arena = StringArena {
+            data: String::with_capacity(estimated_string_bytes.min(u32::MAX as usize)),
+            offsets: Vec::with_capacity(span_count.min(u32::MAX as usize - 1) + 1),
+            dedup: FxHashMap::with_capacity_and_hasher(
+                span_count / 2,
+                Default::default(),
+            ),
+            sealed: false,
+        };
+        let hash_arena = ByteArena {
+            data: Vec::with_capacity(estimated_hash_bytes.min(u32::MAX as usize)),
+            offsets: Vec::with_capacity(span_count.min(u32::MAX as usize - 1) + 1),
+            dedup: FxHashMap::with_capacity_and_hasher(
+                span_count / 2,
+                Default::default(),
+            ),
+            sealed: false,
+        };
         Self {
-            arena: StringArena::with_capacity(span_count, estimated_string_bytes),
-            hash_arena: ByteArena::with_capacity(span_count, estimated_hash_bytes),
+            arena,
+            hash_arena,
             file_name_idx: Vec::with_capacity(total_files),
             file_hash_idx: Vec::with_capacity(total_files),
             file_type: Vec::with_capacity(total_files),
