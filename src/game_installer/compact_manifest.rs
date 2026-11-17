@@ -94,6 +94,25 @@ impl StringArena {
     }
 
     pub fn try_intern(&mut self, s: &str) -> Result<u32, CompactManifestLimitError> {
+        // Fast path: when offsets and data fit u32 and capacity is sufficient
+        // (the common case for pre-allocated arenas), skip the error paths.
+        let offsets_len = self.offsets.len();
+        let data_len = self.data.len();
+        if offsets_len < u32::MAX as usize
+            && data_len < u32::MAX as usize
+            && data_len + s.len() <= (u32::MAX as usize).min(isize::MAX as usize)
+            && self.data.capacity() >= data_len + s.len()
+            && self.offsets.capacity() > offsets_len
+        {
+            // SAFETY: all bounds checked above; push_str copies s into the
+            // reserved capacity; offsets has room for one more entry.
+            let index = offsets_len as u32;
+            let offset = data_len as u32;
+            self.offsets.push(offset);
+            self.data.push_str(s);
+            return Ok(index);
+        }
+        // Slow path with full validation for edge cases.
         let index = u32::try_from(self.offsets.len())
             .map_err(|_| CompactManifestLimitError("string index count"))?;
         let offset = u32::try_from(self.data.len())
@@ -104,8 +123,6 @@ impl StringArena {
             .checked_add(s.len())
             .filter(|&length| length <= max_string_len)
             .ok_or(CompactManifestLimitError("string byte length"))?;
-        // Reserve fallibly only when capacity is insufficient, avoiding the
-        // per-call try_reserve overhead for the common pre-allocated case.
         if self.data.capacity() < self.data.len() + s.len() {
             self.data
                 .try_reserve(s.len())
