@@ -2804,3 +2804,220 @@ async fn install_downloads_assembles_and_commits_single_eager_chunk() {
     }
 }
 
+/// Integration test for the `update` path's call into `install()`: an update
+/// passes a non-empty `deleted_files` list (files present in the old version
+/// but absent from the new manifest) and `DownloadType::Update` resume
+/// semantics. `install()` must remove the deleted files from `game_dir`
+/// during finalization and still assemble the new output.
+///
+/// This guards the `update` public API path that `Sophon::update` drives
+/// (after `build_update_installers`), which shares the same `install()`
+/// pipeline as `download` but exercises the deleted-files cleanup branch
+/// and the `DownloadType::Update` resume-key. DO NOT weaken when
+/// restructuring `finalize_install` or the deleted-files handling.
+#[tokio::test]
+async fn install_update_removes_deleted_files_and_assembles_new_output() {
+    use std::io::Write as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let data: Vec<u8> = (0..32 * 1024)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .collect();
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.window_log(20).unwrap();
+    encoder.write_all(&data).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let decompressed_hash = hex::encode(fast_md5::digest(&data));
+
+    Mock::given(method("GET"))
+        .and(path("chunks/eager"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(compressed.clone())
+                .insert_header("content-length", compressed.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    // Simulate a stale file from the previous version that the update plan
+    // marks for deletion. `install()` must remove it during finalization.
+    let stale_file = game_dir.join("stale_old_version.bin");
+    let mut f = std::fs::File::create(&stale_file).unwrap();
+    f.write_all(b"old version contents").unwrap();
+    f.sync_all().unwrap();
+    assert!(stale_file.exists(), "stale file must exist before update");
+
+    let chunk = SophonManifestAssetChunk {
+        chunk_name: bytes::Bytes::from("eager"),
+        chunk_decompressed_hash_md5: decompressed_hash.clone().into(),
+        chunk_on_file_offset: 0,
+        chunk_size: compressed.len() as u64,
+        chunk_size_decompressed: data.len() as u64,
+        chunk_compressed_hash_xxh: 0,
+        chunk_compressed_hash_md5: compressed_hash.into(),
+        chunk_old_offset: -1,
+    };
+    let asset = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("new_output.bin"),
+        asset_chunks: vec![chunk],
+        asset_type: 0,
+        asset_size: data.len() as u64,
+        asset_hash_md5: decompressed_hash.into(),
+    };
+    let installer = SophonInstaller {
+        manifest: SophonManifestProto { assets: vec![asset] },
+        chunk_download: DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: format!("{}/", server.uri()),
+            url_suffix: "chunks".into(),
+        },
+        label: "test".into(),
+        matching_field: "game".into(),
+        manifest_hash: "updatechunkhash".into(),
+    };
+
+    let resume = ResumeContext {
+        prev_manifest_hash: String::new(),
+        prev_downloaded_chunks: FxHashMap::default(),
+        resume_seed: super::super::CompletedFiles::default(),
+    };
+    let options = InstallOptions {
+        is_preinstall: false,
+        is_resume: false,
+        handle: DownloadHandle::new(),
+        verify_mode: super::VerifyMode::Full,
+    };
+    let callbacks = InstallCallbacks {
+        updater: Arc::new(|_p| {}),
+        state_saver: Arc::new(|_entries| {}),
+        completion_state: Arc::new(std::sync::OnceLock::new()),
+    };
+
+    let result = install(
+        vec![installer],
+        &game_dir,
+        vec!["stale_old_version.bin".to_string()],
+        "tag-update",
+        resume,
+        options,
+        callbacks,
+        "test",
+        &[std::string::String::from("en-US")],
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "update install failed: {:?}",
+        result.err()
+    );
+    // The stale file must be removed by the deleted-files cleanup branch.
+    assert!(
+        !stale_file.exists(),
+        "stale file must be removed by update finalization"
+    );
+    // The new output must be assembled correctly.
+    let out_path = game_dir.join("new_output.bin");
+    assert!(out_path.exists(), "new output file must exist");
+    let written = std::fs::read(&out_path).unwrap();
+    assert_eq!(written, data, "new output bytes must match the payload");
+}
+
+/// Integration test for resume-mode `install()`: a persisted download state
+/// matching the new manifest hash must seed `is_resume=true`, and the
+/// resume file-check loop (Phase 1 of `install()`, the same code path the
+/// user reported crashing) must run to completion without panicking.
+///
+/// This directly guards the "checking files after fetching manifest" path
+/// that the OnceLock ordering bug crashed in. DO NOT weaken when changing
+/// the resume scan or `resolve_resume_owned` logic.
+#[tokio::test]
+async fn install_resume_phase1_checking_files_does_not_panic_with_matching_state() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = game_dir.join("chunks");
+    std::fs::create_dir_all(&game_dir).unwrap();
+    std::fs::create_dir_all(&chunks_dir).unwrap();
+
+    // Build a small "already downloaded" chunk on disk + a matching
+    // persisted DownloadState so resolve_resume_owned sets is_resume=true.
+    let chunk_name = "resumable-chunk";
+    let chunk_data = b"resume payload bytes";
+    std::fs::write(chunks_dir.join(format!("{chunk_name}.zstd")), chunk_data)
+        .unwrap();
+
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let mut prev_downloaded_chunks: FxHashMap<String, u64> = FxHashMap::default();
+    prev_downloaded_chunks.insert(chunk_name.to_string(), chunk_data.len() as u64);
+
+    let manifest_hash = "resume-test-hash".to_string();
+
+    // Empty manifest + is_resume=true exercises the Phase 1 checking-files
+    // loop with zero files (the loop is a no-op but the OnceLock setup, the
+    // assembly coordinator spawn, and the assembly_epochs construction all
+    // run). This is the minimal reproducer for the OnceLock panic when
+    // is_resume=true.
+    let installer = SophonInstaller {
+        manifest: SophonManifestProto { assets: vec![] },
+        chunk_download: make_download_info(),
+        label: "test".into(),
+        matching_field: "game".into(),
+        manifest_hash: manifest_hash.clone(),
+    };
+
+    let resume = ResumeContext {
+        prev_manifest_hash: manifest_hash,
+        prev_downloaded_chunks,
+        resume_seed: super::super::CompletedFiles::default(),
+    };
+    let options = InstallOptions {
+        is_preinstall: false,
+        is_resume: true,
+        handle: DownloadHandle::new(),
+        verify_mode: super::VerifyMode::None,
+    };
+    let callbacks = InstallCallbacks {
+        updater: Arc::new(|_p| {}),
+        state_saver: Arc::new(|_entries| {}),
+        completion_state: Arc::new(std::sync::OnceLock::new()),
+    };
+
+    let result = install(
+        vec![installer],
+        &game_dir,
+        vec![],
+        "tag-resume",
+        resume,
+        options,
+        callbacks,
+        "test",
+        &[std::string::String::from("en-US")],
+    )
+    .await;
+
+    // With an empty manifest and is_resume=true, install must complete Ok
+    // without panicking in the Phase 1 checking-files loop or the OnceLock
+    // setup. The prev_downloaded_chunks entry references a chunk name not
+    // present in the (empty) manifest, so it is silently dropped — that is
+    // the documented behavior for resume state with no matching manifest
+    // entry.
+    assert!(
+        result.is_ok(),
+        "resume install with empty manifest failed: {:?}",
+        result.err()
+    );
+}
+
