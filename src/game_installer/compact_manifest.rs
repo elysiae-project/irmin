@@ -706,7 +706,6 @@ impl CompactManifestBuilder {
         }
     }
 
-    #[inline(never)]
     fn push(
         &mut self,
         file: &SophonManifestAssetProperty,
@@ -876,6 +875,7 @@ fn checked_intern(
 
 /// Decode a hex hash to binary and intern it in the `ByteArena`. Empty hex
 /// strings produce an empty binary entry.
+#[inline]
 fn intern_hash(arena: &mut ByteArena, hex: &str) -> Result<u32, CompactManifestLimitError> {
     if hex.is_empty() {
         return Ok(arena.intern_dedup(&[]));
