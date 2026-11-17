@@ -270,6 +270,22 @@ impl ByteArena {
     }
 
     pub(crate) fn try_intern(&mut self, bytes: &[u8]) -> Result<u32, CompactManifestLimitError> {
+        // Fast path: when offsets and data fit u32 and capacity is sufficient
+        // (the common case for pre-allocated arenas), skip the error paths.
+        let offsets_len = self.offsets.len();
+        let data_len = self.data.len();
+        if offsets_len < u32::MAX as usize
+            && data_len < u32::MAX as usize
+            && data_len + bytes.len() <= (u32::MAX as usize).min(isize::MAX as usize)
+            && self.data.capacity() >= data_len + bytes.len()
+            && self.offsets.capacity() > offsets_len
+        {
+            let index = offsets_len as u32;
+            let offset = data_len as u32;
+            self.offsets.push(offset);
+            self.data.extend_from_slice(bytes);
+            return Ok(index);
+        }
         let index = u32::try_from(self.offsets.len())
             .map_err(|_| CompactManifestLimitError("byte index count"))?;
         let offset =
