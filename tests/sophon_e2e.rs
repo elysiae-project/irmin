@@ -298,6 +298,376 @@ async fn sophon_check_update_e2e_mocked_http() {
     let _ = info.update_available;
 }
 
+/// `Sophon::update` end-to-end: writes an installed tag, fetches the
+/// mocked front-door + old build + new build + manifests, computes the diff,
+/// downloads the new chunk, assembles, and commits. Guards the update
+/// public API path which `elysiae` calls to update an existing install.
+///
+/// The old manifest is empty (no files) and the new manifest has one file,
+/// so the diff produces one installer with one eager chunk. This exercises
+/// `build_update_installers` → `build_diff_installers` → `install()` with
+/// the `DownloadType::Update` resume key and a non-empty deleted_files list
+/// (none here since the old manifest is empty).
+#[tokio::test]
+async fn sophon_update_e2e_mocked_http_full_pipeline() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+
+    // Payload for the new file's chunk.
+    let payload: Vec<u8> = (0..16 * 1024)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .collect();
+    let compressed = {
+        use std::io::Write as _;
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(20).unwrap();
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap()
+    };
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let decompressed_hash = hex::encode(fast_md5::digest(&payload));
+    let file_md5 = decompressed_hash.clone();
+
+    // New manifest with one file + one eager chunk.
+    let chunk = SophonManifestAssetChunk::from_parts(
+        Bytes::from("chunk0"),
+        Bytes::from(decompressed_hash),
+        0,
+        compressed.len() as u64,
+        payload.len() as u64,
+        0,
+        Bytes::from(compressed_hash),
+        -1,
+    );
+    let asset = SophonManifestAssetProperty::from_parts(
+        Bytes::from("updated.bin"),
+        vec![chunk],
+        0,
+        payload.len() as u64,
+        Bytes::from(file_md5),
+    );
+    let new_manifest = SophonManifestProto { assets: vec![asset] };
+    let new_manifest_bytes = new_manifest.encode_to_vec();
+
+    // Old manifest (empty — no files to diff against).
+    let old_manifest = SophonManifestProto { assets: vec![] };
+    let old_manifest_bytes = old_manifest.encode_to_vec();
+
+    // Chunk endpoint.
+    Mock::given(method("GET"))
+        .and(path("chunks/chunk0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(compressed.clone())
+                .insert_header("content-length", compressed.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+
+    // New manifest endpoint (manifest id "new-manifest").
+    Mock::given(method("GET"))
+        .and(path("manifests/new-manifest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(new_manifest_bytes.clone())
+                .insert_header("content-length", new_manifest_bytes.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+
+    // Old manifest endpoint (manifest id "old-manifest").
+    Mock::given(method("GET"))
+        .and(path("manifests/old-manifest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(old_manifest_bytes.clone())
+                .insert_header("content-length", old_manifest_bytes.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+
+    // Front-door.
+    let front_door_body = serde_json::json!({
+        "retcode": 0,
+        "message": "OK",
+        "data": {
+            "game_branches": [{
+                "game": { "id": "nap_e2e", "biz": "nap_e2e" },
+                "main": {
+                    "package_id": "pkg",
+                    "branch": "main",
+                    "password": "pw",
+                    "tag": "2.0.0",
+                },
+                "pre_download": null,
+            }]
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("api/getGameBranches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(front_door_body))
+        .mount(&server)
+        .await;
+
+    // Build endpoint: match on the tag query param to differentiate old vs new.
+    // Old build (tag=1.0.0) → empty manifest; New build (no tag or tag=2.0.0)
+    // → file manifest.
+    let old_build_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": {
+            "build_id": "old-build", "tag": "1.0.0",
+            "manifests": [{
+                "category_id": "1", "category_name": "game", "matching_field": "game",
+                "manifest": { "id": "old-manifest", "checksum": "x",
+                    "compressed_size": "0", "uncompressed_size": "0" },
+                "chunk_download": { "encryption": 0, "password": "", "compression": 0,
+                    "url_prefix": format!("{}/", server.uri()), "url_suffix": "chunks" },
+                "manifest_download": { "encryption": 0, "password": "", "compression": 0,
+                    "url_prefix": format!("{}/", server.uri()), "url_suffix": "manifests" },
+                "stats": { "compressed_size": "0", "uncompressed_size": "0",
+                    "file_count": "0", "chunk_count": "0" },
+            }],
+        }
+    });
+    let new_build_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": {
+            "build_id": "new-build", "tag": "2.0.0",
+            "manifests": [{
+                "category_id": "1", "category_name": "game", "matching_field": "game",
+                "manifest": { "id": "new-manifest", "checksum": "x",
+                    "compressed_size": "0", "uncompressed_size": "0" },
+                "chunk_download": { "encryption": 0, "password": "", "compression": 0,
+                    "url_prefix": format!("{}/", server.uri()), "url_suffix": "chunks" },
+                "manifest_download": { "encryption": 0, "password": "", "compression": 0,
+                    "url_prefix": format!("{}/", server.uri()), "url_suffix": "manifests" },
+                "stats": { "compressed_size": "0", "uncompressed_size": "0",
+                    "file_count": "1", "chunk_count": "1" },
+            }],
+        }
+    });
+    // Old build: tag=1.0.0 query param.
+    Mock::given(method("GET"))
+        .and(path("getBuild"))
+        .and(query_param("tag", "1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(old_build_body))
+        .mount(&server)
+        .await;
+    // New build: no tag query param (fetch_build with tag=None).
+    Mock::given(method("GET"))
+        .and(path("getBuild"))
+        .and(wiremock::matchers::query_param_is_missing("tag"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(new_build_body))
+        .mount(&server)
+        .await;
+
+    set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
+    set_build_base(Some(format!("{}/getBuild", server.uri())));
+    set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+    // Write an installed tag so update() can read it (from_tag = "1.0.0").
+    irmin_rs::game_installer::write_installed_tag(&game_dir, "1.0.0").unwrap();
+
+    let sophon = Sophon::builder("nap", game_dir.clone())
+        .vo_lang("en-US")
+        .verify_mode(VerifyMode::Full)
+        .build();
+
+    let handle = DownloadHandle::new();
+    let on_progress = |_p: SophonProgress| {};
+    let result = sophon.update(&handle, on_progress).await;
+    assert!(
+        result.is_ok(),
+        "Sophon::update e2e failed: {:?}",
+        result.err()
+    );
+
+    // The updated output file must exist and match the payload.
+    let out_path = game_dir.join("updated.bin");
+    assert!(out_path.exists(), "updated output file must exist");
+    let written = std::fs::read(&out_path).unwrap();
+    assert_eq!(written, payload, "updated output must match the payload");
+
+    // Clear overrides.
+    set_front_door(None);
+    set_build_base(None);
+    set_patch_build_base(None);
+}
+
+/// `Sophon::preinstall` end-to-end: fetches the mocked front-door (with a
+/// pre_download branch), patch build (POST), main build, patch manifest
+/// (empty), and main manifest, then runs `preinstall_download` with zero
+/// chunks (Phase 1 no-op → immediate completion + state save). Guards the
+/// preinstall public API path which `elysiae` calls to pre-download
+/// upcoming patches.
+///
+/// DO NOT weaken or delete. This guards the full `Sophon::preinstall` →
+/// `build_preinstall_plan` → `preinstall_download` pipeline, including the
+/// Phase 1 checking-files loop that was the user's crash site (the same
+/// loop that panicked in `install()`).
+#[tokio::test]
+async fn sophon_preinstall_e2e_mocked_http_empty_patch() {
+    use std::collections::HashMap;
+
+    let server = MockServer::start().await;
+
+    // Main manifest (empty — the preinstall plan references it but has no
+    // patch assets to apply).
+    let main_manifest = SophonManifestProto { assets: vec![] };
+    let main_manifest_bytes = main_manifest.encode_to_vec();
+
+    // Patch manifest (empty — no patch assets).
+    let patch_manifest = irmin_rs::proto_parse::SophonPatchProto::default();
+    let patch_manifest_bytes = patch_manifest.encode_to_vec();
+
+    // Main manifest endpoint.
+    Mock::given(method("GET"))
+        .and(path("manifests/main-manifest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(main_manifest_bytes.clone())
+                .insert_header("content-length", main_manifest_bytes.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+
+    // Patch manifest endpoint.
+    Mock::given(method("GET"))
+        .and(path("patch-manifests/patch-manifest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(patch_manifest_bytes.clone())
+                .insert_header("content-length", patch_manifest_bytes.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+
+    // Front-door with a pre_download branch.
+    let front_door_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": {
+            "game_branches": [{
+                "game": { "id": "nap_e2e", "biz": "nap_e2e" },
+                "main": {
+                    "package_id": "pkg", "branch": "main", "password": "pw", "tag": "2.0.0",
+                },
+                "pre_download": {
+                    "package_id": "pkg2", "branch": "main", "password": "pw", "tag": "2.0.0",
+                },
+            }]
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("api/getGameBranches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(front_door_body))
+        .mount(&server)
+        .await;
+
+    let dl = serde_json::json!({
+        "encryption": 0, "password": "", "compression": 0,
+        "url_prefix": format!("{}/", server.uri()), "url_suffix": "manifests",
+    });
+    let patch_dl = serde_json::json!({
+        "encryption": 0, "password": "", "compression": 0,
+        "url_prefix": format!("{}/", server.uri()), "url_suffix": "patch-manifests",
+    });
+    let chunk_dl = serde_json::json!({
+        "encryption": 0, "password": "", "compression": 0,
+        "url_prefix": format!("{}/", server.uri()), "url_suffix": "chunks",
+    });
+
+    // Patch build endpoint (POST).
+    let patch_build_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": {
+            "build_id": "patch-build", "patch_id": "patch-1", "tag": "2.0.0",
+            "manifests": [{
+                "category_id": "1", "category_name": "game", "matching_field": "game",
+                "manifest": { "id": "patch-manifest", "checksum": "x",
+                    "compressed_size": "0", "uncompressed_size": "0" },
+                "diff_download": chunk_dl,
+                "manifest_download": patch_dl,
+                "stats": {},
+            }],
+        }
+    });
+    Mock::given(method("POST"))
+        .and(path("getPatchBuild"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_build_body))
+        .mount(&server)
+        .await;
+
+    // Main build endpoint (tag=2.0.0 — the preinstall target tag).
+    let main_build_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": {
+            "build_id": "main-build", "tag": "2.0.0",
+            "manifests": [{
+                "category_id": "1", "category_name": "game", "matching_field": "game",
+                "manifest": { "id": "main-manifest", "checksum": "x",
+                    "compressed_size": "0", "uncompressed_size": "0" },
+                "chunk_download": chunk_dl,
+                "manifest_download": dl,
+                "stats": { "compressed_size": "0", "uncompressed_size": "0",
+                    "file_count": "0", "chunk_count": "0" },
+            }],
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("getBuild"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(main_build_body))
+        .mount(&server)
+        .await;
+
+    set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
+    set_build_base(Some(format!("{}/getBuild", server.uri())));
+    set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+    // Write an installed tag (preinstall requires it).
+    irmin_rs::game_installer::write_installed_tag(&game_dir, "1.0.0").unwrap();
+
+    let sophon = Sophon::builder("nap", game_dir.clone())
+        .vo_lang("en-US")
+        .verify_mode(VerifyMode::None)
+        .build();
+
+    let handle = DownloadHandle::new();
+    let on_progress = |_p: SophonProgress| {};
+    let result = sophon.preinstall(&handle, on_progress).await;
+    assert!(
+        result.is_ok(),
+        "Sophon::preinstall e2e failed: {:?}",
+        result.err()
+    );
+
+    // A preinstall state file should be written (the marker file).
+    let entries: Vec<_> = std::fs::read_dir(&game_dir).unwrap().collect();
+    let has_preinstall_marker = entries.iter().any(|e| {
+        e.as_ref()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sophon_preinstall")
+    });
+    assert!(
+        has_preinstall_marker,
+        "preinstall state file must be written after successful preinstall"
+    );
+
+    // Clear overrides.
+    set_front_door(None);
+    set_build_base(None);
+    set_patch_build_base(None);
+    let _ = HashMap::<u8, u8>::new(); // suppress unused import in some cfgs
+}
+
 /// `Sophon::verify_integrity` end-to-end: fetches the mocked front-door and
 /// build, then scans the (empty) game dir. Guards the verify_integrity
 /// public API path which `elysiae` calls to repair/verify installs.
