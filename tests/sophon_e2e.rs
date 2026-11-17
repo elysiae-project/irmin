@@ -845,3 +845,313 @@ async fn sophon_apply_preinstall_e2e_mocked_http_empty_patch() {
     set_patch_build_base(None);
     let _ = HashMap::<u8, u8>::new();
 }
+
+/// `Sophon::download` with a chunk that returns WRONG content (hash
+/// mismatch). The download must detect the MD5 mismatch, remove the
+/// corrupt chunk, and return an error — NOT crash or silently accept it.
+#[tokio::test]
+async fn sophon_download_e2e_chunk_hash_mismatch_returns_error_not_panic() {
+    let server = MockServer::start().await;
+
+    let corrupt_compressed = b"corrupt chunk bytes that don't match any hash";
+    let corrupt_hash = hex::encode(fast_md5::digest(corrupt_compressed.as_ref()));
+    // Manifest declares a hash that does NOT match the corrupt payload.
+    let wrong_hash = hex::encode(fast_md5::digest(b"completely different data"));
+    let decompressed_hash = hex::encode(fast_md5::digest(b"decompressed placeholder"));
+
+    let chunk = SophonManifestAssetChunk::from_parts(
+        Bytes::from("chunk0"),
+        Bytes::from(decompressed_hash.clone()),
+        0,
+        corrupt_compressed.len() as u64,
+        4096,
+        0,
+        Bytes::from(wrong_hash),
+        -1,
+    );
+    let asset = SophonManifestAssetProperty::from_parts(
+        Bytes::from("output.bin"),
+        vec![chunk],
+        0,
+        4096,
+        Bytes::from(decompressed_hash),
+    );
+    let manifest = SophonManifestProto { assets: vec![asset] };
+    let manifest_bytes = manifest.encode_to_vec();
+
+    Mock::given(method("GET"))
+        .and(path("chunks/chunk0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(corrupt_compressed.as_ref())
+                .insert_header("content-length", corrupt_compressed.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("manifests/manifest-game"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.clone())
+                .insert_header("content-length", manifest_bytes.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    let front_door_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": { "game_branches": [{
+            "game": { "id": "nap_e2e", "biz": "nap_e2e" },
+            "main": { "package_id": "pkg", "branch": "main", "password": "pw", "tag": "1.0.0" },
+            "pre_download": null,
+        }] }
+    });
+    Mock::given(method("GET"))
+        .and(path("api/getGameBranches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(front_door_body))
+        .mount(&server)
+        .await;
+    let build_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": { "build_id": "b", "tag": "1.0.0", "manifests": [{
+            "category_id": "1", "category_name": "game", "matching_field": "game",
+            "manifest": { "id": "manifest-game", "checksum": "x",
+                "compressed_size": "0", "uncompressed_size": "0" },
+            "chunk_download": { "encryption": 0, "password": "", "compression": 0,
+                "url_prefix": format!("{}/", server.uri()), "url_suffix": "chunks" },
+            "manifest_download": { "encryption": 0, "password": "", "compression": 0,
+                "url_prefix": format!("{}/", server.uri()), "url_suffix": "manifests" },
+            "stats": { "compressed_size": "0", "uncompressed_size": "0",
+                "file_count": "1", "chunk_count": "1" },
+        }] }
+    });
+    Mock::given(method("GET"))
+        .and(path("getBuild"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_body))
+        .mount(&server)
+        .await;
+
+    set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
+    set_build_base(Some(format!("{}/getBuild", server.uri())));
+    set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    let sophon = Sophon::builder("nap", game_dir)
+        .vo_lang("en-US")
+        .verify_mode(VerifyMode::Full)
+        .build();
+
+    let handle = DownloadHandle::new();
+    let result = sophon
+        .download(&handle, |_p: SophonProgress| {})
+        .await;
+
+    set_front_door(None);
+    set_build_base(None);
+    set_patch_build_base(None);
+    let _ = corrupt_hash; // suppress unused in some paths
+
+    assert!(
+        result.is_err(),
+        "download with corrupt chunk must return an error, got Ok"
+    );
+}
+
+/// `Sophon::download` with a chunk that returns TRUNCATED data (fewer
+/// bytes than promised). Must return an error — NOT crash or hang.
+#[tokio::test]
+async fn sophon_download_e2e_truncated_chunk_returns_error_not_panic() {
+    let server = MockServer::start().await;
+
+    let payload: Vec<u8> = (0..16 * 1024)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .collect();
+    let compressed = {
+        use std::io::Write as _;
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(20).unwrap();
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap()
+    };
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let decompressed_hash = hex::encode(fast_md5::digest(&payload));
+    let file_md5 = decompressed_hash.clone();
+
+    let chunk = SophonManifestAssetChunk::from_parts(
+        Bytes::from("chunk0"),
+        Bytes::from(decompressed_hash),
+        0,
+        compressed.len() as u64,
+        payload.len() as u64,
+        0,
+        Bytes::from(compressed_hash),
+        -1,
+    );
+    let asset = SophonManifestAssetProperty::from_parts(
+        Bytes::from("output.bin"),
+        vec![chunk],
+        0,
+        payload.len() as u64,
+        Bytes::from(file_md5),
+    );
+    let manifest = SophonManifestProto { assets: vec![asset] };
+    let manifest_bytes = manifest.encode_to_vec();
+
+    Mock::given(method("GET"))
+        .and(path("chunks/chunk0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(&compressed[..4])
+                .insert_header("content-length", compressed.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("manifests/manifest-game"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.clone())
+                .insert_header("content-length", manifest_bytes.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    let front_door_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": { "game_branches": [{
+            "game": { "id": "nap_e2e", "biz": "nap_e2e" },
+            "main": { "package_id": "pkg", "branch": "main", "password": "pw", "tag": "1.0.0" },
+            "pre_download": null,
+        }] }
+    });
+    Mock::given(method("GET"))
+        .and(path("api/getGameBranches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(front_door_body))
+        .mount(&server)
+        .await;
+    let build_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": { "build_id": "b", "tag": "1.0.0", "manifests": [{
+            "category_id": "1", "category_name": "game", "matching_field": "game",
+            "manifest": { "id": "manifest-game", "checksum": "x",
+                "compressed_size": "0", "uncompressed_size": "0" },
+            "chunk_download": { "encryption": 0, "password": "", "compression": 0,
+                "url_prefix": format!("{}/", server.uri()), "url_suffix": "chunks" },
+            "manifest_download": { "encryption": 0, "password": "", "compression": 0,
+                "url_prefix": format!("{}/", server.uri()), "url_suffix": "manifests" },
+            "stats": { "compressed_size": "0", "uncompressed_size": "0",
+                "file_count": "1", "chunk_count": "1" },
+        }] }
+    });
+    Mock::given(method("GET"))
+        .and(path("getBuild"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_body))
+        .mount(&server)
+        .await;
+
+    set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
+    set_build_base(Some(format!("{}/getBuild", server.uri())));
+    set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    let sophon = Sophon::builder("nap", game_dir)
+        .vo_lang("en-US")
+        .verify_mode(VerifyMode::Full)
+        .build();
+
+    let handle = DownloadHandle::new();
+    let result = sophon
+        .download(&handle, |_p: SophonProgress| {})
+        .await;
+
+    set_front_door(None);
+    set_build_base(None);
+    set_patch_build_base(None);
+
+    assert!(
+        result.is_err(),
+        "download with truncated chunk must return an error, got Ok"
+    );
+}
+
+/// `Sophon::download` with a manifest that returns CORRUPT protobuf.
+/// Must return an error — NOT crash.
+#[tokio::test]
+async fn sophon_download_e2e_corrupt_manifest_returns_error_not_panic() {
+    let server = MockServer::start().await;
+
+    let corrupt_manifest = b"\xff\xff\xff\xff\xff\xff\xff\xff not a protobuf";
+
+    Mock::given(method("GET"))
+        .and(path("manifests/manifest-game"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(corrupt_manifest.as_slice())
+                .insert_header("content-length", corrupt_manifest.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    let front_door_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": { "game_branches": [{
+            "game": { "id": "nap_e2e", "biz": "nap_e2e" },
+            "main": { "package_id": "pkg", "branch": "main", "password": "pw", "tag": "1.0.0" },
+            "pre_download": null,
+        }] }
+    });
+    Mock::given(method("GET"))
+        .and(path("api/getGameBranches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(front_door_body))
+        .mount(&server)
+        .await;
+    let build_body = serde_json::json!({
+        "retcode": 0, "message": "OK",
+        "data": { "build_id": "b", "tag": "1.0.0", "manifests": [{
+            "category_id": "1", "category_name": "game", "matching_field": "game",
+            "manifest": { "id": "manifest-game", "checksum": "x",
+                "compressed_size": "0", "uncompressed_size": "0" },
+            "chunk_download": { "encryption": 0, "password": "", "compression": 0,
+                "url_prefix": format!("{}/", server.uri()), "url_suffix": "chunks" },
+            "manifest_download": { "encryption": 0, "password": "", "compression": 0,
+                "url_prefix": format!("{}/", server.uri()), "url_suffix": "manifests" },
+            "stats": { "compressed_size": "0", "uncompressed_size": "0",
+                "file_count": "1", "chunk_count": "1" },
+        }] }
+    });
+    Mock::given(method("GET"))
+        .and(path("getBuild"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_body))
+        .mount(&server)
+        .await;
+
+    set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
+    set_build_base(Some(format!("{}/getBuild", server.uri())));
+    set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    let sophon = Sophon::builder("nap", game_dir)
+        .vo_lang("en-US")
+        .verify_mode(VerifyMode::Full)
+        .build();
+
+    let handle = DownloadHandle::new();
+    let result = sophon
+        .download(&handle, |_p: SophonProgress| {})
+        .await;
+
+    set_front_door(None);
+    set_build_base(None);
+    set_patch_build_base(None);
+
+    assert!(
+        result.is_err(),
+        "download with corrupt manifest must return an error, got Ok"
+    );
+}
