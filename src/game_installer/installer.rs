@@ -3990,29 +3990,6 @@ pub async fn install(
     // Shared cancellation token. Cancelling stops the RAM adjuster and
     // wakes any blocked recv().
     let assembly_cancel_token = tokio_util::sync::CancellationToken::new();
-    // Batched assembly durability: staged files flush once per epoch
-    // instead of one fdatasync+rename each. Chunk files stay until the
-    // epoch commit deletes them (via the refcount decrements there).
-    let assembly_epochs = Arc::new(super::assembly_epochs::AssemblyEpochs::new(
-        Arc::clone(ctx.chunk_names.get().expect("chunk_names set before assembly")),
-        Arc::clone(
-            ctx.chunk_refcounts
-                .get()
-                .expect("chunk_refcounts set before assembly"),
-        ),
-        Arc::clone(&ctx.chunks_dir),
-        super::assembly_epochs::EPOCH_MAX_FILES,
-        super::assembly_epochs::EPOCH_MAX_BYTES,
-    ));
-    let assembly_task = spawn_assembly_coordinator(
-        &ctx,
-        assemble_rx,
-        assembly_cancel_token.clone(),
-        Arc::clone(&assembly_epochs),
-    );
-    // The coordinator drops its Arc clone when it exits; install keeps
-    // this one for the final commit below.
-    let assembly_epochs_for_commit = Arc::clone(&assembly_epochs);
 
     let (
         download_items,
@@ -4056,6 +4033,38 @@ pub async fn install(
     let _ = ctx.chunk_names.set(Arc::clone(&chunk_names_lookup));
 
     let _ = ctx.save_chunk_names.set(Arc::clone(&chunk_names_lookup));
+
+    // Batched assembly durability: staged files flush once per epoch
+    // instead of one fdatasync+rename each. Chunk files stay until the
+    // epoch commit deletes them (via the refcount decrements there).
+    //
+    // DO NOT move this construction above the `ctx.chunk_names.set` /
+    // `ctx.chunk_refcounts.set` calls. AssemblyEpochs::new reads both
+    // OnceLocks synchronously; calling it before the locks are set
+    // panics with "chunk_names set before assembly" on every install.
+    // The earlier `tokio::spawn` coordinator waits via a yield loop,
+    // but this synchronous construction cannot. See the regression test
+    // `install_does_not_panic_on_fresh_download_epoch_construction`.
+    let assembly_epochs = Arc::new(super::assembly_epochs::AssemblyEpochs::new(
+        Arc::clone(ctx.chunk_names.get().expect("chunk_names set before assembly")),
+        Arc::clone(
+            ctx.chunk_refcounts
+                .get()
+                .expect("chunk_refcounts set before assembly"),
+        ),
+        Arc::clone(&ctx.chunks_dir),
+        super::assembly_epochs::EPOCH_MAX_FILES,
+        super::assembly_epochs::EPOCH_MAX_BYTES,
+    ));
+    let assembly_task = spawn_assembly_coordinator(
+        &ctx,
+        assemble_rx,
+        assembly_cancel_token.clone(),
+        Arc::clone(&assembly_epochs),
+    );
+    // The coordinator drops its Arc clone when it exits; install keeps
+    // this one for the final commit below.
+    let assembly_epochs_for_commit = Arc::clone(&assembly_epochs);
 
     {
         let downloaded_chunks_vec: Vec<AtomicU32> = (0..download_items.len())

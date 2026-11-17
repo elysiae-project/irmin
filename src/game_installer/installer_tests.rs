@@ -2577,3 +2577,85 @@ async fn save_assembly_state_coalesces_triggers_while_a_save_is_in_flight() {
     );
 }
 
+/// Regression guard for a guaranteed panic introduced when the batched
+/// assembly durability feature wired `AssemblyEpochs::new` to read
+/// `ctx.chunk_names`/`ctx.chunk_refcounts` via `OnceLock::get().expect()`
+/// synchronously inside `install()`, before `build_download_state` had
+/// populated those locks. The `tokio::spawn` assembly coordinator waited
+/// on the locks via a yield loop, but the synchronous `assembly_epochs`
+/// construction did not, so every fresh install panicked with
+/// "chunk_names set before assembly" the moment the manifest was parsed
+/// and the code reached the epoch construction.
+///
+/// This test calls `install()` with an empty installer list, which is
+/// sufficient to reach the OnceLock setup + assembly_epochs construction
+/// path without needing HTTP mocking. If the ordering regresses, the call
+/// panics and the test fails. DO NOT delete or weaken this test when
+/// reordering initialization in `install()` — the OnceLock reads must stay
+/// after the corresponding `OnceLock::set` calls, or the reads must
+/// tolerate `None` (e.g. via a yield loop or `if let Some`).
+#[tokio::test]
+async fn install_does_not_panic_on_empty_fresh_download_epoch_construction() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    let installer = SophonInstaller {
+        manifest: SophonManifestProto { assets: vec![] },
+        chunk_download: make_download_info(),
+        label: "test".into(),
+        matching_field: "game".into(),
+        manifest_hash: "emptytesthash".into(),
+    };
+
+    let resume = ResumeContext {
+        prev_manifest_hash: String::new(),
+        prev_downloaded_chunks: FxHashMap::default(),
+        resume_seed: super::super::CompletedFiles::default(),
+    };
+    let options = InstallOptions {
+        is_preinstall: false,
+        is_resume: false,
+        handle: DownloadHandle::new(),
+        verify_mode: super::VerifyMode::None,
+    };
+    let progress_calls = Arc::new(AtomicU64::new(0));
+    let progress_calls_for_saver = Arc::clone(&progress_calls);
+    let callbacks = InstallCallbacks {
+        updater: Arc::new(move |_p| {
+            progress_calls_for_saver.fetch_add(1, Ordering::Relaxed);
+        }),
+        state_saver: Arc::new(|_entries| {}),
+        completion_state: Arc::new(std::sync::OnceLock::new()),
+    };
+
+    let result = install(
+        vec![installer],
+        &game_dir,
+        vec![],
+        "tag-empty",
+        resume,
+        options,
+        callbacks,
+        "test",
+        &[std::string::String::from("en-US")],
+    )
+    .await;
+
+    // Empty manifest is a valid no-op install; it must not panic and must
+    // return Ok. The progress callback should have fired at least once
+    // (the initial Downloading/CalculatingDownloads event).
+    assert!(
+        result.is_ok(),
+        "install with empty manifest failed: {:?}",
+        result.err()
+    );
+    assert!(
+        progress_calls.load(Ordering::Relaxed) >= 1,
+        "progress callback should have fired at least once"
+    );
+}
+
