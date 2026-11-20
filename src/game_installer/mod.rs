@@ -21,7 +21,7 @@ pub mod chunk_batch_hasher;
 pub mod chunk_bitmap;
 /// Memory-compact columnar manifest representation.
 pub mod compact_manifest;
-mod decompress_oneshot;
+pub(crate) mod decompress_oneshot;
 mod download;
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]

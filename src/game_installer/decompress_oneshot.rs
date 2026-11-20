@@ -3,18 +3,74 @@
 //! instruction layout (which is sensitive to the state_save canary).
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use super::assembly_opt::{
-    Md5, bytes_to_hex, chunk_hash_required, md5_bytes_eq, md5_to_hex, mmap_read_write,
-    posix_advise, return_compressed_buf, return_dctx, return_md5, take_compressed_buf,
-    take_dctx, take_md5,
+    Md5, bytes_to_hex, chunk_hash_required, md5_bytes_eq, md5_to_hex, mmap_read_only_unchecked,
+    mmap_read_write, posix_advise, return_dctx, return_md5, take_dctx, take_md5,
 };
 use super::error::{SophonError, SophonResult};
 
-#[expect(clippy::too_many_arguments, reason = "matches the original assembly_opt signature")]
+/// Map the compressed chunk read-only instead of copying it into a per-worker
+/// buffer.
+///
+/// The previous `pread` path staged each chunk in a pooled `Vec` owned by the
+/// worker thread, so peak RSS scaled with `workers * chunk_size` instead of
+/// with the output size. A private file mapping is backed by page cache
+/// instead: those pages are clean and reclaimable (they count as `RssFile`,
+/// not anonymous memory), so the kernel may drop them under pressure rather
+/// than forcing them to swap or triggering the OOM killer.
+#[inline]
+fn map_compressed_chunk(file: &File, len: usize) -> SophonResult<super::assembly_opt::MmapGuard> {
+    // SAFETY: `len` was validated against the file's on-disk length by
+    // `resolve_map_len`, and chunk files are written once during download then
+    // only read during assembly, so they are not truncated while mapped. This
+    // process never writes them.
+    let map = unsafe { mmap_read_only_unchecked(file, len) }.map_err(SophonError::Io)?;
+    // The chunk is decompressed start-to-end exactly once, so ask for
+    // sequential readahead. Best-effort: advice failures are not fatal.
+    unsafe {
+        libc::madvise(map.map_base, map.map_len, libc::MADV_SEQUENTIAL);
+    }
+    Ok(map)
+}
+
+/// Resolve the number of bytes to map for a compressed chunk.
+///
+/// The manifest's declared compressed size is untrusted input. Mapping past
+/// EOF would make a later page touch raise SIGBUS, so the declared size must
+/// fit inside the file. A declared size that EXCEEDS the on-disk length means
+/// the chunk is truncated or corrupt: that is a hard error rather than a
+/// silent clamp, because a shorter mapping would make the decompressor read a
+/// partial frame and report a confusing failure.
+#[inline]
+pub(crate) fn resolve_map_len(
+    declared: Option<u64>,
+    on_disk_len: u64,
+    chunk_path: &Path,
+) -> SophonResult<usize> {
+    let len = match declared {
+        Some(s) => {
+            if s > on_disk_len {
+                return Err(SophonError::SizeMismatch {
+                    item: chunk_path.display().to_string(),
+                    expected: s,
+                    actual: on_disk_len,
+                });
+            }
+            s
+        }
+        None => on_disk_len,
+    };
+    usize::try_from(len)
+        .map_err(|_| SophonError::Io(std::io::Error::other("compressed chunk too large to map")))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches the original assembly_opt signature"
+)]
 pub(crate) fn decompress_chunk_oneshot(
     chunk_path: &Path,
     out_file: &File,
@@ -31,24 +87,14 @@ pub(crate) fn decompress_chunk_oneshot(
     let expected_usize = expected_size as usize;
 
     let f = File::open(chunk_path)?;
-    let compressed_size = match compressed_size {
-        Some(s) => s as usize,
-        None => f.metadata()?.len() as usize,
-    };
+    let on_disk_len = f.metadata()?.len();
+    let compressed_size = resolve_map_len(compressed_size, on_disk_len, chunk_path)?;
     if compressed_size == 0 {
         return Err(SophonError::Io(std::io::Error::other("empty chunk")));
     }
 
-    // pread into thread-local buffer instead of mmap; saves ~5 syscalls/chunk.
-    let mut compressed_buf = take_compressed_buf(compressed_size);
-    let n = f.read_at(&mut compressed_buf[..compressed_size], 0)?;
-    if n != compressed_size {
-        return_compressed_buf(compressed_buf);
-        return Err(SophonError::Io(std::io::Error::other(
-            "short read on compressed chunk",
-        )));
-    }
-    let compressed = &compressed_buf[..compressed_size];
+    let compressed_map = map_compressed_chunk(&f, compressed_size)?;
+    let compressed = compressed_map.as_slice();
 
     let mut out_mmap = mmap_read_write(out_file, offset, expected_usize)?;
 
@@ -128,8 +174,10 @@ pub(crate) fn decompress_chunk_oneshot(
         Ok(expected_size)
     })();
 
-    return_compressed_buf(compressed_buf);
-    // Evict compressed chunk pages from page cache.
+    // Unmap the compressed chunk BEFORE advising the page cache to drop it:
+    // POSIX_FADV_DONTNEED only drops pages with no remaining mapping, so the
+    // order here is what makes the eviction actually happen.
+    drop(compressed_map);
     posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
     drop(f);
     out_mmap.flush_and_evict();

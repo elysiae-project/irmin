@@ -350,10 +350,6 @@ pub(crate) fn trim_thread_local_buffers() {
     ZSTD_DCTX.with(|cell| {
         *cell.borrow_mut() = None;
     });
-    COMPRESSED_BUF.with(|cell| {
-        cell.borrow_mut().clear();
-        cell.borrow_mut().shrink_to_fit();
-    });
     HASH_READ_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
@@ -576,54 +572,6 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
             fd: file.as_raw_fd(),
         })
     }
-}
-
-// Thread-local buffer for reading compressed chunk data via pread.
-thread_local! {
-    static COMPRESSED_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Takes the compressed-chunk buffer, growing it if needed. Caller must
-/// return it via [`return_compressed_buf`] when done.
-#[allow(clippy::uninit_vec)]
-#[inline]
-pub(super) fn take_compressed_buf(len: usize) -> Vec<u8> {
-    COMPRESSED_BUF.with(|cell| {
-        if tls_reclaim_stale() {
-            *cell.borrow_mut() = Vec::new();
-        }
-        let mut buf = std::mem::take(&mut *cell.borrow_mut());
-        // Reserve without zeroing: the caller fills the buffer via pread
-        // before reading any bytes, so the uninitialized tail is never
-        // observed. On error, the buffer is returned to the pool.
-        if buf.capacity() < len {
-            buf.reserve(len);
-        }
-        // SAFETY: capacity is >= len after reserve. The bytes are
-        // uninitialized but the caller writes before reading.
-        unsafe {
-            buf.set_len(len);
-        }
-        buf
-    })
-}
-
-/// Returns the compressed buffer to the thread-local pool. Shrinks oversized
-/// buffers to cap retained memory.
-#[inline]
-pub(super) fn return_compressed_buf(mut buf: Vec<u8>) {
-    const MAX_RETAINED_COMPRESSED_BUF: usize = 8 * 1024 * 1024;
-    if buf.capacity() > MAX_RETAINED_COMPRESSED_BUF {
-        buf = Vec::with_capacity(MAX_RETAINED_COMPRESSED_BUF);
-    }
-    COMPRESSED_BUF.with(|cell| {
-        *cell.borrow_mut() = buf;
-    });
-}
-
-#[cfg(all(feature = "bench-diagnostics", test))]
-pub(crate) fn compressed_buffer_capacity() -> usize {
-    COMPRESSED_BUF.with(|cell| cell.borrow().capacity())
 }
 
 pub(crate) use super::decompress_oneshot::decompress_chunk_oneshot;
@@ -1347,6 +1295,27 @@ mod tests {
         drop(out2);
         assert_eq!(bytes2, raw.len() as u64);
         assert_eq!(std::fs::read(&dst2).unwrap(), raw);
+    }
+
+    /// The manifest's compressed size is untrusted input. The oneshot path
+    /// maps the compressed chunk, and mapping past EOF would make a later
+    /// page touch raise SIGBUS. A declared size above the on-disk length is
+    /// a truncated/corrupt chunk and must be rejected, not silently clamped;
+    /// a declared size within the file is mapped as-is.
+    #[test]
+    fn compressed_map_len_rejects_oversized_and_accepts_valid() {
+        use crate::game_installer::decompress_oneshot::resolve_map_len;
+        use std::path::Path;
+
+        let path = Path::new("chunk.zstd");
+        // Declared larger than the file: reject rather than map past EOF.
+        assert!(resolve_map_len(Some(16 * 1024 * 1024), 1234, path).is_err());
+        // Declared smaller than the file: map only the declared range.
+        assert_eq!(resolve_map_len(Some(100), 1234, path).unwrap(), 100);
+        // No declaration: map the whole file.
+        assert_eq!(resolve_map_len(None, 1234, path).unwrap(), 1234);
+        // Exact match stays exact.
+        assert_eq!(resolve_map_len(Some(1234), 1234, path).unwrap(), 1234);
     }
 
     #[test]
