@@ -2092,9 +2092,14 @@ mod tests {
                                     Ok::<_, Infallible>(resp)
                                 }
                             });
-                            let _ = http1::Builder::new()
-                                .serve_connection(TokioIo::new(socket), service)
-                                .await;
+                            // Serve each connection in its own task. The keep-alive
+                            // connection stays open after the last response, so
+                            // awaiting it inline would stall the shutdown select.
+                            tokio::spawn(async move {
+                                let _ = http1::Builder::new()
+                                    .serve_connection(TokioIo::new(socket), service)
+                                    .await;
+                            });
                         }
                     }
                 }
