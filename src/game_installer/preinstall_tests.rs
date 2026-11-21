@@ -1,6 +1,372 @@
 use super::*;
 use fast_md5;
 
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures repeated original-file validation on hash mismatch"]
+fn benchmark_original_hash_mismatch_validation() {
+    use std::time::{Duration, Instant};
+
+    let size = std::env::var("IRMIN_ORIGINAL_HASH_DIAG_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+        .saturating_mul(1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("original.bin");
+    let mut file = std::fs::File::create(&path).unwrap();
+    let block = vec![0x5a; 256 * 1024];
+    let mut remaining = size;
+    while remaining > 0 {
+        let write_len = remaining.min(block.len());
+        std::io::Write::write_all(&mut file, &block[..write_len]).unwrap();
+        remaining -= write_len;
+    }
+    drop(file);
+
+    let wrong_hash = "00000000000000000000000000000000";
+    // verify_file_hash compares raw digest bytes (unlike chunk_hash_required,
+    // it gives the all-zero 16-byte digest no "placeholder" meaning), so the
+    // probe must pass the decoded bytes, not the hex form.
+    let wrong_hash_raw = hex::decode(wrong_hash).unwrap();
+    assert!(!verify_file_hash(&path, &wrong_hash_raw));
+    let asset = PatchAssetInfo {
+        target_file_path: "original.bin".to_owned(),
+        target_file_size: size as u64,
+        target_file_hash: String::new(),
+        patch_method: PatchMethod::Patch,
+        patch_name: "patch.bin".to_owned(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 0,
+        patch_chunk_length: 0,
+        original_file_path: Some("original.bin".to_owned()),
+        original_file_hash: Some(wrong_hash.to_owned()),
+        original_file_size: Some(size as u64),
+        matching_field: "game".to_owned(),
+    };
+    let unfiltered_cache = FilterCache::new(dir.path());
+    let mut filtered_cache = FilterCache::new(dir.path());
+    filtered_cache.blacklist_entries = Some(vec!["original.bin".to_owned()]);
+
+    let verify_existing = |cache: &FilterCache, expected_hash: &[u8]| {
+        let mismatch_for_filtered = !verify_file_hash(&path, expected_hash);
+        if mismatch_for_filtered && is_filtered_asset(cache, &asset) {
+            return Ok::<bool, ()>(true);
+        }
+        let mismatch_for_normal = !verify_file_hash(&path, expected_hash);
+        if mismatch_for_normal && !is_filtered_asset(cache, &asset) {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    let verify_single_hash = |cache: &FilterCache, expected_hash: &[u8]| {
+        let mismatch = !verify_file_hash(&path, expected_hash);
+        if mismatch && is_filtered_asset(cache, &asset) {
+            return Ok::<bool, ()>(true);
+        }
+        if mismatch {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    let repetitions = 5;
+    let mut existing_elapsed = Duration::ZERO;
+    let mut single_hash_elapsed = Duration::ZERO;
+    for round in 0..repetitions * 2 {
+        for variant in (0..2).cycle().skip(round % 2).take(2) {
+            let started = Instant::now();
+            let outcome = if variant == 0 {
+                verify_existing(&unfiltered_cache, &wrong_hash_raw).unwrap()
+            } else {
+                verify_single_hash(&unfiltered_cache, &wrong_hash_raw).unwrap()
+            };
+            assert!(!outcome);
+            let elapsed = started.elapsed();
+            if variant == 0 {
+                existing_elapsed += elapsed;
+            } else {
+                single_hash_elapsed += elapsed;
+            }
+        }
+    }
+    assert_eq!(
+        verify_existing(&filtered_cache, &wrong_hash_raw).unwrap(),
+        verify_single_hash(&filtered_cache, &wrong_hash_raw).unwrap()
+    );
+    let actual_hash = super::super::cache::file_md5_digest(&path).unwrap();
+    assert_eq!(
+        verify_existing(&unfiltered_cache, &actual_hash).unwrap(),
+        verify_single_hash(&unfiltered_cache, &actual_hash).unwrap()
+    );
+    println!(
+        "original_hash_mismatch size_mib={} repetitions={} existing_total_ms={:.3} single_hash_total_ms={:.3}",
+        size / (1024 * 1024),
+        repetitions,
+        existing_elapsed.as_secs_f64() * 1000.0,
+        single_hash_elapsed.as_secs_f64() * 1000.0
+    );
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures DownloadOver context clone cost and resident memory"]
+fn benchmark_download_over_context_clone() {
+    use std::time::Instant;
+
+    let asset_count = std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_ASSETS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50_000);
+    let chunks_per_asset = std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_CHUNKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
+    let mut assets = Vec::with_capacity(asset_count);
+    for asset_index in 0..asset_count {
+        let mut chunks = Vec::with_capacity(chunks_per_asset);
+        for chunk_index in 0..chunks_per_asset {
+            chunks.push(SophonManifestAssetChunk {
+                chunk_name: format!("chunk-{asset_index:06}-{chunk_index:02}").into(),
+                chunk_decompressed_hash_md5: format!("{asset_index:016x}{chunk_index:016x}").into(),
+                chunk_on_file_offset: (chunk_index * 1024 * 1024) as u64,
+                chunk_size: 256 * 1024,
+                chunk_size_decompressed: 1024 * 1024,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: format!("{chunk_index:032x}").into(),
+                chunk_old_offset: -1,
+            });
+        }
+        assets.push(SophonManifestAssetProperty {
+            asset_name: format!("GameData/StreamingAssets/Persistent/{asset_index:08}.bundle").into(),
+            asset_chunks: chunks,
+            asset_type: 0,
+            asset_size: (chunks_per_asset * 1024 * 1024) as u64,
+            asset_hash_md5: format!("{asset_index:032x}").into(),
+        });
+    }
+    let snapshot = TargetSnapshot {
+        version: 1,
+        game_id: "hk4e_global".to_owned(),
+        vo_lang: "en-us".to_owned(),
+        installed_tag: "source".to_owned(),
+        tag: "target".to_owned(),
+        build_id: "synthetic".to_owned(),
+        legacy_coverage: false,
+        manifests: vec![TargetManifest {
+            matching_field: "game".to_owned(),
+            manifest_id: "synthetic-manifest".to_owned(),
+            chunk_download: make_download_info(),
+            manifest: SophonManifestProto { assets },
+        }],
+        digest: String::new(),
+    };
+    let context = DownloadOverContext::from_snapshot(&snapshot);
+    let baseline_rss = read_process_rss();
+    let shared = std::sync::Arc::new(context);
+    let clone_mode =
+        std::env::var("IRMIN_DOWNLOAD_OVER_CONTEXT_CLONE").unwrap_or_else(|_| "deep".to_owned());
+    let started = Instant::now();
+    let retained = match clone_mode.as_str() {
+        "deep" => {
+            let clone = DownloadOverContext {
+                manifests: shared
+                    .manifests
+                    .iter()
+                    .map(|(key, (download, manifest, index))| {
+                        (
+                            key.clone(),
+                            (
+                                download.clone(),
+                                std::sync::Arc::new((**manifest).clone()),
+                                index.clone(),
+                            ),
+                        )
+                    })
+                    .collect(),
+            };
+            std::hint::black_box(&clone);
+            CloneStorage::Deep(Box::new(clone))
+        }
+        "arc" => {
+            let clone = std::sync::Arc::clone(&shared);
+            std::hint::black_box(&clone);
+            CloneStorage::Shared(clone)
+        }
+        other => panic!("unsupported clone mode: {other}"),
+    };
+    let elapsed = started.elapsed();
+    let clone_rss = read_process_rss();
+    assert_eq!(retained.manifest_count(), 1);
+    assert_eq!(
+        retained.asset_count(),
+        asset_count,
+        "clone must preserve all target assets"
+    );
+    println!(
+        "download_over_context_clone mode={clone_mode} assets={asset_count} chunks_per_asset={chunks_per_asset} baseline_rss_kib={baseline_rss} clone_ms={:.3} clone_rss_kib={clone_rss}",
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+#[cfg(feature = "bench-diagnostics")]
+enum CloneStorage {
+    Deep(Box<DownloadOverContext>),
+    Shared(std::sync::Arc<DownloadOverContext>),
+}
+
+#[cfg(feature = "bench-diagnostics")]
+impl CloneStorage {
+    fn manifest_count(&self) -> usize {
+        match self {
+            Self::Deep(context) => context.manifests.len(),
+            Self::Shared(context) => context.manifests.len(),
+        }
+    }
+
+    fn asset_count(&self) -> usize {
+        match self {
+            Self::Deep(context) => context.manifests["game"].1.assets.len(),
+            Self::Shared(context) => context.manifests["game"].1.assets.len(),
+        }
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn read_process_rss() -> u64 {
+    let mut status = String::new();
+    std::fs::File::open("/proc/self/status")
+        .unwrap()
+        .read_to_string(&mut status)
+        .unwrap();
+    status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn insert_unique_chunk_name_skips_duplicate_owned_key() {
+    let mut seen = rustc_hash::FxHashSet::default();
+    assert!(insert_unique_chunk_name(&mut seen, "chunk-a"));
+    assert!(insert_unique_chunk_name(&mut seen, "chunk-b"));
+    assert!(!insert_unique_chunk_name(&mut seen, "chunk-a"));
+    assert_eq!(seen.len(), 2);
+    assert!(seen.contains("chunk-a"));
+    assert!(seen.contains("chunk-b"));
+}
+
+fn chunk_info(name: &str, size: u64) -> PatchChunkInfo {
+    PatchChunkInfo {
+        patch_name: name.to_owned(),
+        patch_size: size,
+        patch_md5: String::new(),
+        matching_field: String::new(),
+    }
+}
+
+fn capture_saver() -> (
+    Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+    super::super::installer::StateSaver,
+) {
+    let saved = Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
+    let saved_for_callback = Arc::clone(&saved);
+    let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
+        *saved_for_callback.lock().unwrap() =
+            snapshot.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    });
+    (saved, saver)
+}
+
+#[test]
+fn snapshot_downloaded_chunks_saves_sizes_and_names() {
+    let unique_chunks: Arc<[PatchChunkInfo]> =
+        Arc::from(vec![chunk_info("chunk-a", 11), chunk_info("chunk-b", 22)]);
+    let sizes = Arc::new(ChunkSizes::new(2));
+    sizes.mark(0, 11);
+    sizes.mark(1, 22);
+    let (saved, saver) = capture_saver();
+
+    let names = snapshot_downloaded_chunks(sizes, Arc::clone(&unique_chunks), &saver);
+
+    let saved = saved.lock().unwrap();
+    assert_eq!(saved.len(), 2);
+    assert!(saved.iter().any(|(k, v)| k == "chunk-a" && *v == 11));
+    assert!(saved.iter().any(|(k, v)| k == "chunk-b" && *v == 22));
+    assert_eq!(
+        names,
+        rustc_hash::FxHashSet::from_iter(["chunk-a".into(), "chunk-b".into()])
+    );
+}
+
+#[test]
+fn snapshot_downloaded_chunks_with_nothing_completed_saves_nothing() {
+    let unique_chunks: Arc<[PatchChunkInfo]> = Arc::from(vec![
+        chunk_info("chunk-a", 11),
+        chunk_info("chunk-b", 22),
+    ]);
+    let sizes = Arc::new(ChunkSizes::new(2));
+    let (saved, saver) = capture_saver();
+
+    let names = snapshot_downloaded_chunks(sizes, Arc::clone(&unique_chunks), &saver);
+
+    assert!(saved.lock().unwrap().is_empty());
+    assert!(names.is_empty());
+}
+
+#[test]
+fn snapshot_downloaded_chunks_skips_pending_and_counts_only_completed() {
+    let unique_chunks: Arc<[PatchChunkInfo]> = Arc::from(vec![
+        chunk_info("chunk-a", 11),
+        chunk_info("chunk-b", 22),
+        chunk_info("chunk-c", 33),
+    ]);
+    let sizes = Arc::new(ChunkSizes::new(3));
+    // Only the outer two are confirmed; the middle stays pending.
+    sizes.mark(0, 11);
+    sizes.mark(2, 33);
+    let (saved, saver) = capture_saver();
+
+    let names = snapshot_downloaded_chunks(sizes, Arc::clone(&unique_chunks), &saver);
+
+    let saved = saved.lock().unwrap();
+    assert_eq!(saved.len(), 2, "pending chunk must not be saved");
+    assert!(!saved.iter().any(|(k, _)| k == "chunk-b"));
+    assert_eq!(saved.iter().find(|(k, _)| k == "chunk-c").unwrap().1, 33);
+    assert_eq!(
+        names,
+        rustc_hash::FxHashSet::from_iter(["chunk-a".into(), "chunk-c".into()])
+    );
+}
+
+#[tokio::test]
+async fn first_stream_error_drains_all_results_and_returns_first_error() {
+    let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream = futures_util::stream::iter([
+        Ok::<_, SophonError>(()),
+        Err(SophonError::Io(std::io::Error::other("first"))),
+        Err(SophonError::Io(std::io::Error::other("second"))),
+        Ok(()),
+    ])
+    .inspect({
+        let consumed = Arc::clone(&consumed);
+        move |_| {
+            consumed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
+    let error = first_stream_error(stream).await.unwrap();
+
+    assert_eq!(consumed.load(std::sync::atomic::Ordering::Relaxed), 4);
+    assert!(error.to_string().contains("first"));
+}
+
 #[tokio::test]
 async fn preinstall_falls_back_to_current_build_only_for_matching_target_tag() {
     use crate::api_scrape::SophonBuildData;
@@ -163,7 +529,10 @@ fn verify_chunk_md5_correct() {
     let data = b"hello world";
     let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(verify_chunk_md5(&path, &md5_hex));
+    assert!(verify_chunk_md5(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default()
+    ));
 }
 
 #[test]
@@ -171,14 +540,14 @@ fn verify_chunk_md5_wrong() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_chunk");
     fs::write(&path, b"hello world").unwrap();
-    assert!(!verify_chunk_md5(&path, "wrong_md5_hash_here"));
+    assert!(!verify_chunk_md5(&path, b"wrong_md5_hash_here"));
 }
 
 #[test]
 fn verify_chunk_md5_missing_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nonexistent");
-    assert!(!verify_chunk_md5(&path, "any_hash"));
+    assert!(!verify_chunk_md5(&path, b"any_hash"));
 }
 
 #[test]
@@ -188,7 +557,11 @@ fn verify_file_hash_md5_uppercase_expected() {
     let data = b"hello world";
     let md5_hex_lower = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(verify_file_hash(&path, &md5_hex_lower.to_uppercase()));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&md5_hex_lower.to_uppercase())
+            .unwrap_or_default()
+    ));
 }
 
 #[test]
@@ -200,7 +573,10 @@ fn verify_file_hash_xxh64_uppercase_expected() {
     let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
     hasher.update(data);
     let xxh64_lower = format!("{:016x}", hasher.digest());
-    assert!(verify_file_hash(&path, &xxh64_lower.to_uppercase()));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&xxh64_lower.to_uppercase()).unwrap_or_default()
+    ));
 }
 
 #[test]
@@ -208,7 +584,7 @@ fn verify_file_hash_empty_returns_true() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_empty");
     fs::write(&path, b"some data").unwrap();
-    assert!(verify_file_hash(&path, ""));
+    assert!(verify_file_hash(&path, b""));
 }
 
 #[test]
@@ -216,9 +592,9 @@ fn verify_file_hash_whitespace_only_returns_false() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_whitespace");
     fs::write(&path, b"some data").unwrap();
-    assert!(!verify_file_hash(&path, "   "));
-    assert!(!verify_file_hash(&path, "\t"));
-    assert!(!verify_file_hash(&path, "\n"));
+    assert!(!verify_file_hash(&path, b"   "));
+    assert!(!verify_file_hash(&path, b"\t"));
+    assert!(!verify_file_hash(&path, b"\n"));
 }
 
 #[test]
@@ -226,10 +602,10 @@ fn verify_file_hash_unknown_length_returns_false() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_unknown");
     fs::write(&path, b"some data").unwrap();
-    assert!(!verify_file_hash(&path, "short"));
+    assert!(!verify_file_hash(&path, b"short"));
     assert!(!verify_file_hash(
         &path,
-        "1234567890abcdef1234567890abcdef1234567890abcdef"
+        b"1234567890abcdef1234567890abcdef1234567890abcdef"
     ));
 }
 
@@ -237,8 +613,11 @@ fn verify_file_hash_unknown_length_returns_false() {
 fn verify_file_hash_missing_file_returns_false() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nonexistent_file");
-    assert!(!verify_file_hash(&path, "0123456789abcdef0123456789abcdef"));
-    assert!(!verify_file_hash(&path, "0123456789abcdef"));
+    assert!(!verify_file_hash(
+        &path,
+        b"0123456789abcdef0123456789abcdef"
+    ));
+    assert!(!verify_file_hash(&path, b"0123456789abcdef"));
 }
 
 /// Lowercase MD5 hash must be accepted (verify_file_hash normalizes to
@@ -250,7 +629,10 @@ fn verify_file_hash_md5_lowercase_expected() {
     let data = b"hello world";
     let md5_lower = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(verify_file_hash(&path, &md5_lower));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&md5_lower).unwrap_or_default()
+    ));
 }
 
 /// A real MD5 mismatch must return false (verify_file_hash dispatcher).
@@ -260,7 +642,10 @@ fn verify_file_hash_md5_wrong_hash_returns_false() {
     let path = dir.path().join("test_md5_wrong");
     fs::write(&path, b"hello world").unwrap();
     // MD5 of "hello world"
-    assert!(!verify_file_hash(&path, "00000000000000000000000000000000"));
+    assert!(!verify_file_hash(
+        &path,
+        b"00000000000000000000000000000000"
+    ));
 }
 
 /// Lowercase XXH64 hash must be accepted (verify_file_hash normalizes to
@@ -274,7 +659,10 @@ fn verify_file_hash_xxh64_lowercase_expected() {
     hasher.update(data);
     let xxh64_lower = format!("{:016x}", hasher.digest());
     fs::write(&path, data).unwrap();
-    assert!(verify_file_hash(&path, &xxh64_lower));
+    assert!(verify_file_hash(
+        &path,
+        &super::super::assembly_opt::hex_to_bytes(&xxh64_lower).unwrap_or_default()
+    ));
 }
 
 /// A real XXH64 mismatch must return false (verify_file_hash dispatcher).
@@ -284,7 +672,7 @@ fn verify_file_hash_xxh64_wrong_hash_returns_false() {
     let path = dir.path().join("test_xxh64_wrong");
     fs::write(&path, b"hello world").unwrap();
     // All-zero string is not a valid XXH64.
-    assert!(!verify_file_hash(&path, "0000000000000000"));
+    assert!(!verify_file_hash(&path, b"0000000000000000"));
 }
 
 #[test]
@@ -435,7 +823,7 @@ fn is_file_already_patched_size_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.bin");
     fs::write(&path, b"short").unwrap();
-    assert!(!is_file_already_patched(&path, 9999, "any_hash"));
+    assert!(!is_file_already_patched(&path, 9999, b"any_hash"));
 }
 
 #[test]
@@ -447,7 +835,7 @@ fn is_file_already_patched_md5_mismatch() {
     assert!(!is_file_already_patched(
         &path,
         data.len() as u64,
-        "wrong_hash"
+        b"wrong_hash"
     ));
 }
 
@@ -458,14 +846,18 @@ fn is_file_already_patched_valid() {
     let data = b"hello world";
     let md5_hex = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
-    assert!(is_file_already_patched(&path, data.len() as u64, &md5_hex));
+    assert!(is_file_already_patched(
+        &path,
+        data.len() as u64,
+        &super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap()[..]
+    ));
 }
 
 #[test]
 fn is_file_already_patched_missing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nonexistent.bin");
-    assert!(!is_file_already_patched(&path, 100, "any_hash"));
+    assert!(!is_file_already_patched(&path, 100, b"any_hash"));
 }
 
 #[test]
@@ -476,7 +868,11 @@ fn is_file_already_patched_returns_false_when_file_missing() {
     // Keep tempdir alive for the duration of the test.
     let _keep_dir_alive = &dir;
 
-    let result = is_file_already_patched(&path, 0, "d41d8cd98f00b204e9800998ecf8427e");
+    let result = is_file_already_patched(
+        &path,
+        0,
+        &super::super::assembly_opt::hex_to_bytes("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+    );
 
     assert!(!result);
 }
@@ -490,11 +886,7 @@ fn is_file_already_patched_returns_false_when_size_mismatch() {
     fs::write(&path, data).unwrap();
     let actual_size = data.len() as u64;
 
-    let result = is_file_already_patched(
-        &path,
-        actual_size + 9_999,
-        "00000000000000000000000000000000",
-    );
+    let result = is_file_already_patched(&path, actual_size + 9_999, &[0; 16]);
 
     assert!(!result);
 }
@@ -508,7 +900,11 @@ fn is_file_already_patched_returns_true_when_size_and_md5_match() {
     let expected_md5 = hex::encode(fast_md5::digest(data));
     fs::write(&path, data).unwrap();
 
-    let result = is_file_already_patched(&path, data.len() as u64, &expected_md5);
+    let result = is_file_already_patched(
+        &path,
+        data.len() as u64,
+        &super::super::assembly_opt::hex_to_bytes(&expected_md5).unwrap()[..],
+    );
 
     assert!(result);
 }
@@ -521,8 +917,11 @@ fn is_file_already_patched_returns_false_when_only_md5_mismatch() {
     let data = b"hello world";
     fs::write(&path, data).unwrap();
 
-    let result =
-        is_file_already_patched(&path, data.len() as u64, "00000000000000000000000000000000");
+    let result = is_file_already_patched(
+        &path,
+        data.len() as u64,
+        &super::super::assembly_opt::hex_to_bytes("00000000000000000000000000000000").unwrap(),
+    );
 
     assert!(!result);
 }
@@ -997,6 +1396,71 @@ fn apply_hdiff_patch_size_mismatch_returns_error() {
 }
 
 #[test]
+fn apply_hdiff_patch_original_hash_mismatch_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks_dir = dir.path().join("patching/chunk");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    let original_path = dir.path().join("original.bin");
+    fs::write(&original_path, b"original data").unwrap();
+    fs::write(chunks_dir.join("patch_chunk.bin"), b"dummy chunk data").unwrap();
+
+    let asset = PatchAssetInfo {
+        target_file_path: "original.bin".to_owned(),
+        target_file_size: 100,
+        target_file_hash: "target_hash".to_owned(),
+        patch_method: PatchMethod::Patch,
+        patch_name: "patch_chunk.bin".to_owned(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 20,
+        patch_chunk_length: 20,
+        original_file_path: Some("original.bin".to_owned()),
+        original_file_hash: Some("00000000000000000000000000000000".to_owned()),
+        original_file_size: Some(fs::metadata(&original_path).unwrap().len()),
+        matching_field: "game".to_owned(),
+    };
+
+    let error = apply_hdiff_patch(
+        dir.path(),
+        &chunks_dir,
+        &asset,
+        &FilterCache::new(dir.path()),
+    )
+    .unwrap_err();
+    assert!(matches!(error, SophonError::OriginalFileMissing(_)));
+}
+
+#[test]
+fn apply_hdiff_patch_filtered_original_hash_mismatch_skips() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks_dir = dir.path().join("patching/chunk");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    let original_path = dir.path().join("original.bin");
+    fs::write(&original_path, b"original data").unwrap();
+    fs::write(chunks_dir.join("patch_chunk.bin"), b"dummy chunk data").unwrap();
+
+    let asset = PatchAssetInfo {
+        target_file_path: "original.bin".to_owned(),
+        target_file_size: 100,
+        target_file_hash: "target_hash".to_owned(),
+        patch_method: PatchMethod::Patch,
+        patch_name: "patch_chunk.bin".to_owned(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 20,
+        patch_chunk_length: 20,
+        original_file_path: Some("original.bin".to_owned()),
+        original_file_hash: Some("00000000000000000000000000000000".to_owned()),
+        original_file_size: Some(fs::metadata(&original_path).unwrap().len()),
+        matching_field: "game".to_owned(),
+    };
+    let mut cache = FilterCache::new(dir.path());
+    cache.blacklist_entries = Some(vec!["original.bin".to_owned()]);
+
+    apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &cache).unwrap();
+}
+
+#[test]
 fn apply_hdiff_patch_blank_original_creates_diff_ref() {
     let dir = tempfile::tempdir().unwrap();
     let chunks_dir = dir.path().join("patching/chunk");
@@ -1212,7 +1676,10 @@ fn apply_hdiff_patch_from_files_blank_diff_ref_hash_matches() {
     let empty_path = dir.path().join("empty_file.txt");
     fs::write(&empty_path, b"").unwrap();
     assert!(
-        verify_file_hash(&empty_path, BLANK_FILE_MD5),
+        verify_file_hash(
+            &empty_path,
+            &super::super::assembly_opt::hex_to_bytes(BLANK_FILE_MD5).unwrap_or_default()
+        ),
         "BLANK_FILE_MD5 should match the hash of an empty file"
     );
 }
@@ -1464,6 +1931,120 @@ fn is_filtered_asset_no_game_dir_markers() {
 }
 
 #[test]
+fn contains_ignore_ascii_case_matches_reference_for_edge_cases() {
+    fn reference(haystack: &str, pattern: &str) -> bool {
+        if pattern.len() > haystack.len() {
+            return false;
+        }
+        let haystack = haystack.as_bytes();
+        let pattern = pattern.as_bytes();
+        (0..=haystack.len() - pattern.len()).any(|start| {
+            haystack[start..start + pattern.len()]
+                .iter()
+                .zip(pattern)
+                .all(|(actual, expected)| actual.to_ascii_lowercase() == *expected)
+        })
+    }
+
+    let cases = [
+        ("", ""),
+        ("path/to/file", ""),
+        ("", "long"),
+        ("Audio/Japanese/Voice.Pak", "japanese/voice"),
+        ("DATA/OTHER/file.PAK", "data/other/"),
+        ("café/音声.PAK", "音声"),
+        ("café/音声.PAK", "É"),
+        ("prefix", "prefix-too-long"),
+    ];
+    for (haystack, pattern) in cases {
+        assert_eq!(
+            contains_ignore_ascii_case(haystack, pattern),
+            reference(haystack, pattern),
+            "haystack={haystack:?}, pattern={pattern:?}",
+        );
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures complete preinstall patch-asset filter pass"]
+fn benchmark_patch_asset_filter_pass() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for asset_count in [1_000usize, 10_000, 50_000] {
+        for pattern_count in [5usize, 32, 100] {
+            for hit_stride in [0usize, 2] {
+                let mut patterns = (0..pattern_count)
+                    .map(|index| match index % 4 {
+                        0 => format!("audio/korean/voice_{index:04}.pak"),
+                        1 => format!("persistent/resource_{index:04}.pak"),
+                        2 => format!("/japanese/voice_{index:04}/"),
+                        _ => format!("streamingassets/voice_{index:04}.pak"),
+                    })
+                    .collect::<Vec<_>>();
+                if hit_stride > 0 {
+                    *patterns.last_mut().unwrap() = "/audio/japanese/".to_owned();
+                }
+                let cache = FilterCache {
+                    kdel_tokens: None,
+                    blacklist_entries: Some(patterns),
+                    ignored_lang_patterns: None,
+                };
+                let assets = (0..asset_count)
+                    .map(|index| PatchAssetInfo {
+                        target_file_path: if hit_stride > 0 && index % hit_stride == 1 {
+                            format!("data/audio/japanese/voice_{index}.pak")
+                        } else {
+                            format!("data/other/voice_{index}.pak")
+                        },
+                        target_file_size: 1,
+                        target_file_hash: String::new(),
+                        patch_method: PatchMethod::Patch,
+                        patch_name: String::new(),
+                        patch_hash: String::new(),
+                        patch_offset: 0,
+                        patch_size: 0,
+                        patch_chunk_length: 0,
+                        original_file_path: None,
+                        original_file_hash: None,
+                        original_file_size: None,
+                        matching_field: "game".to_owned(),
+                    })
+                    .collect::<Vec<_>>();
+                let repetitions = if asset_count >= 50_000 { 10 } else { 50 };
+                let mut filter_time = std::time::Duration::ZERO;
+                let started = Instant::now();
+                let mut total_filtered = 0usize;
+                for _ in 0..repetitions {
+                    let mut batch = assets.clone();
+                    let filter_started = Instant::now();
+                    filter_patch_assets_for_removed_features(&cache, &mut batch);
+                    filter_time += filter_started.elapsed();
+                    let filtered = batch
+                        .iter()
+                        .filter(|asset| asset.patch_method == PatchMethod::Skip)
+                        .count();
+                    let expected_filtered = if hit_stride > 0 {
+                        asset_count / hit_stride
+                    } else {
+                        0
+                    };
+                    assert_eq!(filtered, expected_filtered);
+                    total_filtered += filtered;
+                }
+                println!(
+                    "patch_asset_filter_pass assets={asset_count} patterns={pattern_count} hit_stride={hit_stride} repetitions={repetitions} clone_and_filter_us={} filter_only_us={} filtered={}",
+                    started.elapsed().as_micros(),
+                    filter_time.as_micros(),
+                    black_box(total_filtered),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn patching_chunk_dir_path() {
     let dir = tempfile::tempdir().unwrap();
     let chunks = patching_chunk_dir(dir.path());
@@ -1592,7 +2173,10 @@ fn verify_chunk_md5_large_file_multi_buffer() {
     fs::write(&path, &data).unwrap();
 
     assert!(
-        verify_chunk_md5(&path, &md5_hex),
+        verify_chunk_md5(
+            &path,
+            &super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default()
+        ),
         "multi-buffer MD5 should match single-shot digest"
     );
 }
@@ -1708,20 +2292,20 @@ fn snapshot_state(fields: &[(&str, &str, &[u8])], url: &str) -> PreinstallState 
             chunk_download,
             manifest: SophonManifestProto {
                 assets: vec![SophonManifestAssetProperty {
-                    asset_name: path.into(),
+                    asset_name: path.to_string().into(),
                     asset_size: data.len() as u64,
                     asset_type: 0,
-                    asset_hash_md5: hash.clone(),
+                    asset_hash_md5: hash.clone().into(),
                     asset_chunks: if data.is_empty() {
                         vec![]
                     } else {
                         vec![SophonManifestAssetChunk {
-                            chunk_name: format!("chunk-{field}"),
+                            chunk_name: format!("chunk-{field}").into(),
                             chunk_on_file_offset: 0,
                             chunk_size: data.len() as u64,
                             chunk_size_decompressed: data.len() as u64,
-                            chunk_compressed_hash_md5: hash.clone(),
-                            chunk_decompressed_hash_md5: hash,
+                            chunk_compressed_hash_md5: hash.clone().into(),
+                            chunk_decompressed_hash_md5: hash.into(),
                             chunk_compressed_hash_xxh: 0,
                             chunk_old_offset: 0,
                         }]
@@ -1870,7 +2454,7 @@ async fn publication_saves_valid_state_before_marker_and_rejects_changed_source(
     assert!(!PreinstallState::marker_file_path(dir.path(), &state.tag).exists());
     fs::remove_dir(state_path).unwrap();
     let gd = dir.path().to_owned();
-    let change_source = Arc::new(move |_: &HashMap<String, u64>| {
+    let change_source = Arc::new(move |_: &[(&str, u64)]| {
         super::super::write_installed_tag(&gd, "changed").unwrap();
     });
     let result = preinstall_download(
@@ -1977,6 +2561,60 @@ async fn resumed_missing_or_corrupt_patch_chunks_are_downloaded_before_ready() {
     }
 }
 
+#[test]
+fn pending_chunk_cursor_claims_each_index_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    for (chunk_count, worker_count) in [(0usize, 4usize), (1, 8), (7, 3), (64, 16)] {
+        let cursor = AtomicUsize::new(0);
+        let claims = (0..chunk_count)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
+
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let cursor = &cursor;
+                let claims = &claims;
+                scope.spawn(move || {
+                    loop {
+                        let index = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(claim) = claims.get(index) else {
+                            break;
+                        };
+                        claim.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert!(
+            claims
+                .iter()
+                .all(|claim| claim.load(Ordering::Relaxed) == 1)
+        );
+        assert_eq!(
+            chunk_count.saturating_sub(cursor.load(Ordering::Relaxed)),
+            0
+        );
+    }
+}
+
+#[test]
+fn preinstall_worker_scaling_fills_available_target_without_idle_workers() {
+    assert_eq!(preinstall_workers_to_spawn(24, 16, 32), 8);
+    assert_eq!(preinstall_workers_to_spawn(0, 5, 32), 5);
+    assert_eq!(preinstall_workers_to_spawn(4, 0, 32), 0);
+    assert_eq!(preinstall_workers_to_spawn(32, 8, 32), 0);
+    assert_eq!(preinstall_workers_to_spawn(40, 8, 32), 0);
+}
+
+#[test]
+fn preinstall_scheduler_stops_spawning_when_stopping() {
+    assert_eq!(preinstall_workers_to_spawn_if_running(false, 0, 12, 16), 12);
+    assert_eq!(preinstall_workers_to_spawn_if_running(true, 0, 12, 16), 0);
+}
+
 #[tokio::test]
 async fn download_worker_panic_cannot_publish_ready_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -1989,21 +2627,51 @@ async fn download_worker_panic_cannot_publish_ready_state() {
             panic!("worker callback panic");
         }
     });
-    let result = preinstall_download(
-        &Client::new(),
-        plan_from_state(state, vec![chunk]),
-        dir.path(),
-        "nap",
-        "en",
-        handle,
-        updater,
-        Arc::new(|_| {}),
-        HashMap::new(),
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        preinstall_download(
+            &Client::new(),
+            plan_from_state(state, vec![chunk]),
+            dir.path(),
+            "nap",
+            "en",
+            handle,
+            updater,
+            Arc::new(|_| {}),
+            HashMap::new(),
+        ),
     )
-    .await;
+    .await
+    .expect("worker panic must not stall the scheduler");
     assert!(matches!(result, Err(SophonError::JoinError(_))));
     assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
     assert!(!PreinstallState::state_file_path(dir.path(), "2.0").exists());
+}
+
+#[tokio::test]
+async fn preinstall_download_cancel_with_pending_chunks_returns_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let (state, chunk) = patch_download_fixture("http://localhost");
+    let handle = DownloadHandle::new();
+    handle.cancel();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        preinstall_download(
+            &Client::new(),
+            plan_from_state(state, vec![chunk]),
+            dir.path(),
+            "nap",
+            "en",
+            handle,
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            HashMap::new(),
+        ),
+    )
+    .await
+    .expect("cancelled download must not stall the scheduler");
+    assert!(matches!(result, Err(SophonError::Cancelled)));
 }
 
 async fn serve_target_chunks(
@@ -2024,11 +2692,12 @@ async fn serve_target_chunks(
         let compressed = zstd::encode_all(data, 1).unwrap();
         let chunk = &mut entry.manifest.assets[0].asset_chunks[0];
         chunk.chunk_size = compressed.len() as u64;
-        chunk.chunk_compressed_hash_md5 = hex::encode(fast_md5::digest(&compressed));
+        chunk.chunk_compressed_hash_md5 = hex::encode(fast_md5::digest(&compressed)).into();
         entry.chunk_download.compression = crate::api_scrape::Compression::Zstd;
         Mock::given(path(format!(
             "/{}/{}",
-            entry.matching_field, chunk.chunk_name
+            entry.matching_field,
+            chunk.chunk_name_str()
         )))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed))
         .expect(1)
@@ -2393,7 +3062,7 @@ async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
     state.target_snapshot.as_mut().unwrap().manifests[0]
         .manifest
         .assets[0]
-        .asset_hash_md5 = wrong_hash;
+        .asset_hash_md5 = wrong_hash.into();
     reseal(&mut state);
     save_preinstall_state(dir.path(), &state).unwrap();
     fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
@@ -2797,4 +3466,340 @@ async fn legacy_recovery_rejects_substituted_target_and_manifest_ids() {
             Err(SophonError::PreinstallStateInvalid(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn bounded_download_stream_deduplicates_chunks_and_respects_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let chunks = ["a", "b", "a", "c", "d", "e", "f", "g", "h", "i", "j"]
+        .into_iter()
+        .map(|chunk_name| SophonManifestAssetChunk {
+            chunk_name: chunk_name.to_owned().into(),
+            chunk_decompressed_hash_md5: bytes::Bytes::new(),
+            chunk_on_file_offset: 0,
+            chunk_size: 1,
+            chunk_size_decompressed: 1,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: -1,
+        })
+        .collect::<Vec<_>>();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut downloads = build_unique_chunk_stream(&chunks, 3, {
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        let started = Arc::clone(&started);
+        move |_| {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            started.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                max_active.fetch_max(current, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                Ok::<(), SophonError>(())
+            }
+        }
+    });
+    while let Some(result) = downloads.next().await {
+        result.unwrap();
+    }
+
+    assert_eq!(started.load(Ordering::Relaxed), 10);
+    assert!(max_active.load(Ordering::Relaxed) <= 3);
+    assert!(max_active.load(Ordering::Relaxed) > 1);
+}
+
+#[tokio::test]
+async fn bounded_download_stream_stops_scheduling_after_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let chunks = (0..100)
+        .map(|index| SophonManifestAssetChunk {
+            chunk_name: format!("chunk-{index}").into(),
+            chunk_decompressed_hash_md5: bytes::Bytes::new(),
+            chunk_on_file_offset: 0,
+            chunk_size: 1,
+            chunk_size_decompressed: 1,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: -1,
+        })
+        .collect::<Vec<_>>();
+    let scheduled = AtomicUsize::new(0);
+    let result = run_unique_chunks_bounded(&chunks, 4, |_| {
+        let index = scheduled.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if index == 0 {
+                Err(SophonError::Cancelled)
+            } else {
+                std::future::pending::<SophonResult<()>>().await
+            }
+        }
+    })
+    .await;
+
+    assert!(matches!(result, Err(SophonError::Cancelled)));
+    assert!(scheduled.load(Ordering::Relaxed) <= 4);
+}
+
+#[tokio::test]
+async fn bounded_download_stream_rejects_zero_limit() {
+    let chunks = [SophonManifestAssetChunk {
+        chunk_name: bytes::Bytes::from("chunk"),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
+        chunk_on_file_offset: 0,
+        chunk_size: 1,
+        chunk_size_decompressed: 1,
+        chunk_compressed_hash_xxh: 0,
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
+        chunk_old_offset: -1,
+    }];
+    let result = run_unique_chunks_bounded(&chunks, 0, |_| async {
+        panic!("zero concurrency must not construct any chunk future")
+    })
+    .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let output_parts = [b"first-".as_slice(), b"second-", b"third"];
+    let mut asset_chunks = Vec::new();
+    let mut expected = Vec::new();
+
+    for (index, data) in output_parts.iter().enumerate() {
+        let chunk_name = format!("unique-{index}");
+        let compressed = zstd::encode_all(*data, 1).unwrap();
+        let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+        let decompressed_hash = hex::encode(fast_md5::digest(data));
+        Mock::given(path(format!("/chunks/{chunk_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        asset_chunks.push(SophonManifestAssetChunk {
+            chunk_name: chunk_name.clone().into(),
+            chunk_decompressed_hash_md5: decompressed_hash.into(),
+            chunk_on_file_offset: expected.len() as u64,
+            chunk_size: compressed.len() as u64,
+            chunk_size_decompressed: data.len() as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: compressed_hash.into(),
+            chunk_old_offset: -1,
+        });
+        expected.extend_from_slice(data);
+        if index == 0 {
+            let mut duplicate = asset_chunks[0].clone();
+            duplicate.chunk_on_file_offset = expected.len() as u64;
+            asset_chunks.push(duplicate);
+            expected.extend_from_slice(data);
+        }
+    }
+
+    let target_hash = hex::encode(fast_md5::digest(&expected));
+    let manifest = SophonManifestProto {
+        assets: vec![
+            SophonManifestAssetProperty {
+                asset_name: bytes::Bytes::from("unused.bin"),
+                asset_chunks: Vec::new(),
+                asset_type: 0,
+                asset_size: 0,
+                asset_hash_md5: bytes::Bytes::new(),
+            },
+            SophonManifestAssetProperty {
+                asset_name: bytes::Bytes::from("downloaded.bin"),
+                asset_chunks: asset_chunks.clone(),
+                asset_type: 0,
+                asset_size: expected.len() as u64,
+                asset_hash_md5: target_hash.clone().into(),
+            },
+        ],
+    };
+    let download_info = DownloadInfo {
+        url_prefix: server.uri(),
+        url_suffix: "chunks".to_owned(),
+        ..make_download_info()
+    };
+    let mut asset_index: rustc_hash::FxHashMap<String, usize> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(manifest.assets.len(), Default::default());
+    for (i, a) in manifest.assets.iter().enumerate() {
+        asset_index.entry(a.asset_name_str().to_string()).or_insert(i);
+    }
+    let context = DownloadOverContext {
+        manifests: [(
+            "game".to_owned(),
+            (download_info.clone(), Arc::new(manifest), asset_index),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let asset = PatchAssetInfo {
+        target_file_path: "downloaded.bin".to_owned(),
+        target_file_size: expected.len() as u64,
+        target_file_hash: target_hash,
+        patch_method: PatchMethod::DownloadOver,
+        patch_name: String::new(),
+        patch_hash: String::new(),
+        patch_offset: 0,
+        patch_size: 0,
+        patch_chunk_length: 0,
+        original_file_path: None,
+        original_file_hash: None,
+        original_file_size: None,
+        matching_field: "game".to_owned(),
+    };
+
+    apply_download_over(
+        &Client::new(),
+        dir.path(),
+        &PreinstallState {
+            tag: "target".to_owned(),
+            game_id: "synthetic".to_owned(),
+            vo_lang: "en-us".to_owned(),
+            installed_tag: "source".to_owned(),
+            target_snapshot: None,
+            patch_assets: vec![asset.clone()],
+            deleted_files: Vec::new(),
+            downloaded_chunks: Default::default(),
+            diff_downloads: Default::default(),
+            main_chunk_download: download_info.clone(),
+            main_manifest_ids: Vec::new(),
+        },
+        &asset,
+        &context,
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fs::read(dir.path().join("downloaded.bin")).unwrap(),
+        expected
+    );
+}
+
+/// More assets than the parallel apply window, end to end: the window cap
+/// engages the backpressure path (wait for a completion before scheduling
+/// the next task), and every asset still lands with the right content and
+/// progress reaches the full count.
+#[tokio::test]
+async fn backpressured_parallel_apply_drains_all_assets() {
+    use wiremock::MockServer;
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+    let fields: Vec<(&str, String, &'static [u8])> = vec![
+        ("game", "file0.bin".to_string(), b"asset zero"),
+        ("en-us", "file1.bin".to_string(), b"asset one"),
+        ("cutscenes", "file2.bin".to_string(), b"asset two"),
+        ("game2", "file3.bin".to_string(), b"asset three"),
+        ("en-us2", "file4.bin".to_string(), b"asset four"),
+        ("cutscenes2", "file5.bin".to_string(), b"asset five"),
+    ];
+    let field_refs: Vec<(&str, &str, &[u8])> = fields
+        .iter()
+        .map(|(f, p, d)| (*f, p.as_str(), *d))
+        .collect();
+    let mut state = snapshot_state(&field_refs, &server.uri());
+    serve_target_chunks(&server, &mut state, &field_refs).await;
+    preinstall_download(
+        &Client::new(),
+        plan_from_state(state, vec![]),
+        dir.path(),
+        "nap",
+        "en",
+        DownloadHandle::new(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = {
+        let recorded = std::sync::Arc::clone(&recorded);
+        Arc::new(move |progress: crate::progress::SophonProgress| {
+            if let crate::progress::SophonProgress::ApplyingPreinstall {
+                applied_files,
+                total_files,
+            } = progress
+            {
+                recorded.lock().unwrap().push((applied_files, total_files));
+            }
+        })
+    };
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        recorder,
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+
+    for (i, (_, path, data)) in fields.iter().enumerate() {
+        assert_eq!(
+            fs::read(dir.path().join(path)).unwrap(),
+            *data,
+            "asset {i} content"
+        );
+    }
+    let recorded = recorded.lock().unwrap();
+    assert!(
+        recorded.iter().all(|&(_, total)| total == 6),
+        "all progress reports carry the asset total"
+    );
+    assert_eq!(recorded.last().copied(), Some((6, 6)));
+}
+
+/// Unit contract of the join-result handler: success passes through,
+/// the first task error is kept (later errors ignored), and a panicked
+/// task both records a JoinError and reports false so the caller knows
+/// the drain is abnormal.
+#[tokio::test]
+async fn handle_asset_result_keeps_first_error_and_flags_panics() {
+    use super::handle_asset_result;
+
+    // Success passes through without recording anything.
+    let mut first_error = None;
+    assert!(handle_asset_result(Ok(Ok(())), &mut first_error));
+    assert!(first_error.is_none());
+
+    // The first task error is recorded verbatim and later errors do not
+    // displace it.
+    let mut first_error = None;
+    assert!(handle_asset_result(
+        Ok(Err(SophonError::Io(std::io::Error::other("boom")))),
+        &mut first_error
+    ));
+    let message = first_error.as_ref().unwrap().to_string();
+    assert!(message.contains("boom"), "recorded: {message}");
+    assert!(handle_asset_result(
+        Ok(Err(SophonError::Io(std::io::Error::other("second")))),
+        &mut first_error
+    ));
+    let again = first_error.as_ref().unwrap().to_string();
+    assert!(
+        again.contains("boom") && !again.contains("second"),
+        "first error must win: {again}"
+    );
+
+    // Produce a real JoinError from a panicked task.
+    let join_err = tokio::spawn(async { panic!("intentional") })
+        .await
+        .unwrap_err();
+    let fresh = &mut Option::<SophonError>::None;
+    assert!(!handle_asset_result(Err(join_err), fresh));
+    assert!(matches!(fresh, Some(SophonError::JoinError(_))));
 }

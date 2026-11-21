@@ -1,7 +1,7 @@
 use libc;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{BufRead as _, BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -12,21 +12,37 @@ use std::time::{Duration, Instant};
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+
 #[inline]
 fn now_nanos() -> u64 {
     EPOCH.elapsed().as_nanos() as u64
 }
 
-use dashmap::DashMap;
 
 use futures_util::StreamExt;
-use futures_util::future::try_join_all;
+use futures_util::future::{Future, ready, try_join_all};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Adapter that feeds bytes written by `serde_json::to_writer` directly into a
+/// SHA-256 hasher, avoiding the intermediate `Vec` allocation that
+/// `serde_json::to_vec` would require.
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl std::io::Write for Sha256Writer<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 use super::api::{
-    fetch_build, fetch_front_door, fetch_manifest, fetch_patch_build, fetch_patch_manifest,
+    fetch_build, fetch_front_door, fetch_manifest_proto, fetch_patch_build, fetch_patch_manifest,
     is_known_vo_locale, vo_lang_matches,
 };
 use super::assembly_opt::{md5_hex_eq, md5_to_hex, posix_advise};
@@ -188,7 +204,7 @@ fn validate_patch_range(asset: &PatchAssetInfo) -> SophonResult<()> {
 impl TargetSnapshot {
     fn seal(&mut self, assets: &[PatchAssetInfo], deleted: &[String]) -> SophonResult<()> {
         self.manifests
-            .sort_by(|a, b| a.matching_field.cmp(&b.matching_field));
+            .sort_unstable_by(|a, b| a.matching_field.cmp(&b.matching_field));
         for entry in &mut self.manifests {
             normalize_full_download_manifest(&mut entry.manifest);
         }
@@ -201,21 +217,27 @@ impl TargetSnapshot {
         assets: &[PatchAssetInfo],
         deleted: &[String],
     ) -> SophonResult<String> {
-        // Structs and ordered vectors only: no randomized map iteration in the encoding.
-        let bytes = serde_json::to_vec(&(
-            self.version,
-            &self.game_id,
-            &self.vo_lang,
-            &self.installed_tag,
-            &self.tag,
-            &self.build_id,
-            self.legacy_coverage,
-            &self.manifests,
-            assets,
-            deleted,
-        ))
+        // Stream directly to the SHA-256 hasher, avoiding the intermediate
+        // Vec allocation that serde_json::to_vec would require.
+        let mut hasher = Sha256::new();
+        let mut writer = Sha256Writer(&mut hasher);
+        serde_json::to_writer(
+            &mut writer,
+            &(
+                self.version,
+                &self.game_id,
+                &self.vo_lang,
+                &self.installed_tag,
+                &self.tag,
+                &self.build_id,
+                self.legacy_coverage,
+                &self.manifests,
+                assets,
+                deleted,
+            ),
+        )
         .map_err(|err| invalid_state(err.to_string()))?;
-        Ok(hex::encode(Sha256::digest(bytes)))
+        Ok(hex::encode(hasher.finalize()))
     }
 
     fn validate(&self, state: &PreinstallState) -> SophonResult<()> {
@@ -261,51 +283,48 @@ impl TargetSnapshot {
                 return Err(invalid_state("Unsupported target chunk URL scheme"));
             }
             for file in &entry.manifest.assets {
-                super::assembly::validate_asset_name(&file.asset_name)?;
+                super::assembly::validate_asset_name(file.asset_name_str())?;
                 if files
-                    .insert(
-                        (entry.matching_field.as_str(), file.asset_name.as_str()),
-                        file,
-                    )
+                    .insert((entry.matching_field.as_str(), file.asset_name_str()), file)
                     .is_some()
                 {
                     return Err(invalid_state(format!(
                         "Duplicate target asset: {}",
-                        file.asset_name
+                        file.asset_name_str()
                     )));
                 }
                 if file.is_directory() {
                     if file.asset_size != 0 || !file.asset_chunks.is_empty() {
                         return Err(invalid_state(format!(
                             "Invalid target directory: {}",
-                            file.asset_name
+                            file.asset_name_str()
                         )));
                     }
                     continue;
                 }
-                if !valid_hash(&file.asset_hash_md5) || file.asset_size > i64::MAX as u64 {
+                if !valid_hash(file.asset_hash_md5_str()) || file.asset_size > i64::MAX as u64 {
                     return Err(invalid_state(format!(
                         "Invalid target size/hash: {}",
-                        file.asset_name
+                        file.asset_name_str()
                     )));
                 }
                 let mut chunks: Vec<_> = file.asset_chunks.iter().collect();
-                chunks.sort_by_key(|c| c.chunk_on_file_offset);
+                chunks.sort_unstable_by_key(|c| c.chunk_on_file_offset);
                 let mut end = 0u64;
                 for chunk in chunks {
-                    if !super::assembly::validate_chunk_name(&chunk.chunk_name)
+                    if !super::assembly::validate_chunk_name(chunk.chunk_name_str())
                         || chunk.chunk_on_file_offset != end
                         || chunk.chunk_size == 0
                         || chunk.chunk_size > i64::MAX as u64
                         || (chunk.chunk_size_decompressed == 0 && file.asset_size != 0)
                         || (!chunk.chunk_decompressed_hash_md5.is_empty()
-                            && !valid_hash(&chunk.chunk_decompressed_hash_md5))
+                            && !valid_hash(chunk.chunk_decompressed_hash_md5_str()))
                         || (!chunk.chunk_compressed_hash_md5.is_empty()
-                            && !valid_hash(&chunk.chunk_compressed_hash_md5))
+                            && !valid_hash(chunk.chunk_compressed_hash_md5_str()))
                     {
                         return Err(invalid_state(format!(
                             "Invalid target chunk/range: {}",
-                            file.asset_name
+                            file.asset_name_str()
                         )));
                     }
                     end = end
@@ -315,7 +334,7 @@ impl TargetSnapshot {
                 if end != file.asset_size {
                     return Err(invalid_state(format!(
                         "Incomplete target chunk coverage: {}",
-                        file.asset_name
+                        file.asset_name_str()
                     )));
                 }
             }
@@ -350,7 +369,7 @@ impl TargetSnapshot {
                 if file.is_directory()
                     || file.asset_size != asset.target_file_size
                     || !file
-                        .asset_hash_md5
+                        .asset_hash_md5_str()
                         .eq_ignore_ascii_case(&asset.target_file_hash)
                 {
                     return Err(invalid_state(format!(
@@ -406,7 +425,7 @@ impl PreinstallState {
                 for file in &entry.manifest.assets {
                     decompressed = decompressed.saturating_add(file.asset_size);
                     for chunk in &file.asset_chunks {
-                        if seen.insert((entry.matching_field.as_str(), chunk.chunk_name.as_str())) {
+                        if seen.insert((entry.matching_field.as_str(), chunk.chunk_name_str())) {
                             compressed = compressed.saturating_add(chunk.chunk_size);
                         }
                     }
@@ -517,6 +536,168 @@ pub fn save_preinstall_state(game_dir: &Path, state: &PreinstallState) -> Sophon
     Ok(())
 }
 
+#[cfg(feature = "benchmark")]
+pub fn prepare_synthetic_apply_state(
+    game_dir: &Path,
+    original_path: &Path,
+    target_path: &Path,
+    patch_path: &Path,
+    target_relative_path: &str,
+) -> SophonResult<(String, u64)> {
+    prepare_synthetic_apply_state_with_method(
+        game_dir,
+        original_path,
+        target_path,
+        patch_path,
+        target_relative_path,
+        PatchMethod::Patch,
+    )
+}
+
+#[cfg(feature = "benchmark")]
+pub fn prepare_synthetic_copyover_state(
+    game_dir: &Path,
+    original_path: &Path,
+    target_path: &Path,
+    patch_path: &Path,
+    target_relative_path: &str,
+) -> SophonResult<(String, u64)> {
+    prepare_synthetic_apply_state_with_method(
+        game_dir,
+        original_path,
+        target_path,
+        patch_path,
+        target_relative_path,
+        PatchMethod::CopyOver,
+    )
+}
+
+#[cfg(feature = "benchmark")]
+fn prepare_synthetic_apply_state_with_method(
+    game_dir: &Path,
+    original_path: &Path,
+    target_path: &Path,
+    patch_path: &Path,
+    target_relative_path: &str,
+    patch_method: PatchMethod,
+) -> SophonResult<(String, u64)> {
+    super::assembly::validate_asset_name(target_relative_path)?;
+    let patch_name = "synthetic.hdiff";
+    let patch_size = fs::metadata(patch_path)?.len();
+    let patch_hash = hash_file_md5(patch_path)?;
+    let original_size = fs::metadata(original_path)?.len();
+    let original_hash = hash_file_md5(original_path)?;
+    let target_size = fs::metadata(target_path)?.len();
+    let target_hash = hash_file_md5(target_path)?;
+    let game_id = "synthetic";
+    let installed_tag = "synthetic-source";
+    let tag = "synthetic-target";
+    let matching_field = "game";
+    let manifest_id = "synthetic-manifest";
+    let chunk_download = DownloadInfo {
+        encryption: 0,
+        password: String::new(),
+        compression: crate::api_scrape::Compression::None,
+        // Port zero has no listener, so an unexpected DownloadOver fallback fails locally.
+        url_prefix: "http://127.0.0.1:0/unused".to_owned(),
+        url_suffix: String::new(),
+    };
+    let patch_asset = PatchAssetInfo {
+        target_file_path: target_relative_path.to_owned(),
+        target_file_size: target_size,
+        target_file_hash: target_hash.clone(),
+        patch_method,
+        patch_name: patch_name.to_owned(),
+        patch_hash: patch_hash.clone(),
+        patch_offset: 0,
+        patch_size,
+        patch_chunk_length: patch_size,
+        original_file_path: Some(target_relative_path.to_owned()),
+        original_file_hash: Some(original_hash),
+        original_file_size: Some(original_size),
+        matching_field: matching_field.to_owned(),
+    };
+    let target_chunk = SophonManifestAssetChunk {
+        chunk_name: bytes::Bytes::from("synthetic-target-data"),
+        chunk_decompressed_hash_md5: target_hash.clone().into(),
+        chunk_on_file_offset: 0,
+        chunk_size: target_size.max(1),
+        chunk_size_decompressed: target_size,
+        chunk_compressed_hash_xxh: 0,
+        chunk_compressed_hash_md5: target_hash.clone().into(),
+        chunk_old_offset: -1,
+    };
+    let mut state = PreinstallState {
+        tag: tag.to_owned(),
+        game_id: game_id.to_owned(),
+        vo_lang: "en-us".to_owned(),
+        installed_tag: installed_tag.to_owned(),
+        patch_assets: vec![patch_asset],
+        deleted_files: Vec::new(),
+        downloaded_chunks: [patch_name.to_owned()].into_iter().collect(),
+        diff_downloads: Default::default(),
+        main_chunk_download: chunk_download.clone(),
+        main_manifest_ids: vec![(matching_field.to_owned(), manifest_id.to_owned())],
+        target_snapshot: None,
+    };
+    let mut snapshot = TargetSnapshot {
+        version: 1,
+        game_id: game_id.to_owned(),
+        vo_lang: state.vo_lang.clone(),
+        installed_tag: installed_tag.to_owned(),
+        tag: tag.to_owned(),
+        build_id: "synthetic-build".to_owned(),
+        legacy_coverage: false,
+        manifests: vec![TargetManifest {
+            matching_field: matching_field.to_owned(),
+            manifest_id: manifest_id.to_owned(),
+            chunk_download,
+            manifest: SophonManifestProto {
+                assets: vec![SophonManifestAssetProperty {
+                    asset_name: target_relative_path.to_owned().into(),
+                    asset_chunks: vec![target_chunk],
+                    asset_type: 0,
+                    asset_size: target_size,
+                    asset_hash_md5: target_hash.clone().into(),
+                }],
+            },
+        }],
+        digest: String::new(),
+    };
+    snapshot.seal(&state.patch_assets, &state.deleted_files)?;
+    state.target_snapshot = Some(snapshot);
+
+    fs::create_dir_all(game_dir)?;
+    let install_path = game_dir.join(target_relative_path);
+    if let Some(parent) = install_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(original_path, &install_path)?;
+    let chunk_dir = patching_chunk_dir(game_dir);
+    fs::create_dir_all(&chunk_dir)?;
+    fs::copy(patch_path, chunk_dir.join(patch_name))?;
+    super::write_installed_tag(game_dir, installed_tag)?;
+    save_preinstall_state(game_dir, &state)?;
+    Ok((target_relative_path.to_owned(), target_size))
+}
+
+#[cfg(feature = "benchmark")]
+fn hash_file_md5(path: &Path) -> SophonResult<String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = fast_md5::Md5::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Load and validate persisted preinstall metadata for `tag`.
 pub fn load_preinstall_state(game_dir: &Path, tag: &str) -> SophonResult<PreinstallState> {
     validate_tag(tag)?;
@@ -589,6 +770,17 @@ fn validate_patch_asset_fields(asset: &SophonPatchAssetProperty) -> bool {
     true
 }
 
+fn insert_unique_chunk_name(
+    seen_chunk_names: &mut rustc_hash::FxHashSet<String>,
+    chunk_name: &str,
+) -> bool {
+    if seen_chunk_names.contains(chunk_name) {
+        false
+    } else {
+        seen_chunk_names.insert(chunk_name.to_owned())
+    }
+}
+
 fn select_preinstall_build(
     target_tag: &str,
     exact_build: SophonResult<SophonBuildData>,
@@ -611,6 +803,17 @@ fn select_preinstall_build(
     }
 }
 
+async fn first_stream_error<S, T>(stream: S) -> Option<SophonError>
+where
+    S: futures_util::Stream<Item = SophonResult<T>>,
+{
+    stream
+        .fold(None, |first_error, result| {
+            futures_util::future::ready(first_error.or_else(|| result.err()))
+        })
+        .await
+}
+
 /// Resolve available patch manifests into a plan for the upcoming release.
 pub async fn build_preinstall_plan(
     client: &Client,
@@ -618,8 +821,11 @@ pub async fn build_preinstall_plan(
     vo_lang: &str,
     game_dir: &Path,
 ) -> SophonResult<PreinstallPlan> {
-    let (_, pre_branch) = fetch_front_door(client, game_id).await?;
-    let pre_branch = pre_branch.ok_or(SophonError::NoPreinstallAvailable)?;
+    let pre_branch = fetch_front_door(client, game_id)
+        .await?
+        .take_branches()
+        .1
+        .ok_or(SophonError::NoPreinstallAvailable)?;
 
     let installed_tag = read_installed_tag(game_dir).ok_or(SophonError::NoInstalledVersion)?;
 
@@ -714,7 +920,7 @@ async fn build_preinstall_plan_from_builds(
     let mut seen_patch_targets: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     let mut unique_chunks: Vec<PatchChunkInfo> = Vec::new();
     let mut diff_downloads: rustc_hash::FxHashMap<String, Arc<DownloadInfo>> =
-        rustc_hash::FxHashMap::default();
+        rustc_hash::FxHashMap::with_capacity_and_hasher(qualifying_patch.len(), Default::default());
 
     let fetch_futures: Vec<_> = qualifying_patch
         .iter()
@@ -741,10 +947,7 @@ async fn build_preinstall_plan_from_builds(
         let patch_manifest = result.patch_manifest;
         let matching_field = result.matching_field;
 
-        diff_downloads.insert(
-            matching_field.clone(),
-            Arc::new(result.diff_download.clone()),
-        );
+        diff_downloads.insert(matching_field.clone(), Arc::new(result.diff_download));
 
         for asset_prop in &patch_manifest.patch_assets {
             let patch_info = asset_prop
@@ -808,7 +1011,7 @@ async fn build_preinstall_plan_from_builds(
                             )
                         };
 
-                    if seen_chunk_names.insert(chunk.patch_name.clone()) {
+                    if insert_unique_chunk_name(&mut seen_chunk_names, &chunk.patch_name) {
                         unique_chunks.push(PatchChunkInfo {
                             patch_name: chunk.patch_name.clone(),
                             patch_size: chunk.patch_size as u64,
@@ -890,28 +1093,29 @@ async fn build_preinstall_plan_from_builds(
         .map(|(matching_field, meta)| {
             let field = matching_field.to_string();
             async move {
-                let result =
-                    fetch_manifest(client, &meta.manifest_download, &meta.manifest.id).await?;
-                Ok::<_, SophonError>((field, result))
+                let manifest =
+                    fetch_manifest_proto(client, &meta.manifest_download, &meta.manifest.id)
+                        .await?;
+                Ok::<_, SophonError>((field, manifest))
             }
         })
         .collect();
     let manifest_results = try_join_all(manifest_futures).await?;
 
     let mut target_manifests = Vec::with_capacity(manifest_results.len());
-    for (matching_field, manifest_result) in manifest_results {
-        for asset in &manifest_result.manifest.assets {
+    for (matching_field, manifest) in manifest_results {
+        for asset in &manifest.assets {
             if asset.is_directory() {
-                seen_patch_targets.insert(asset.asset_name.clone());
+                seen_patch_targets.insert(asset.asset_name_str().to_string());
                 continue;
             }
-            if seen_patch_targets.contains(asset.asset_name.as_str()) {
+            if seen_patch_targets.contains(asset.asset_name_str()) {
                 continue;
             }
             all_patch_assets.push(PatchAssetInfo {
-                target_file_path: asset.asset_name.clone(),
+                target_file_path: asset.asset_name_str().to_string(),
                 target_file_size: asset.asset_size,
-                target_file_hash: asset.asset_hash_md5.clone(),
+                target_file_hash: asset.asset_hash_md5_str().to_string(),
                 patch_method: PatchMethod::DownloadOver,
                 patch_name: String::new(),
                 patch_hash: String::new(),
@@ -923,14 +1127,14 @@ async fn build_preinstall_plan_from_builds(
                 original_file_size: None,
                 matching_field: matching_field.clone(),
             });
-            seen_patch_targets.insert(asset.asset_name.clone());
+            seen_patch_targets.insert(asset.asset_name_str().to_string());
         }
         let meta = main_by_field[matching_field.as_str()];
         target_manifests.push(TargetManifest {
             matching_field,
             manifest_id: meta.manifest.id.clone(),
             chunk_download: meta.chunk_download.clone(),
-            manifest: manifest_result.manifest,
+            manifest,
         });
     }
     let mut target_snapshot = TargetSnapshot {
@@ -965,6 +1169,63 @@ fn patching_chunk_dir(game_dir: &Path) -> PathBuf {
 
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 
+fn preinstall_workers_to_spawn(active: usize, pending: usize, target: usize) -> usize {
+    target.saturating_sub(active).min(pending)
+}
+
+fn preinstall_workers_to_spawn_if_running(
+    stopping: bool,
+    active: usize,
+    pending: usize,
+    target: usize,
+) -> usize {
+    if stopping {
+        0
+    } else {
+        preinstall_workers_to_spawn(active, pending, target)
+    }
+}
+
+/// Dense per-chunk completion tracking, indexed by position in the plan's
+/// unique-chunk list. `PENDING` marks a chunk the download has not yet
+/// confirmed; any other value is its recorded size. Each index has exactly
+/// one writer, so Relaxed stores and loads are sufficient; a periodic save
+/// may miss the last few completions, and the terminal save catches them.
+pub struct ChunkSizes(Box<[AtomicU64]>);
+
+/// Sentinel for "not downloaded yet"; no real chunk file can be this large.
+const PENDING: u64 = u64::MAX;
+
+impl ChunkSizes {
+    pub fn new(len: usize) -> Self {
+        Self((0..len).map(|_| AtomicU64::new(PENDING)).collect())
+    }
+
+    /// Record the chunk at `idx` as downloaded with its size in bytes.
+    /// Relaxed ordering relies on each index having a single writer.
+    /// Idempotent: a retried chunk stores the same value twice.
+    pub fn mark(&self, idx: usize, size: u64) {
+        debug_assert_ne!(size, PENDING);
+        self.0[idx].store(size, Ordering::Relaxed);
+    }
+
+    /// The chunk's size once it has been confirmed downloaded.
+    fn get(&self, idx: usize) -> Option<u64> {
+        match self.0[idx].load(Ordering::Relaxed) {
+            PENDING => None,
+            size => Some(size),
+        }
+    }
+
+    /// How many chunks are confirmed downloaded.
+    fn completed(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|v| v.load(Ordering::Relaxed) != PENDING)
+            .count()
+    }
+}
+
 /// Shared state for preinstall download workers. Created once per worker,
 /// passed by reference to each chunk — eliminates per-chunk Arc clones.
 struct PreinstallWorkerCtx {
@@ -976,13 +1237,55 @@ struct PreinstallWorkerCtx {
     downloaded_bytes: Arc<AtomicU64>,
     resume_offset: u64,
     total_bytes: u64,
-    chunk_bytes_map: Arc<DashMap<String, u64>>,
+    chunk_sizes: Arc<ChunkSizes>,
+    unique_chunks: Arc<[PatchChunkInfo]>,
+    save_slot: Arc<super::installer::SaveSlot>,
     state_saver: super::installer::StateSaver,
     chunks_since_save: Arc<AtomicUsize>,
 }
 
+/// Borrow the names and sizes of every confirmed chunk for the state saver.
+/// Names are borrowed from `unique_chunks`; entries are valid only for
+/// the duration of the `state_saver` call.
+pub fn save_state_snapshot(
+    chunk_sizes: &ChunkSizes,
+    unique_chunks: &[PatchChunkInfo],
+    state_saver: &super::installer::StateSaver,
+) {
+    let mut entries: Vec<(&str, u64)> = Vec::with_capacity(unique_chunks.len());
+    for (idx, chunk) in unique_chunks.iter().enumerate() {
+        if let Some(size) = chunk_sizes.get(idx) {
+            entries.push((chunk.patch_name.as_str(), size));
+        }
+    }
+    state_saver(&entries);
+}
+
+/// Final save plus the once-owned name set persisted in the preinstall
+/// state (resume validation looks chunks up by name).
+fn snapshot_downloaded_chunks(
+    chunk_sizes: Arc<ChunkSizes>,
+    unique_chunks: Arc<[PatchChunkInfo]>,
+    state_saver: &super::installer::StateSaver,
+) -> rustc_hash::FxHashSet<String> {
+    save_state_snapshot(&chunk_sizes, &unique_chunks, state_saver);
+
+    let count = chunk_sizes.completed();
+    let mut names = rustc_hash::FxHashSet::with_capacity_and_hasher(count, Default::default());
+    for (idx, chunk) in unique_chunks.iter().enumerate() {
+        if chunk_sizes.get(idx).is_some() {
+            names.insert(chunk.patch_name.clone());
+        }
+    }
+    // Plan-build dedup makes indices and names 1:1; if that invariant
+    // breaks, the count check above would pass while the state file lies.
+    debug_assert_eq!(names.len(), count);
+    names
+}
+
 async fn process_preinstall_chunk(
-    chunk_info: PatchChunkInfo,
+    chunk_idx: usize,
+    chunk_info: &PatchChunkInfo,
     ctx: &PreinstallWorkerCtx,
     diff_download: &Arc<DownloadInfo>,
 ) -> SophonResult<()> {
@@ -1002,37 +1305,26 @@ async fn process_preinstall_chunk(
 
     let chunk_path = ctx.chunks_dir.join(&chunk_info.patch_name);
 
-    download_patch_chunk_with_retries(
-        &ctx.client,
-        diff_download,
-        &chunk_info.patch_name,
-        &chunk_path,
-        &chunk_info.patch_md5,
-        super::MAX_RETRIES,
-        &ctx.handle,
-        &ctx.downloaded_bytes,
-    )
-    .await?;
+    download_patch_chunk_with_retries(chunk_info, ctx, diff_download, &chunk_path).await?;
 
     let actual = fs::metadata(&chunk_path)?.len();
     if actual != chunk_info.patch_size {
         return Err(SophonError::SizeMismatch {
-            item: chunk_info.patch_name,
+            item: chunk_info.patch_name.clone(),
             expected: chunk_info.patch_size,
             actual,
         });
     }
-    ctx.chunk_bytes_map
-        .insert(chunk_info.patch_name.clone(), chunk_info.patch_size);
+    ctx.chunk_sizes.mark(chunk_idx, chunk_info.patch_size);
 
     let save_count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if save_count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL as usize) {
-        let map: HashMap<String, u64> = ctx
-            .chunk_bytes_map
-            .iter()
-            .map(|r| (r.key().clone(), *r.value()))
-            .collect();
-        (ctx.state_saver)(&map);
+        let sizes = Arc::clone(&ctx.chunk_sizes);
+        let chunks = Arc::clone(&ctx.unique_chunks);
+        let saver = Arc::clone(&ctx.state_saver);
+        ctx.save_slot.trigger(move || {
+            save_state_snapshot(&sizes, &chunks, &saver);
+        });
     }
 
     Ok(())
@@ -1067,7 +1359,10 @@ pub async fn preinstall_download(
             "Source installation or target identity changed since preinstall planning",
         ));
     }
-    let mut planned_chunks = rustc_hash::FxHashMap::default();
+    let mut planned_chunks = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        plan.unique_chunks.len(),
+        Default::default(),
+    );
     for chunk in &plan.unique_chunks {
         validate_patch_name(&chunk.patch_name)?;
         if planned_chunks
@@ -1115,7 +1410,8 @@ pub async fn preinstall_download(
         .fold(0u64, |acc, x| acc.saturating_add(x));
     let downloaded_bytes = Arc::new(AtomicU64::new(0));
 
-    let chunk_bytes_map: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
+    let unique_chunks: Arc<[PatchChunkInfo]> = plan.unique_chunks.into();
+    let chunk_sizes: Arc<ChunkSizes> = Arc::new(ChunkSizes::new(unique_chunks.len()));
     // Generic progress state is only a hint. Populate readiness exclusively from
     // fresh on-disk size/hash checks, including on resumed downloads.
 
@@ -1123,7 +1419,7 @@ pub async fn preinstall_download(
     // matching hash are folded into the baseline offset, NOT into
     // `downloaded_bytes`, so the download phase only counts bytes actually
     // streamed over the network.
-    let total_files = plan.unique_chunks.len() as u64;
+    let total_files = unique_chunks.len() as u64;
     updater(SophonProgress::CalculatingDownloads {
         checked_files: 0,
         total_files,
@@ -1132,27 +1428,31 @@ pub async fn preinstall_download(
     let resume_offset_arc = Arc::new(AtomicU64::new(0));
     let last_check_emit = Arc::new(AtomicU64::new(now_nanos()));
     {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-        let map = Arc::clone(&chunk_bytes_map);
         let upd = Arc::clone(&updater);
-        let futures = plan.unique_chunks.iter().cloned().map(|chunk| {
-            let permit = Arc::clone(&semaphore);
+        // Clone the Arc so each future can access chunks by index without
+        // cloning the entire Vec upfront. Only the two strings (name + md5)
+        // are cloned per chunk, moved into spawn_blocking.
+        let chunks_ref = Arc::clone(&unique_chunks);
+        let futures = (0..unique_chunks.len()).map(|chunk_idx| {
+            let chunk = &chunks_ref[chunk_idx];
             let checked = Arc::clone(&checked_arc);
             let offset = Arc::clone(&resume_offset_arc);
-            let map = Arc::clone(&map);
+            let sizes = Arc::clone(&chunk_sizes);
             let upd = Arc::clone(&upd);
             let last_emit = Arc::clone(&last_check_emit);
             let chunks_dir = chunks_dir.clone();
+            let patch_name = chunk.patch_name.clone();
+            let patch_md5_hex = chunk.patch_md5.clone();
+            let patch_size = chunk.patch_size;
             async move {
-                let _permit = permit.acquire().await.expect("semaphore not closed");
-                let path = chunks_dir.join(&chunk.patch_name);
+                let path = chunks_dir.join(&patch_name);
                 let ok = tokio::task::spawn_blocking(move || {
-                    is_file_already_patched(&path, chunk.patch_size, &chunk.patch_md5)
+                    is_file_already_patched_hex(&path, patch_size, &patch_md5_hex)
                 })
                 .await?;
                 if ok {
-                    map.insert(chunk.patch_name.clone(), chunk.patch_size);
-                    offset.fetch_add(chunk.patch_size, Ordering::Relaxed);
+                    sizes.mark(chunk_idx, patch_size);
+                    offset.fetch_add(patch_size, Ordering::Relaxed);
                 }
                 let checked = checked.fetch_add(1, Ordering::Relaxed) + 1;
                 // Emit by elapsed time (not a fixed file multiple) so the bar
@@ -1170,12 +1470,10 @@ pub async fn preinstall_download(
                 Ok::<(), SophonError>(())
             }
         });
-        let results = futures_util::stream::iter(futures)
-            .buffer_unordered(16)
-            .collect::<Vec<_>>()
-            .await;
-        for result in results {
-            result?;
+        let first_error =
+            first_stream_error(futures_util::stream::iter(futures).buffer_unordered(super::verify_concurrency())).await;
+        if let Some(err) = first_error {
+            return Err(err);
         }
     }
     updater(SophonProgress::CalculatingDownloads {
@@ -1194,21 +1492,30 @@ pub async fn preinstall_download(
     });
 
     let chunks_since_save = Arc::new(AtomicUsize::new(0usize));
+    let save_slot = Arc::new(super::installer::SaveSlot::new());
 
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
     }
 
-    let total: usize = plan.unique_chunks.len();
-    let queue: Arc<Mutex<VecDeque<PatchChunkInfo>>> = Arc::new(Mutex::new(
-        plan.unique_chunks
-            .into_iter()
-            .filter(|c| !chunk_bytes_map.contains_key(&c.patch_name))
+    let total: usize = unique_chunks.len();
+    if total > u32::MAX as usize {
+        return Err(invalid_state(
+            "preinstall chunk count exceeds u32 index space",
+        ));
+    }
+    // Pending work is a dense index list: workers borrow chunk metadata
+    // from unique_chunks and completion is recorded at the index.
+    let pending_chunks: Arc<Vec<u32>> = Arc::new(
+        unique_chunks
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| chunk_sizes.get(*idx).is_none())
+            .map(|(idx, _)| idx as u32)
             .collect(),
-    ));
-    let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(
-        queue.lock().unwrap_or_else(|e| e.into_inner()).len(),
-    ));
+    );
+    let next_chunk = Arc::new(AtomicUsize::new(0));
+    let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(pending_chunks.len()));
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let mut workers = tokio::task::JoinSet::new();
@@ -1281,7 +1588,8 @@ pub async fn preinstall_download(
 
     // Spawn a worker closure factory to avoid repeating the body.
     let spawn_worker = |workers: &mut tokio::task::JoinSet<()>| {
-        let queue = Arc::clone(&queue);
+        let pending_chunks = Arc::clone(&pending_chunks);
+        let next_chunk = Arc::clone(&next_chunk);
         let cancelled = Arc::clone(&cancelled);
         let first_error = Arc::clone(&first_error);
         let remaining = Arc::clone(&remaining);
@@ -1294,7 +1602,9 @@ pub async fn preinstall_download(
             downloaded_bytes: Arc::clone(&downloaded_bytes),
             resume_offset,
             total_bytes,
-            chunk_bytes_map: Arc::clone(&chunk_bytes_map),
+            chunk_sizes: Arc::clone(&chunk_sizes),
+            unique_chunks: Arc::clone(&unique_chunks),
+            save_slot: Arc::clone(&save_slot),
             state_saver: Arc::clone(&state_saver),
             chunks_since_save: Arc::clone(&chunks_since_save),
         };
@@ -1309,13 +1619,13 @@ pub async fn preinstall_download(
                 {
                     return;
                 }
-                let chunk_info = {
-                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-                    match q.pop_front() {
-                        Some(v) => v,
-                        None => break,
-                    }
+                let pending_pos = next_chunk.fetch_add(1, Ordering::Relaxed);
+                let Some(chunk_idx) = pending_chunks.get(pending_pos) else {
+                    break;
                 };
+                // Direct indexing: a pending index that failed to address
+                // unique_chunks panics instead of silently stalling.
+                let chunk_info = &ctx.unique_chunks[*chunk_idx as usize];
                 let diff_download = ctx
                     .diff_downloads
                     .get(&chunk_info.matching_field)
@@ -1331,7 +1641,13 @@ pub async fn preinstall_download(
                             .cloned()
                             .expect("diff_downloads must not be empty")
                     });
-                let result = process_preinstall_chunk(chunk_info, &ctx, &diff_download).await;
+                let result = process_preinstall_chunk(
+                    *chunk_idx as usize,
+                    chunk_info,
+                    &ctx,
+                    &diff_download,
+                )
+                .await;
                 if let Err(err) = result {
                     if matches!(err, SophonError::Cancelled) {
                         cancelled.store(1, Ordering::Relaxed);
@@ -1351,19 +1667,32 @@ pub async fn preinstall_download(
     // Spawn initial workers and scale up while throughput keeps growing,
     // mirroring the main installer's adaptive download scheduler.
     let adaptive = super::adaptive_download::AdaptiveDownload::new();
-    let initial = adaptive.current_target().min(total);
-    let mut spawned = 0;
+    let initial = adaptive.current_target().min(pending_chunks.len());
     for _ in 0..initial {
         spawn_worker(&mut workers);
-        spawned += 1;
     }
 
     loop {
+        if workers.is_empty() {
+            let pending = pending_chunks
+                .len()
+                .saturating_sub(next_chunk.load(Ordering::Relaxed));
+            let stopping = handle.is_cancelled()
+                || cancelled.load(Ordering::Relaxed) != 0
+                || first_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+            if stopping || pending == 0 {
+                break;
+            }
+        }
+
         tokio::select! {
             biased;
-            result = workers.join_next() => {
+            result = workers.join_next(), if !workers.is_empty() => {
                 match result {
-                    None => break,
+                    None => unreachable!("join_next is guarded by a non-empty worker set"),
                     Some(Err(err)) => {
                         first_error.lock().unwrap_or_else(|e| e.into_inner())
                             .get_or_insert(SophonError::JoinError(err));
@@ -1376,11 +1705,23 @@ pub async fn preinstall_download(
                 adaptive.measure(db);
 
                 let target = adaptive.current_target();
-                let queue_len = queue.lock().unwrap_or_else(|e| e.into_inner()).len();
-                // Spawn up to target, but only if queue has work.
-                while spawned < target && queue_len > spawned {
+                let pending = pending_chunks
+                    .len()
+                    .saturating_sub(next_chunk.load(Ordering::Relaxed));
+                let stopping = handle.is_cancelled()
+                    || cancelled.load(Ordering::Relaxed) != 0
+                    || first_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                let to_spawn = preinstall_workers_to_spawn_if_running(
+                    stopping,
+                    workers.len(),
+                    pending,
+                    target,
+                );
+                for _ in 0..to_spawn {
                     spawn_worker(&mut workers);
-                    spawned += 1;
                 }
 
                 if remaining.load(Ordering::Relaxed) == 0 {
@@ -1399,6 +1740,11 @@ pub async fn preinstall_download(
         }
     }
 
+    // Workers are joined, so no further periodic triggers can occur. One
+    // drain here covers every exit path and guarantees no state write
+    // outlives this call; the terminal snapshot below is ordered after it.
+    save_slot.drain().await;
+
     super::reclaim_memory();
 
     progress_done.store(true, Ordering::Relaxed);
@@ -1410,19 +1756,23 @@ pub async fn preinstall_download(
         return Err(err);
     }
 
-    if chunk_bytes_map.len() != total {
-        return Err(invalid_state(
-            "Preinstall download ended with unverified patch chunks",
-        ));
+    let completed = chunk_sizes.completed();
+    if completed != total {
+        let missing: Vec<&str> = unique_chunks
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| chunk_sizes.get(*idx).is_none())
+            .map(|(_, chunk)| chunk.patch_name.as_str())
+            .take(8)
+            .collect();
+        return Err(invalid_state(format!(
+            "Preinstall download ended with {completed}/{total} verified patch chunks; first missing: {missing:?}",
+        )));
     }
 
     // Persist all downloaded chunks.
-    let final_map = Arc::clone(&chunk_bytes_map);
-    let map: HashMap<String, u64> = final_map
-        .iter()
-        .map(|r| (r.key().clone(), *r.value()))
-        .collect();
-    state_saver(&map);
+    let downloaded_chunks =
+        snapshot_downloaded_chunks(chunk_sizes, unique_chunks, &state_saver);
 
     updater(SophonProgress::Downloading {
         downloaded_bytes: total_bytes,
@@ -1431,13 +1781,6 @@ pub async fn preinstall_download(
         eta_seconds: 0.0,
     });
 
-    let downloaded_chunks: rustc_hash::FxHashSet<String> = match Arc::try_unwrap(chunk_bytes_map) {
-        Ok(map) => map.into_iter().map(|(k, _)| k).collect(),
-        Err(arc) => {
-            log::warn!("chunk_bytes_map DashMap still has references, using iter");
-            arc.iter().map(|r| r.key().clone()).collect()
-        }
-    };
     let tag_str = plan.tag.clone();
     let state = PreinstallState {
         tag: plan.tag,
@@ -1476,43 +1819,53 @@ pub async fn preinstall_download(
 }
 
 async fn download_patch_chunk_with_retries(
-    client: &Client,
+    chunk_info: &PatchChunkInfo,
+    ctx: &PreinstallWorkerCtx,
     diff_download: &DownloadInfo,
-    patch_name: &str,
     dest: &Path,
-    expected_md5: &str,
-    max_retries: u32,
-    handle: &DownloadHandle,
-    progress: &Arc<AtomicU64>,
 ) -> SophonResult<()> {
-    validate_patch_name(patch_name)?;
-    let url = diff_download.url_for(patch_name);
+    validate_patch_name(&chunk_info.patch_name)?;
+    let mut url = String::with_capacity(256);
+    diff_download.url_for_into(&chunk_info.patch_name, &mut url);
     let mut last_err = String::new();
 
-    for attempt in 0..max_retries {
-        if handle.is_cancelled() {
+    for attempt in 0..super::MAX_RETRIES {
+        if ctx.handle.is_cancelled() {
             return Err(SophonError::Cancelled);
         }
-        match download_patch_chunk_inner(client, &url, dest, expected_md5, handle, progress).await {
+        match download_patch_chunk_inner(
+            &ctx.client,
+            &url,
+            dest,
+            &chunk_info.patch_md5,
+            &ctx.handle,
+            &ctx.downloaded_bytes,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = err.to_string();
                 if !err.is_retryable() {
                     return Err(err);
                 }
-                if attempt < max_retries - 1 {
+                if attempt < super::MAX_RETRIES - 1 {
                     log::warn!(
                         "Patch chunk {patch_name} failed (attempt {attempt_num}/{max_retries}): {last_err}",
+                        patch_name = chunk_info.patch_name,
                         attempt_num = attempt + 1,
+                        max_retries = super::MAX_RETRIES,
                     );
                     let delay = retry_delay(attempt);
-                    if cancelable_sleep(handle, delay).await.is_err() {
+                    if cancelable_sleep(&ctx.handle, delay).await.is_err() {
                         return Err(SophonError::Cancelled);
                     }
                 } else {
                     log::warn!(
                         "Patch chunk {patch_name} failed (final attempt {attempt_num}/{max_retries}): {last_err}",
+                        patch_name = chunk_info.patch_name,
                         attempt_num = attempt + 1,
+                        max_retries = super::MAX_RETRIES,
                     );
                 }
             }
@@ -1520,8 +1873,8 @@ async fn download_patch_chunk_with_retries(
     }
 
     Err(SophonError::DownloadFailed {
-        chunk: patch_name.to_string(),
-        attempts: max_retries,
+        chunk: chunk_info.patch_name.clone(),
+        attempts: super::MAX_RETRIES,
         error: last_err,
     })
 }
@@ -1535,6 +1888,19 @@ async fn download_chunk_with_retries(
 ) -> SophonResult<()> {
     let mut last_err = String::new();
 
+    let mut decomp_hash = [0u8; 16];
+    let decomp_len = crate::game_installer::assembly_opt::hex_decode_into(
+        chunk.chunk_decompressed_hash_md5_str(),
+        &mut decomp_hash,
+    )
+    .unwrap_or(0);
+    let mut comp_hash = [0u8; 16];
+    let comp_len = crate::game_installer::assembly_opt::hex_decode_into(
+        chunk.chunk_compressed_hash_md5_str(),
+        &mut comp_hash,
+    )
+    .unwrap_or(0);
+
     for attempt in 0..MAX_RETRIES {
         if handle.is_cancelled() {
             return Err(SophonError::Cancelled);
@@ -1542,7 +1908,14 @@ async fn download_chunk_with_retries(
         match super::download::download_chunk(
             client,
             chunk_download,
-            chunk.into(),
+            crate::game_installer::compact_manifest::ChunkRef {
+                chunk_name: chunk.chunk_name_str(),
+                chunk_decompressed_hash_md5: &decomp_hash[..decomp_len],
+                chunk_size: chunk.chunk_size,
+                chunk_size_decompressed: chunk.chunk_size_decompressed,
+                chunk_compressed_hash_md5: &comp_hash[..comp_len],
+                chunk_old_offset: chunk.chunk_old_offset,
+            },
             dest,
             None,
             Some(handle),
@@ -1558,8 +1931,8 @@ async fn download_chunk_with_retries(
                 }
                 if attempt < MAX_RETRIES - 1 {
                     log::warn!(
-                        "Chunk {chunk_name} failed (attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
-                        chunk_name = chunk.chunk_name,
+                        "Chunk {} failed (attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
+                        chunk.chunk_name_str(),
                         attempt_num = attempt + 1,
                     );
                     let delay = retry_delay(attempt);
@@ -1568,8 +1941,8 @@ async fn download_chunk_with_retries(
                     }
                 } else {
                     log::warn!(
-                        "Chunk {chunk_name} failed (final attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
-                        chunk_name = chunk.chunk_name,
+                        "Chunk {} failed (final attempt {attempt_num}/{MAX_RETRIES}): {last_err}",
+                        chunk.chunk_name_str(),
                         attempt_num = attempt + 1,
                     );
                 }
@@ -1578,7 +1951,7 @@ async fn download_chunk_with_retries(
     }
 
     Err(SophonError::DownloadFailed {
-        chunk: chunk.chunk_name.clone(),
+        chunk: chunk.chunk_name_str().to_string(),
         attempts: MAX_RETRIES,
         error: last_err,
     })
@@ -1618,17 +1991,26 @@ async fn download_patch_chunk_inner(
         None
     };
     let mut total_len = 0u64;
+    // One cancellation waiter per chunk, not per frame: the biased select
+    // polls the data arm first, and the atomic `is_cancelled` check
+    // preserves cancellation priority without re-registering the waiter.
+    let mut cancel_waiter = std::pin::pin!(handle.cancelled_future());
 
     loop {
         let next_chunk = stream.next();
+        if handle.is_cancelled() {
+            progress.fetch_sub(total_len, Ordering::Relaxed);
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(SophonError::Cancelled);
+        }
         let result = tokio::select! {
             biased;
-            _ = handle.cancelled_future() => {
+            result = next_chunk => result,
+            _ = cancel_waiter.as_mut() => {
                 progress.fetch_sub(total_len, Ordering::Relaxed);
                 let _ = tokio::fs::remove_file(dest).await;
                 return Err(SophonError::Cancelled);
             }
-            result = next_chunk => result,
         };
 
         match result {
@@ -1653,12 +2035,12 @@ async fn download_patch_chunk_inner(
                         actual: total_len,
                     });
                 }
-                if let Some(ref mut h) = hasher {
-                    if let Err(e) = h.update(&bytes) {
-                        progress.fetch_sub(total_len, Ordering::Relaxed);
-                        let _ = tokio::fs::remove_file(dest).await;
-                        return Err(e.into());
-                    }
+                if let Some(ref mut h) = hasher
+                    && let Err(e) = h.update(&bytes)
+                {
+                    progress.fetch_sub(total_len, Ordering::Relaxed);
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(e.into());
                 }
                 if let Err(e) = file.write_all(&bytes).await {
                     progress.fetch_sub(total_len, Ordering::Relaxed);
@@ -1710,8 +2092,19 @@ async fn download_patch_chunk_inner(
     Ok(())
 }
 
-pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
+    verify_chunk_md5_inner(path, |digest| super::assembly_opt::md5_bytes_eq(digest, expected_md5))
+}
+
+/// Verifies a file's MD5 against a hex-encoded expected hash,
+/// avoiding the `Vec<u8>` allocation from `hex_to_bytes`.
+pub fn verify_chunk_md5_hex(path: &Path, expected_hex: &str) -> bool {
+    verify_chunk_md5_inner(path, |digest| super::assembly_opt::md5_hex_eq(digest, expected_hex))
+}
+
+fn verify_chunk_md5_inner<F: Fn(&[u8; 16]) -> bool>(path: &Path, verify: F) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
     let fd = file.as_raw_fd();
@@ -1728,32 +2121,29 @@ pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
         true
     } else {
         posix_advise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+        let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
+        let mut buffer = super::assembly_opt::HashReadBuffer::take(cap);
         let mut ok = true;
         loop {
-            let buf = match reader.fill_buf() {
-                Ok(b) => b,
+            let n = match file.read(buffer.as_mut_slice()) {
+                Ok(0) => break,
+                Ok(n) => n,
                 Err(_) => {
                     ok = false;
                     break;
                 }
             };
-            if buf.is_empty() {
-                break;
-            }
-            if hasher.update(buf).is_err() {
+            if hasher.update(buffer.filled(n)).is_err() {
                 ok = false;
                 break;
             }
-            let n = buf.len();
-            reader.consume(n);
         }
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         ok
     };
     let result = if hashed {
         match hasher.finish() {
-            Ok(digest) => md5_hex_eq(&digest, expected_md5),
+            Ok(digest) => verify(&digest),
             Err(_) => false,
         }
     } else {
@@ -1763,8 +2153,23 @@ pub(super) fn verify_chunk_md5(path: &Path, expected_md5: &str) -> bool {
     result
 }
 
-pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub fn verify_chunk_xxh64(path: &Path, expected_xxh64: &[u8]) -> bool {
+    verify_chunk_xxh64_inner(path, |digest| {
+        super::assembly_opt::xxh64_bytes_eq(digest, expected_xxh64)
+    })
+}
+
+/// Verifies a file's XXH64 against a hex-encoded expected hash,
+/// avoiding the `Vec<u8>` allocation from `hex_to_bytes`.
+pub fn verify_chunk_xxh64_hex(path: &Path, expected_hex: &str) -> bool {
+    verify_chunk_xxh64_inner(path, |digest| {
+        super::assembly_opt::xxh64_hex_eq(digest, expected_hex)
+    })
+}
+
+fn verify_chunk_xxh64_inner<F: Fn(u64) -> bool>(path: &Path, verify: F) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
         log::warn!(
             "Failed to open file for XXH64 verification: {path_display}",
             path_display = path.display()
@@ -1779,29 +2184,26 @@ pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
     let mut hasher = super::assembly_opt::take_xxh64();
     let result = if len == 0 {
         hasher.update(b"");
-        super::assembly_opt::xxh64_hex_eq(hasher.digest(), expected_xxh64)
+        verify(hasher.digest())
     } else {
         posix_advise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+        let cap = (len as usize).min(super::assembly_opt::HASH_READ_BUFFER_SIZE);
+        let mut buffer = super::assembly_opt::HashReadBuffer::take(cap);
         let mut ok = true;
         loop {
-            let buf = match reader.fill_buf() {
-                Ok(b) => b,
+            let n = match file.read(buffer.as_mut_slice()) {
+                Ok(0) => break,
+                Ok(n) => n,
                 Err(_) => {
                     ok = false;
                     break;
                 }
             };
-            if buf.is_empty() {
-                break;
-            }
-            hasher.update(buf);
-            let n = buf.len();
-            reader.consume(n);
+            hasher.update(buffer.filled(n));
         }
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         if ok {
-            super::assembly_opt::xxh64_hex_eq(hasher.digest(), expected_xxh64)
+            verify(hasher.digest())
         } else {
             false
         }
@@ -1810,18 +2212,39 @@ pub(super) fn verify_chunk_xxh64(path: &Path, expected_xxh64: &str) -> bool {
     result
 }
 
-pub(super) fn verify_file_hash(path: &Path, expected_hash: &str) -> bool {
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
+pub fn verify_file_hash(path: &Path, expected_hash: &[u8]) -> bool {
     if expected_hash.is_empty() {
         return true;
     }
     match expected_hash.len() {
-        32 => verify_chunk_md5(path, expected_hash),
-        16 => verify_chunk_xxh64(path, expected_hash),
+        16 => verify_chunk_md5(path, expected_hash),
+        8 => verify_chunk_xxh64(path, expected_hash),
         _ => {
             log::warn!(
-                "Unknown hash format (length={len}): {hash}",
-                len = expected_hash.len(),
-                hash = expected_hash
+                "Unknown hash format (length={len})",
+                len = expected_hash.len()
+            );
+            false
+        }
+    }
+}
+
+/// Verifies a file's hash against a hex-encoded expected hash string,
+/// avoiding the `Vec<u8>` allocation from `hex_to_bytes`. Dispatches on
+/// hex string length: 32 chars = MD5, 16 chars = XXH64.
+pub fn verify_file_hash_hex(path: &Path, expected_hex: &str) -> bool {
+    if expected_hex.is_empty() {
+        return true;
+    }
+    match expected_hex.len() {
+        32 => verify_chunk_md5_hex(path, expected_hex),
+        16 => verify_chunk_xxh64_hex(path, expected_hex),
+        _ => {
+            log::warn!(
+                "Unknown hex hash format (length={len})",
+                len = expected_hex.len()
             );
             false
         }
@@ -1856,6 +2279,7 @@ where
     F: FnOnce(PreinstallState) -> Fut,
     Fut: std::future::Future<Output = SophonResult<TargetSnapshot>>,
 {
+    let _buffer_pool_trim = HdiffPoolTrimGuard;
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
     }
@@ -1905,27 +2329,45 @@ where
         log::warn!("{message}");
         updater(SophonProgress::Warning { message });
     }
-    let download_over_context = DownloadOverContext::from_snapshot(snapshot);
+    let download_over_context = Arc::new(DownloadOverContext::from_snapshot(snapshot));
 
     let chunks_dir = patching_chunk_dir(game_dir);
+    let game_dir: Arc<std::path::Path> = Arc::from(game_dir);
+    let chunks_dir: Arc<std::path::Path> = Arc::from(chunks_dir);
     let total_files = state.patch_assets.len() as u64;
     let applied_files = Arc::new(AtomicU64::new(0u64));
-    let last_apply_update = AtomicU64::new(0);
+    let last_apply_update = Arc::new(AtomicU64::new(0));
 
     let game_dir_owned = game_dir.to_path_buf();
-    let filter_cache =
-        tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned)).await?;
+    let filter_cache = Arc::new(
+        tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned)).await?,
+    );
     filter_patch_assets_for_removed_features(&filter_cache, &mut state.patch_assets);
 
+    // State is immutable from here on; share it with in-flight patch
+    // tasks without cloning the (possibly large) asset vectors.
+    let state = Arc::new(state);
+
     let regenerate_pkg_version = if state.game_id == "hk4e" {
-        Some(download_over_context.clone())
+        Some(Arc::clone(&download_over_context))
     } else {
         None
     };
 
+    // Apply patches through a bounded sliding window so per-apply
+    // writeback stalls on one file overlap CPU work on the next. The
+    // window scales with available CPUs: each in-flight apply spends
+    // most of its time in I/O wait, so the window typically exceeds
+    // the CPU count to keep all cores busy during fsync and temp-file
+    // writeback.
+    let window = preinstall_patch_window();
+    let mut join_set: tokio::task::JoinSet<SophonResult<()>> = tokio::task::JoinSet::new();
+    let mut first_error: Option<SophonError> = None;
+
     for asset in &state.patch_assets {
         if handle.is_cancelled() {
-            return Err(SophonError::Cancelled);
+            first_error = first_error.or(Some(SophonError::Cancelled));
+            break;
         }
         if asset.patch_method == PatchMethod::Skip {
             applied_files.fetch_add(1, Ordering::Relaxed);
@@ -1946,184 +2388,74 @@ where
             continue;
         }
 
-        let target_path = validate_asset_path(game_dir, &asset.target_file_path)?;
-        let already_patched = {
-            let tp = target_path.clone();
-            let sz = asset.target_file_size;
-            let md5 = asset.target_file_hash.clone();
-            tokio::task::spawn_blocking(move || is_file_already_patched(&tp, sz, &md5)).await?
+        // Path validation fails the whole run eagerly, before any task
+        // is scheduled.
+        let target_path = match validate_asset_path(&game_dir, &asset.target_file_path) {
+            Ok(path) => path,
+            Err(err) => {
+                first_error = first_error.or(Some(err));
+                break;
+            }
         };
-        if already_patched {
-            applied_files.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
 
-        let is_filtered = is_filtered_asset(&filter_cache, asset);
-        let asset = Arc::new(asset.clone());
-
-        match asset.patch_method {
-            PatchMethod::CopyOver => {
-                const COPY_MAX_RETRIES: usize = 4;
-                let mut fallback_to_download = false;
-                let mut skip_progress = false;
-                let asset = Arc::new(asset.clone());
-
-                for attempt in 0..=COPY_MAX_RETRIES {
-                    let gd = game_dir.to_path_buf();
-                    let cd = chunks_dir.to_path_buf();
-                    let a = Arc::clone(&asset);
-                    let result =
-                        tokio::task::spawn_blocking(move || apply_copy_over(&gd, &cd, a.as_ref()))
-                            .await?;
-
-                    match result {
-                        Ok(()) => break,
-                        Err(err) => {
-                            if is_filtered {
-                                log::warn!(
-                                    "CopyOver failed for filtered asset, skipping: {path} ({err})",
-                                    path = asset.target_file_path,
-                                );
-                                applied_files.fetch_add(1, Ordering::Relaxed);
-                                skip_progress = true;
-                                break;
-                            }
-                            if attempt == COPY_MAX_RETRIES || !err.is_retryable() {
-                                log::warn!(
-                                    "CopyOver failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
-                                    path = asset.target_file_path,
-                                    attempts = COPY_MAX_RETRIES + 1,
-                                );
-                                fallback_to_download = true;
-                            } else {
-                                if handle.is_cancelled() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                                let delay = retry_delay(attempt as u32);
-                                log::warn!(
-                                    "CopyOver failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
-                                    path = asset.target_file_path,
-                                    attempt_num = attempt + 1,
-                                    max_attempts = COPY_MAX_RETRIES + 1,
-                                    delay_ms = delay.as_millis()
-                                );
-                                if cancelable_sleep(handle, delay).await.is_err() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                            }
-                        }
+        // Backpressure: keep at most `window` assets in flight. Results
+        // are handled in completion order; the first error stops new
+        // scheduling but in-flight assets still finish (their atomic
+        // temp-file writes are safe) before the drain below.
+        while join_set.len() >= window {
+            match join_set.join_next().await {
+                Some(outcome) => {
+                    if !handle_asset_result(outcome, &mut first_error) {
+                        break;
                     }
                 }
-
-                if skip_progress {
-                    continue;
-                }
-                if fallback_to_download {
-                    apply_download_over_with_retry(
-                        client,
-                        game_dir,
-                        &state,
-                        asset.as_ref(),
-                        &download_over_context,
-                        handle,
-                    )
-                    .await?;
-                }
+                None => break,
             }
-            PatchMethod::Patch => {
-                const PATCH_MAX_RETRIES: usize = 4;
-                let mut fallback_to_download = false;
-                let mut skip_progress = false;
-
-                for attempt in 0..=PATCH_MAX_RETRIES {
-                    let gd = game_dir.to_path_buf();
-                    let cd = chunks_dir.to_path_buf();
-                    let a = Arc::clone(&asset);
-                    let fc = filter_cache.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        apply_hdiff_patch(&gd, &cd, a.as_ref(), &fc)
-                    })
-                    .await?;
-
-                    match result {
-                        Ok(()) => break,
-                        Err(err) => {
-                            if is_filtered {
-                                log::warn!(
-                                    "HDiff patch failed for filtered asset, skipping: {path} ({err})",
-                                    path = asset.target_file_path,
-                                );
-                                applied_files.fetch_add(1, Ordering::Relaxed);
-                                skip_progress = true;
-                                break;
-                            }
-                            if attempt == PATCH_MAX_RETRIES || !err.is_retryable() {
-                                log::warn!(
-                                    "HDiff patch failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
-                                    path = asset.target_file_path,
-                                    attempts = PATCH_MAX_RETRIES + 1,
-                                );
-                                fallback_to_download = true;
-                            } else {
-                                if handle.is_cancelled() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                                let delay = retry_delay(attempt as u32);
-                                log::warn!(
-                                    "HDiff patch failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
-                                    path = asset.target_file_path,
-                                    attempt_num = attempt + 1,
-                                    max_attempts = PATCH_MAX_RETRIES + 1,
-                                    delay_ms = delay.as_millis()
-                                );
-                                if cancelable_sleep(handle, delay).await.is_err() {
-                                    return Err(SophonError::Cancelled);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if skip_progress {
-                    continue;
-                }
-                if fallback_to_download {
-                    apply_download_over_with_retry(
-                        client,
-                        game_dir,
-                        &state,
-                        asset.as_ref(),
-                        &download_over_context,
-                        handle,
-                    )
-                    .await?;
-                }
-            }
-            PatchMethod::DownloadOver => {
-                apply_download_over_with_retry(
-                    client,
-                    game_dir,
-                    &state,
-                    asset.as_ref(),
-                    &download_over_context,
-                    handle,
-                )
-                .await?;
-            }
-            PatchMethod::Remove | PatchMethod::Skip => {}
+        }
+        if first_error.is_some() {
+            break;
         }
 
-        let count = applied_files.fetch_add(1, Ordering::Relaxed) + 1;
-        let now = now_nanos();
-        if now.saturating_sub(last_apply_update.load(Ordering::Relaxed))
-            >= super::PROGRESS_UPDATE_INTERVAL_MS * 1_000_000
-        {
-            updater(SophonProgress::ApplyingPreinstall {
-                applied_files: count,
-                total_files,
-            });
-            last_apply_update.store(now, Ordering::Relaxed);
-        }
+        let task = PatchTaskContext {
+            game_dir: Arc::clone(&game_dir),
+            chunks_dir: Arc::clone(&chunks_dir),
+            filter_cache: Arc::clone(&filter_cache),
+            download_over_context: Arc::clone(&download_over_context),
+            state: Arc::clone(&state),
+            client: client.clone(),
+            handle: handle.clone(),
+            asset: Arc::new(asset.clone()),
+            target_path,
+            applied_files: Arc::clone(&applied_files),
+            last_apply_update: Arc::clone(&last_apply_update),
+            updater: Arc::clone(&updater),
+            total_files,
+        };
+        join_set.spawn(process_patch_asset(task));
+    }
+
+    // Drain remaining tasks. spawn_blocking bodies cannot be interrupted;
+    // every in-flight apply must complete before the post-loop steps
+    // (pkg_version regeneration, deletions, tag write) observe the
+    // filesystem. A panicked task is recorded but never abandons the
+    // drain: dropping the JoinSet would detach still-running apply
+    // writers that the post-loop steps could then race.
+    while let Some(outcome) = join_set.join_next().await {
+        let _ = handle_asset_result(outcome, &mut first_error);
+    }
+    // Final progress tick is sent even when the throttle would suppress
+    // it: parallel completions cluster and would otherwise leave the UI
+    // stuck below 100%.
+    let count = applied_files.load(Ordering::Relaxed);
+    if count > 0 {
+        updater(SophonProgress::ApplyingPreinstall {
+            applied_files: count,
+            total_files,
+        });
+        last_apply_update.store(now_nanos(), Ordering::Relaxed);
+    }
+    if let Some(err) = first_error {
+        return Err(err);
     }
 
     if handle.is_cancelled() {
@@ -2179,13 +2511,21 @@ where
     Ok(())
 }
 
+struct HdiffPoolTrimGuard;
+
+impl Drop for HdiffPoolTrimGuard {
+    fn drop(&mut self) {
+        super::hdiffpatch::trim_idle_buffers();
+    }
+}
+
 fn regenerate_hk4e_pkg_version(
     game_dir: &Path,
     context: &DownloadOverContext,
     vo_lang: &[String],
 ) -> SophonResult<()> {
     let mut assets: Vec<SophonManifestAssetProperty> = Vec::new();
-    for (_, proto) in context.manifests.values() {
+    for (_, proto, _) in context.manifests.values() {
         for asset in &proto.assets {
             if !asset.is_directory() {
                 assets.push(asset.clone());
@@ -2195,11 +2535,12 @@ fn regenerate_hk4e_pkg_version(
 
     super::game_filters::filter_hk4e_asset_list(game_dir, &mut assets, vo_lang);
 
-    let manifest = Arc::new(super::compact_manifest::CompactManifest::from(assets));
+    let manifest = Arc::new(super::compact_manifest::CompactManifest::try_from_properties(assets)?);
     super::game_filters::write_pkg_version_from_manifest(game_dir, &manifest, vo_lang)?;
     Ok(())
 }
 
+#[inline]
 fn validate_asset_path(game_dir: &Path, asset_path: &str) -> SophonResult<PathBuf> {
     super::assembly::validate_asset_name(asset_path)?;
     Ok(game_dir.join(asset_path))
@@ -2233,7 +2574,7 @@ fn validate_patch_name(patch_name: &str) -> SophonResult<()> {
     Ok(())
 }
 
-fn is_file_already_patched(path: &Path, expected_size: u64, expected_md5: &str) -> bool {
+fn is_file_already_patched(path: &Path, expected_size: u64, expected_md5: &[u8]) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
@@ -2241,6 +2582,16 @@ fn is_file_already_patched(path: &Path, expected_size: u64, expected_md5: &str) 
         return false;
     }
     verify_file_hash(path, expected_md5)
+}
+
+fn is_file_already_patched_hex(path: &Path, expected_size: u64, expected_hex: &str) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() != expected_size {
+        return false;
+    }
+    verify_file_hash_hex(path, expected_hex)
 }
 
 #[derive(Clone)]
@@ -2307,7 +2658,7 @@ impl FilterCache {
                     let mut entries: Vec<String> = content
                         .lines()
                         .filter_map(extract_blacklist_filename)
-                        .map(|name| name.to_lowercase())
+                        .map(|name| name.to_ascii_lowercase())
                         .collect();
                     // Generate cross-path variants.
                     let variants: Vec<String> = entries
@@ -2339,7 +2690,7 @@ impl FilterCache {
             let ignored: Vec<String> = all_langs
                 .iter()
                 .filter(|lang| !installed.iter().any(|inst| inst == **lang))
-                .map(|lang| format!("/{lang}/").to_lowercase())
+                .map(|lang| format!("/{lang}/").to_ascii_lowercase())
                 .collect();
             Some(ignored)
         } else {
@@ -2360,13 +2711,18 @@ fn contains_ignore_ascii_case(haystack: &str, pattern: &str) -> bool {
     if pattern.len() > haystack.len() {
         return false;
     }
+    if pattern.is_empty() {
+        return true;
+    }
     let h = haystack.as_bytes();
     let p = pattern.as_bytes();
+    let first = p[0].to_ascii_lowercase();
     for i in 0..=(h.len() - p.len()) {
-        if h[i..i + p.len()]
-            .iter()
-            .zip(p.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        if h[i].to_ascii_lowercase() == first
+            && h[i + 1..i + p.len()]
+                .iter()
+                .zip(p[1..].iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
         {
             return true;
         }
@@ -2374,6 +2730,7 @@ fn contains_ignore_ascii_case(haystack: &str, pattern: &str) -> bool {
     false
 }
 
+#[inline]
 fn is_filtered_asset(cache: &FilterCache, asset: &PatchAssetInfo) -> bool {
     if let Some(ref tokens) = cache.kdel_tokens {
         for token in tokens {
@@ -2453,6 +2810,8 @@ pub(super) fn filter_patch_assets_for_removed_features(
 }
 
 /// Apply copyover patch to target file. Caller performs path validation.
+// Large function; keeping it out-of-line preserves hot-path code layout.
+#[inline(never)]
 fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -> SophonResult<()> {
     validate_patch_name(&asset.patch_name)?;
     let chunk_path = chunks_dir.join(&asset.patch_name);
@@ -2460,7 +2819,7 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
         if !chunk_path.exists() {
             return Err(SophonError::PatchChunkNotFound(asset.patch_name.clone()));
         }
-    } else if !verify_file_hash(&chunk_path, &asset.patch_hash) {
+    } else if !verify_file_hash_hex(&chunk_path, &asset.patch_hash) {
         return Err(SophonError::Md5Mismatch {
             item: asset.patch_name.clone(),
             expected: asset.patch_hash.clone(),
@@ -2532,7 +2891,8 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
             actual: actual_size,
         });
     }
-    if !asset.target_file_hash.is_empty() && !verify_file_hash(&temp_path, &asset.target_file_hash)
+    if !asset.target_file_hash.is_empty()
+        && !verify_file_hash_hex(&temp_path, &asset.target_file_hash)
     {
         let _ = fs::remove_file(&temp_path);
         return Err(SophonError::Md5Mismatch {
@@ -2547,16 +2907,373 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
     Ok(())
 }
 
+/// Upper bound on concurrently in-flight patch applies. Each apply is
+/// mostly I/O wait (target md5 read, temp-file write, fsync) around a
+/// short CPU decode, so the window can exceed the CPU count to overlap
+/// those waits; twice the CPUs with a fixed ceiling keeps scheduling
+/// and temp-file bookkeeping cheap on very large machines. Falls back
+/// to a mid-range default when the CPU count is unavailable.
+fn preinstall_patch_window() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(8, |n| n.get());
+    cpus.saturating_mul(2).min(32)
+}
+
+/// Shared context a single in-flight patch asset needs. Everything the
+/// JoinSet task touches is owned or Arc'd so the task is 'static.
+struct PatchTaskContext {
+    game_dir: Arc<std::path::Path>,
+    chunks_dir: Arc<std::path::Path>,
+    filter_cache: Arc<FilterCache>,
+    download_over_context: Arc<DownloadOverContext>,
+    state: Arc<PreinstallState>,
+    client: Client,
+    handle: DownloadHandle,
+    asset: Arc<PatchAssetInfo>,
+    target_path: std::path::PathBuf,
+    applied_files: Arc<AtomicU64>,
+    last_apply_update: Arc<AtomicU64>,
+    updater: ProgressUpdater,
+    total_files: u64,
+}
+
+/// Applies one patch asset through its full lifecycle: already-patched
+/// check, method dispatch with bounded retries, filtered-asset skip,
+/// DownloadOver fallback, and the throttled progress update.
+async fn process_patch_asset(ctx: PatchTaskContext) -> SophonResult<()> {
+    let PatchTaskContext {
+        game_dir,
+        chunks_dir,
+        filter_cache,
+        download_over_context,
+        state,
+        client,
+        handle,
+        asset,
+        target_path,
+        applied_files,
+        last_apply_update,
+        updater,
+        total_files,
+    } = ctx;
+
+    // Already-patched check runs inside the task: it is a full md5 read
+    // of the target and hiding it behind other applies is the point of
+    // the window.
+    let already_patched = {
+        let tp = target_path.clone();
+        let sz = asset.target_file_size;
+        let hex = asset.target_file_hash.clone();
+        tokio::task::spawn_blocking(move || is_file_already_patched_hex(&tp, sz, &hex))
+            .await
+            .map_err(SophonError::JoinError)?
+    };
+    if already_patched {
+        report_apply_progress(
+            &applied_files,
+            &last_apply_update,
+            &updater,
+            total_files,
+        );
+        return Ok(());
+    }
+
+    let is_filtered = is_filtered_asset(&filter_cache, &asset);
+
+    // The CopyOver and Patch retry ladders below are intentionally
+    // parallel copies: they differ only in the applied function, its
+    // retry ceiling label, and log wording. Sharing them through a
+    // closure would hide the retry/fallback control flow behind
+    // indirection in correctness-critical code.
+    let mut skip_progress = false;
+    match asset.patch_method {
+        PatchMethod::CopyOver => {
+            const COPY_MAX_RETRIES: usize = 4;
+            let mut fallback_to_download = false;
+
+            for attempt in 0..=COPY_MAX_RETRIES {
+                let gd = Arc::clone(&game_dir);
+                let cd = Arc::clone(&chunks_dir);
+                let a = Arc::clone(&asset);
+                let result =
+                    tokio::task::spawn_blocking(move || apply_copy_over(&gd, &cd, a.as_ref()))
+                        .await
+                        .map_err(SophonError::JoinError)?;
+
+                match result {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if is_filtered {
+                            log::warn!(
+                                "CopyOver failed for filtered asset, skipping: {path} ({err})",
+                                path = asset.target_file_path,
+                            );
+                            skip_progress = true;
+                            break;
+                        }
+                        if attempt == COPY_MAX_RETRIES || !err.is_retryable() {
+                            log::warn!(
+                                "CopyOver failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
+                                path = asset.target_file_path,
+                                attempts = COPY_MAX_RETRIES + 1,
+                            );
+                            fallback_to_download = true;
+                        } else {
+                            if handle.is_cancelled() {
+                                return Err(SophonError::Cancelled);
+                            }
+                            let delay = retry_delay(attempt as u32);
+                            log::warn!(
+                                "CopyOver failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
+                                path = asset.target_file_path,
+                                attempt_num = attempt + 1,
+                                max_attempts = COPY_MAX_RETRIES + 1,
+                                delay_ms = delay.as_millis()
+                            );
+                            if cancelable_sleep(&handle, delay).await.is_err() {
+                                return Err(SophonError::Cancelled);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !skip_progress && fallback_to_download {
+                if handle.is_cancelled() {
+                    return Err(SophonError::Cancelled);
+                }
+                apply_download_over_with_retry(
+                    &client,
+                    &game_dir,
+                    &state,
+                    &asset,
+                    &download_over_context,
+                    &handle,
+                )
+                .await?;
+            }
+        }
+        PatchMethod::Patch => {
+            const PATCH_MAX_RETRIES: usize = 4;
+            let mut fallback_to_download = false;
+
+            for attempt in 0..=PATCH_MAX_RETRIES {
+                let gd = Arc::clone(&game_dir);
+                let cd = Arc::clone(&chunks_dir);
+                let a = Arc::clone(&asset);
+                let fc = Arc::clone(&filter_cache);
+                let result = tokio::task::spawn_blocking(move || {
+                    apply_hdiff_patch(&gd, &cd, a.as_ref(), &fc)
+                })
+                .await
+                .map_err(SophonError::JoinError)?;
+
+                match result {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if is_filtered {
+                            log::warn!(
+                                "HDiff patch failed for filtered asset, skipping: {path} ({err})",
+                                path = asset.target_file_path,
+                            );
+                            skip_progress = true;
+                            break;
+                        }
+                        if attempt == PATCH_MAX_RETRIES || !err.is_retryable() {
+                            log::warn!(
+                                "HDiff patch failed for {path} after {attempts} attempts: {err}, falling back to DownloadOver",
+                                path = asset.target_file_path,
+                                attempts = PATCH_MAX_RETRIES + 1,
+                            );
+                            fallback_to_download = true;
+                        } else {
+                            if handle.is_cancelled() {
+                                return Err(SophonError::Cancelled);
+                            }
+                            let delay = retry_delay(attempt as u32);
+                            log::warn!(
+                                "HDiff patch failed for {path} (attempt {attempt_num}/{max_attempts}): {err}, retrying in {delay_ms}ms...",
+                                path = asset.target_file_path,
+                                attempt_num = attempt + 1,
+                                max_attempts = PATCH_MAX_RETRIES + 1,
+                                delay_ms = delay.as_millis()
+                            );
+                            if cancelable_sleep(&handle, delay).await.is_err() {
+                                return Err(SophonError::Cancelled);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !skip_progress && fallback_to_download {
+                if handle.is_cancelled() {
+                    return Err(SophonError::Cancelled);
+                }
+                apply_download_over_with_retry(
+                    &client,
+                    &game_dir,
+                    &state,
+                    &asset,
+                    &download_over_context,
+                    &handle,
+                )
+                .await?;
+            }
+        }
+        PatchMethod::DownloadOver => {
+            apply_download_over_with_retry(
+                &client,
+                &game_dir,
+                &state,
+                &asset,
+                &download_over_context,
+                &handle,
+            )
+            .await?;
+        }
+        PatchMethod::Remove | PatchMethod::Skip => {}
+    }
+
+    if !skip_progress {
+        report_apply_progress(&applied_files, &last_apply_update, &updater, total_files);
+    }
+    Ok(())
+}
+
+/// Throttled progress tick shared by every completion path of a patch
+/// asset.
+fn report_apply_progress(
+    applied_files: &AtomicU64,
+    last_apply_update: &AtomicU64,
+    updater: &ProgressUpdater,
+    total_files: u64,
+) {
+    let count = applied_files.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_nanos();
+    if now.saturating_sub(last_apply_update.load(Ordering::Relaxed))
+        >= super::PROGRESS_UPDATE_INTERVAL_MS * 1_000_000
+    {
+        updater(SophonProgress::ApplyingPreinstall {
+            applied_files: count,
+            total_files,
+        });
+        last_apply_update.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Handle one completed patch task: record the first error (failures
+/// abort the run after draining in-flight work). Returns false only for
+/// a panicked or cancelled task; callers must still drain the set.
+fn handle_asset_result(
+    outcome: Result<SophonResult<()>, tokio::task::JoinError>,
+    first_error: &mut Option<SophonError>,
+) -> bool {
+    match outcome {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            if first_error.is_none() {
+                log::warn!("Patch task failed: {err}");
+                *first_error = Some(err);
+            }
+            true
+        }
+        Err(join_err) => {
+            if first_error.is_none() {
+                log::error!("Patch task panicked or was cancelled: {join_err}");
+                *first_error = Some(SophonError::JoinError(join_err));
+            }
+            false
+        }
+    }
+}
+
 fn apply_hdiff_patch(
     game_dir: &Path,
     chunks_dir: &Path,
     asset: &PatchAssetInfo,
     cache: &FilterCache,
 ) -> SophonResult<()> {
+    apply_hdiff_patch_impl(
+        game_dir,
+        chunks_dir,
+        asset,
+        cache,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
+    )
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HdiffPhaseTimings {
+    pub original_metadata_and_hash_validation: std::time::Duration,
+    pub patch_application: std::time::Duration,
+    pub output_verification: std::time::Duration,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[derive(Default)]
+struct TimingHdiffPhaseObserver {
+    timings: HdiffPhaseTimings,
+    phase_started: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "bench-diagnostics")]
+impl TimingHdiffPhaseObserver {
+    fn start(&mut self) {
+        self.phase_started = Some(std::time::Instant::now());
+    }
+
+    fn finish(&mut self) -> std::time::Duration {
+        self.phase_started
+            .take()
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(feature = "bench-diagnostics")]
+pub fn apply_synthetic_hdiff_for_benchmark(
+    game_dir: &Path,
+    preinstall_tag: &str,
+    target_relative_path: &str,
+) -> SophonResult<HdiffPhaseTimings> {
+    let _buffer_pool_trim = HdiffPoolTrimGuard;
+    let state = load_preinstall_state(game_dir, preinstall_tag)?;
+    let asset = state
+        .patch_assets
+        .iter()
+        .find(|asset| asset.target_file_path == target_relative_path)
+        .ok_or_else(|| invalid_state("Benchmark patch asset was not found"))?;
+    let filter_cache = FilterCache::new(game_dir);
+    let mut observer = TimingHdiffPhaseObserver::default();
+    apply_hdiff_patch_impl(
+        game_dir,
+        &patching_chunk_dir(game_dir),
+        asset,
+        &filter_cache,
+        Some(&mut observer),
+    )?;
+    Ok(observer.timings)
+}
+
+// Large function; keeping it out-of-line preserves hot-path code layout.
+#[inline(never)]
+fn apply_hdiff_patch_impl(
+    game_dir: &Path,
+    chunks_dir: &Path,
+    asset: &PatchAssetInfo,
+    cache: &FilterCache,
+    #[cfg(feature = "bench-diagnostics")] mut observer: Option<&mut TimingHdiffPhaseObserver>,
+) -> SophonResult<()> {
     let original_path = match &asset.original_file_path {
         Some(p) => validate_asset_path(game_dir, p)?,
         None => validate_asset_path(game_dir, &asset.target_file_path)?,
     };
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.start();
+    }
     let mut diff_ref_guard: DiffRefGuard = DiffRefGuard(None);
     if !original_path.exists() {
         let is_blank = asset.original_file_hash.as_deref() == Some(BLANK_FILE_MD5)
@@ -2568,7 +3285,10 @@ fn apply_hdiff_patch(
                 fs::create_dir_all(parent)?;
             }
             fs::File::create(&diff_ref)?;
-            if !verify_file_hash(&diff_ref, BLANK_FILE_MD5) {
+            if !verify_file_hash_hex(
+                &diff_ref,
+                BLANK_FILE_MD5,
+            ) {
                 return Err(SophonError::HDiffPatchFailed {
                     file: asset.target_file_path.clone(),
                     error: format!(
@@ -2635,29 +3355,30 @@ fn apply_hdiff_patch(
         && diff_ref_guard.0.is_none()
         && original_path.exists()
         && !expected_md5.is_empty()
-        && !verify_file_hash(&original_path, expected_md5)
-        && is_filtered_asset(cache, asset)
+        && !verify_file_hash_hex(
+            &original_path,
+            expected_md5,
+        )
     {
-        log::warn!(
-            "Original file MD5 mismatch for filtered asset, skipping: {path}",
-            path = asset.target_file_path
-        );
-        return Ok(());
+        if is_filtered_asset(cache, asset) {
+            log::warn!(
+                "Original file MD5 mismatch for filtered asset, skipping: {path}",
+                path = asset.target_file_path
+            );
+            return Ok(());
+        } else {
+            log::warn!(
+                "Original file MD5 mismatch for {path}, falling back to DownloadOver (keeping file for old-chunk reuse)",
+                path = original_path.display()
+            );
+            return Err(SophonError::OriginalFileMissing(
+                original_path.to_string_lossy().to_string(),
+            ));
+        }
     }
-    if let Some(ref expected_md5) = asset.original_file_hash
-        && diff_ref_guard.0.is_none()
-        && original_path.exists()
-        && !expected_md5.is_empty()
-        && !verify_file_hash(&original_path, expected_md5)
-        && !is_filtered_asset(cache, asset)
-    {
-        log::warn!(
-            "Original file MD5 mismatch for {path}, falling back to DownloadOver (keeping file for old-chunk reuse)",
-            path = original_path.display()
-        );
-        return Err(SophonError::OriginalFileMissing(
-            original_path.to_string_lossy().to_string(),
-        ));
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.timings.original_metadata_and_hash_validation = observer.finish();
     }
 
     validate_patch_name(&asset.patch_name)?;
@@ -2685,10 +3406,18 @@ fn apply_hdiff_patch(
     let tp = temp_output.to_string_lossy().into_owned();
     let diff_offset = asset.patch_offset;
 
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.start();
+    }
     let patch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let mut hdiff = super::hdiffpatch::HDiff::with_offset(op, dp, tp, diff_offset);
         hdiff.apply(None)
     }));
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.timings.patch_application = observer.finish();
+    }
 
     {
         if let Ok(f) = fs::File::open(&chunk_path) {
@@ -2698,6 +3427,10 @@ fn apply_hdiff_patch(
 
     match patch_result {
         Ok(true) => {
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.start();
+            }
             let actual_size = fs::metadata(&temp_output)?.len();
             if actual_size != asset.target_file_size {
                 let _ = fs::remove_file(&temp_output);
@@ -2708,7 +3441,10 @@ fn apply_hdiff_patch(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash(&temp_output, &asset.target_file_hash)
+                && !verify_file_hash_hex(
+                    &temp_output,
+                    &asset.target_file_hash,
+                )
             {
                 let _ = fs::remove_file(&temp_output);
                 return Err(SophonError::Md5Mismatch {
@@ -2718,6 +3454,10 @@ fn apply_hdiff_patch(
                 });
             }
             fs::rename(&temp_output, &target_path)?;
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(observer) = observer {
+                observer.timings.output_verification = observer.finish();
+            }
             Ok(())
         }
         Ok(false) => {
@@ -2744,6 +3484,8 @@ fn apply_hdiff_patch(
     }
 }
 
+// Large function; keeping it out-of-line preserves hot-path code layout.
+#[inline(never)]
 fn apply_hdiff_patch_from_files(
     game_dir: &Path,
     diff_path: &Path,
@@ -2760,7 +3502,10 @@ fn apply_hdiff_patch_from_files(
         }
         fs::File::create(&empty_original_path)?;
         // Verify the freshly-created diff_ref is empty before proceeding.
-        if !verify_file_hash(&empty_original_path, BLANK_FILE_MD5) {
+        if !verify_file_hash_hex(
+            &empty_original_path,
+            BLANK_FILE_MD5,
+        ) {
             let _ = fs::remove_file(&empty_original_path);
             return Err(SophonError::HDiffPatchFailed {
                 file: asset.target_file_path.clone(),
@@ -2805,7 +3550,10 @@ fn apply_hdiff_patch_from_files(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash(&temp_output, &asset.target_file_hash)
+                && !verify_file_hash_hex(
+                    &temp_output,
+                    &asset.target_file_hash,
+                )
             {
                 let _ = fs::remove_file(&temp_output);
                 return Err(SophonError::Md5Mismatch {
@@ -2841,9 +3589,10 @@ fn apply_hdiff_patch_from_files(
     }
 }
 
-#[derive(Debug, Clone)]
+type AssetIndex = rustc_hash::FxHashMap<String, usize>;
+
 struct DownloadOverContext {
-    manifests: rustc_hash::FxHashMap<String, (DownloadInfo, SophonManifestProto)>,
+    manifests: rustc_hash::FxHashMap<String, (DownloadInfo, Arc<SophonManifestProto>, AssetIndex)>,
 }
 
 impl DownloadOverContext {
@@ -2855,9 +3604,19 @@ impl DownloadOverContext {
                 .map(|entry| {
                     let mut manifest = entry.manifest.clone();
                     normalize_full_download_manifest(&mut manifest);
+                    let mut asset_index: AssetIndex =
+                        rustc_hash::FxHashMap::with_capacity_and_hasher(
+                            manifest.assets.len(),
+                            Default::default(),
+                        );
+                    for (i, a) in manifest.assets.iter().enumerate() {
+                        asset_index
+                            .entry(a.asset_name_str().to_string())
+                            .or_insert(i);
+                    }
                     (
                         entry.matching_field.clone(),
-                        (entry.chunk_download.clone(), manifest),
+                        (entry.chunk_download.clone(), Arc::new(manifest), asset_index),
                     )
                 })
                 .collect(),
@@ -2869,8 +3628,10 @@ async fn recover_legacy_snapshot(
     client: &Client,
     state: PreinstallState,
 ) -> SophonResult<TargetSnapshot> {
-    let (branch, pre) = fetch_front_door(client, &state.game_id).await?;
-    let branches = branch.main.into_iter().chain(pre).collect();
+    let (main_branch, pre) = fetch_front_door(client, &state.game_id)
+        .await?
+        .take_branches();
+    let branches = main_branch.into_iter().chain(pre).collect();
     recover_legacy_from_branches(client, &state, branches, |branch, tag| async move {
         fetch_build(client, &branch, Some(&tag)).await
     })
@@ -2909,12 +3670,12 @@ where
                     .ok_or_else(|| {
                         invalid_state(format!("Saved target manifest {field}/{id} is unavailable"))
                     })?;
-                let result = fetch_manifest(client, &meta.manifest_download, id).await?;
+                let manifest = fetch_manifest_proto(client, &meta.manifest_download, id).await?;
                 manifests.push(TargetManifest {
                     matching_field: field.clone(),
                     manifest_id: id.clone(),
                     chunk_download: meta.chunk_download.clone(),
-                    manifest: result.manifest,
+                    manifest,
                 });
             }
             let mut snapshot = TargetSnapshot {
@@ -2987,6 +3748,16 @@ async fn apply_download_over_with_retry(
     }))
 }
 
+/// Unique suffix for per-apply staging directories. Combines the process
+/// id with an in-process counter: two concurrent DownloadOver applies
+/// can never share a staging dir, and a stale dir left by a crashed
+/// previous run cannot collide with this process's staging areas.
+fn assembly_temp_token() -> u64 {
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    let counter = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    (std::process::id() as u64) << 32 | counter
+}
+
 async fn apply_download_over(
     client: &Client,
     game_dir: &Path,
@@ -3001,19 +3772,18 @@ async fn apply_download_over(
         fs::create_dir_all(parent)?;
     }
 
-    let (chunk_download, manifest) = context
+    let (chunk_download, manifest, asset_index) = context
         .manifests
         .get(&asset.matching_field)
         .ok_or_else(|| SophonError::NoVoiceManifest(asset.matching_field.clone()))?;
 
-    let file_entry = manifest
-        .assets
-        .iter()
-        .find(|a| a.asset_name == asset.target_file_path)
+    let file_index = *asset_index
+        .get(&asset.target_file_path)
         .ok_or_else(|| SophonError::AssemblyFailed {
             file: asset.target_file_path.clone(),
             error: "File not found in main manifest for DownloadOver".to_string(),
         })?;
+    let file_entry = &manifest.assets[file_index];
 
     let chunks_dir = game_dir.join("chunks");
     {
@@ -3021,43 +3791,43 @@ async fn apply_download_over(
         tokio::task::spawn_blocking(move || fs::create_dir_all(&cd)).await??;
     }
 
-    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(super::DOWNLOAD_CONCURRENCY));
-    let mut seen_chunks = rustc_hash::FxHashSet::default();
-    let chunk_futures = file_entry
-        .asset_chunks
-        .iter()
-        .filter(|chunk| seen_chunks.insert(chunk.chunk_name.as_str()))
-        .map(|chunk| {
-            let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
-            chunk_path.set_extension("zstd");
-            let client = client.clone();
-            let chunk_download = chunk_download.clone();
-            let chunk = chunk.clone();
-            let handle = handle.clone();
-            let permit = Arc::clone(&download_semaphore);
-            async move {
-                let _permit = permit.acquire().await.expect("semaphore not closed");
-                download_chunk_with_retries(&client, &chunk_download, &chunk, &chunk_path, &handle)
-                    .await
-            }
-        });
-    try_join_all(chunk_futures).await?;
+    run_unique_chunks_bounded(
+        &file_entry.asset_chunks,
+        super::download_concurrency(),
+        |chunk| make_download_over_chunk_future(chunk, &chunks_dir, client, chunk_download, handle),
+    )
+    .await?;
 
     {
         let gd = game_dir.to_path_buf();
-        let file_entry = file_entry.clone();
         let cd = chunks_dir.clone();
+        let target_manifest = Arc::clone(manifest);
+        let target_file_path = asset.target_file_path.clone();
         let vc = Arc::new(dashmap::DashMap::new());
         tokio::task::spawn_blocking(move || {
-            let tmp_dir = gd.join("tmp-patch-downloadover");
+            // Unique temp directory per apply: parallel in-flight patch
+            // assets each get their own staging area so one task's
+            // cleanup cannot race another task's assembly.
+            let tmp_dir = gd.join(format!(
+                "tmp-patch-downloadover-{token}",
+                token = assembly_temp_token(),
+            ));
             fs::create_dir_all(&tmp_dir)?;
-            let manifest = super::compact_manifest::CompactManifest::from(vec![file_entry]);
+            let file_entry = target_manifest.assets.get(file_index).ok_or_else(|| {
+                SophonError::AssemblyFailed {
+                    file: target_file_path.clone(),
+                    error: "File index no longer exists in DownloadOver manifest".to_owned(),
+                }
+            })?;
+            debug_assert_eq!(file_entry.asset_name_str(), target_file_path);
+            let manifest =
+                super::compact_manifest::CompactManifest::try_from_property_ref(file_entry)?;
             // No deletion ownership: these are shared cached payloads. Keep
             // them on failure/cancellation and for other packages' fallback.
             let chunk_lookup = super::installer::ChunkNameLookup::from_arena(
                 super::compact_manifest::StringArena::with_capacity(0, 0),
             );
-            let result = super::assembly::assemble_file(
+            let result = super::assembly::assemble_file_for_download_over(
                 &manifest,
                 0,
                 &gd,
@@ -3066,18 +3836,25 @@ async fn apply_download_over(
                 &chunk_lookup,
                 &[],
                 &vc,
-                false,
-                super::VerifyMode::Full, // preinstall always uses full verification
-            );
+            )
+            .map_err(|error| match error {
+                SophonError::Md5Mismatch { .. } => SophonError::AssemblyFailed {
+                    file: manifest.file_name(0).into(),
+                    error: "DownloadOver output failed whole-file size/hash verification".into(),
+                },
+                other => other,
+            });
             if let Err(err) = fs::remove_dir_all(&tmp_dir) {
                 log::warn!(
                     "Failed to clean up temp directory {path}: {err}",
                     path = tmp_dir.display(),
                 );
             }
-            result?;
+            let outcome = result?;
             let path = gd.join(manifest.file_name(0));
-            if !is_file_already_patched(&path, manifest.file_size(0), manifest.file_hash_md5(0)) {
+            if !outcome.file_hash_verified
+                && !is_file_already_patched(&path, manifest.file_size(0), manifest.file_hash_md5(0))
+            {
                 return Err(SophonError::AssemblyFailed {
                     file: manifest.file_name(0).into(),
                     error: "DownloadOver output failed whole-file size/hash verification".into(),
@@ -3091,8 +3868,185 @@ async fn apply_download_over(
     Ok(())
 }
 
+#[cfg(feature = "benchmark")]
+fn build_download_over_chunk_futures(
+    asset_chunks: &[SophonManifestAssetChunk],
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl std::future::Future<Output = SophonResult<Vec<()>>> + 'static {
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(super::download_concurrency()));
+    let mut seen_chunks = rustc_hash::FxHashSet::default();
+    let mut chunk_futures = Vec::with_capacity(asset_chunks.len());
+    for chunk in asset_chunks {
+        if !seen_chunks.insert(chunk.chunk_name_str()) {
+            continue;
+        }
+        let permit = Arc::clone(&download_semaphore);
+        let download =
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
+        chunk_futures.push(async move {
+            let _permit = permit.acquire().await.expect("semaphore not closed");
+            download.await
+        });
+    }
+    try_join_all(chunk_futures)
+}
+
+fn make_download_over_chunk_future(
+    chunk: &SophonManifestAssetChunk,
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl Future<Output = SophonResult<()>> + 'static {
+    let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
+    chunk_path.set_extension("zstd");
+    let client = client.clone();
+    let chunk_download = chunk_download.clone();
+    let chunk = chunk.clone();
+    let handle = handle.clone();
+    async move {
+        download_chunk_with_retries(&client, &chunk_download, &chunk, &chunk_path, &handle).await
+    }
+}
+
+// The move closure owns the future factory for the stream's lifetime.
+#[allow(clippy::redundant_closure)]
+fn build_unique_chunk_stream<'a, F, Fut>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    limit: usize,
+    mut make_future: F,
+) -> impl futures_util::Stream<Item = Fut::Output> + 'a
+where
+    F: FnMut(&'a SophonManifestAssetChunk) -> Fut + 'a,
+    Fut: Future + 'a,
+{
+    let mut seen_chunks = rustc_hash::FxHashSet::default();
+    futures_util::stream::iter(asset_chunks.iter())
+        .filter(move |chunk| ready(seen_chunks.insert(chunk.chunk_name_str())))
+        .map(move |chunk| make_future(chunk))
+        .buffer_unordered(limit)
+}
+
+async fn run_unique_chunks_bounded<'a, F, Fut>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    limit: usize,
+    make_future: F,
+) -> SophonResult<()>
+where
+    F: FnMut(&'a SophonManifestAssetChunk) -> Fut + 'a,
+    Fut: Future<Output = SophonResult<()>> + 'a,
+{
+    if limit == 0 {
+        return Err(SophonError::Io(std::io::Error::other(
+            "download concurrency limit must be positive",
+        )));
+    }
+    let mut downloads = build_unique_chunk_stream(asset_chunks, limit, make_future);
+    while let Some(result) = downloads.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_future_batch(
+    asset_chunks: &[SophonManifestAssetChunk],
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl std::future::Future<Output = SophonResult<Vec<()>>> + 'static {
+    build_download_over_chunk_futures(asset_chunks, chunks_dir, client, chunk_download, handle)
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_chunk_future(
+    chunk: &SophonManifestAssetChunk,
+    chunks_dir: &Path,
+    client: &Client,
+    chunk_download: &DownloadInfo,
+    handle: &DownloadHandle,
+) -> impl std::future::Future<Output = SophonResult<()>> + 'static {
+    make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle)
+}
+
+#[cfg(feature = "benchmark")]
+pub async fn benchmark_download_over_bounded_stream<'a>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    chunks_dir: &'a Path,
+    client: &'a Client,
+    chunk_download: &'a DownloadInfo,
+    handle: &'a DownloadHandle,
+) -> SophonResult<()> {
+    let mut downloads =
+        build_unique_chunk_stream(asset_chunks, super::download_concurrency(), |chunk| {
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle)
+        });
+    while let Some(result) = downloads.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_bounded_drain_stream<'a>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    chunks_dir: &'a Path,
+    client: &'a Client,
+    chunk_download: &'a DownloadInfo,
+    handle: &'a DownloadHandle,
+) -> impl futures_util::Stream<Item = SophonResult<()>> + 'a {
+    build_unique_chunk_stream(asset_chunks, super::download_concurrency(), move |chunk| {
+        let download =
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
+        async move {
+            tokio::task::yield_now().await;
+            drop(download);
+            Ok(())
+        }
+    })
+}
+
+#[cfg(feature = "benchmark")]
+pub fn benchmark_download_over_bounded_pending_stream<'a>(
+    asset_chunks: &'a [SophonManifestAssetChunk],
+    chunks_dir: &'a Path,
+    client: &'a Client,
+    chunk_download: &'a DownloadInfo,
+    handle: &'a DownloadHandle,
+    started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl futures_util::Stream<Item = SophonResult<()>> + 'a {
+    build_unique_chunk_stream(asset_chunks, super::download_concurrency(), move |chunk| {
+        started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let download =
+            make_download_over_chunk_future(chunk, chunks_dir, client, chunk_download, handle);
+        async move {
+            std::future::pending::<()>().await;
+            download.await
+        }
+    })
+}
+
 use crate::SophonProgress;
 
 #[cfg(test)]
 #[path = "preinstall_tests.rs"]
 mod tests;
+
+/// Frozen replica of the DashMap-based periodic save for paired criterion
+/// comparison against [save_state_snapshot]: each save cloned every
+/// completed chunk's name out of the map. Safe to delete once its
+/// measurements are no longer needed.
+#[cfg(feature = "benchmark")]
+pub fn legacy_dashmap_snapshot(map: &dashmap::DashMap<String, u64>) -> Vec<(String, u64)> {
+    map.iter().map(|r| (r.key().clone(), *r.value())).collect()
+}
+
+pub mod bench_internals {
+    pub use super::{verify_chunk_md5, verify_chunk_xxh64, verify_file_hash};
+    #[cfg(feature = "benchmark")]
+    pub use super::{ChunkSizes, legacy_dashmap_snapshot, save_state_snapshot};
+}

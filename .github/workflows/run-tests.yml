@@ -40,3 +40,10 @@ jobs:
             - name: Run Tests
               run: |
                 cargo test
+
+            - name: Check feature-gated targets
+              # CI never *runs* the diagnostics, but it must keep them
+              # compiling: gated code rots silently otherwise.
+              run: |
+                cargo check --all-targets --features bench-diagnostics
+                cargo check --all-targets --features benchmark,bench-internals

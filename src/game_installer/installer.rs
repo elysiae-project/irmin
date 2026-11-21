@@ -1,57 +1,16 @@
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-
-/// Compact sorted index over a `StringArena` for `&str -> usize` lookup
-/// via binary search. Avoids per-entry HashMap overhead.
-/// Compact index that maps chunk names to their original arena index via binary search.
-pub struct ChunkNameLookup {
-    arena: super::compact_manifest::StringArena,
-    sorted_indices: Vec<u32>,
-}
-
-impl ChunkNameLookup {
-    /// Build a sorted lookup index while retaining the arena's original ordering.
-    pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
-        let n = arena.len();
-        let mut sorted_indices: Vec<u32> = (0..n as u32).collect();
-        sorted_indices.sort_by(|&a, &b| {
-            let sa = arena.get(a);
-            let sb = arena.get(b);
-            sa.cmp(sb)
-        });
-        Self {
-            arena,
-            sorted_indices,
-        }
-    }
-
-    /// Return the arena string at its original index; panics when out of range.
-    pub fn get(&self, idx: usize) -> &str {
-        self.arena.get(idx as u32)
-    }
-
-    /// Find a name and return its original arena index, or `None` if absent.
-    pub fn lookup(&self, name: &str) -> Option<usize> {
-        let arena = &self.arena;
-        let result = self
-            .sorted_indices
-            .binary_search_by(|&i| arena.get(i).cmp(name));
-        match result {
-            Ok(pos) => Some(self.sorted_indices[pos] as usize),
-            Err(_) => None,
-        }
-    }
-}
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
 use futures_util::future::try_join_all;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::StreamExt;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -66,6 +25,7 @@ use super::assembly::{
 use super::cache::{self, VerificationEntry};
 use super::compact_manifest::{ChunkRef, CompactManifest};
 use super::error::{SophonError, SophonResult};
+use super::game_filters::{Hk4eFilter, HkrpgFilter};
 use super::handle::DownloadHandle;
 use super::*;
 use crate::SophonProgress;
@@ -74,9 +34,230 @@ use crate::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
 
 use crate::proto_parse::SophonManifestAssetChunk;
 
+/// Sorted name index mapping chunk names to dense indices via binary search.
+///
+/// Borrows names from the manifest's `StringArena` to avoid duplicating
+/// chunk-name bytes. `name_locs` stores the byte offset and length of each
+/// name inline (indexed by dense index), so `get` is a single array load
+/// plus a slice of the arena data. `sorted` holds dense indices ordered by
+/// name for binary search.
+pub struct ChunkNameLookup {
+    manifest: Arc<CompactManifest>,
+    pub(super) name_locs: Box<[(u32, u32)]>,
+    /// Dense indices in eytzinger order for cache-friendly binary search.
+    /// Root at index 0, left child at 2i+1, right child at 2i+2.
+    sorted: Box<[u32]>,
+}
+
+/// Compare two arena-embedded names by byte content. UTF-8 byte order
+/// matches `str` order, so this is equivalent to `&str::cmp` without the
+/// per-slice char-boundary checks.
+#[inline]
+fn name_cmp(arena: &[u8], a: (u32, u32), b: (u32, u32)) -> std::cmp::Ordering {
+    let na = span(a, arena.len());
+    let nb = span(b, arena.len());
+    arena[na].cmp(&arena[nb])
+}
+
+/// Convert a `(start, len)` pair to a byte range, widening to `usize` before
+/// addition so a u32 overflow in the intermediate sum cannot occur.
+#[inline]
+fn span(loc: (u32, u32), arena_len: usize) -> std::ops::Range<usize> {
+    let start = loc.0 as usize;
+    let end = start + loc.1 as usize;
+    debug_assert!(end <= arena_len, "name range exceeds arena data");
+    start..end
+}
+
+/// Write a sorted slice into an eytzinger-layout array at `node`.
+/// Root at index 0; left child at 2*node+1; right child at 2*node+2.
+/// Produces a cache-friendly implicit BST: the hot path near the root
+/// lives at the array's start, staying in L1 across consecutive lookups.
+fn write_eytzinger(sorted: &[u32], layout: &mut [u32], source: &mut usize, node: usize) {
+    if node >= layout.len() {
+        return;
+    }
+    write_eytzinger(sorted, layout, source, node * 2 + 1);
+    layout[node] = sorted[*source];
+    *source += 1;
+    write_eytzinger(sorted, layout, source, node * 2 + 2);
+}
+
+impl ChunkNameLookup {
+    /// Wrap a bare `StringArena` as the name source; arena indices become
+    /// dense indices one-to-one. Used by tests and the repair path that own
+    /// a standalone arena not backed by a full manifest.
+    pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
+        let n = arena.len();
+        let manifest = Arc::new(CompactManifest::wrap_arena(arena));
+        let name_locs: Vec<(u32, u32)> = (0..n as u32)
+            .map(|i| manifest.str_offsets_at(i))
+            .collect();
+        let bytes = manifest.arena_str().as_bytes();
+        let mut sorted: Vec<u32> = (0..n as u32).collect();
+        sorted.sort_unstable_by(|&a, &b| {
+            name_cmp(bytes, name_locs[a as usize], name_locs[b as usize])
+        });
+        let mut eytzinger = vec![0u32; sorted.len()];
+        let mut source = 0usize;
+        write_eytzinger(&sorted, &mut eytzinger, &mut source, 0);
+        Self {
+            manifest,
+            name_locs: name_locs.into_boxed_slice(),
+            sorted: eytzinger.into_boxed_slice(),
+        }
+    }
+
+    /// Build a lookup over a real manifest's chunk names, deduplicating by
+    /// name so each unique chunk name maps to one dense index. The manifest
+    /// builder does not dedup chunk names during interning, so dedup happens
+    /// here by comparing the resolved name bytes.
+    pub(crate) fn from_manifest(
+        manifest: Arc<CompactManifest>,
+        items: impl IntoIterator<Item = (u32, u32)>,
+    ) -> Self {
+        let items = items.into_iter();
+        let (lower, upper) = items.size_hint();
+        let hint = upper.unwrap_or(lower);
+        let arena_bytes = manifest.arena_str().as_bytes();
+        let arena_len = arena_bytes.len();
+        let mut seen: FxHashMap<&[u8], u32> = FxHashMap::with_capacity_and_hasher(hint, Default::default());
+        let mut name_locs: Vec<(u32, u32)> = Vec::with_capacity(hint);
+        for (file_idx, chunk_idx) in items {
+            let id = manifest.file_chunk_name_id_at(file_idx as usize, chunk_idx as usize);
+            let loc = manifest.str_offsets_at(id);
+            let name_bytes = &arena_bytes[span(loc, arena_len)];
+            if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(name_bytes) {
+                e.insert(name_locs.len() as u32);
+                name_locs.push(loc);
+            }
+        }
+        let mut sorted: Vec<u32> = (0..name_locs.len() as u32).collect();
+        sorted.sort_unstable_by(|&a, &b| {
+            name_cmp(arena_bytes, name_locs[a as usize], name_locs[b as usize])
+        });
+        // Convert the sorted indices to eytzinger layout for cache-friendly
+        // binary search: the hot path near the root lives at the array start,
+        // staying in L1 across consecutive lookups.
+        let mut eytzinger = vec![0u32; sorted.len()];
+        let mut source = 0usize;
+        write_eytzinger(&sorted, &mut eytzinger, &mut source, 0);
+        Self {
+            manifest,
+            name_locs: name_locs.into_boxed_slice(),
+            sorted: eytzinger.into_boxed_slice(),
+        }
+    }
+
+    /// Return the chunk name at a dense index; panics when out of range.
+    #[inline]
+    pub fn get(&self, idx: usize) -> &str {
+        let loc = self.name_locs[idx];
+        let arena = self.manifest.arena_str();
+        let range = span(loc, arena.len());
+        &arena[range]
+    }
+
+    /// Find a name and return its dense index, or `None` if absent.
+    /// Uses the eytzinger-layout implicit BST: root at 0, left child at
+    /// 2*node+1, right child at 2*node+2. Each step touches a cache line
+    /// near the array start (the hot root path), reducing L1 misses vs
+    /// the conventional sorted-array binary search.
+    #[inline]
+    pub fn lookup(&self, name: &str) -> Option<usize> {
+        let arena = self.manifest.arena_str().as_bytes();
+        let name_locs = &self.name_locs;
+        let layout = &self.sorted;
+        let query = name.as_bytes();
+        let mut node = 0usize;
+        while node < layout.len() {
+            let i = layout[node] as usize;
+            let loc = name_locs[i];
+            let range = span(loc, arena.len());
+            match arena[range].cmp(query) {
+                std::cmp::Ordering::Equal => return Some(i),
+                std::cmp::Ordering::Less => node = node * 2 + 2,
+                std::cmp::Ordering::Greater => node = node * 2 + 1,
+            }
+        }
+        None
+    }
+}
+
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
 /// Thread-safe callback receiving the current downloaded-chunk size map for persistence.
-pub type StateSaver = Arc<dyn Fn(&HashMap<String, u64>) + Send + Sync>;
+pub type StateSaver = Arc<dyn Fn(&[(&str, u64)]) + Send + Sync>;
+
+/// Coalescing single-flight slot for background state saves.
+///
+/// A trigger while the previous save is still running is skipped: saved
+/// state is cumulative, so the next trigger (or the terminal save) persists
+/// everything a skipped save would have. A skipped boundary extends the
+/// worst-case staleness to two save intervals instead of one. Running
+/// saves execute on the blocking pool so an async worker never performs
+/// the blocking serialize-and-rename itself.
+#[derive(Default)]
+pub struct SaveSlot {
+    in_flight: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl SaveSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Spawn `save` on the blocking pool unless one is already running.
+    /// Does not await or block on the save; the snapshot must be built
+    /// inside `save` from live shared state so a save delayed behind the
+    /// blocking pool still captures current progress. Must be called
+    /// within a Tokio runtime (spawn_blocking panics outside one).
+    pub fn trigger<F>(&self, save: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        // Only an Option swap happens under the lock, so recovering from
+        // poisoning is safe.
+        let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        if let Some(prev) = guard.take() {
+            debug_assert!(prev.is_finished(), "unfinished handle took the early return");
+            // Surface a panic from the finished save rather than dropping
+            // its JoinError.
+            if let Some(Err(err)) = futures_util::future::FutureExt::now_or_never(prev) {
+                log::warn!("state save task failed: {err}");
+            }
+        }
+        *guard = Some(tokio::task::spawn_blocking(save));
+    }
+
+    /// Whether a triggered save is still running. Diagnostic aid for
+    /// ordering invariants; the answer is a snapshot that may be stale the
+    /// moment it is read, so it is only meaningful at quiescent points.
+    pub(crate) fn is_in_flight(&self) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
+    /// Wait for the in-flight save, if any. Call at the terminal barrier
+    /// before the final save so an older snapshot cannot be the last write.
+    pub async fn drain(&self) {
+        let handle = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(handle) = handle
+            && let Err(err) = handle.await
+        {
+            log::warn!("state save task failed: {err}");
+        }
+    }
+}
 
 /// Previously persisted data used to reuse valid chunks and completed files.
 pub struct ResumeContext {
@@ -96,31 +277,35 @@ struct InstallContext {
     game_dir: Arc<PathBuf>,
     all_tmp_dirs: Arc<Vec<std::path::PathBuf>>,
     all_files: Arc<CompactManifest>,
-    downloaded_bytes: Arc<AtomicU64>,
+    downloaded_bytes: AtomicU64,
     assembled_files: Arc<AtomicU64>,
     checked_files: Arc<AtomicU64>,
     total_bytes: u64,
     total_files: u64,
-    resume_bytes_offset: Arc<AtomicU64>,
+    resume_bytes_offset: AtomicU64,
     verify_cache: Arc<DashMap<String, VerificationEntry>>,
     chunk_refcounts: Arc<OnceLock<Arc<Vec<AtomicU32>>>>,
     chunk_names: Arc<OnceLock<Arc<ChunkNameLookup>>>,
     last_assembly_update: Arc<Mutex<Instant>>,
-    last_update: Arc<AtomicU64>,
+    last_update: AtomicU64,
     /// EWMA-smoothed speed for display (bytes/sec, scaled by 1000).
-    smooth_speed_bps: Arc<AtomicU64>,
+    smooth_speed_bps: AtomicU64,
     /// Ring buffer of recent speed samples for ETA calculation.
-    eta_speed_history: Arc<Mutex<VecDeque<f64>>>,
-    last_speed_bytes: Arc<AtomicU64>,
-    last_speed_time: Arc<AtomicU64>,
+    eta_speed_history: Mutex<VecDeque<f64>>,
+    last_speed_bytes: AtomicU64,
+    last_speed_time: AtomicU64,
     updater: ProgressUpdater,
     downloaded_chunks: Arc<OnceLock<Vec<AtomicU32>>>,
-    chunks_since_save: Arc<AtomicU64>,
-    last_save: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Download-path completions since the last state save; gates saves on
+    /// [`crate::CHUNK_STATE_SAVE_INTERVAL`] to bound per-save work.
+    chunks_since_save: AtomicU64,
+    /// Assembly completions since the last state save; paced by
+    /// [`save_assembly_state_if_due`].
+    assemblies_since_save: AtomicU64,
+    save_slot: SaveSlot,
     state_saver: StateSaver,
-    /// Pre-built chunk name vec indexed by item_idx. Built once at init,
-    /// reused on every state save to avoid per-save String allocations.
-    save_chunk_names: Arc<OnceLock<Vec<String>>>,
+    /// Shares chunk names with the lookup used by assembly tasks.
+    save_chunk_names: Arc<OnceLock<Arc<ChunkNameLookup>>>,
     adaptive_assembly: Arc<AdaptiveAssembly>,
     profiler: Arc<super::profiling::PipelineProfiler>,
     /// Per-file completion bitset indexed by `file_idx`.
@@ -129,8 +314,26 @@ struct InstallContext {
     output_allocator: Arc<super::output_allocator::OutputAllocator>,
     /// Completion bitmap for eager decompression resume.
     chunk_bitmap: Arc<super::chunk_bitmap::ChunkBitmap>,
+    /// Coalescing slot for periodic bitmap syncs, so download workers
+    /// never run the blocking flush inline. Separate from `save_slot` so
+    /// a state save cannot coalesce away a bitmap sync (or vice versa).
+    bitmap_save_slot: SaveSlot,
+    /// Sender for eager file-durability jobs (set once the consumer task is
+    /// spawned; see [`spawn_eager_durability_task`]). The mutex allows the
+    /// download phase to take (drop) the sender for a clean drain; the
+    /// drain's join must complete before the final `chunk_bitmap` persist.
+    durability_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<EagerDurabilityJob>>>>,
     /// Verification mode controlling hash overhead.
     verify_mode: super::VerifyMode,
+}
+
+/// Eager file whose data needs a durability tail: fsync the output file,
+/// then mark its chunks complete in the resume bitmap, then close the fd.
+/// The tail's ordering contract lives on [`run_eager_durability_tail`].
+struct EagerDurabilityJob {
+    file_idx: usize,
+    /// Chunk range within the file to mark complete after the fsync.
+    chunk_range: std::ops::Range<u32>,
 }
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -141,21 +344,399 @@ fn now_nanos() -> u64 {
 }
 
 pub(crate) struct InstallerData {
-    chunk_download: Arc<DownloadInfo>,
-    file_count: usize,
-    label: String,
+    pub(crate) chunk_download: Arc<DownloadInfo>,
+    /// Number of this installer's assets that survived game filtering.
+    pub(crate) file_count: usize,
+    pub(crate) label: String,
     pub matching_field: String,
 }
 
+#[derive(Clone, Copy)]
 struct DownloadItem {
     file_idx: u32,
     chunk_idx: u32,
+    output_offset: u64,
     installer_idx: u32,
     is_pre_downloaded: bool,
     use_eager: bool,
 }
 
+impl DownloadItem {
+    fn claim_index(next_index: &AtomicUsize, item_count: usize) -> Option<usize> {
+        // fetch_add is a single atomic op (no CAS retry loop). Overshoot
+        // wastes at most one index per worker, which is negligible for
+        // 250k+ items and avoids cache-line bouncing under contention.
+        let index = next_index.fetch_add(1, Ordering::Relaxed);
+        if index < item_count {
+            Some(index)
+        } else {
+            None
+        }
+    }
+}
+
+#[inline]
+fn next_download_worker_count(spawned: usize, target: usize, unclaimed: usize) -> usize {
+    spawned.saturating_add(unclaimed).min(target)
+}
+
+fn record_download_cancellation(cancelled: &AtomicU8) {
+    cancelled.store(1, Ordering::Relaxed);
+}
+
+#[cold]
+fn record_download_cancelled_result(
+    cancelled: &AtomicU8,
+    first_error: &Mutex<Option<SophonError>>,
+    handle: &DownloadHandle,
+) {
+    if handle.is_cancelled() {
+        record_download_cancellation(cancelled);
+    } else {
+        record_download_worker_error(
+            first_error,
+            SophonError::Io(std::io::Error::other(
+                "download worker cancelled without a user cancellation request",
+            )),
+        );
+    }
+}
+
+fn download_was_cancelled(recorded: &AtomicU8, handle: &DownloadHandle) -> bool {
+    recorded.load(Ordering::Relaxed) != 0 || handle.is_cancelled()
+}
+
+#[cold]
+fn record_download_worker_error(first_error: &Mutex<Option<SophonError>>, error: SophonError) {
+    let mut guard = first_error.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(error);
+    }
+}
+
+fn download_work_finished(remaining: &AtomicUsize) -> bool {
+    remaining.load(Ordering::Acquire) == 0
+}
+
+fn download_work_abandoned(remaining: &AtomicUsize, handle: &DownloadHandle) -> bool {
+    !handle.is_cancelled() && !download_work_finished(remaining)
+}
+
+fn insert_new_chunk_name<'a>(
+    seen_chunks: &mut rustc_hash::FxHashSet<&'a str>,
+    name: &'a str,
+) -> bool {
+    seen_chunks.insert(name)
+}
+
+#[cfg(test)]
+fn push_nested_chunk_entry(
+    chunk_entries: &mut Vec<Vec<FileEntry>>,
+    item_idx: usize,
+    entry: FileEntry,
+) -> SophonResult<()> {
+    if item_idx >= chunk_entries.len() {
+        chunk_entries.resize_with(item_idx + 1, Vec::new);
+    }
+    chunk_entries[item_idx].push(entry);
+    Ok(())
+}
+
+fn disable_eager_for_tainted_files(
+    download_items: &mut [DownloadItem],
+    eager_tainted_files: &rustc_hash::FxHashSet<u32>,
+) {
+    for item in download_items {
+        if eager_tainted_files.contains(&item.file_idx) {
+            item.use_eager = false;
+        }
+    }
+}
+
+const PARALLEL_RESUME_VALIDATION_THRESHOLD: usize = 64;
+
+fn validated_resume_chunks(
+    chunks: Vec<Option<(String, u64)>>,
+) -> rustc_hash::FxHashMap<String, u64> {
+    let valid_count = chunks.iter().filter(|entry| entry.is_some()).count();
+    let mut validated =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(valid_count, rustc_hash::FxBuildHasher);
+    validated.extend(chunks.into_iter().flatten());
+    validated
+}
+
+fn validate_resume_chunk_entries(
+    mut candidates: Vec<Option<(String, u64)>>,
+    chunks_dir: &Path,
+) -> rustc_hash::FxHashMap<String, u64> {
+    if candidates.len() < PARALLEL_RESUME_VALIDATION_THRESHOLD {
+        for entry in &mut candidates {
+            if !entry
+                .as_ref()
+                .is_some_and(|(name, size)| chunk_still_valid_for_resume(name, *size, chunks_dir))
+            {
+                *entry = None;
+            }
+        }
+        return validated_resume_chunks(candidates);
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let chunk_size = candidates.len().div_ceil(num_threads);
+    let worker_panicked = std::thread::scope(|scope| {
+        let handles: Vec<_> = candidates
+            .chunks_mut(chunk_size.max(1))
+            .map(|batch| {
+                scope.spawn(move || {
+                    validate_resume_chunk_batch(batch, chunks_dir);
+                })
+            })
+            .collect();
+        let mut worker_panicked = false;
+        for handle in handles {
+            if let Err(err) = handle.join() {
+                log::error!("Resume chunk validation worker panicked: {err:?}");
+                worker_panicked = true;
+            }
+        }
+        worker_panicked
+    });
+    if worker_panicked {
+        candidates.fill(None);
+    }
+    validated_resume_chunks(candidates)
+}
+
+fn validate_resume_chunk_batch(entries: &mut [Option<(String, u64)>], chunks_dir: &Path) {
+    for entry in entries {
+        if !entry
+            .as_ref()
+            .is_some_and(|(name, size)| chunk_still_valid_for_resume(name, *size, chunks_dir))
+        {
+            *entry = None;
+        }
+    }
+}
+
+fn bounded_stoppable_stream<I, F, Fut>(
+    items: Vec<I>,
+    limit: usize,
+    stopped: Arc<AtomicBool>,
+    make_future: F,
+    operation: &str,
+) -> SophonResult<impl futures_util::Stream<Item = Fut::Output>>
+where
+    I: 'static,
+    F: FnMut(I) -> Fut,
+    Fut: std::future::Future,
+{
+    if limit == 0 {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{operation} concurrency limit must be positive"),
+        )));
+    }
+    Ok(futures_util::stream::iter(items)
+        .take_while(move |_| futures_util::future::ready(!stopped.load(Ordering::Acquire)))
+        .map(make_future)
+        .buffer_unordered(limit))
+}
+
+async fn wait_for_download_cancellation(handle: &DownloadHandle) {
+    if !handle.is_cancelled() {
+        handle.cancelled_future().await;
+    }
+}
+
 type FileEntry = (u32, u32, u32);
+
+fn push_chunk_entry_offset(offsets: &mut Vec<u32>, count: usize) -> SophonResult<()> {
+    let current = offsets
+        .last()
+        .copied()
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("missing chunk-entry offset base")))?;
+    let next = (current as usize)
+        .checked_add(count)
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("chunk-entry offset overflow")))?;
+    offsets.push(u32::try_from(next).map_err(|_| {
+        SophonError::Io(std::io::Error::other(
+            "chunk-entry offset exceeds the u32 index range",
+        ))
+    })?);
+    Ok(())
+}
+
+struct ChunkEntryCollector {
+    tagged_entries: Vec<(u32, FileEntry)>,
+    counts: Vec<usize>,
+    max_items: usize,
+}
+
+impl ChunkEntryCollector {
+    fn with_capacity(total_occurrences: usize, expected_items: usize) -> SophonResult<Self> {
+        let mut tagged_entries = Vec::new();
+        tagged_entries
+            .try_reserve(total_occurrences)
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve flat chunk-entry records: {error}"
+                )))
+            })?;
+        Ok(Self {
+            tagged_entries,
+            counts: Vec::new(),
+            max_items: expected_items,
+        })
+    }
+
+    fn push(&mut self, item_idx: usize, entry: FileEntry) -> SophonResult<()> {
+        if item_idx >= self.max_items {
+            return Err(SophonError::Io(std::io::Error::other(
+                "chunk-entry item index exceeds expected groups",
+            )));
+        }
+        let tagged_item_idx = u32::try_from(item_idx).map_err(|_| {
+            SophonError::Io(std::io::Error::other("download item index exceeds u32"))
+        })?;
+        let required_len = item_idx.checked_add(1).ok_or_else(|| {
+            SophonError::Io(std::io::Error::other("download item count overflow"))
+        })?;
+        let additional_counts = required_len.saturating_sub(self.counts.len());
+        self.counts
+            .try_reserve(additional_counts)
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve chunk-entry group counts: {error}"
+                )))
+            })?;
+        self.tagged_entries.try_reserve(1).map_err(|error| {
+            SophonError::Io(std::io::Error::other(format!(
+                "failed to reserve flat chunk-entry records: {error}"
+            )))
+        })?;
+        let next_count = if item_idx < self.counts.len() {
+            self.counts[item_idx].checked_add(1).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other("chunk-entry count overflow"))
+            })?
+        } else {
+            1
+        };
+        if required_len > self.counts.len() {
+            self.counts.resize(required_len, 0);
+        }
+        self.counts[item_idx] = next_count;
+        self.tagged_entries.push((tagged_item_idx, entry));
+        Ok(())
+    }
+
+    fn finish(self, expected_items: usize) -> SophonResult<(Vec<FileEntry>, Vec<u32>)> {
+        if expected_items > self.max_items {
+            return Err(SophonError::Io(std::io::Error::other(
+                "download item count exceeds chunk-entry collector capacity",
+            )));
+        }
+        if self.counts.len() > expected_items {
+            return Err(SophonError::Io(std::io::Error::other(
+                "chunk-entry groups exceed download item count",
+            )));
+        }
+        let mut counts = self.counts;
+        counts
+            .try_reserve(expected_items - counts.len())
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve chunk-entry groups: {error}"
+                )))
+            })?;
+        counts.resize(expected_items, 0);
+        let offset_capacity = expected_items
+            .checked_add(1)
+            .ok_or_else(|| SophonError::Io(std::io::Error::other("offset capacity overflow")))?;
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(offset_capacity)
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve chunk-entry offsets: {error}"
+                )))
+            })?;
+        offsets.push(0u32);
+        for &count in &counts {
+            push_chunk_entry_offset(&mut offsets, count)?;
+        }
+
+        let mut cursors = Vec::new();
+        cursors.try_reserve_exact(expected_items).map_err(|error| {
+            SophonError::Io(std::io::Error::other(format!(
+                "failed to reserve chunk-entry scatter cursors: {error}"
+            )))
+        })?;
+        cursors.extend(
+            offsets[..expected_items]
+                .iter()
+                .map(|&offset| offset as usize),
+        );
+        // Every slot is assigned once by the stable scatter below.
+        let mut flat = Vec::new();
+        flat.try_reserve_exact(self.tagged_entries.len())
+            .map_err(|error| {
+                SophonError::Io(std::io::Error::other(format!(
+                    "failed to reserve flat chunk-entry output: {error}"
+                )))
+            })?;
+        flat.resize(self.tagged_entries.len(), (0u32, 0u32, 0u32));
+        for (item_idx, entry) in self.tagged_entries {
+            let cursor = cursors.get_mut(item_idx as usize).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other(
+                    "chunk-entry item index is out of range",
+                ))
+            })?;
+            let slot = flat.get_mut(*cursor).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other(
+                    "chunk-entry target offset is out of range",
+                ))
+            })?;
+            *slot = entry;
+            *cursor = cursor.checked_add(1).ok_or_else(|| {
+                SophonError::Io(std::io::Error::other("chunk-entry cursor overflow"))
+            })?;
+        }
+        for item_idx in 0..expected_items {
+            let expected_end = offsets[item_idx + 1] as usize;
+            if cursors[item_idx] != expected_end {
+                return Err(SophonError::Io(std::io::Error::other(format!(
+                    "chunk-entry scatter count mismatch at group {item_idx}: cursor={} end={expected_end}",
+                    cursors[item_idx]
+                ))));
+            }
+        }
+        if offsets.last().copied()
+            != Some(u32::try_from(flat.len()).map_err(|_| {
+                SophonError::Io(std::io::Error::other("flat chunk-entry count exceeds u32"))
+            })?)
+        {
+            return Err(SophonError::Io(std::io::Error::other(
+                "flat chunk-entry sentinel mismatch",
+            )));
+        }
+        Ok((flat, offsets))
+    }
+}
+
+#[inline]
+fn uses_chunk_deduplication(verify_mode: super::VerifyMode) -> bool {
+    verify_mode == super::VerifyMode::Full
+}
+
+fn new_download_items_index<'a>(
+    verify_mode: super::VerifyMode,
+    total_chunks: usize,
+) -> Option<FxHashMap<&'a str, u32>> {
+    uses_chunk_deduplication(verify_mode)
+        .then(|| FxHashMap::with_capacity_and_hasher(total_chunks, Default::default()))
+}
 
 /// One manifest category together with its chunk download endpoint and identity.
 pub struct SophonInstaller {
@@ -198,7 +779,7 @@ pub async fn build_installers(
     game_id: &str,
     vo_lang: &str,
 ) -> SophonResult<(Vec<SophonInstaller>, String, String)> {
-    let (branch, _) = fetch_front_door(client, game_id).await?;
+    let branch = fetch_front_door(client, game_id).await?;
 
     let build = fetch_build(
         client,
@@ -221,7 +802,7 @@ pub async fn build_installers_for_tag(
     vo_lang: &str,
     tag: &str,
 ) -> SophonResult<(Vec<SophonInstaller>, String, String)> {
-    let (branch, _) = fetch_front_door(client, game_id).await?;
+    let branch = fetch_front_door(client, game_id).await?;
 
     let build = fetch_build(
         client,
@@ -244,7 +825,7 @@ pub async fn build_update_installers(
     from_tag: &str,
     game_dir: &Path,
 ) -> SophonResult<(Vec<SophonInstaller>, Vec<String>, String, String)> {
-    let (branch, _) = fetch_front_door(client, game_id).await?;
+    let branch = fetch_front_door(client, game_id).await?;
 
     let (old_build, new_build) = tokio::try_join!(
         fetch_build(
@@ -299,7 +880,7 @@ fn combine_manifest_hashes(installers: &[SophonInstaller]) -> String {
         .iter()
         .map(|i| i.manifest_hash.as_str())
         .collect();
-    hashes.sort();
+    hashes.sort_unstable();
     let mut hasher = Sha256::new();
     for h in hashes {
         hasher.update(h.as_bytes());
@@ -315,8 +896,8 @@ fn collect_deleted_files(
     old_manifest
         .assets
         .iter()
-        .filter(|f| !f.is_directory() && !new_names.contains(f.asset_name.as_str()))
-        .map(|f| f.asset_name.clone())
+        .filter(|f| !f.is_directory() && !new_names.contains(f.asset_name_str()))
+        .map(|f| f.asset_name_str().to_string())
         .collect()
 }
 
@@ -326,7 +907,7 @@ fn build_old_md5_map(old_manifest: &SophonManifestProto) -> FxHashMap<&str, &str
         .assets
         .iter()
         .filter(|f| !f.is_directory())
-        .map(|f| (f.asset_name.as_str(), f.asset_hash_md5.as_str()))
+        .map(|f| (f.asset_name_str(), f.asset_hash_md5_str()))
         .collect()
 }
 
@@ -342,8 +923,8 @@ fn compute_diff_files(
             if f.is_directory() {
                 return true;
             }
-            match old_md5_map.get(f.asset_name.as_str()) {
-                Some(&old_md5) => old_md5 != f.asset_hash_md5.as_str(),
+            match old_md5_map.get(f.asset_name_str()) {
+                Some(&old_md5) => old_md5 != f.asset_hash_md5_str(),
                 None => true,
             }
         })
@@ -378,13 +959,11 @@ pub fn intern_old_chunk_offsets<'a>(
         FxHashMap::with_capacity_and_hasher(total_chunks, Default::default());
     for f in non_dir {
         let next_name_id = name_to_id.len() as u32;
-        let name_id = *name_to_id
-            .entry(f.asset_name.as_str())
-            .or_insert(next_name_id);
+        let name_id = *name_to_id.entry(f.asset_name_str()).or_insert(next_name_id);
         for c in &f.asset_chunks {
             let next_hash_id = hash_to_id.len() as u32;
             let hash_id = *hash_to_id
-                .entry(c.chunk_decompressed_hash_md5.as_str())
+                .entry(c.chunk_decompressed_hash_md5_str())
                 .or_insert(next_hash_id);
             offsets.insert((name_id, hash_id), c.chunk_on_file_offset);
         }
@@ -403,12 +982,12 @@ pub fn assign_chunk_offsets(
     hash_to_id: &FxHashMap<&str, u32>,
 ) {
     for file in diff_files.iter_mut() {
-        let name_id = name_to_id.get(file.asset_name.as_str()).copied();
+        let name_id = name_to_id.get(file.asset_name_str()).copied();
         for chunk in &mut file.asset_chunks {
             chunk.chunk_old_offset = match (
                 name_id,
                 hash_to_id
-                    .get(chunk.chunk_decompressed_hash_md5.as_str())
+                    .get(chunk.chunk_decompressed_hash_md5_str())
                     .copied(),
             ) {
                 (Some(n), Some(h)) => offsets
@@ -455,7 +1034,7 @@ async fn build_diff_installers(
             .manifest
             .assets
             .iter()
-            .map(|f| f.asset_name.as_str())
+            .map(|f| f.asset_name_str())
             .collect();
 
         // Keys are interned to `(u32, u32)` ids instead of `(String, String)`
@@ -465,16 +1044,15 @@ async fn build_diff_installers(
 
         match old_by_field.get(new_meta.matching_field.as_str()) {
             Some(old_meta) => {
-                let old_result = super::api::fetch_manifest(
+                let old_manifest = super::api::fetch_manifest_proto(
                     client,
                     &old_meta.manifest_download,
                     &old_meta.manifest.id,
                 )
                 .await?;
 
-                deleted_files.extend(collect_deleted_files(&old_result.manifest, &new_names));
+                deleted_files.extend(collect_deleted_files(&old_manifest, &new_names));
 
-                let old_manifest = old_result.manifest;
                 let gd = game_dir.to_path_buf();
                 let (old_manifest, corrupted_indices) = tokio::task::spawn_blocking(move || {
                     let mut bad: Vec<usize> = Vec::new();
@@ -484,7 +1062,7 @@ async fn build_diff_installers(
                         .enumerate()
                         .filter(|(_, f)| !f.is_directory())
                     {
-                        let path = gd.join(&f.asset_name);
+                        let path = gd.join(f.asset_name_str());
                         let corrupted = match std::fs::metadata(&path) {
                             Ok(meta) => meta.len() != f.asset_size,
                             Err(_) => true,
@@ -508,7 +1086,7 @@ async fn build_diff_installers(
                     );
                     let corrupted_names_set: rustc_hash::FxHashSet<&str> = corrupted_indices
                         .iter()
-                        .map(|&i| old_manifest.assets[i].asset_name.as_str())
+                        .map(|&i| old_manifest.assets[i].asset_name_str())
                         .collect();
                     let mut corrupted_name_ids = rustc_hash::FxHashSet::default();
                     for name in &corrupted_names_set {
@@ -569,24 +1147,61 @@ async fn prepare_directories(game_dir: &Path, chunks_dir: &Path) -> SophonResult
     Ok(())
 }
 
+/// Game-code-specific manifest filtering applied while installer data is
+/// being built. The configuration (blacklists, installed audio languages)
+/// is loaded once up front and then applied to each installer's assets
+/// separately, so file counts come out positionally correct with no
+/// name-keyed attribution map.
+enum GameAssetFilter {
+    Unfiltered,
+    Hkrpg(HkrpgFilter),
+    Hk4e(Hk4eFilter),
+    Nap,
+}
+
+impl GameAssetFilter {
+    fn load(game_code: &str, game_dir: &Path, vo_langs: &[String]) -> Self {
+        match game_code {
+            "hkrpg" => Self::Hkrpg(HkrpgFilter::load(game_dir)),
+            "hk4e" => Self::Hk4e(Hk4eFilter::load(game_dir, vo_langs)),
+            // NAP filtering runs on whole installers
+            // (filter_nap_installers) before flattening.
+            "nap" => Self::Nap,
+            _ => Self::Unfiltered,
+        }
+    }
+
+    /// Drop assets this game excludes from the given segment. Returns the
+    /// number of assets removed.
+    fn apply(&self, assets: &mut Vec<SophonManifestAssetProperty>) -> usize {
+        match self {
+            Self::Unfiltered | Self::Nap => 0,
+            Self::Hkrpg(filter) => filter.apply(assets),
+            Self::Hk4e(filter) => filter.apply(assets),
+        }
+    }
+}
+
 fn build_installer_data(
     installers: Vec<SophonInstaller>,
+    game_code: &str,
+    game_dir: &Path,
+    vo_langs: &[String],
 ) -> (Vec<InstallerData>, Vec<SophonManifestAssetProperty>) {
-    let mut all_files = Vec::new();
+    let game_filter = GameAssetFilter::load(game_code, game_dir, vo_langs);
+    let mut removed_assets = 0usize;
+    let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
+    let mut all_files = Vec::with_capacity(total_assets);
     let mut data = Vec::with_capacity(installers.len());
     for inst in installers {
-        let file_count = inst
-            .manifest
-            .assets
-            .iter()
-            .filter(|a| !a.is_directory())
-            .count();
-        all_files.extend(
-            inst.manifest
-                .assets
-                .into_iter()
-                .filter(|a| !a.is_directory()),
-        );
+        // Retain reuses the decoded manifest's allocation; the segment is
+        // filtered before it joins the shared list, so each survivor belongs
+        // to exactly one installer and its count needs no name mapping.
+        let mut assets = inst.manifest.assets;
+        assets.retain(|a| !a.is_directory());
+        removed_assets += game_filter.apply(&mut assets);
+        let file_count = assets.len();
+        all_files.extend(assets);
         data.push(InstallerData {
             label: inst.label,
             matching_field: inst.matching_field,
@@ -594,16 +1209,21 @@ fn build_installer_data(
             file_count,
         });
     }
+    if removed_assets > 0 {
+        let installer_count = data.len();
+        log::info!(
+            "{game_code} filter removed {removed_assets} assets across {installer_count} installers",
+        );
+    }
     (data, all_files)
 }
 
 fn compute_totals(all_files: &CompactManifest) -> (u64, u64) {
     let mut seen_chunks: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
     let total_compressed: u64 = (0..all_files.num_chunks())
-        .map(|i| all_files.chunk(i))
-        .filter(|c| c.chunk_old_offset < 0)
-        .filter(|c| seen_chunks.insert(c.chunk_name))
-        .map(|c| c.chunk_size)
+        .filter(|&i| all_files.chunk_old_offset_at(i) < 0)
+        .filter(|&i| seen_chunks.insert(all_files.chunk_name_at(i)))
+        .map(|i| all_files.chunk_size_at(i))
         .fold(0u64, |acc, x| acc.saturating_add(x));
 
     let total_files: u64 = all_files.num_files() as u64;
@@ -611,33 +1231,38 @@ fn compute_totals(all_files: &CompactManifest) -> (u64, u64) {
     (total_compressed, total_files)
 }
 
+// Large function; keeping it out-of-line preserves hot-path code layout.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn register_chunks_for_file<'a>(
     all_files: &'a CompactManifest,
     file_idx: usize,
     tmp_dir_idx: usize,
-    chunk_entries: &mut Vec<Vec<FileEntry>>,
+    mut add_chunk_entry: impl FnMut(usize, FileEntry) -> SophonResult<()>,
     download_items: &mut Vec<DownloadItem>,
-    download_items_index: &mut FxHashMap<&'a str, u32>,
+    download_items_index: &mut Option<FxHashMap<&'a str, u32>>,
     chunk_refcounts: &mut Vec<AtomicU32>,
     pending_counts: &mut Vec<AtomicU32>,
     installer_idx: usize,
     pre_downloaded: &FxHashMap<u32, u64>,
     eager_tainted_files: &mut rustc_hash::FxHashSet<u32>,
     force_eager: bool,
-) {
+) -> SophonResult<()> {
     let range = all_files.file_chunk_range(file_idx);
 
     // A file qualifies for eager decompression when all its chunks are
     // pure downloads (no old_offset chunks requiring the assembly path).
     let all_pure_downloads =
-        (range.start..range.end).all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+        (range.start..range.end).all(|ci| all_files.chunk_old_offset_at(ci as usize) < 0);
     let file_is_eager = all_pure_downloads;
     let pending_idx = pending_counts.len() as u32;
     pending_counts.push(AtomicU32::new(0));
+    let mut output_offset = 0u64;
     for ci in range.start..range.end {
         let global_chunk_idx = ci as usize;
         let chunk = all_files.chunk(global_chunk_idx);
+        let chunk_offset = output_offset;
+        output_offset += chunk.chunk_size_decompressed;
         if chunk.chunk_old_offset >= 0 {
             continue;
         }
@@ -648,7 +1273,10 @@ fn register_chunks_for_file<'a>(
         // When force_eager, skip dedup — create independent DownloadItems per file.
         // Shared chunks get downloaded multiple times but avoid .zstd intermediates.
         let item_idx = if !force_eager {
-            if let Some(&idx) = download_items_index.get(name) {
+            let index = download_items_index
+                .as_mut()
+                .expect("dedup index is initialized for full verification mode");
+            if let Some(&idx) = index.get(name) {
                 if is_pre {
                     download_items[idx as usize].is_pre_downloaded = true;
                 }
@@ -662,11 +1290,12 @@ fn register_chunks_for_file<'a>(
                 download_items.push(DownloadItem {
                     file_idx: file_idx as u32,
                     chunk_idx: (global_chunk_idx - range.start as usize) as u32,
+                    output_offset: chunk_offset,
                     installer_idx: installer_idx as u32,
                     is_pre_downloaded: is_pre,
                     use_eager: file_is_eager,
                 });
-                download_items_index.insert(name, idx);
+                index.insert(name, idx);
                 idx
             }
         } else {
@@ -675,6 +1304,7 @@ fn register_chunks_for_file<'a>(
             download_items.push(DownloadItem {
                 file_idx: file_idx as u32,
                 chunk_idx: (global_chunk_idx - range.start as usize) as u32,
+                output_offset: chunk_offset,
                 installer_idx: installer_idx as u32,
                 is_pre_downloaded: is_pre,
                 use_eager: true,
@@ -682,10 +1312,10 @@ fn register_chunks_for_file<'a>(
             idx
         };
 
-        if item_idx as usize >= chunk_entries.len() {
-            chunk_entries.resize_with(item_idx as usize + 1, Vec::new);
-        }
-        chunk_entries[item_idx as usize].push((file_idx as u32, tmp_dir_idx as u32, pending_idx));
+        add_chunk_entry(
+            item_idx as usize,
+            (file_idx as u32, tmp_dir_idx as u32, pending_idx),
+        )?;
 
         if item_idx as usize >= chunk_refcounts.len() {
             chunk_refcounts.resize_with(item_idx as usize + 1, || AtomicU32::new(0));
@@ -696,6 +1326,7 @@ fn register_chunks_for_file<'a>(
     if pending_counts[pending_idx as usize].load(Ordering::Relaxed) == 0 {
         pending_counts.pop();
     }
+    Ok(())
 }
 
 async fn build_download_state(
@@ -716,9 +1347,10 @@ async fn build_download_state(
     let total_chunks: usize = ctx.all_files.num_chunks();
     let total_files: usize = ctx.all_files.num_files();
     let mut download_items: Vec<DownloadItem> = Vec::with_capacity(total_chunks);
-    let mut download_items_index: FxHashMap<&str, u32> =
-        FxHashMap::with_capacity_and_hasher(total_chunks, Default::default());
-    let mut chunk_entries: Vec<Vec<FileEntry>> = Vec::with_capacity(total_chunks);
+    let force_eager = !uses_chunk_deduplication(ctx.verify_mode);
+    let mut download_items_index = new_download_items_index(ctx.verify_mode, total_chunks);
+    // Each download item originates from a chunk occurrence, so total_chunks bounds item IDs.
+    let mut chunk_entries = ChunkEntryCollector::with_capacity(total_chunks, total_chunks)?;
     let mut chunk_refcounts: Vec<AtomicU32> = Vec::with_capacity(total_chunks);
     let mut pending_counts: Vec<AtomicU32> = Vec::with_capacity(total_files);
     let mut eager_tainted_files: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
@@ -748,7 +1380,7 @@ async fn build_download_state(
                 &ctx.all_files,
                 all_files_index,
                 tmp_dir_idx,
-                &mut chunk_entries,
+                |item_idx, entry| chunk_entries.push(item_idx, entry),
                 &mut download_items,
                 &mut download_items_index,
                 &mut chunk_refcounts,
@@ -756,8 +1388,8 @@ async fn build_download_state(
                 tmp_dir_idx,
                 pre_downloaded,
                 &mut eager_tainted_files,
-                ctx.verify_mode != super::VerifyMode::Full,
-            );
+                force_eager,
+            )?;
 
             if pending_counts.len() == pending_before {
                 let _ = assemble_tx.send((all_files_index, tmp_dir_idx));
@@ -770,47 +1402,25 @@ async fn build_download_state(
     // A file must go entirely through eager OR entirely through assembly.
     // Skip when force_eager (non-Full mode): all chunks are independent.
     if !eager_tainted_files.is_empty() && ctx.verify_mode == super::VerifyMode::Full {
-        for item in download_items.iter_mut() {
-            if eager_tainted_files.contains(&item.file_idx) {
-                item.use_eager = false;
-            }
-        }
+        disable_eager_for_tainted_files(&mut download_items, &eager_tainted_files);
     }
 
     log::info!(
         "build_download_state: {items} download items, {entries} chunk entries, all_files_index={all_files_index}",
         items = download_items.len(),
-        entries = chunk_entries.len(),
+        entries = download_items.len(),
     );
 
-    let total_flat_entries: usize = chunk_entries.iter().map(|v| v.len()).sum();
-    let mut chunk_entry_offsets: Vec<u32> = Vec::with_capacity(chunk_entries.len() + 1);
-    let mut flat_chunk_entries: Vec<FileEntry> = Vec::with_capacity(total_flat_entries);
-    chunk_entry_offsets.push(0);
-    for inner in chunk_entries.drain(..) {
-        flat_chunk_entries.extend(inner);
-        chunk_entry_offsets.push(flat_chunk_entries.len() as u32);
-    }
+    let (flat_chunk_entries, chunk_entry_offsets) = chunk_entries.finish(download_items.len())?;
 
-    let total_name_bytes: usize = download_items
-        .iter()
-        .map(|item| {
-            ctx.all_files
-                .file_chunk(item.file_idx as usize, item.chunk_idx as usize)
-                .chunk_name
-                .len()
-        })
-        .sum();
-    let mut arena =
-        super::compact_manifest::StringArena::with_capacity(download_items.len(), total_name_bytes);
-    for item in &download_items {
-        let name = ctx
-            .all_files
-            .file_chunk(item.file_idx as usize, item.chunk_idx as usize)
-            .chunk_name;
-        arena.intern(name);
-    }
-    let chunk_names_lookup = Arc::new(ChunkNameLookup::from_arena(arena));
+    // Reuse the manifest's arena as the name source. Dense indices follow the
+    // first occurrence of each chunk name in download_items order.
+    let chunk_names_lookup = Arc::new(ChunkNameLookup::from_manifest(
+        Arc::clone(&ctx.all_files),
+        download_items
+            .iter()
+            .map(|item| (item.file_idx, item.chunk_idx)),
+    ));
 
     Ok((
         download_items,
@@ -827,10 +1437,12 @@ fn make_assembly_params(
     ctx: &InstallContext,
     file_idx: usize,
     tmp_dir_idx: usize,
+    epochs: &Arc<super::assembly_epochs::AssemblyEpochs>,
 ) -> AssemblyTaskParams {
     AssemblyTaskParams {
         file_idx,
         tmp_dir_idx,
+        epochs: Arc::clone(epochs),
         all_files: Arc::clone(&ctx.all_files),
         all_tmp_dirs: Arc::clone(&ctx.all_tmp_dirs),
         game_dir: Arc::clone(&ctx.game_dir),
@@ -873,55 +1485,54 @@ async fn drain_join_set(join_set: &mut tokio::task::JoinSet<SophonResult<()>>) -
     }
 }
 
-async fn save_assembly_state(ctx: &Arc<InstallContext>) {
+fn save_assembly_state(ctx: &Arc<InstallContext>) {
     let dc = Arc::clone(&ctx.downloaded_chunks);
     let names = Arc::clone(&ctx.save_chunk_names);
     let saver = Arc::clone(&ctx.state_saver);
-    let prev_handle = {
-        let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-            log::error!("last_save mutex poisoned, recovering");
-            err.into_inner()
-        });
-        guard.take()
-    };
-    if let Some(h) = prev_handle {
-        let _ = h.await;
-    }
-    let new_handle = tokio::task::spawn_blocking(move || {
-        let map: HashMap<String, u64> = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
-            let mut m = HashMap::with_capacity(dc.len() / 2);
-            for (i, v) in dc.iter().enumerate() {
-                let val = v.load(Ordering::Relaxed);
-                if val > 0 {
-                    m.insert(names[i].clone(), val as u64);
-                }
-            }
-            m
+    // The snapshot is built inside the blocking task from live atomics, so
+    // a save delayed behind the blocking pool still captures current
+    // progress; concurrent boundary hits coalesce into one save.
+    ctx.save_slot.trigger(move || {
+        let entries: Vec<(&str, u64)> = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+            snapshot_downloaded_chunks(dc, names)
         } else {
-            HashMap::new()
+            Vec::new()
         };
-        saver(&map);
+        saver(&entries);
     });
-    {
-        let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-            log::error!("last_save mutex poisoned, recovering");
-            err.into_inner()
-        });
-        *guard = Some(new_handle);
+}
+
+/// Gate assembly-completion saves on the same interval used for chunk
+/// completions. Assembly completions only delete consumed chunk files (the
+/// persisted set shrinks), resume re-validates every persisted entry against
+/// disk, and the install end performs a terminal save regardless.
+fn save_assembly_state_if_due(ctx: &Arc<InstallContext>) {
+    // Pacing only; the actual save coalesces through the save slot.
+    let count = ctx.assemblies_since_save.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
+        save_assembly_state(ctx);
     }
 }
 
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
+pub use super::snapshot::snapshot_downloaded_chunks;
+
+// Large function; keeping it out-of-line preserves hot-path code layout.
+#[inline(never)]
 #[allow(clippy::let_and_return)]
 fn spawn_assembly_coordinator(
     ctx: &Arc<InstallContext>,
     assemble_rx: mpsc::UnboundedReceiver<(usize, usize)>,
     assembly_cancel: tokio_util::sync::CancellationToken,
+    assembly_epochs: Arc<super::assembly_epochs::AssemblyEpochs>,
 ) -> tokio::task::JoinHandle<SophonResult<()>> {
     let ctx = Arc::clone(ctx);
     ctx.adaptive_assembly
         .spawn_adjuster(assembly_cancel.clone());
     let task_cancel = assembly_cancel;
     let total_files = ctx.total_files;
+    let assembly_epochs = assembly_epochs;
 
     let handle = tokio::spawn(async move {
         let mut rx = assemble_rx;
@@ -951,7 +1562,7 @@ fn spawn_assembly_coordinator(
                                 total_files,
                             });
                         }
-                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx);
+                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
                         let updater = Arc::clone(&ctx.updater);
                         join_set.spawn(spawn_assembly_task(params, move |p| updater(p)));
                     }
@@ -983,7 +1594,7 @@ fn spawn_assembly_coordinator(
                                 total_files,
                             });
                         }
-                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx);
+                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
                         let updater = Arc::clone(&ctx.updater);
                         join_set.spawn(spawn_assembly_task(params, move |p| updater(p)));
                     }
@@ -991,7 +1602,7 @@ fn spawn_assembly_coordinator(
             } else if let Some(res) = join_set.try_join_next() {
                 match res {
                     Ok(Ok(())) => {
-                        save_assembly_state(&ctx).await;
+                        save_assembly_state_if_due(&ctx);
                     }
                     Ok(Err(err)) => {
                         log::error!("Assembly task failed: {err}");
@@ -1021,14 +1632,14 @@ fn spawn_assembly_coordinator(
                                 total_files,
                             });
                         }
-                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx);
+                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
                         let updater = Arc::clone(&ctx.updater);
                         join_set.spawn(spawn_assembly_task(params, move |p| updater(p)));
                     }
                     res = join_set.join_next() => {
                         match res {
                             Some(Ok(Ok(()))) => {
-                                save_assembly_state(&ctx).await;
+                                save_assembly_state_if_due(&ctx);
                             }
                             Some(Ok(Err(err))) => {
                                 log::error!("Assembly task failed: {err}");
@@ -1055,13 +1666,12 @@ async fn check_needs_download(
     game_dir: Arc<PathBuf>,
     verify_cache: Arc<DashMap<String, VerificationEntry>>,
 ) -> SophonResult<(bool, Option<u64>)> {
-    let chunk_size = all_files.file_chunk(file_idx, chunk_idx).chunk_size;
+    let global_idx = all_files.file_chunk_range(file_idx).start as usize + chunk_idx;
+    let chunk_size = all_files.chunk_size_at(global_idx);
     let dest = dest.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || {
-        let expected_md5 = all_files
-            .file_chunk(file_idx, chunk_idx)
-            .chunk_compressed_hash_md5;
+        let expected_md5 = all_files.chunk_compressed_hash_at(global_idx);
         cache::check_file_md5_cached_with_size(
             &dest,
             chunk_size,
@@ -1199,6 +1809,344 @@ async fn process_eager_item(
     pending_counts: &[AtomicU32],
     handle: &DownloadHandle,
 ) -> SophonResult<()> {
+    process_eager_item_with_mode(
+        item,
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        handle,
+        None,
+        None,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+        #[cfg(feature = "bench-diagnostics")]
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item_with_mode(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    handle: &DownloadHandle,
+    force_streaming: Option<bool>,
+    stream_queue_capacity: Option<usize>,
+    #[cfg(test)] decoded_selector: Option<(u64, u64)>,
+    #[cfg(test)] selection_counts: Option<Arc<EagerSelectionCounts>>,
+    #[cfg(feature = "bench-diagnostics")] timings: Option<
+        Arc<super::eager_decompress::EagerStreamPhaseTimings>,
+    >,
+) -> SophonResult<()> {
+    if stream_queue_capacity == Some(0) {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "eager stream queue capacity must be positive",
+        )));
+    }
+    if ctx.verify_mode == super::VerifyMode::Full
+        && !chunk.chunk_compressed_hash_md5.is_empty()
+        && !matches!(chunk.chunk_compressed_hash_md5.len(), 16 | 8)
+    {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported compressed chunk hash length",
+        )));
+    }
+    #[cfg(test)]
+    let should_stream = decoded_selector.map_or_else(
+        || should_stream_eager(chunk.chunk_size, force_streaming),
+        |(decoded_size, threshold)| {
+            should_stream_eager_with_decoded_size(
+                chunk.chunk_size,
+                Some(decoded_size),
+                Some(threshold),
+                force_streaming,
+            )
+        },
+    );
+    #[cfg(not(test))]
+    let should_stream = should_stream_eager(chunk.chunk_size, force_streaming);
+    #[cfg(test)]
+    if let Some(counts) = selection_counts.as_ref() {
+        counts.record(should_stream);
+    }
+    if should_stream {
+        return process_eager_item_streaming(
+            item,
+            item_idx,
+            chunk,
+            ctx,
+            chunk_entries,
+            chunk_entry_offsets,
+            pending_counts,
+            handle,
+            stream_queue_capacity.unwrap_or(EAGER_STREAM_QUEUE_CAPACITY),
+            #[cfg(feature = "bench-diagnostics")]
+            timings,
+        )
+        .await;
+    }
+    process_eager_item_oneshot(
+        item,
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+        handle,
+    )
+    .await
+}
+
+const EAGER_STREAM_THRESHOLD: u64 = 64 * 1024 * 1024;
+const EAGER_STREAM_QUEUE_CAPACITY: usize = 8;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct EagerSelectionCounts {
+    pub(super) streaming: AtomicU32,
+    pub(super) oneshot: AtomicU32,
+}
+
+#[cfg(test)]
+impl EagerSelectionCounts {
+    fn record(&self, streaming: bool) {
+        let counter = if streaming {
+            &self.streaming
+        } else {
+            &self.oneshot
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn should_stream_eager(compressed_size: u64, forced: Option<bool>) -> bool {
+    forced.unwrap_or(compressed_size >= EAGER_STREAM_THRESHOLD)
+}
+
+/// Applies the optional decoded-size rule used by selector tests and the ignored
+/// benchmark diagnostic. Production callers retain the compressed-size selector.
+///
+/// Streaming is selected when the compressed-size rule or the optional decoded-size
+/// hint reaches its threshold. Missing or zero decoded sizes do not affect selection.
+#[cfg(any(test, feature = "bench-diagnostics"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn should_stream_eager_with_decoded_size(
+    compressed_size: u64,
+    decoded_size: Option<u64>,
+    decoded_threshold: Option<u64>,
+    forced: Option<bool>,
+) -> bool {
+    if let Some(forced) = forced {
+        return forced;
+    }
+    compressed_size >= EAGER_STREAM_THRESHOLD
+        || decoded_threshold.is_some_and(|threshold| {
+            decoded_size.is_some_and(|size| size != 0 && size >= threshold)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item_oneshot(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    handle: &DownloadHandle,
+) -> SophonResult<()> {
+    let global_chunk_idx = {
+        let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
+        range.start as usize + item.chunk_idx as usize
+    };
+    if ctx.chunk_bitmap.is_complete(global_chunk_idx) {
+        ctx.downloaded_bytes
+            .fetch_add(chunk.chunk_size, Ordering::Relaxed);
+        if let Some(dc) = ctx.downloaded_chunks.get() {
+            dc[item_idx].store(chunk.chunk_size as u32, Ordering::Relaxed);
+        }
+        notify_eager_file_complete(
+            item_idx,
+            chunk_entries,
+            chunk_entry_offsets,
+            pending_counts,
+            ctx,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let file_idx = item.file_idx as usize;
+    if ctx.output_allocator.get_handle(file_idx).is_none() {
+        let file_name = ctx.all_files.file_name(file_idx);
+        validate_asset_name(file_name)?;
+        ctx.output_allocator.preallocate_file(
+            file_idx,
+            file_name,
+            ctx.all_files.file_size(file_idx),
+        )?;
+    }
+    let client = &ctx.installer_clients[item.installer_idx as usize];
+    let download_info = &ctx.installer_downloads[item.installer_idx as usize];
+    let mut url = String::with_capacity(256);
+    download_info.url_for_into(chunk.chunk_name, &mut url);
+    let mut attempts = 0;
+    let compressed_data = loop {
+        if handle.is_cancelled() {
+            return Err(SophonError::Cancelled);
+        }
+        let response = tokio::select! {
+            biased;
+            _ = handle.cancelled_future() => return Err(SophonError::Cancelled),
+            result = client.get(&url).send() => result,
+        }?
+        .error_for_status()?;
+        if let Some(length) = response.content_length()
+            && length != chunk.chunk_size
+        {
+            return Err(SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_owned(),
+                expected: chunk.chunk_size,
+                actual: length,
+            });
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() as u64 != chunk.chunk_size {
+            let error = SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_owned(),
+                expected: chunk.chunk_size,
+                actual: bytes.len() as u64,
+            };
+            attempts += 1;
+            if attempts >= MAX_RETRIES {
+                return Err(SophonError::DownloadFailed {
+                    chunk: chunk.chunk_name.to_owned(),
+                    attempts: MAX_RETRIES,
+                    error: error.to_string(),
+                });
+            }
+            if cancelable_sleep(handle, retry_delay(attempts))
+                .await
+                .is_err()
+            {
+                return Err(SophonError::Cancelled);
+            }
+            continue;
+        }
+        break bytes;
+    };
+
+    let out_file = ctx
+        .output_allocator
+        .get_handle(file_idx)
+        .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
+    let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
+    // Capture the manifest and chunk index instead of copying hash strings,
+    // avoiding two String allocations per chunk. The Arc keeps the arena
+    // alive for the spawn_blocking closure's lifetime.
+    let all_files = if skip_hash {
+        None
+    } else {
+        Some(Arc::clone(&ctx.all_files))
+    };
+    let mut attempts = 0;
+    loop {
+        let result = tokio::task::spawn_blocking({
+            let out = Arc::clone(&out_file);
+            let compressed_data = compressed_data.clone();
+            let all_files = all_files.clone();
+            let chunk_offset = item.output_offset;
+            let expected_size = chunk.chunk_size_decompressed;
+            move || {
+                let (compressed_hash, decompressed_hash) = match &all_files {
+                    Some(manifest) => {
+                        let chunk = manifest.chunk(global_chunk_idx);
+                        (
+                            chunk.chunk_compressed_hash_md5,
+                            chunk.chunk_decompressed_hash_md5,
+                        )
+                    }
+                    None => (&b""[..], &b""[..]),
+                };
+                super::eager_decompress::eager_decompress_chunk(
+                    &compressed_data,
+                    &out,
+                    chunk_offset,
+                    expected_size,
+                    compressed_hash,
+                    decompressed_hash,
+                )
+            }
+        })
+        .await
+        .map_err(SophonError::JoinError)?;
+        match result {
+            Ok(_) => break,
+            Err(error) if error.is_retryable() => {
+                attempts += 1;
+                if attempts >= MAX_HASH_RETRIES {
+                    clear_eager_range(
+                        &out_file,
+                        item.output_offset,
+                        chunk.chunk_size_decompressed,
+                    )?;
+                    return Err(SophonError::DownloadFailed {
+                        chunk: chunk.chunk_name.to_owned(),
+                        attempts,
+                        error: error.to_string(),
+                    });
+                }
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                if cancelable_sleep(handle, retry_delay(attempts))
+                    .await
+                    .is_err()
+                {
+                    return Err(SophonError::Cancelled);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    finish_eager_item(
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_eager_item_streaming(
+    item: &DownloadItem,
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+    handle: &DownloadHandle,
+    stream_queue_capacity: usize,
+    #[cfg(feature = "bench-diagnostics")] timings: Option<
+        Arc<super::eager_decompress::EagerStreamPhaseTimings>,
+    >,
+) -> SophonResult<()> {
     // Check bitmap for resume.
     let global_chunk_idx = {
         let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
@@ -1217,7 +2165,8 @@ async fn process_eager_item(
             chunk_entry_offsets,
             pending_counts,
             ctx,
-        );
+        )
+        .await;
         return Ok(());
     }
 
@@ -1231,121 +2180,349 @@ async fn process_eager_item(
             .preallocate_file(file_idx, file_name, file_size)?;
     }
 
-    // Download compressed chunk into memory (with retries).
+    // Download and decompress each attempt without retaining the full chunk.
     let client = &ctx.installer_clients[item.installer_idx as usize];
     let download_info = &ctx.installer_downloads[item.installer_idx as usize];
     let mut url = String::with_capacity(256);
     download_info.url_for_into(chunk.chunk_name, &mut url);
-
-    let compressed_data = {
-        let mut attempts: u32 = 0;
-        loop {
-            if handle.is_cancelled() {
-                return Err(SophonError::Cancelled);
-            }
-            let result: SophonResult<_> = async {
-                let resp = client.get(&url).send().await?;
-                if !resp.status().is_success() {
-                    return Err(SophonError::Io(std::io::Error::other(format!(
-                        "HTTP {} for chunk {}",
-                        resp.status(),
-                        chunk.chunk_name
-                    ))));
-                }
-                resp.bytes().await.map_err(SophonError::Http)
-            }
-            .await;
-            match result {
-                Ok(data) => break data,
-                Err(err) => {
-                    if !err.is_retryable() {
-                        return Err(err);
-                    }
-                    attempts += 1;
-                    if attempts >= MAX_RETRIES {
-                        return Err(SophonError::DownloadFailed {
-                            chunk: chunk.chunk_name.to_string(),
-                            attempts: MAX_RETRIES,
-                            error: err.to_string(),
-                        });
-                    }
-                    log::warn!(
-                        "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}): {err}",
-                        chunk.chunk_name,
-                    );
-                    if cancelable_sleep(handle, retry_delay(attempts))
-                        .await
-                        .is_err()
-                    {
-                        return Err(SophonError::Cancelled);
-                    }
-                }
-            }
-        }
-    };
-
-    if handle.is_cancelled() {
-        return Err(SophonError::Cancelled);
-    }
-
-    // Compute chunk offset within the output file.
-    let chunk_offset = ctx
-        .all_files
-        .file_chunk_offset(file_idx, item.chunk_idx as usize);
-
-    // Decompress and write to output file.
     let out_file = ctx
         .output_allocator
         .get_handle(file_idx)
         .ok_or_else(|| SophonError::Io(std::io::Error::other("output file not pre-allocated")))?;
+    let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
+    let compressed_hash: &[u8] = if skip_hash {
+        b""
+    } else {
+        chunk.chunk_compressed_hash_md5
+    };
+    // Capture the manifest to reconstruct the decompressed hash inside the
+    // spawn_blocking closure, avoiding a String allocation per attempt.
+    let all_files = if skip_hash {
+        None
+    } else {
+        Some(Arc::clone(&ctx.all_files))
+    };
 
-    let _decompressed_bytes = tokio::task::spawn_blocking({
+    if !compressed_hash.is_empty() && !matches!(compressed_hash.len(), 16 | 8) {
+        return Err(SophonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported compressed chunk hash length",
+        )));
+    }
+    // Hash the compressed stream only when the decoder will not verify a
+    // real decompressed digest for this chunk — the decompressed check
+    // subsumes transport corruption detection, so the producer pass only
+    // costs CPU when that check is absent. Both inputs are chunk-scoped
+    // and never change across download attempts, so this is hoisted out
+    // of the retry loop.
+    let verify_compressed = super::eager_decompress::compressed_hash_needed(
+        compressed_hash,
+        all_files
+            .as_deref()
+            .map(|manifest| manifest.chunk_decompressed_hash_at(global_chunk_idx))
+            .unwrap_or(b""),
+    );
+    let mut attempts = 0;
+    loop {
+        if handle.is_cancelled() {
+            return Err(SophonError::Cancelled);
+        }
+        let response = tokio::select! {
+            biased;
+            _ = handle.cancelled_future() => return Err(SophonError::Cancelled),
+            result = client.get(&url).send() => result,
+        }?;
+        let response = response.error_for_status()?;
+        let content_length = response.content_length();
+        if content_length.is_some_and(|length| length > chunk.chunk_size) {
+            clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+            return Err(SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_string(),
+                expected: chunk.chunk_size,
+                actual: content_length.unwrap(),
+            });
+        }
+
+        let mut stream = response.bytes_stream();
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<StreamMessage, std::io::Error>>(
+            stream_queue_capacity,
+        );
         let out = Arc::clone(&out_file);
-        let skip_hash = ctx.verify_mode != super::VerifyMode::Full;
-        let decomp_hash = if skip_hash {
-            String::new()
-        } else {
-            chunk.chunk_decompressed_hash_md5.to_string()
-        };
-        let comp_hash = if skip_hash {
-            String::new()
-        } else {
-            chunk.chunk_compressed_hash_md5.to_string()
-        };
-        let expected_size = chunk.chunk_size_decompressed;
-        move || {
-            super::eager_decompress::eager_decompress_chunk(
-                &compressed_data,
+        let expected_decompressed_size = chunk.chunk_size_decompressed;
+        let chunk_offset = item.output_offset;
+        let all_files = all_files.clone();
+        #[cfg(feature = "bench-diagnostics")]
+        let decoder_timings = timings.clone();
+        let decode_task = tokio::task::spawn_blocking(move || {
+            let decompressed_hash: &[u8] = match &all_files {
+                Some(manifest) => manifest.chunk_decompressed_hash_at(global_chunk_idx),
+                None => b"",
+            };
+            // A plain BufRead chain: zstd's zio loop consumes the frame
+            // slices straight from the reader (no intermediate copies —
+            // wrapping it in a BufReader would reintroduce them).
+            let reader = ChunkStreamReader {
+                receiver,
+                current: None,
+                offset: 0,
+                complete: false,
+                #[cfg(feature = "bench-diagnostics")]
+                timings: decoder_timings.clone(),
+            };
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = decoder_timings {
+                return super::eager_decompress::stream_decompress_to_file_with_timings(
+                    reader,
+                    &out,
+                    chunk_offset,
+                    expected_decompressed_size,
+                    decompressed_hash,
+                    timings,
+                );
+            }
+            super::eager_decompress::stream_decompress_to_file(
+                reader,
                 &out,
                 chunk_offset,
-                expected_size,
-                &comp_hash,
-                &decomp_hash,
+                expected_decompressed_size,
+                decompressed_hash,
             )
-        }
-    })
-    .await
-    .map_err(|e| SophonError::Io(std::io::Error::other(e.to_string())))??;
+        });
 
-    // Mark chunk in bitmap. Durability is batched: sync_data runs every
-    // CHUNK_STATE_SAVE_INTERVAL chunks (not per-chunk) to amortize the
-    // fdatasync cost across many writes. The per-file sync in
-    // notify_eager_file_complete covers final durability.
+        let mut compressed_md5 =
+            (verify_compressed && compressed_hash.len() == 16).then(fast_md5::Md5::new);
+        let mut compressed_xxh64 =
+            (verify_compressed && compressed_hash.len() == 8).then(super::assembly_opt::take_xxh64);
+        let mut bytes_received = 0u64;
+        let mut stream_error = None;
+        loop {
+            #[cfg(feature = "bench-diagnostics")]
+            let wait_started = std::time::Instant::now();
+            let next = tokio::select! {
+                biased;
+                _ = handle.cancelled_future() => {
+                    let _ = sender
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "download cancelled",
+                        )))
+                        .await;
+                    stream_error = Some(SophonError::Cancelled);
+                    break;
+                }
+                item = stream.next() => item,
+            };
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                timings
+                    .producer_wait_ns
+                    .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let Some(result) = next else { break };
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = sender
+                        .send(Err(std::io::Error::other(error.to_string())))
+                        .await;
+                    stream_error = Some(SophonError::Http(error));
+                    break;
+                }
+            };
+            bytes_received = match bytes_received.checked_add(bytes.len() as u64) {
+                Some(total) if total <= chunk.chunk_size => total,
+                Some(total) => {
+                    let _ = sender
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "compressed response exceeds declared size",
+                        )))
+                        .await;
+                    stream_error = Some(SophonError::SizeMismatch {
+                        item: chunk.chunk_name.to_string(),
+                        expected: chunk.chunk_size,
+                        actual: total,
+                    });
+                    break;
+                }
+                None => {
+                    let _ = sender
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "compressed response size overflow",
+                        )))
+                        .await;
+                    stream_error = Some(SophonError::SizeMismatch {
+                        item: chunk.chunk_name.to_string(),
+                        expected: chunk.chunk_size,
+                        actual: u64::MAX,
+                    });
+                    break;
+                }
+            };
+            #[cfg(feature = "bench-diagnostics")]
+            let hash_started = std::time::Instant::now();
+            if let Some(hasher) = compressed_md5.as_mut() {
+                hasher.update(&bytes);
+            }
+            if let Some(hasher) = compressed_xxh64.as_mut() {
+                hasher.update(&bytes);
+            }
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                timings
+                    .compressed_hash_ns
+                    .fetch_add(hash_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            #[cfg(feature = "bench-diagnostics")]
+            let send_started = std::time::Instant::now();
+            let send_result = sender.send(Ok(StreamMessage::Data(bytes))).await;
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = timings.as_ref() {
+                timings
+                    .channel_send_ns
+                    .fetch_add(send_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            if send_result.is_err() {
+                stream_error = Some(SophonError::Io(std::io::Error::other(
+                    "eager decompressor stopped reading response",
+                )));
+                break;
+            }
+        }
+        if stream_error.is_none() && bytes_received != chunk.chunk_size {
+            stream_error = Some(SophonError::SizeMismatch {
+                item: chunk.chunk_name.to_string(),
+                expected: chunk.chunk_size,
+                actual: bytes_received,
+            });
+        }
+        let compressed_hash_mismatch = if stream_error.is_none() {
+            // When the compressed check is skipped the hashers stay None and
+            // this branch yields false; an empty-expected mismatch report is
+            // therefore impossible.
+            debug_assert_eq!(
+                verify_compressed,
+                compressed_md5.is_some() || compressed_xxh64.is_some()
+            );
+            if let Some(hasher) = compressed_md5.take() {
+                let digest = hasher.finalize();
+                !super::assembly_opt::md5_bytes_eq(&digest, compressed_hash)
+            } else if let Some(hasher) = compressed_xxh64.take() {
+                let digest = hasher.digest();
+                !super::assembly_opt::xxh64_bytes_eq(digest, compressed_hash)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if compressed_hash_mismatch {
+            stream_error = Some(SophonError::Md5Mismatch {
+                item: chunk.chunk_name.to_string(),
+                expected: super::assembly_opt::bytes_to_hex(compressed_hash),
+                actual: String::from("streamed compressed hash mismatch"),
+            });
+        }
+        if stream_error.is_none() {
+            let _ = sender.send(Ok(StreamMessage::Complete)).await;
+        }
+        drop(sender);
+        if let Some(error) = stream_error {
+            drop(stream);
+            drop(decode_task.abort_handle());
+            let _ = decode_task.await;
+            if matches!(error, SophonError::Cancelled) {
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                return Err(error);
+            }
+            if !error.is_retryable() {
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                return Err(error);
+            }
+            attempts += 1;
+            if attempts >= MAX_RETRIES {
+                clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+                return Err(SophonError::DownloadFailed {
+                    chunk: chunk.chunk_name.to_string(),
+                    attempts: MAX_RETRIES,
+                    error: error.to_string(),
+                });
+            }
+        } else {
+            match decode_task.await.map_err(SophonError::JoinError)? {
+                Ok(_) => break,
+                Err(error) => {
+                    if !error.is_retryable() {
+                        clear_eager_range(
+                            &out_file,
+                            item.output_offset,
+                            chunk.chunk_size_decompressed,
+                        )?;
+                        return Err(error);
+                    }
+                    attempts += 1;
+                    if attempts >= MAX_RETRIES {
+                        clear_eager_range(
+                            &out_file,
+                            item.output_offset,
+                            chunk.chunk_size_decompressed,
+                        )?;
+                        return Err(SophonError::DownloadFailed {
+                            chunk: chunk.chunk_name.to_string(),
+                            attempts: MAX_RETRIES,
+                            error: error.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        log::warn!(
+            "Eager chunk {} failed (attempt {attempts}/{MAX_RETRIES}), re-downloading",
+            chunk.chunk_name,
+        );
+        if cancelable_sleep(handle, retry_delay(attempts))
+            .await
+            .is_err()
+        {
+            clear_eager_range(&out_file, item.output_offset, chunk.chunk_size_decompressed)?;
+            return Err(SophonError::Cancelled);
+        }
+    }
+
+    finish_eager_item(
+        item_idx,
+        chunk,
+        ctx,
+        chunk_entries,
+        chunk_entry_offsets,
+        pending_counts,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_eager_item(
+    item_idx: usize,
+    chunk: super::compact_manifest::ChunkRef<'_>,
+    ctx: &Arc<InstallContext>,
+    chunk_entries: &[FileEntry],
+    chunk_entry_offsets: &[u32],
+    pending_counts: &[AtomicU32],
+) -> SophonResult<()> {
     if ctx.verify_mode == super::VerifyMode::Full {
-        ctx.chunk_bitmap.mark_complete(global_chunk_idx);
         // Record in `downloaded_chunks` so the periodic state save tracks
-        // eager chunks the same way the non-eager path does.
+        // eager chunks the same way the non-eager path does. The bitmap bit
+        // is deferred to the file-durability tail (notify path below): that
+        // tail fsyncs the file before marking any of its bits, so bits only
+        // ever exist for durable data.
         if let Some(dc) = ctx.downloaded_chunks.get() {
             dc[item_idx].store(chunk.chunk_size as u32, Ordering::Relaxed);
         }
 
         let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-            let _ = out_file.sync_data();
-            save_assembly_state(ctx).await;
-            if let Err(e) = ctx.chunk_bitmap.sync() {
-                log::warn!("Failed to sync chunk bitmap: {e}");
-            }
+            save_assembly_state(ctx);
         }
     }
 
@@ -1364,14 +2541,127 @@ async fn process_eager_item(
         chunk_entry_offsets,
         pending_counts,
         ctx,
-    );
+    )
+    .await;
 
     Ok(())
 }
 
+fn clear_eager_range(file: &std::fs::File, offset: u64, length: u64) -> SophonResult<()> {
+    let zeros = [0u8; 64 * 1024];
+    let mut written = 0u64;
+    while written < length {
+        let count = (length - written).min(zeros.len() as u64) as usize;
+        file.write_all_at(&zeros[..count], offset + written)
+            .map_err(SophonError::Io)?;
+        written += count as u64;
+    }
+    Ok(())
+}
+
+enum StreamMessage {
+    Data(bytes::Bytes),
+    Complete,
+}
+
+struct ChunkStreamReader {
+    receiver: tokio::sync::mpsc::Receiver<Result<StreamMessage, std::io::Error>>,
+    current: Option<bytes::Bytes>,
+    offset: usize,
+    complete: bool,
+    #[cfg(feature = "bench-diagnostics")]
+    timings: Option<Arc<super::eager_decompress::EagerStreamPhaseTimings>>,
+}
+
+impl std::io::BufRead for ChunkStreamReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        // Refill with len() checks only: a &self borrow must not stay
+        // live across the channel receive below.
+        while !self.complete
+            && self
+                .current
+                .as_ref()
+                .is_none_or(|current| self.offset >= current.len())
+        {
+            self.current = None;
+            self.offset = 0;
+            #[cfg(feature = "bench-diagnostics")]
+            let wait_started = std::time::Instant::now();
+            let message = self.receiver.blocking_recv();
+            #[cfg(feature = "bench-diagnostics")]
+            if let Some(timings) = self.timings.as_ref() {
+                timings
+                    .consumer_wait_ns
+                    .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            match message {
+                // Zero-length frames carry no bytes; keep pulling instead
+                // of handing the decoder an empty slice mid-stream.
+                Some(Ok(StreamMessage::Data(bytes))) if !bytes.is_empty() => {
+                    #[cfg(feature = "bench-diagnostics")]
+                    if let Some(timings) = self.timings.as_ref() {
+                        timings.input_read_calls.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.current = Some(bytes);
+                }
+                Some(Ok(StreamMessage::Data(_))) => continue,
+                Some(Ok(StreamMessage::Complete)) => {
+                    self.complete = true;
+                }
+                Some(Err(error)) => return Err(error),
+                // The channel closed without a Complete marker — the
+                // producer died mid-stream. Surfacing an empty buffer here
+                // could let a cleanly frame-aligned truncation decode as a
+                // complete chunk, so it must be an error.
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "producer closed before Complete marker",
+                    ));
+                }
+            }
+        }
+        let slice = match self.current.as_ref() {
+            Some(current) if self.offset < current.len() => &current[self.offset..],
+            _ => &[],
+        };
+        Ok(slice)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        let remaining = self
+            .current
+            .as_ref()
+            .map_or(0, |current| current.len() - self.offset);
+        debug_assert!(amt <= remaining, "consumer over-consumed the frame slice");
+        let amt = amt.min(remaining);
+        #[cfg(feature = "bench-diagnostics")]
+        if let Some(timings) = self.timings.as_ref() {
+            timings
+                .input_read_requested_bytes
+                .fetch_add(amt as u64, Ordering::Relaxed);
+        }
+        self.offset += amt;
+    }
+}
+
+impl std::io::Read for ChunkStreamReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        // Standard BufRead blanket shape: one fill_buf, one copy out.
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let filled = std::io::BufRead::fill_buf(self)?;
+        let count = output.len().min(filled.len());
+        output[..count].copy_from_slice(&filled[..count]);
+        std::io::BufRead::consume(self, count);
+        Ok(count)
+    }
+}
+
 /// When all eager chunks for a file complete, mark the file done directly
 /// (no assembly needed since pwrite already placed decompressed data).
-fn notify_eager_file_complete(
+async fn notify_eager_file_complete(
     item_idx: usize,
     chunk_entries: &[FileEntry],
     chunk_entry_offsets: &[u32],
@@ -1388,70 +2678,177 @@ fn notify_eager_file_complete(
         let prev = pending_counts[*pending_idx as usize].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             let file_idx = *file_idx as usize;
-            // Flush output data to disk before marking bitmap — prevents
-            // corruption if power is lost before kernel writeback.
-            // Skip in non-Full mode: crash-resume is disabled.
+            // The pending count hit zero: this worker wrote the file's last
+            // chunk. Exactly one worker observes prev == 1 per file, so the
+            // durability tail below runs exactly once.
             if ctx.verify_mode == super::VerifyMode::Full {
-                if let Some(handle) = ctx.output_allocator.get_handle(file_idx) {
-                    let _ = handle.sync_data();
+                // Hand the fsync + bitmap-mark tail to the durability task
+                // so this worker never blocks on disk I/O itself; it only
+                // waits when the bounded queue is full (fsync backpressure).
+                let job = EagerDurabilityJob {
+                    file_idx,
+                    chunk_range: ctx.all_files.file_chunk_range(file_idx),
+                };
+                // unwrap_or_else(into_inner): a poisoned lock still holds a
+                // usable sender, and treating it as absent would silently
+                // change completion semantics.
+                let sender = ctx
+                    .durability_tx
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .clone();
+                let unsent = match sender {
+                    Some(tx) => match tx.send(job).await {
+                        Ok(()) => None,
+                        Err(err) => Some(err.0),
+                    },
+                    None => Some(job),
+                };
+                if let Some(job) = unsent {
+                    // Sender absent (unit-test contexts), drained (the
+                    // download phase already ended), or lock poisoned: run
+                    // the tail per completed file, inline.
+                    run_eager_durability_tail(ctx, job);
                 }
+            } else {
+                // Non-Full mode has no crash-resume: no bitmap, no fsync,
+                // so the tail is pure bookkeeping and can run inline.
+                finalize_eager_file(ctx, file_idx);
             }
-            // Close the cached output FD.
-            ctx.output_allocator.close_file(file_idx);
-            // Mark file complete (idempotent).
-            ctx.completion_flags[file_idx].store(true, Ordering::Release);
-            // Populate verify_cache so resume skips expensive MD5 rehash.
-            // Skip in non-Full mode: no crash-resume benefit.
-            if ctx.verify_mode == super::VerifyMode::Full
-                && ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES
-            {
-                let file_name = ctx.all_files.file_name(file_idx);
-                let target_path = ctx.game_dir.join(file_name);
-                if let Ok(meta) = target_path.metadata() {
-                    let mtime_secs = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs());
+        }
+    }
+}
+
+/// Post-completion bookkeeping that does not touch disk: counters, progress
+/// emission, and the verify-cache entry. Called by the durability task in
+/// Full mode and directly in non-Full mode. Also closes the cached FD.
+fn finalize_eager_file(ctx: &InstallContext, file_idx: usize) {
+    // Close the cached output FD (it belongs to a finished file).
+    ctx.output_allocator.close_file(file_idx);
+    if ctx.verify_mode == super::VerifyMode::Full {
+        // Mark file complete (idempotent).
+        ctx.completion_flags[file_idx].store(true, Ordering::Release);
+        // Populate verify_cache so resume skips expensive MD5 rehash.
+        if ctx.verify_cache.len() < super::cache::VERIFICATION_CACHE_MAX_ENTRIES {
+            let file_name = ctx.all_files.file_name(file_idx);
+            let target_path = ctx.game_dir.join(file_name);
+            if let Ok(meta) = target_path.metadata() {
+                let mtime_secs = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                let hash = ctx.all_files.file_hash_md5(file_idx);
+                if let Ok(md5) = <[u8; 16]>::try_from(hash) {
                     ctx.verify_cache.insert(
                         file_name.to_string(),
                         super::cache::VerificationEntry {
                             size: ctx.all_files.file_size(file_idx),
-                            md5: ctx.all_files.file_hash_md5(file_idx).to_string(),
+                            md5,
                             mtime_secs,
                         },
                     );
                 }
             }
-            // Update counters + progress (mirrors assembly coordinator).
-            let checked = ctx.checked_files.fetch_add(1, Ordering::Relaxed) + 1;
-            let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
-            let total = ctx.total_files;
-            let force = checked == total || assembled == total;
-            if force {
-                (ctx.updater)(SophonProgress::CheckingFiles {
-                    checked_files: checked,
-                    total_files: total,
-                });
-                (ctx.updater)(SophonProgress::Assembling {
-                    assembled_files: assembled,
-                    total_files: total,
-                });
-            } else if let Ok(mut lu) = ctx.last_assembly_update.try_lock()
-                && lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS)
-            {
-                (ctx.updater)(SophonProgress::CheckingFiles {
-                    checked_files: checked,
-                    total_files: total,
-                });
-                (ctx.updater)(SophonProgress::Assembling {
-                    assembled_files: assembled,
-                    total_files: total,
-                });
-                *lu = std::time::Instant::now();
-            }
         }
     }
+    // Update counters + progress (mirrors assembly coordinator).
+    let checked = ctx.checked_files.fetch_add(1, Ordering::Relaxed) + 1;
+    let assembled = ctx.assembled_files.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = ctx.total_files;
+    let force = checked == total || assembled == total;
+    if force
+        || ctx.last_assembly_update.try_lock().is_ok_and(|mut lu| {
+            let due = lu.elapsed() >= std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS);
+            if due {
+                *lu = std::time::Instant::now();
+            }
+            due
+        })
+    {
+        (ctx.updater)(SophonProgress::CheckingFiles {
+            checked_files: checked,
+            total_files: total,
+        });
+        (ctx.updater)(SophonProgress::Assembling {
+            assembled_files: assembled,
+            total_files: total,
+        });
+    }
+}
+
+/// Durability tail for one completed eager file: fsync its output data,
+/// mark its chunks' resume bits, then finalize the bookkeeping.
+///
+/// This is the single place enforcing the crash-ordering invariant required
+/// by [`super::chunk_bitmap::ChunkBitmap`]: the file's data must be durable
+/// before its bitmap bits are marked (and before any later bitmap persist).
+/// If the fsync fails or the output handle is gone, the bits stay unset so
+/// a later resume re-downloads the file instead of trusting data that may
+/// not be durable.
+fn run_eager_durability_tail(ctx: &InstallContext, job: EagerDurabilityJob) {
+    let EagerDurabilityJob {
+        file_idx,
+        chunk_range,
+    } = job;
+    let durable = match ctx.output_allocator.get_handle(file_idx) {
+        Some(handle) if handle.sync_data().is_ok() => true,
+        Some(_) => {
+            log::warn!("Eager durability fsync failed for file index {file_idx}");
+            false
+        }
+        None => {
+            log::warn!(
+                "Eager durability handle missing for file index {file_idx}; \
+                 leaving resume bits unset"
+            );
+            false
+        }
+    };
+    if durable {
+        for ci in chunk_range {
+            ctx.chunk_bitmap.mark_complete(ci as usize);
+        }
+        finalize_eager_file(ctx, file_idx);
+    }
+}
+
+/// Consumer for eager file-durability jobs. Runs the fsync + bitmap-mark
+/// tail on the blocking pool so download workers never stall on disk I/O,
+/// keeping the invariant that bitmap bits exist only for durable data.
+///
+/// The channel is bounded, so a backlog of unsynced files applies fsync
+/// backpressure to the finishing worker instead of growing without bound.
+/// The send side lives in `InstallContext`; the returned handle finishes
+/// once that sender is dropped and every queued job's fsync has completed.
+fn spawn_eager_durability_task(ctx: &Arc<InstallContext>) -> tokio::task::JoinHandle<()> {
+    const DURABILITY_QUEUE_DEPTH: usize = 64;
+    let (tx, mut rx) = mpsc::channel::<EagerDurabilityJob>(DURABILITY_QUEUE_DEPTH);
+    *ctx.durability_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+
+    let task_ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let EagerDurabilityJob {
+                file_idx,
+                chunk_range,
+            } = job;
+            let ctx = Arc::clone(&task_ctx);
+            let result = tokio::task::spawn_blocking(move || {
+                run_eager_durability_tail(
+                    ctx.as_ref(),
+                    EagerDurabilityJob {
+                        file_idx,
+                        chunk_range,
+                    },
+                );
+            })
+            .await;
+            if let Err(err) = result {
+                log::error!("Eager durability task join error: {err}");
+            }
+        }
+    })
 }
 
 fn notify_assembly_ready(
@@ -1571,6 +2968,9 @@ async fn process_download_item(
             ctx.last_update.store(now, Ordering::Relaxed);
             ctx.smooth_speed_bps.store(0, Ordering::Relaxed);
             ctx.eta_speed_history.lock().unwrap().clear();
+            // Reclaim thread-local pools and evict open-file page cache on resume.
+            ctx.output_allocator.evict_all_open_pages();
+            super::reclaim_memory();
         }
     }
 
@@ -1660,10 +3060,13 @@ async fn process_download_item(
 
     let count = ctx.chunks_since_save.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(crate::CHUNK_STATE_SAVE_INTERVAL) {
-        save_assembly_state(ctx).await;
-        if let Err(e) = ctx.chunk_bitmap.sync() {
-            log::warn!("Failed to sync chunk bitmap: {e}");
-        }
+        save_assembly_state(ctx);
+        let bitmap = Arc::clone(&ctx.chunk_bitmap);
+        ctx.bitmap_save_slot.trigger(move || {
+            if let Err(e) = bitmap.sync() {
+                log::warn!("Failed to sync chunk bitmap: {e}");
+            }
+        });
     }
 
     let db = if was_actually_downloaded {
@@ -1706,21 +3109,29 @@ async fn run_downloads(
     handle: DownloadHandle,
 ) -> DownloadSummary {
     const RECLAIM_INTERVAL: usize = 100;
+    let max_inflight_compressed_bytes: usize =
+        super::adaptive_download::max_concurrency() * 8 * 1024 * 1024;
     let adaptive = Arc::new(super::adaptive_download::AdaptiveDownload::new());
     let cancelled = Arc::new(AtomicU8::new(0));
     let first_error: Arc<Mutex<Option<SophonError>>> = Arc::new(Mutex::new(None));
     let total: usize = download_items.len();
-    let queue: Arc<Mutex<VecDeque<(usize, DownloadItem)>>> =
-        Arc::new(Mutex::new(download_items.into_iter().enumerate().collect()));
+    let download_items = Arc::new(download_items);
+    let next_index = Arc::new(AtomicUsize::new(0));
     let remaining: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(total));
     let reclaim_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    // Coalescing flag for offloaded reclaims: at most one trim runs at a
+    // time, so a worker hitting the reclaim boundary while a trim is in
+    // flight skips it and lets the next boundary reclaim instead.
+    let reclaim_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let byte_semaphore = Arc::new(tokio::sync::Semaphore::new(max_inflight_compressed_bytes));
     let mut workers = tokio::task::JoinSet::new();
 
     ctx.profiler.total_chunks.store(total, Ordering::Relaxed);
 
     // Spawn a worker closure factory to avoid repeating the body.
     let spawn_worker = |workers: &mut tokio::task::JoinSet<()>| {
-        let queue = Arc::clone(&queue);
+        let download_items = Arc::clone(&download_items);
+        let next_index = Arc::clone(&next_index);
         let ctx = Arc::clone(&ctx);
         let chunk_entries = Arc::clone(&chunk_entries);
         let chunk_entry_offsets = Arc::clone(&chunk_entry_offsets);
@@ -1731,6 +3142,8 @@ async fn run_downloads(
         let first_error = Arc::clone(&first_error);
         let remaining = Arc::clone(&remaining);
         let reclaim_count = Arc::clone(&reclaim_count);
+        let reclaim_in_flight = Arc::clone(&reclaim_in_flight);
+        let byte_semaphore = Arc::clone(&byte_semaphore);
 
         workers.spawn(async move {
             loop {
@@ -1738,17 +3151,30 @@ async fn run_downloads(
                     return;
                 }
                 let idle_start = std::time::Instant::now();
-                let (item_idx, item) = {
-                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-                    match q.pop_front() {
-                        Some(v) => v,
-                        None => break,
-                    }
+                let Some(item_idx) = DownloadItem::claim_index(&next_index, total) else {
+                    break;
                 };
+                let item = download_items[item_idx];
                 {
                     let idle_ns = idle_start.elapsed().as_nanos() as u64;
                     ctx.profiler.record_idle(idle_ns);
                 }
+                // Bound in-flight compressed data by acquiring a byte-sized
+                // semaphore permit proportional to the chunk's compressed size.
+                // This prevents 48 workers from each loading a large compressed
+                // chunk simultaneously, bounding peak RSS from compressed data.
+                let global_chunk_idx = {
+                    let range = ctx.all_files.file_chunk_range(item.file_idx as usize);
+                    range.start as usize + item.chunk_idx as usize
+                };
+                let chunk = ctx.all_files.chunk(global_chunk_idx);
+                let compressed_bytes =
+                    (chunk.chunk_size.max(1) as usize).min(max_inflight_compressed_bytes);
+                let _byte_permit = match byte_semaphore.acquire_many(compressed_bytes as u32).await
+                {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
                 let result = process_download_item(
                     item,
                     item_idx,
@@ -1762,7 +3188,8 @@ async fn run_downloads(
                 .await;
                 if let Err(err) = result {
                     if matches!(err, SophonError::Cancelled) {
-                        cancelled.store(1, Ordering::Relaxed);
+                        record_download_cancelled_result(&cancelled, &first_error, &handle);
+                        break;
                     } else if let Ok(mut guard) = first_error.lock()
                         && guard.is_none()
                     {
@@ -1771,7 +3198,18 @@ async fn run_downloads(
                 }
                 let processed = reclaim_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if processed.is_multiple_of(RECLAIM_INTERVAL) {
-                    super::reclaim_memory();
+                    // malloc_trim and the thread-local sweeps are blocking
+                    // work (arena locks, madvise); running them inline would
+                    // stall a runtime worker. Hand the trim to the blocking
+                    // pool, coalesced so overlapping boundary hits skip
+                    // instead of queueing behind a slow trim.
+                    if !reclaim_in_flight.swap(true, Ordering::AcqRel) {
+                        let in_flight = Arc::clone(&reclaim_in_flight);
+                        tokio::task::spawn_blocking(move || {
+                            super::reclaim_memory();
+                            in_flight.store(false, Ordering::Release);
+                        });
+                    }
                 }
                 if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                     break;
@@ -1789,11 +3227,26 @@ async fn run_downloads(
     // Adaptive scaling: periodically measure throughput and spawn more workers.
     let mut spawned = initial;
     loop {
+        if handle.is_cancelled() {
+            record_download_cancellation(&cancelled);
+            break;
+        }
         tokio::select! {
             biased;
+            _ = wait_for_download_cancellation(&handle) => {
+                record_download_cancellation(&cancelled);
+                break;
+            }
             result = workers.join_next() => {
-                if result.is_none() {
-                    break;
+                match result {
+                    Some(Ok(())) => {}
+                    Some(Err(err)) => {
+                        record_download_worker_error(
+                            &first_error,
+                            SophonError::JoinError(err),
+                        );
+                    }
+                    None => break,
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
@@ -1802,9 +3255,12 @@ async fn run_downloads(
                 adaptive.measure(db);
 
                 let target = adaptive.current_target();
-                let queue_len = queue.lock().unwrap_or_else(|e| e.into_inner()).len();
-                // Spawn up to target, but only if queue has work.
-                while spawned < target && queue_len > spawned {
+                // Keep the adaptive target staffed while unclaimed work remains.
+                while spawned < next_download_worker_count(
+                    spawned,
+                    target,
+                    total.saturating_sub(next_index.load(Ordering::Relaxed)),
+                ) {
                     spawn_worker(&mut workers);
                     spawned += 1;
                 }
@@ -1816,10 +3272,22 @@ async fn run_downloads(
         }
     }
 
-    while workers.join_next().await.is_some() {}
+    while let Some(result) = workers.join_next().await {
+        if let Err(err) = result {
+            record_download_worker_error(&first_error, SophonError::JoinError(err));
+        }
+    }
+    if download_work_abandoned(&remaining, &handle) {
+        record_download_worker_error(
+            &first_error,
+            SophonError::Io(std::io::Error::other(
+                "download workers exited before processing all claimed items",
+            )),
+        );
+    }
 
     DownloadSummary {
-        cancelled: cancelled.load(Ordering::Relaxed) != 0,
+        cancelled: download_was_cancelled(&cancelled, &handle),
         first_error: first_error.lock().unwrap_or_else(|e| e.into_inner()).take(),
     }
 }
@@ -1828,17 +3296,27 @@ async fn run_downloads(
 async fn finalize_install(
     ctx: &InstallContext,
     summary: DownloadSummary,
+    handle: &DownloadHandle,
     deleted_files: Vec<String>,
     tag: &str,
     is_preinstall: bool,
     assembly_task: tokio::task::JoinHandle<SophonResult<()>>,
     assembly_cancel_token: CancellationToken,
+    assembly_epochs: Arc<super::assembly_epochs::AssemblyEpochs>,
     game_code: &str,
     vo_langs: &[String],
 ) -> SophonResult<()> {
-    if summary.cancelled {
+    if summary.cancelled || handle.is_cancelled() {
         assembly_cancel_token.cancel(); // stop assembly before deleting chunks
         let _ = assembly_task.await; // drain before cleanup
+        // Commit files the workers fully wrote before the cancellation:
+        // their data is complete, and committing keeps the pre-epoch
+        // semantics where finished files kept their renames. A commit
+        // failure is only logged — cancel cleanup must proceed and the
+        // leftover tmp files are swept on the next resume.
+        if let Err(err) = assembly_epochs.commit() {
+            log::warn!("assembly epoch commit on cancel failed: {err}");
+        }
         let cd = Arc::clone(&ctx.chunks_dir);
         #[allow(unused_must_use)]
         tokio::task::spawn_blocking(move || {
@@ -1854,9 +3332,21 @@ async fn finalize_install(
     }
 
     if let Some(err) = summary.first_error {
+        assembly_cancel_token.cancel();
+        let _ = assembly_task.await;
         return Err(err);
     }
     assembly_task.await??;
+
+    // Commit any staged files the last epoch did not flush; renames and
+    // chunk releases must complete before the verification cache below can
+    // claim file validity. syncfs can take seconds on a busy filesystem,
+    // so the commit runs on the blocking pool.
+    let commit_epochs = Arc::clone(&assembly_epochs);
+    if let Err(err) = tokio::task::spawn_blocking(move || commit_epochs.commit()).await? {
+        log::error!("Final assembly epoch commit failed: {err}");
+        return Err(err);
+    }
 
     {
         let total = ctx.total_files;
@@ -1880,23 +3370,20 @@ async fn finalize_install(
     }
 
     {
+        debug_assert!(
+            !ctx.save_slot.is_in_flight(),
+            "terminal save must run after the drain in install()"
+        );
         let dc = Arc::clone(&ctx.downloaded_chunks);
         let names = Arc::clone(&ctx.save_chunk_names);
         let saver = Arc::clone(&ctx.state_saver);
         tokio::task::spawn_blocking(move || {
-            let map = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
-                let mut m = HashMap::with_capacity(dc.len() / 2);
-                for (i, v) in dc.iter().enumerate() {
-                    let val = v.load(Ordering::Relaxed);
-                    if val > 0 {
-                        m.insert(names[i].clone(), val as u64);
-                    }
-                }
-                m
+            let entries = if let (Some(dc), Some(names)) = (dc.get(), names.get()) {
+                snapshot_downloaded_chunks(dc, names)
             } else {
-                HashMap::new()
+                Vec::new()
             };
-            saver(&map);
+            saver(&entries);
         })
         .await
         .unwrap_or_else(|err| {
@@ -2050,14 +3537,14 @@ pub async fn install(
             .flat_map(|inst| inst.manifest.assets.iter())
             .filter(|a| a.is_directory())
             .filter_map(|a| {
-                if let Err(err) = validate_asset_name(&a.asset_name) {
+                if let Err(err) = validate_asset_name(a.asset_name_str()) {
                     log::warn!(
-                        "Skipping directory with invalid asset_name \"{name}\": {err}",
-                        name = a.asset_name
+                        "Skipping directory with invalid asset_name \"{}\": {err}",
+                        a.asset_name_str()
                     );
                     None
                 } else {
-                    Some(game_dir.join(&a.asset_name))
+                    Some(game_dir.join(a.asset_name_str()))
                 }
             })
             .collect();
@@ -2076,7 +3563,7 @@ pub async fn install(
     let ResumeContext {
         prev_manifest_hash,
         mut prev_downloaded_chunks,
-        resume_seed,
+        mut resume_seed,
     } = resume;
     let current_manifest_hash = combine_manifest_hashes(&installers);
     let manifest_changed = prev_manifest_hash != current_manifest_hash;
@@ -2087,30 +3574,12 @@ pub async fn install(
             let chunks_dir_validate = Arc::clone(&chunks_dir);
             prev_downloaded_chunks = tokio::task::spawn_blocking(move || {
                 let before = prev_downloaded_chunks.len();
-                let num_threads = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let chunks_vec: Vec<_> = prev_downloaded_chunks.into_iter().collect();
-                let chunk_size = chunks_vec.len().div_ceil(num_threads);
-                let validated: rustc_hash::FxHashMap<String, u64> = std::thread::scope(|s| {
-                    let handles: Vec<_> = chunks_vec
-                        .chunks(chunk_size.max(1))
-                        .map(|batch| {
-                            let dir = &chunks_dir_validate;
-                            s.spawn(move || {
-                                batch
-                                    .iter()
-                                    .filter(|(name, size)| chunk_still_valid_for_resume(name, *size, dir))
-                                    .map(|(name, size)| (name.clone(), *size))
-                                    .collect::<Vec<_>>()
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .flat_map(|h| h.join().unwrap_or_default())
-                        .collect()
-                });
+                let candidates: Vec<Option<_>> = prev_downloaded_chunks
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+                let validated =
+                    validate_resume_chunk_entries(candidates, &chunks_dir_validate);
                 let removed = before - validated.len();
                 if removed > 0 {
                     log::warn!(
@@ -2132,7 +3601,7 @@ pub async fn install(
                 .iter()
                 .flat_map(|inst| inst.manifest.assets.iter())
                 .flat_map(|asset| asset.asset_chunks.iter())
-                .map(|c| c.chunk_name.as_str())
+                .map(|c| c.chunk_name_str())
                 .collect();
             let before = prev_downloaded_chunks.len();
             prev_downloaded_chunks
@@ -2151,42 +3620,33 @@ pub async fn install(
         }
     }
 
-    let (mut installer_data, mut all_files_vec) = build_installer_data(installers);
+    // NAP may drop whole installers (KDelResource); removing them before
+    // flattening keeps every surviving asset attached to the right
+    // installer and its download endpoint.
+    let mut installers = installers;
     if game_code == "nap" {
-        super::game_filters::filter_nap_installers(game_dir, &mut installer_data);
-    }
-    {
-        let file_installer_map: FxHashMap<String, usize> = {
-            let mut m: FxHashMap<String, usize> =
-                FxHashMap::with_capacity_and_hasher(all_files_vec.len(), Default::default());
-            let mut idx: usize = 0;
-            for (inst_idx, d) in installer_data.iter().enumerate() {
-                for _ in 0..d.file_count {
-                    if idx < all_files_vec.len() {
-                        m.insert(all_files_vec[idx].asset_name.clone(), inst_idx);
-                    }
-                    idx += 1;
-                }
-            }
-            m
-        };
-        if game_code == "hkrpg" {
-            super::game_filters::filter_hkrpg_asset_list(game_dir, &mut all_files_vec);
-        } else if game_code == "hk4e" {
-            super::game_filters::filter_hk4e_asset_list(game_dir, &mut all_files_vec, vo_langs);
-        } else if game_code == "nap" {
-            super::game_filters::filter_nap_asset_list(game_dir, &mut all_files_vec);
-        }
-        for d in &mut installer_data {
-            d.file_count = 0;
-        }
-        for f in all_files_vec.iter() {
-            if let Some(&inst_idx) = file_installer_map.get(f.asset_name.as_str()) {
-                installer_data[inst_idx].file_count += 1;
+        let removed = super::game_filters::filter_nap_installers(game_dir, &mut installers);
+        if removed > 0 {
+            // Persisted completion indices are positional into the previous
+            // run's file list, and the combined manifest hash does not cover
+            // the local KDel set (a same-hash resume with a different
+            // removal set would mis-seed them). Demote the seed; the
+            // disk-verified resume scan still marks genuinely finished
+            // files. Name-keyed legacy seeds are layout-independent and
+            // stay untouched.
+            if let super::CompletedFiles::Indices(idxs) = &mut resume_seed {
+                log::warn!(
+                    "Discarding {count} persisted completion indices: the KDelResource removal set changed the file layout",
+                    count = idxs.len(),
+                );
+                idxs.clear();
             }
         }
     }
-    let all_files: Arc<CompactManifest> = Arc::new(CompactManifest::from(all_files_vec));
+    let (installer_data, all_files_vec) =
+        build_installer_data(installers, game_code, game_dir, vo_langs);
+    let all_files: Arc<CompactManifest> =
+        Arc::new(CompactManifest::try_from_properties(all_files_vec)?);
     super::reclaim_memory();
     let all_tmp_dirs: Arc<Vec<std::path::PathBuf>> = Arc::new(
         installer_data
@@ -2229,7 +3689,6 @@ pub async fn install(
             total_files: total,
         });
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
         let checked_files = Arc::new(AtomicU64::new(0));
         let resume_bytes_offset_arc = Arc::new(AtomicU64::new(0));
         let pre_assembled_arc = Arc::new(AtomicU64::new(0));
@@ -2239,18 +3698,13 @@ pub async fn install(
         let resume_bitmap: Option<Arc<super::chunk_bitmap::ChunkBitmap>> = {
             let bitmap_path =
                 game_dir.join(format!(".sophon_bitmap_{}", &current_manifest_hash[..16]));
-            if bitmap_path.exists() {
-                super::chunk_bitmap::ChunkBitmap::load(&bitmap_path)
-                    .ok()
-                    .map(Arc::new)
-            } else {
-                None
-            }
+            super::chunk_bitmap::ChunkBitmap::load(&bitmap_path)
+                .ok()
+                .map(Arc::new)
         };
 
         let calc_futures = (0..all_files.num_files()).map(|file_idx| {
             let all_files = Arc::clone(&all_files);
-            let permit = Arc::clone(&semaphore);
             let verify_cache = Arc::clone(&verify_cache);
             let game_dir = Arc::clone(&game_dir_arc);
             let checked_files = Arc::clone(&checked_files);
@@ -2264,11 +3718,9 @@ pub async fn install(
             let resume_bitmap = resume_bitmap.clone();
 
             async move {
-                let _permit = permit.acquire().await.ok()?;
-
                 let file_name = all_files.file_name(file_idx).to_string();
                 let file_size = all_files.file_size(file_idx);
-                let file_hash = all_files.file_hash_md5(file_idx).to_string();
+                let file_hash = all_files.file_hash_md5(file_idx).to_vec();
                 let chunk_range = all_files.file_chunk_range(file_idx);
                 let is_dir = all_files.is_directory(file_idx);
                 let num_chunks = chunk_range.end - chunk_range.start;
@@ -2308,7 +3760,7 @@ pub async fn install(
                         // For eager files (preallocated to full size), size alone is
                         // insufficient — verify bitmap confirms all chunks were written.
                         let is_eager = (chunk_range.start..chunk_range.end)
-                            .all(|ci| all_files.chunk(ci as usize).chunk_old_offset < 0);
+                            .all(|ci| all_files.chunk_old_offset_at(ci as usize) < 0);
                         if size_ok && is_eager {
                             resume_bitmap.as_ref().is_some_and(|bm| {
                                 bm.all_complete_for_range(
@@ -2324,9 +3776,8 @@ pub async fn install(
                     if valid {
                         indices_arc.insert(file_idx);
                         let file_chunk_size: u64 = (chunk_range.start..chunk_range.end)
-                            .map(|i| all_files.chunk(i as usize))
-                            .filter(|c| c.chunk_old_offset < 0)
-                            .map(|c| c.chunk_size)
+                            .filter(|&i| all_files.chunk_old_offset_at(i as usize) < 0)
+                            .map(|i| all_files.chunk_size_at(i as usize))
                             .fold(0u64, |acc, x| acc.saturating_add(x));
                         resume_bytes_offset_arc.fetch_add(file_chunk_size, Ordering::Relaxed);
                         for i in chunk_range.start..chunk_range.end {
@@ -2335,7 +3786,7 @@ pub async fn install(
                         pre_assembled_arc.fetch_add(1, Ordering::Relaxed);
                     } else {
                         let needs_old_file = (chunk_range.start..chunk_range.end)
-                            .any(|i| all_files.chunk(i as usize).chunk_old_offset >= 0);
+                            .any(|i| all_files.chunk_old_offset_at(i as usize) >= 0);
                         if !needs_old_file {
                             files_to_delete.lock().unwrap().push(target_path);
                         }
@@ -2359,8 +3810,8 @@ pub async fn install(
         });
 
         futures_util::stream::iter(calc_futures)
-            .buffer_unordered(16)
-            .collect::<Vec<_>>()
+            .buffer_unordered(super::verify_concurrency())
+            .for_each(|_| futures_util::future::ready(()))
             .await;
 
         for path in files_to_delete.lock().unwrap().drain(..) {
@@ -2397,8 +3848,8 @@ pub async fn install(
         let mut m: FxHashMap<u32, u64> =
             FxHashMap::with_capacity_and_hasher(prev_downloaded_chunks.len(), Default::default());
         for i in 0..all_files.num_chunks() {
-            let chunk = all_files.chunk(i);
-            if let Some(&size) = prev_downloaded_chunks.get(chunk.chunk_name) {
+            let chunk_name = all_files.chunk_name_at(i);
+            if let Some(&size) = prev_downloaded_chunks.get(chunk_name) {
                 if completed_chunk_indices.contains(&(i as u32)) {
                     continue;
                 }
@@ -2498,25 +3949,27 @@ pub async fn install(
         game_dir: Arc::clone(&game_dir_arc),
         all_tmp_dirs: Arc::clone(&all_tmp_dirs),
         all_files: Arc::clone(&all_files),
-        downloaded_bytes: Arc::new(AtomicU64::new(0)),
+        downloaded_bytes: AtomicU64::new(0),
         assembled_files: Arc::clone(&assembled_files),
         checked_files: Arc::new(AtomicU64::new(pre_assembled)),
         total_bytes: total_compressed,
         total_files,
-        resume_bytes_offset: Arc::new(AtomicU64::new(resume_bytes_offset)),
+        resume_bytes_offset: AtomicU64::new(resume_bytes_offset),
         verify_cache,
         chunk_refcounts: Arc::new(OnceLock::new()),
         chunk_names: Arc::new(OnceLock::new()),
         last_assembly_update: Arc::new(Mutex::new(Instant::now())),
-        last_update: Arc::new(AtomicU64::new(now_nanos())),
-        smooth_speed_bps: Arc::new(AtomicU64::new(0)),
-        eta_speed_history: Arc::new(Mutex::new(VecDeque::new())),
-        last_speed_bytes: Arc::new(AtomicU64::new(0)),
-        last_speed_time: Arc::new(AtomicU64::new(now_nanos())),
+        last_update: AtomicU64::new(now_nanos()),
+        smooth_speed_bps: AtomicU64::new(0),
+        eta_speed_history: Mutex::new(VecDeque::new()),
+        last_speed_bytes: AtomicU64::new(0),
+        last_speed_time: AtomicU64::new(now_nanos()),
         updater: Arc::clone(&callbacks.updater),
         downloaded_chunks: Arc::new(OnceLock::new()),
-        chunks_since_save: Arc::new(AtomicU64::new(0)),
-        last_save: Arc::new(Mutex::new(None)),
+        chunks_since_save: AtomicU64::new(0),
+        assemblies_since_save: AtomicU64::new(0),
+        save_slot: SaveSlot::new(),
+        bitmap_save_slot: SaveSlot::new(),
         state_saver: callbacks.state_saver,
         save_chunk_names: Arc::new(OnceLock::new()),
         adaptive_assembly: Arc::clone(&adaptive_assembly),
@@ -2539,18 +3992,14 @@ pub async fn install(
                 }
             }
             let total = all_files.num_chunks();
-            let bm = if bitmap_path.exists() {
-                match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
-                    Ok(bm) if bm.total_chunks() == total => bm,
-                    _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
-                        .map_err(SophonError::Io)?,
-                }
-            } else {
-                super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
-                    .map_err(SophonError::Io)?
+            let bm = match super::chunk_bitmap::ChunkBitmap::load(&bitmap_path) {
+                Ok(bm) if bm.total_chunks() == total => bm,
+                _ => super::chunk_bitmap::ChunkBitmap::create(&bitmap_path, total)
+                    .map_err(SophonError::Io)?,
             };
             Arc::new(bm)
         },
+        durability_tx: Arc::new(std::sync::Mutex::new(None)),
         verify_mode: options.verify_mode,
     });
 
@@ -2579,8 +4028,6 @@ pub async fn install(
     // Shared cancellation token. Cancelling stops the RAM adjuster and
     // wakes any blocked recv().
     let assembly_cancel_token = tokio_util::sync::CancellationToken::new();
-    let assembly_task =
-        spawn_assembly_coordinator(&ctx, assemble_rx, assembly_cancel_token.clone());
 
     let (
         download_items,
@@ -2623,14 +4070,39 @@ pub async fn install(
     let _ = ctx.chunk_refcounts.set(Arc::new(chunk_refcounts_vec));
     let _ = ctx.chunk_names.set(Arc::clone(&chunk_names_lookup));
 
-    // Pre-build chunk name strings for state saves. Built once here,
-    // reused on every save to avoid per-save arena lookups + allocations.
-    {
-        let names: Vec<String> = (0..download_items.len())
-            .map(|i| chunk_names_lookup.get(i).to_owned())
-            .collect();
-        let _ = ctx.save_chunk_names.set(names);
-    }
+    let _ = ctx.save_chunk_names.set(Arc::clone(&chunk_names_lookup));
+
+    // Batched assembly durability: staged files flush once per epoch
+    // instead of one fdatasync+rename each. Chunk files stay until the
+    // epoch commit deletes them (via the refcount decrements there).
+    //
+    // DO NOT move this construction above the `ctx.chunk_names.set` /
+    // `ctx.chunk_refcounts.set` calls. AssemblyEpochs::new reads both
+    // OnceLocks synchronously; calling it before the locks are set
+    // panics with "chunk_names set before assembly" on every install.
+    // The earlier `tokio::spawn` coordinator waits via a yield loop,
+    // but this synchronous construction cannot. See the regression test
+    // `install_does_not_panic_on_fresh_download_epoch_construction`.
+    let assembly_epochs = Arc::new(super::assembly_epochs::AssemblyEpochs::new(
+        Arc::clone(ctx.chunk_names.get().expect("chunk_names set before assembly")),
+        Arc::clone(
+            ctx.chunk_refcounts
+                .get()
+                .expect("chunk_refcounts set before assembly"),
+        ),
+        Arc::clone(&ctx.chunks_dir),
+        super::assembly_epochs::EPOCH_MAX_FILES,
+        super::assembly_epochs::EPOCH_MAX_BYTES,
+    ));
+    let assembly_task = spawn_assembly_coordinator(
+        &ctx,
+        assemble_rx,
+        assembly_cancel_token.clone(),
+        Arc::clone(&assembly_epochs),
+    );
+    // The coordinator drops its Arc clone when it exits; install keeps
+    // this one for the final commit below.
+    let assembly_epochs_for_commit = Arc::clone(&assembly_epochs);
 
     {
         let downloaded_chunks_vec: Vec<AtomicU32> = (0..download_items.len())
@@ -2658,6 +4130,12 @@ pub async fn install(
         ctx.last_update.store(now_nanos(), Ordering::Relaxed);
     }
 
+    // Durability consumer for eager file completions. Spawned before the
+    // download phase so every eager completion can hand off its fsync tail;
+    // drained (sender dropped + handle awaited) before the final bitmap sync
+    // so no unsynced file can outlive the install's last bitmap persist.
+    let durability_handle = spawn_eager_durability_task(&ctx);
+
     let results = run_downloads(
         Arc::clone(&ctx),
         download_items,
@@ -2665,13 +4143,27 @@ pub async fn install(
         chunk_entry_offsets,
         pending_counts,
         &assemble_tx,
-        options.handle,
+        options.handle.clone(),
     )
     .await;
 
     // Downloads are done — let assembly run at full speed.
     ctx.adaptive_assembly.set_download_active(false);
 
+    // Drop the durability sender and wait for queued jobs to finish fsyncing
+    // and marking their bitmap bits; only then is the final bitmap persist
+    // below guaranteed to cover durable data.
+    *ctx.durability_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Err(err) = durability_handle.await {
+        log::error!("Eager durability task join error: {err}");
+    }
+
+    // Drain any in-flight periodic sync before the final flush. Download
+    // workers are joined above (run_downloads returned), so no trigger can
+    // fire after this drain — the final inline sync below is the last
+    // bitmap write of the install.
+    ctx.bitmap_save_slot.drain().await;
+    debug_assert!(!ctx.bitmap_save_slot.is_in_flight());
     // Final bitmap flush — covers the tail that didn't hit the periodic interval.
     if let Err(e) = ctx.chunk_bitmap.sync() {
         log::warn!("Failed final chunk bitmap sync: {e}");
@@ -2694,28 +4186,21 @@ pub async fn install(
 
     super::reclaim_memory();
 
-    {
-        let handle = {
-            let mut guard = ctx.last_save.lock().unwrap_or_else(|err| {
-                log::error!("last_save mutex poisoned, recovering");
-                err.into_inner()
-            });
-            guard.take()
-        };
-        if let Some(h) = handle {
-            let _ = h.await;
-        }
-    }
+    // Workers are finished, so no further triggers can occur; drain any
+    // in-flight save so no state write outlives the install.
+    ctx.save_slot.drain().await;
 
     drop(assemble_tx);
     let result = finalize_install(
         &ctx,
         results,
+        &options.handle,
         deleted_files,
         tag,
         options.is_preinstall,
         assembly_task,
         assembly_cancel_token.clone(),
+        assembly_epochs_for_commit,
         game_code,
         vo_langs,
     )
@@ -2740,7 +4225,7 @@ pub async fn verify_integrity(
 
     let tag = read_installed_tag(game_dir).ok_or(SophonError::NoInstalledVersion)?;
 
-    let (branch, _) = api::fetch_front_door(client, game_id).await?;
+    let branch = api::fetch_front_door(client, game_id).await?;
     let build = api::fetch_build(
         client,
         branch.main.as_ref().ok_or(SophonError::NoGameManifest)?,
@@ -2762,23 +4247,10 @@ async fn verify_installers(
 ) -> SophonResult<()> {
     let vo_langs = vec![vo_lang.to_string()];
     if game_code == "nap" {
-        let mut selected: Vec<_> = installers
-            .iter()
-            .map(|i| InstallerData {
-                chunk_download: Arc::new(i.chunk_download.clone()),
-                file_count: i.manifest.assets.len(),
-                label: i.label.clone(),
-                matching_field: i.matching_field.clone(),
-            })
-            .collect();
-        super::game_filters::filter_nap_installers(game_dir, &mut selected);
-        installers.retain(|i| {
-            selected
-                .iter()
-                .any(|s| s.matching_field == i.matching_field)
-        });
+        super::game_filters::filter_nap_installers(game_dir, &mut installers);
     }
-    let mut all_assets = Vec::new();
+    let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
+    let mut all_assets = Vec::with_capacity(total_assets);
     let mut index_assets = Vec::new();
     let mut has_binary_version = false;
     for mut installer in installers {
@@ -2796,22 +4268,22 @@ async fn verify_installers(
                 continue;
             }
             has_binary_version |=
-                asset.asset_name == "StarRail_Data/StreamingAssets/BinaryVersion.bytes";
+                asset.asset_name_str() == "StarRail_Data/StreamingAssets/BinaryVersion.bytes";
             if game_code == "hk4e" {
                 // Package indexes need file metadata, not a second copy of all chunks.
-                index_assets.push(SophonManifestAssetProperty {
-                    asset_name: asset.asset_name.clone(),
-                    asset_type: asset.asset_type,
-                    asset_size: asset.asset_size,
-                    asset_hash_md5: asset.asset_hash_md5.clone(),
-                    asset_chunks: vec![],
-                });
+                index_assets.push(SophonManifestAssetProperty::from_parts(
+                    (*asset.asset_name()).clone(),
+                    vec![],
+                    asset.asset_type,
+                    asset.asset_size,
+                    (*asset.asset_hash_md5()).clone(),
+                ));
             }
             let generated = match game_code {
                 "hk4e" => {
-                    super::game_filters::is_generated_pkg_version(&asset.asset_name, &vo_langs)
+                    super::game_filters::is_generated_pkg_version(asset.asset_name_str(), &vo_langs)
                 }
-                "hkrpg" => asset.asset_name == "StarRail_Data/app.info",
+                "hkrpg" => asset.asset_name_str() == "StarRail_Data/app.info",
                 _ => false,
             };
             // beyond_pkg_version is NOT rebuilt by the local generator; repair
@@ -2828,7 +4300,7 @@ async fn verify_installers(
         match code.as_str() {
             "hk4e" => {
                 super::game_filters::write_hk4e_audio_lang_record(&gd, &vo_langs)?;
-                let manifest = Arc::new(CompactManifest::from(index_assets));
+                let manifest = Arc::new(CompactManifest::try_from_properties(index_assets)?);
                 super::game_filters::write_pkg_version_from_manifest(&gd, &manifest, &vo_langs)?;
             }
             "hkrpg" => {
@@ -2848,6 +4320,17 @@ async fn verify_installers(
     Ok(())
 }
 
+/// One unique chunk pending a cached-copy MD5 check in the repair path.
+struct PendingChunkCheck {
+    chunk: SophonManifestAssetChunk,
+    download: Arc<DownloadInfo>,
+    chunk_path: PathBuf,
+    expected_md5: [u8; 16],
+    chunk_size: u64,
+    /// Index in the unique-chunk list this item came from.
+    position: usize,
+}
+
 async fn repair_assets(
     client: &Client,
     mut all_assets: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)>,
@@ -2856,30 +4339,35 @@ async fn repair_assets(
 ) -> SophonResult<()> {
     all_assets.retain(|(asset, _)| !asset.is_directory());
     let mut identities = FxHashMap::<PathBuf, usize>::default();
-    let mut unique: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)> = Vec::new();
+    let mut unique: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)> =
+        Vec::with_capacity(all_assets.len());
     for (asset, download) in all_assets {
-        validate_asset_name(&asset.asset_name)?;
-        let identity: PathBuf = Path::new(&asset.asset_name).components().collect();
+        validate_asset_name(asset.asset_name_str())?;
+        let identity: PathBuf = Path::new(asset.asset_name_str()).components().collect();
         if identity.as_os_str().is_empty() {
-            return Err(SophonError::InvalidAssetName(asset.asset_name));
+            return Err(SophonError::InvalidAssetName(
+                asset.asset_name_str().to_string(),
+            ));
         }
         if let Some(&index) = identities.get(&identity) {
             let previous = &unique[index].0;
             if previous.asset_size != asset.asset_size
                 || !previous
-                    .asset_hash_md5
-                    .eq_ignore_ascii_case(&asset.asset_hash_md5)
+                    .asset_hash_md5_str()
+                    .eq_ignore_ascii_case(asset.asset_hash_md5_str())
             {
                 return Err(SophonError::AssemblyFailed {
-                    file: asset.asset_name,
+                    file: asset.asset_name_str().to_string(),
                     error: "Conflicting manifest requirements for one destination".into(),
                 });
             }
             continue;
         }
         for chunk in &asset.asset_chunks {
-            if !validate_chunk_name(&chunk.chunk_name) {
-                return Err(SophonError::PathTraversal(chunk.chunk_name.clone().into()));
+            if !validate_chunk_name(chunk.chunk_name_str()) {
+                return Err(SophonError::PathTraversal(PathBuf::from(
+                    chunk.chunk_name_str(),
+                )));
             }
         }
         identities.insert(identity, unique.len());
@@ -2888,7 +4376,9 @@ async fn repair_assets(
     let all_assets = unique;
     let total_files = all_assets.len() as u64;
     // Explicit repair hashes bytes, never persisted size/mtime cache hits.
-    let verify_cache = Arc::new(DashMap::new());
+    let verify_cache = Arc::new(DashMap::with_capacity(
+        all_assets.len().min(super::cache::VERIFICATION_CACHE_MAX_ENTRIES),
+    ));
     let chunks_dir = game_dir.join("chunks");
     let mut last_emit = Instant::now();
 
@@ -2899,58 +4389,67 @@ async fn repair_assets(
     });
 
     // Phase 1: Verify all files in parallel (bounded by semaphore)
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
     let scanned_count = Arc::new(AtomicU64::new(0));
     let error_count = Arc::new(AtomicU64::new(0));
 
     let stopped = Arc::new(AtomicBool::new(false));
-    let mut verify_stream = FuturesUnordered::new();
-    for (asset, chunk_download) in all_assets {
-        let permit = Arc::clone(&semaphore);
-        let verify_cache = Arc::clone(&verify_cache);
-        let game_dir = game_dir.to_path_buf();
-        let scanned_count = Arc::clone(&scanned_count);
-        let error_count = Arc::clone(&error_count);
-        let stopped = Arc::clone(&stopped);
-
-        verify_stream.push(async move {
-            let _permit = permit.acquire().await.map_err(|_| SophonError::Cancelled)?;
-            if stopped.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-            validate_asset_name(&asset.asset_name)?;
-
-            let file_path = game_dir.join(&asset.asset_name);
-            let asset_size = asset.asset_size;
-            let asset_md5 = asset.asset_hash_md5.clone();
-
-            let is_valid = tokio::task::spawn_blocking({
-                let file_path = file_path.clone();
-                move || {
-                    cache::check_file_md5_cached(
-                        &file_path,
-                        asset_size,
-                        &asset_md5,
-                        &game_dir,
-                        &verify_cache,
-                    )
+    let verify_cache_for_stream = Arc::clone(&verify_cache);
+    let game_dir_for_stream = game_dir.to_path_buf();
+    let scanned_count_for_stream = Arc::clone(&scanned_count);
+    let error_count_for_stream = Arc::clone(&error_count);
+    let verify_stopped = Arc::clone(&stopped);
+    let mut verify_stream = bounded_stoppable_stream(
+        all_assets,
+        super::VERIFY_CONCURRENCY,
+        Arc::clone(&stopped),
+        move |(asset, chunk_download)| {
+            let verify_cache = Arc::clone(&verify_cache_for_stream);
+            let game_dir = game_dir_for_stream.clone();
+            let scanned_count = Arc::clone(&scanned_count_for_stream);
+            let error_count = Arc::clone(&error_count_for_stream);
+            let stopped = Arc::clone(&verify_stopped);
+            async move {
+                if stopped.load(Ordering::Acquire) {
+                    return Ok(None);
                 }
-            })
-            .await??;
+                validate_asset_name(asset.asset_name_str())?;
 
-            let scanned = scanned_count.fetch_add(1, Ordering::Relaxed) + 1;
+                let file_path = game_dir.join(asset.asset_name_str());
+                let asset_size = asset.asset_size;
+                let mut asset_md5 = [0u8; 16];
+                super::assembly_opt::hex_decode_into(asset.asset_hash_md5_str(), &mut asset_md5)
+                    .filter(|&l| l == 16)
+                    .unwrap_or(0);
 
-            if !is_valid {
-                error_count.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, SophonError>(Some((asset, chunk_download, file_path)))
-            } else {
-                if scanned.is_multiple_of(100) {
-                    log::debug!("Verified {scanned}/{total_files} files");
+                let is_valid = tokio::task::spawn_blocking({
+                    let file_path = file_path.clone();
+                    move || {
+                        cache::check_file_md5_cached(
+                            &file_path,
+                            asset_size,
+                            &asset_md5,
+                            &game_dir,
+                            &verify_cache,
+                        )
+                    }
+                })
+                .await??;
+
+                let scanned = scanned_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                if !is_valid {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, SophonError>(Some((asset, chunk_download, file_path)))
+                } else {
+                    if scanned.is_multiple_of(100) {
+                        log::debug!("Verified {scanned}/{total_files} files");
+                    }
+                    Ok(None)
                 }
-                Ok(None)
             }
-        });
-    }
+        },
+        "verification",
+    )?;
 
     let mut failed_verifications: Vec<(
         SophonManifestAssetProperty,
@@ -2995,48 +4494,57 @@ async fn repair_assets(
     for (asset, _, _) in &failed_verifications {
         emit(SophonProgress::Warning {
             message: format!(
-                "File {name} failed integrity check, re-downloading",
-                name = asset.asset_name
+                "File {} failed integrity check, re-downloading",
+                asset.asset_name_str()
             ),
         });
     }
 
-    // Phase 2a: Collect unique chunks that need re-downloading across all
-    // failed files, then download them in parallel.
+    // Phase 2a: Collect unique chunks across all failed files, verify
+    // their cached copies in parallel, then download the rest.
     let total_chunks_upper: usize = failed_verifications
         .iter()
         .map(|(a, _, _)| a.asset_chunks.len())
         .sum();
     fs::create_dir_all(&chunks_dir)?;
-    let mut redownload_items: Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)> =
-        Vec::with_capacity(total_chunks_upper);
-    let mut seen_chunks: rustc_hash::FxHashSet<String> =
+    // Cheap serial pass: dedup chunks (first occurrence wins) and precompute
+    // each unique chunk's on-disk path and expected compressed MD5. No I/O
+    // here; the MD5 checks below run in parallel on the blocking pool.
+    let mut unique_chunks: Vec<PendingChunkCheck> = Vec::new();
+    let mut seen_chunks: rustc_hash::FxHashSet<&str> =
         rustc_hash::FxHashSet::with_capacity_and_hasher(
             total_chunks_upper,
             rustc_hash::FxBuildHasher,
         );
     for (asset, chunk_download, _) in &failed_verifications {
         for chunk in &asset.asset_chunks {
-            if seen_chunks.contains(&chunk.chunk_name) {
+            if !insert_new_chunk_name(&mut seen_chunks, chunk.chunk_name_str()) {
                 continue;
             }
-            seen_chunks.insert(chunk.chunk_name.clone());
-            let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
+            let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
             chunk_path.set_extension("zstd");
-            let needs_download = !chunk_path.exists()
-                || !cache::check_file_md5_cached(
-                    &chunk_path,
-                    chunk.chunk_size,
-                    &chunk.chunk_compressed_hash_md5,
-                    game_dir,
-                    &verify_cache,
-                )
-                .unwrap_or(false);
-            if needs_download {
-                redownload_items.push((chunk.clone(), Arc::clone(chunk_download)));
+            let mut expected_md5 = [0u8; 16];
+            if super::assembly_opt::hex_decode_into(
+                chunk.chunk_compressed_hash_md5_str(),
+                &mut expected_md5,
+            ) != Some(16)
+            {
+                expected_md5 = [0u8; 16];
             }
+            let position = unique_chunks.len();
+            unique_chunks.push(PendingChunkCheck {
+                chunk: chunk.clone(),
+                download: Arc::clone(chunk_download),
+                chunk_path,
+                expected_md5,
+                chunk_size: chunk.chunk_size,
+                position,
+            });
         }
     }
+
+    let redownload_items: Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)> =
+        precheck_cached_chunks(unique_chunks, &verify_cache, game_dir).await?;
 
     let needed_total = redownload_items.len();
     let redownload_total_bytes: u64 = redownload_items
@@ -3061,45 +4569,81 @@ async fn repair_assets(
             eta_seconds: 0.0,
         });
 
-        let dl_semaphore = Arc::new(tokio::sync::Semaphore::new(super::DOWNLOAD_CONCURRENCY));
-        let mut dl_stream = FuturesUnordered::new();
-        for (chunk, dl_info) in redownload_items {
-            let permit = Arc::clone(&dl_semaphore);
-            let chunks_dir = chunks_dir.clone();
-            let client = client.clone();
-            let dl_completed = Arc::clone(&dl_completed);
-            let dl_bytes = Arc::clone(&dl_bytes);
-            let stopped = Arc::clone(&stopped);
-            dl_stream.push(async move {
-                let _permit = permit.acquire().await.map_err(|_| SophonError::Cancelled)?;
-                if stopped.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                let mut chunk_path = chunks_dir.join(&chunk.chunk_name);
-                chunk_path.set_extension("zstd");
-                if let Some(parent) = chunk_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let result = download_chunk_with_retry_policy(
-                    (&chunk).into(),
-                    &client,
-                    &dl_info,
-                    &chunk_path,
-                    None,
-                    &DownloadHandle::new(),
-                    false,
-                    &|_| {},
-                )
-                .await;
-                if result.is_ok() {
-                    dl_completed.fetch_add(1, Ordering::Relaxed);
-                    dl_bytes.fetch_add(chunk.chunk_size, Ordering::Relaxed);
-                }
-                result
-            });
-        }
-
         let mut download_error = None;
+        let stopped_for_stream = Arc::clone(&stopped);
+        let chunks_dir_for_stream = chunks_dir.clone();
+        let client_for_stream = client.clone();
+        let dl_completed_for_stream = Arc::clone(&dl_completed);
+        let dl_bytes_for_stream = Arc::clone(&dl_bytes);
+        let stream_stopped = Arc::clone(&stopped_for_stream);
+        let mut dl_stream = bounded_stoppable_stream(
+            redownload_items,
+            super::download_concurrency(),
+            stream_stopped,
+            move |(chunk, dl_info)| {
+                let chunks_dir = chunks_dir_for_stream.clone();
+                let client = client_for_stream.clone();
+                let dl_completed = Arc::clone(&dl_completed_for_stream);
+                let dl_bytes = Arc::clone(&dl_bytes_for_stream);
+                let stopped = Arc::clone(&stopped_for_stream);
+                async move {
+                    let result = async {
+                        if stopped.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        let mut chunk_path = chunks_dir.join(chunk.chunk_name_str());
+                        chunk_path.set_extension("zstd");
+                        if let Some(parent) = chunk_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let mut decomp_hash = [0u8; 16];
+                        let decomp_len = crate::game_installer::assembly_opt::hex_decode_into(
+                            chunk.chunk_decompressed_hash_md5_str(),
+                            &mut decomp_hash,
+                        )
+                        .filter(|&l| l == 16)
+                        .unwrap_or(0);
+                        let mut comp_hash = [0u8; 16];
+                        let comp_len = crate::game_installer::assembly_opt::hex_decode_into(
+                            chunk.chunk_compressed_hash_md5_str(),
+                            &mut comp_hash,
+                        )
+                        .filter(|&l| l == 16)
+                        .unwrap_or(0);
+                        download_chunk_with_retry_policy(
+                            ChunkRef {
+                                chunk_name: chunk.chunk_name_str(),
+                                chunk_decompressed_hash_md5: &decomp_hash[..decomp_len],
+                                chunk_size: chunk.chunk_size,
+                                chunk_size_decompressed: chunk.chunk_size_decompressed,
+                                chunk_compressed_hash_md5: &comp_hash[..comp_len],
+                                chunk_old_offset: chunk.chunk_old_offset,
+                            },
+                            &client,
+                            &dl_info,
+                            &chunk_path,
+                            None,
+                            &DownloadHandle::new(),
+                            false,
+                            &|_| {},
+                        )
+                        .await?;
+                        Ok(Some(chunk.chunk_size))
+                    }
+                    .await;
+                    match &result {
+                        Ok(Some(chunk_size)) => {
+                            dl_completed.fetch_add(1, Ordering::Relaxed);
+                            dl_bytes.fetch_add(*chunk_size, Ordering::Relaxed);
+                        }
+                        Ok(None) => {}
+                        Err(_) => stopped.store(true, Ordering::Release),
+                    }
+                    result
+                }
+            },
+            "repair",
+        )?;
         while let Some(result) = dl_stream.next().await {
             if let Err(err) = result {
                 stopped.store(true, Ordering::Release);
@@ -3137,15 +4681,15 @@ async fn repair_assets(
 
     // One manifest, lookup and refcount set for the entire repair batch.
     // A compressed chunk must outlive every occurrence in every consumer.
-    let manifest = CompactManifest::from(
+    let manifest = CompactManifest::try_from_properties(
         failed_verifications
             .into_iter()
             .map(|(asset, _, _)| asset)
             .collect::<Vec<_>>(),
-    );
+    )?;
     let mut occurrences = FxHashMap::<&str, u32>::default();
     for i in 0..manifest.num_chunks() {
-        *occurrences.entry(manifest.chunk(i).chunk_name).or_default() += 1;
+        *occurrences.entry(manifest.chunk_name_at(i)).or_default() += 1;
     }
     let mut names = super::compact_manifest::StringArena::default();
     let mut refcounts = Vec::with_capacity(occurrences.len());
@@ -3198,6 +4742,85 @@ async fn repair_assets(
         log::warn!("Failed to save verification cache after repair: {err}");
     }
     Ok(())
+}
+
+/// Verify cached compressed chunks in parallel and return the ones that
+/// need re-downloading, in first-occurrence order.
+///
+/// Missing, mismatched, or unreadable cache files all map to
+/// "needs download": re-downloading rewrites the file and surfaces any
+/// real I/O failure there, instead of failing the whole repair over one
+/// bad cache chunk.
+async fn precheck_cached_chunks(
+    unique_chunks: Vec<PendingChunkCheck>,
+    verify_cache: &Arc<DashMap<String, VerificationEntry>>,
+    game_dir: &Path,
+) -> SophonResult<Vec<(SophonManifestAssetChunk, Arc<DownloadInfo>)>> {
+    let unique_count = unique_chunks.len();
+    // One slot per unique chunk, filled out of completion order and read
+    // back in index order below to keep the re-download list deterministic.
+    let mut redownload_slots: Vec<Option<PendingChunkCheck>> =
+        (0..unique_count).map(|_| None).collect();
+    let verify_cache = Arc::clone(verify_cache);
+    let game_dir = game_dir.to_path_buf();
+    // Never set: the helper's signature requires a stop flag, and checks
+    // are fast enough to always run to completion (like the old loop).
+    let stopped = Arc::new(AtomicBool::new(false));
+    let mut check_stream = bounded_stoppable_stream(
+        unique_chunks,
+        super::VERIFY_CONCURRENCY,
+        Arc::clone(&stopped),
+        move |item| {
+            let verify_cache = Arc::clone(&verify_cache);
+            let game_dir = game_dir.clone();
+            async move {
+                let position = item.position;
+                let chunk_size = item.chunk_size;
+                let expected_md5 = item.expected_md5;
+                let chunk_path = item.chunk_path.clone();
+                let (is_valid, check_err) = match tokio::task::spawn_blocking(move || {
+                    cache::check_file_md5_cached(
+                        &chunk_path,
+                        chunk_size,
+                        &expected_md5,
+                        &game_dir,
+                        &verify_cache,
+                    )
+                })
+                .await?
+                {
+                    Ok(valid) => (valid, None),
+                    Err(err) => (false, Some(err)),
+                };
+                if let Some(err) = check_err {
+                    log::warn!(
+                        "Failed to verify cached chunk {}: {err}",
+                        item.chunk_path.display()
+                    );
+                }
+                Ok::<_, SophonError>((position, item, !is_valid))
+            }
+        },
+        "precheck",
+    )?;
+    // buffer_unordered yields completions out of order; slot each verdict
+    // back by its carried position. On a propagated JoinError the in-flight
+    // futures are dropped, but their spawn_blocking closures finish
+    // detached; any late verify-cache inserts are benign (they only cache
+    // confirmed digests) and chunk files are never mutated by checks.
+    while let Some(result) = check_stream.next().await {
+        let (position, item, needs_download) = result?;
+        if needs_download {
+            let entry = &mut redownload_slots[position];
+            debug_assert!(entry.is_none(), "duplicate chunk position {position}");
+            *entry = Some(item);
+        }
+    }
+    Ok(redownload_slots
+        .into_iter()
+        .flatten()
+        .map(|item| (item.chunk, item.download))
+        .collect())
 }
 
 /// Bounded blocking work: a failed/panicking task stops scheduling, but every
@@ -3277,3 +4900,260 @@ mod tests;
 #[cfg(test)]
 #[path = "repair_tests.rs"]
 mod repair_tests;
+
+#[cfg(test)]
+#[path = "eager_stream_tests.rs"]
+mod eager_stream_tests;
+
+/// Frozen replica of the name-keyed planning flow (unfiltered flatten,
+/// name->installer attribution map, single whole-list filter pass, hash
+/// recount) kept for paired criterion comparison against the positional
+/// accounting in [build_installer_data]. Safe to delete once its
+/// measurements are no longer needed.
+#[cfg(feature = "benchmark")]
+mod bench_legacy {
+    use super::*;
+
+    /// Frozen replica of the await-then-spawn `save_assembly_state` from
+    /// before the save-slot port (commit 82d0208), kept for paired
+    /// criterion comparison against the coalescing [`SaveSlot::trigger`].
+    /// Unlike the slot, a caller takes and awaits the previous handle and
+    /// then always spawns its own save, so concurrent callers can run
+    /// overlapping saves. Safe to delete once its measurements are no
+    /// longer needed.
+    pub async fn legacy_await_then_spawn_save(
+        last_save: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+        downloaded_chunks: &Arc<OnceLock<Vec<AtomicU32>>>,
+        save_chunk_names: &Arc<OnceLock<Arc<ChunkNameLookup>>>,
+        saver: &StateSaver,
+    ) {
+        let dc = Arc::clone(downloaded_chunks);
+        let names = Arc::clone(save_chunk_names);
+        let saver = Arc::clone(saver);
+        let prev_handle = {
+            let mut guard = last_save.lock().unwrap_or_else(|err| err.into_inner());
+            guard.take()
+        };
+        if let Some(h) = prev_handle {
+            let _ = h.await;
+        }
+        let new_handle = tokio::task::spawn_blocking(move || {
+            let entries: Vec<(&str, u64)> = if let (Some(dc), Some(names)) = (dc.get(), names.get())
+            {
+                snapshot_downloaded_chunks(dc, names)
+            } else {
+                Vec::new()
+            };
+            saver(&entries);
+        });
+        let mut guard = last_save.lock().unwrap_or_else(|err| err.into_inner());
+        *guard = Some(new_handle);
+    }
+
+    pub(crate) fn legacy_plan(
+        installers: Vec<SophonInstaller>,
+        game_code: &str,
+        game_dir: &Path,
+        vo_langs: &[String],
+    ) -> (Vec<InstallerData>, Vec<SophonManifestAssetProperty>) {
+        let total_assets: usize = installers.iter().map(|i| i.manifest.assets.len()).sum();
+        let mut all_files_vec = Vec::with_capacity(total_assets);
+        let mut installer_data = Vec::with_capacity(installers.len());
+        for inst in installers {
+            let file_count = inst
+                .manifest
+                .assets
+                .iter()
+                .filter(|a| !a.is_directory())
+                .count();
+            all_files_vec.extend(
+                inst.manifest
+                    .assets
+                    .into_iter()
+                    .filter(|a| !a.is_directory()),
+            );
+            installer_data.push(InstallerData {
+                label: inst.label,
+                matching_field: inst.matching_field,
+                chunk_download: Arc::new(inst.chunk_download),
+                file_count,
+            });
+        }
+        let file_installer_map: FxHashMap<String, usize> = {
+            let mut m: FxHashMap<String, usize> =
+                FxHashMap::with_capacity_and_hasher(all_files_vec.len(), Default::default());
+            let mut idx: usize = 0;
+            for (inst_idx, d) in installer_data.iter().enumerate() {
+                for _ in 0..d.file_count {
+                    if idx < all_files_vec.len() {
+                        m.insert(all_files_vec[idx].asset_name_str().to_string(), inst_idx);
+                    }
+                    idx += 1;
+                }
+            }
+            m
+        };
+        match game_code {
+            "hkrpg" => {
+                super::game_filters::filter_hkrpg_asset_list(game_dir, &mut all_files_vec)
+            }
+            "hk4e" => {
+                super::game_filters::filter_hk4e_asset_list(game_dir, &mut all_files_vec, vo_langs)
+            }
+            "nap" => super::game_filters::filter_nap_asset_list(game_dir, &mut all_files_vec),
+            _ => {}
+        }
+        for d in &mut installer_data {
+            d.file_count = 0;
+        }
+        for f in all_files_vec.iter() {
+            if let Some(&inst_idx) = file_installer_map.get(f.asset_name_str()) {
+                installer_data[inst_idx].file_count += 1;
+            }
+        }
+        (installer_data, all_files_vec)
+    }
+
+    /// Segment file counts and total surviving files from the frozen
+    /// legacy shape; the pair compared against the production planner in
+    /// the criterion group.
+    pub fn legacy_plan_counts(
+        installers: Vec<SophonInstaller>,
+        game_code: &str,
+        game_dir: &Path,
+        vo_langs: &[String],
+    ) -> (Vec<usize>, usize) {
+        let (data, files) = legacy_plan(installers, game_code, game_dir, vo_langs);
+        let counts = data.iter().map(|d| d.file_count).collect();
+        (counts, files.len())
+    }
+
+    /// Segment file counts and total surviving files from the production
+    /// positional planner, exposed with the same shape as
+    /// [legacy_plan_counts] for the paired measurement.
+    pub fn positional_plan_counts(
+        installers: Vec<SophonInstaller>,
+        game_code: &str,
+        game_dir: &Path,
+        vo_langs: &[String],
+    ) -> (Vec<usize>, usize) {
+        let (data, files) = build_installer_data(installers, game_code, game_dir, vo_langs);
+        let counts = data.iter().map(|d| d.file_count).collect();
+        (counts, files.len())
+    }
+}
+
+/// The frozen legacy shape must keep agreeing with the production planner
+/// on segment counts and total files for unfiltered and name-filtered game
+/// codes; drift here means the paired criterion comparison is measuring
+/// the wrong thing. `build_installer_data` is crate-private, so the count
+/// wrappers exist on both sides.
+#[cfg(all(test, feature = "benchmark"))]
+mod bench_legacy_tests {
+    use super::bench_legacy::{legacy_plan_counts, positional_plan_counts};
+    use super::SophonInstaller;
+    use crate::api_scrape::{Compression, DownloadInfo};
+    use crate::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
+    use std::path::Path;
+
+    fn fixture_installer(name_suffix: &str, count: usize) -> super::SophonInstaller {
+        super::SophonInstaller {
+            manifest: SophonManifestProto {
+                assets: (0..count)
+                    .map(|i| {
+                        SophonManifestAssetProperty::from_parts(
+                            format!("data/asset_{i}{name_suffix}.pak").into(),
+                            vec![],
+                            0,
+                            0,
+                            bytes::Bytes::from_static(b"d41d8cd98f00b204e9800998ecf8427e"),
+                        )
+                    })
+                    .collect(),
+            },
+            chunk_download: DownloadInfo {
+                encryption: 0,
+                password: String::new(),
+                compression: Compression::None,
+                url_prefix: String::new(),
+                url_suffix: String::new(),
+            },
+            label: String::new(),
+            matching_field: "game".into(),
+            manifest_hash: String::new(),
+        }
+    }
+
+    fn build_installers() -> Vec<SophonInstaller> {
+        vec![
+            fixture_installer("a", 12),
+            fixture_installer("b", 8),
+            fixture_installer("c", 15),
+        ]
+    }
+
+    #[test]
+    fn legacy_plan_matches_positional_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        for game_code in ["unknown", "hkrpg"] {
+            let legacy = legacy_plan_counts(build_installers(), game_code, dir.path(), &[]);
+            let positional = positional_plan_counts(build_installers(), game_code, dir.path(), &[]);
+            assert_eq!(legacy, positional, "shape mismatch for {game_code}");
+        }
+    }
+
+    #[test]
+    fn legacy_plan_counts_report_expected_totals() {
+        let (counts, total) =
+            legacy_plan_counts(build_installers(), "unknown", Path::new("/none"), &[]);
+        assert_eq!(counts, vec![12, 8, 15]);
+        assert_eq!(total, 35);
+    }
+}
+
+#[cfg(feature = "benchmark")]
+pub mod bench_internals {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    pub use super::bench_legacy::{
+        legacy_await_then_spawn_save, legacy_plan_counts, positional_plan_counts,
+    };
+    pub use super::{snapshot_downloaded_chunks, ChunkNameLookup, SaveSlot};
+
+    /// Drive `boundary_hits` reclaim-boundary hits through a dispatch policy
+    /// on the calling (runtime) thread and return how long the runtime
+    /// thread itself spent blocked. `inline` runs `reclaim_memory` directly
+    /// on the caller; `false` goes through the coalesced `spawn_blocking`
+    /// handoff. The trim work is identical in both arms; this measures only
+    /// the async thread's stall per boundary.
+    pub async fn run_reclaim_dispatch(
+        inline: bool,
+        boundary_hits: usize,
+        reclaim_interval: usize,
+    ) -> std::time::Duration {
+        let reclaim_count = Arc::new(AtomicUsize::new(0));
+        let reclaim_in_flight = Arc::new(AtomicBool::new(false));
+        let mut blocked = std::time::Duration::ZERO;
+        for _ in 0..boundary_hits * reclaim_interval {
+            let n = reclaim_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(reclaim_interval) {
+                if inline {
+                    let start = std::time::Instant::now();
+                    super::super::reclaim_memory();
+                    blocked += start.elapsed();
+                } else if !reclaim_in_flight.swap(true, Ordering::AcqRel) {
+                    let in_flight = Arc::clone(&reclaim_in_flight);
+                    let start = std::time::Instant::now();
+                    let task = tokio::task::spawn_blocking(move || {
+                        super::super::reclaim_memory();
+                        in_flight.store(false, Ordering::Release);
+                    });
+                    blocked += start.elapsed();
+                    let _ = task.await;
+                }
+            }
+        }
+        blocked
+    }
+}

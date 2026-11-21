@@ -63,13 +63,18 @@ impl<'de> Deserialize<'de> for CompletedFiles {
             ) -> Result<Self::Value, A::Error> {
                 let hint = seq.size_hint().unwrap_or(0);
                 let mut indices: Vec<usize> = Vec::with_capacity(hint);
-                let mut names: Vec<String> = Vec::with_capacity(hint);
+                let mut names: Vec<String> = Vec::new();
                 while let Some(v) = seq.next_element::<serde_json::Value>()? {
                     match v {
                         serde_json::Value::Number(n) => {
                             indices.push(n.as_u64().unwrap_or(0) as usize)
                         }
-                        serde_json::Value::String(s) => names.push(s),
+                        serde_json::Value::String(s) => {
+                            if names.is_empty() {
+                                names = Vec::with_capacity(hint);
+                            }
+                            names.push(s)
+                        }
                         serde_json::Value::Null | serde_json::Value::Bool(_) => {}
                         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {}
                     }

@@ -7,11 +7,11 @@ use crate::api_scrape::{
     SophonPatchBuildData, SophonPatchBuildResponse, SophonPatchManifestMeta,
 };
 use crate::proto_parse::{
-    SophonManifestProto, SophonPatchProto, decode_manifest, decode_patch_manifest,
+    SophonManifestProto, SophonPatchProto, decode_manifest_from_bytes, decode_patch_manifest,
 };
 
 use super::error::{SophonError, SophonResult};
-use super::{FRONT_DOOR_URL, SOPHON_BUILD_URL_BASE};
+use super::{front_door_url, sophon_build_url_base, sophon_patch_build_url_base};
 use crate::api_scrape::DownloadInfo;
 use crate::compute_content_manifest_hash;
 
@@ -68,11 +68,11 @@ async fn fetch_json_with_retry<T: serde::de::DeserializeOwned>(
 }
 
 /// Fetch a game's main and pre-download branch metadata.
-pub async fn fetch_front_door(
-    client: &Client,
-    game_id: &str,
-) -> SophonResult<(GameBranch, Option<PackageBranch>)> {
-    let resp: FrontDoorResponse = fetch_json_with_retry(client, FRONT_DOOR_URL, 35).await?;
+///
+/// Returns the full owned branch; callers extract `main`/`pre_download`
+/// through [`GameBranch::take_branches`].
+pub async fn fetch_front_door(client: &Client, game_id: &str) -> SophonResult<GameBranch> {
+    let resp: FrontDoorResponse = fetch_json_with_retry(client, &front_door_url(), 35).await?;
 
     let branch = resp
         .data
@@ -81,8 +81,7 @@ pub async fn fetch_front_door(
         .find(|b| b.game.biz.starts_with(&format!("{game_id}_")))
         .ok_or_else(|| SophonError::UnknownGameId(game_id.into()))?;
 
-    let pre = branch.pre_download.clone();
-    Ok((branch, pre))
+    Ok(branch)
 }
 
 /// Download and decode a manifest object, returning its computed identity.
@@ -91,6 +90,16 @@ pub async fn fetch_manifest(
     dl: &DownloadInfo,
     manifest_id: &str,
 ) -> SophonResult<ManifestWithHash> {
+    let manifest = fetch_manifest_proto(client, dl, manifest_id).await?;
+    let hash = compute_content_manifest_hash(&manifest);
+    Ok(ManifestWithHash { manifest, hash })
+}
+
+pub(crate) async fn fetch_manifest_proto(
+    client: &Client,
+    dl: &DownloadInfo,
+    manifest_id: &str,
+) -> SophonResult<SophonManifestProto> {
     let url = dl.url_for(manifest_id);
 
     let resp = tokio::time::timeout(Duration::from_secs(30), client.get(&url).send())
@@ -104,19 +113,150 @@ pub async fn fetch_manifest(
 
     let manifest: SophonManifestProto = if dl.is_compressed() {
         let raw = tokio::task::spawn_blocking(move || {
-            let mut decoder = zstd::Decoder::new(bytes.as_ref())?;
-            decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok::<Vec<u8>, SophonError>(out)
+            let src = bytes.as_ref();
+            // Use one-shot DCtx::decompress when the frame content size is known
+            // and reasonable. This is significantly faster than streaming
+            // Decoder + read_to_end for typical manifest sizes.
+            const MAX_ONESHOT_SIZE: u64 = 256 * 1024 * 1024;
+            let content_size = zstd::zstd_safe::get_frame_content_size(src).ok().flatten();
+            if let Some(size) = content_size
+                && size <= MAX_ONESHOT_SIZE
+                && let Ok(size_usize) = usize::try_from(size)
+            {
+                decompress_known_size(src, size, size_usize)
+            } else {
+                // Fallback: streaming decode for unknown or oversized content.
+                decompress_manifest_zstd_streaming(src)
+            }
         })
         .await??;
-        decode_manifest(&raw).map_err(SophonError::ManifestDecode)?
+        decode_manifest_from_bytes(bytes::Bytes::from(raw)).map_err(SophonError::ManifestDecode)?
     } else {
-        decode_manifest(&bytes).map_err(SophonError::ManifestDecode)?
+        // `bytes` is already a `Bytes` from `resp.bytes()`; pass it
+        // directly to preserve zero-copy field storage.
+        decode_manifest_from_bytes(bytes).map_err(SophonError::ManifestDecode)?
     };
-    let hash = compute_content_manifest_hash(&manifest);
-    Ok(ManifestWithHash { manifest, hash })
+    Ok(manifest)
+}
+
+/// One-shot zstd decompress into an exact-size buffer, falling back to the
+/// streaming decoder when the frame rejects one-shot decoding (multi-frame
+/// input and similar). Shared by the manifest and patch-manifest fetch paths.
+fn decompress_known_size(src: &[u8], _size: u64, size_usize: usize) -> SophonResult<Vec<u8>> {
+    let mut ctx = zstd::zstd_safe::DCtx::create();
+    ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))
+        .map_err(|_| SophonError::Io(std::io::Error::other("zstd DCtx WindowLogMax")))?;
+    let mut out = Vec::with_capacity(size_usize);
+    match ctx.decompress(&mut out, src) {
+        Ok(written) => {
+            if written != size_usize {
+                return Err(SophonError::Io(std::io::Error::other(
+                    "zstd decompressed size mismatch",
+                )));
+            }
+            Ok(out)
+        }
+        Err(_) => {
+            // Fall back to streaming for multi-frame or other errors.
+            decompress_manifest_zstd_streaming(src)
+        }
+    }
+}
+
+/// Streaming zstd decode used for unknown or oversized frame content and as
+/// the fallback when one-shot decompression rejects the input.
+fn decompress_manifest_zstd_streaming(src: &[u8]) -> SophonResult<Vec<u8>> {
+    let mut decoder = zstd::Decoder::new(src)?;
+    decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut out)?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod manifest_fetch_tests {
+    use super::*;
+    use crate::api_scrape::Compression;
+    use crate::proto_parse::SophonManifestAssetProperty;
+    use prost::Message;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn proto_only_fetch_matches_hashed_fetch() {
+        let server = MockServer::start().await;
+        let manifest = SophonManifestProto {
+            assets: vec![SophonManifestAssetProperty {
+                asset_name: "data.bin".into(),
+                asset_chunks: vec![],
+                asset_type: 0,
+                asset_size: 12,
+                asset_hash_md5: "0123456789abcdef0123456789abcdef".into(),
+            }],
+        };
+        Mock::given(path("/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest.encode_to_vec()))
+            .mount(&server)
+            .await;
+        let download = DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: server.uri(),
+            url_suffix: String::new(),
+        };
+        let client = Client::new();
+
+        let proto = fetch_manifest_proto(&client, &download, "manifest")
+            .await
+            .unwrap();
+        let fetched = fetch_manifest(&client, &download, "manifest")
+            .await
+            .unwrap();
+
+        assert_eq!(proto.assets, manifest.assets);
+        assert_eq!(fetched.manifest.assets, manifest.assets);
+        assert_eq!(fetched.hash, compute_content_manifest_hash(&manifest));
+    }
+
+    #[tokio::test]
+    async fn proto_only_fetch_matches_hashed_fetch_for_zstd() {
+        let server = MockServer::start().await;
+        let manifest = SophonManifestProto {
+            assets: vec![SophonManifestAssetProperty {
+                asset_name: "data.bin".into(),
+                asset_chunks: vec![],
+                asset_type: 0,
+                asset_size: 12,
+                asset_hash_md5: "0123456789abcdef0123456789abcdef".into(),
+            }],
+        };
+        let encoded = manifest.encode_to_vec();
+        let compressed = zstd::stream::encode_all(encoded.as_slice(), 1).unwrap();
+        Mock::given(path("/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed))
+            .mount(&server)
+            .await;
+        let download = DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::Zstd,
+            url_prefix: server.uri(),
+            url_suffix: String::new(),
+        };
+        let client = Client::new();
+
+        let proto = fetch_manifest_proto(&client, &download, "manifest")
+            .await
+            .unwrap();
+        let fetched = fetch_manifest(&client, &download, "manifest")
+            .await
+            .unwrap();
+
+        assert_eq!(proto.assets, manifest.assets);
+        assert_eq!(fetched.manifest.assets, manifest.assets);
+        assert_eq!(fetched.hash, compute_content_manifest_hash(&manifest));
+    }
 }
 
 /// Fetch the current build or a specific tag from a package branch.
@@ -128,7 +268,7 @@ pub async fn fetch_build(
     let url = if let Some(tag_str) = tag {
         format!(
             "{base}?branch={branch}&package_id={package_id}&password={password}&tag={tag_str}",
-            base = SOPHON_BUILD_URL_BASE,
+            base = sophon_build_url_base(),
             branch = branch.branch,
             package_id = branch.package_id,
             password = branch.password,
@@ -136,7 +276,7 @@ pub async fn fetch_build(
     } else {
         format!(
             "{base}?branch={branch}&package_id={package_id}&password={password}",
-            base = SOPHON_BUILD_URL_BASE,
+            base = sophon_build_url_base(),
             branch = branch.branch,
             package_id = branch.package_id,
             password = branch.password,
@@ -153,12 +293,6 @@ pub async fn fetch_build(
     Ok(data)
 }
 
-/// Base endpoint for patch-build metadata requests.
-pub const SOPHON_PATCH_BUILD_URL_BASE: &str = concat!(
-    "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
-    "/downloader/sophon_chunk/api/getPatchBuild"
-);
-
 /// Fetch metadata describing the available patch build.
 pub async fn fetch_patch_build(
     client: &Client,
@@ -166,7 +300,7 @@ pub async fn fetch_patch_build(
 ) -> SophonResult<SophonPatchBuildData> {
     let url = format!(
         "{base}?branch={branch}&package_id={package_id}&password={password}&tag={tag}",
-        base = SOPHON_PATCH_BUILD_URL_BASE,
+        base = sophon_patch_build_url_base(),
         branch = branch.branch,
         package_id = branch.package_id,
         password = branch.password,
@@ -240,21 +374,26 @@ pub async fn fetch_patch_manifest(
         .await
         .map_err(|_| SophonError::Timeout(300))??;
 
-    let raw = if meta.manifest_download.is_compressed() {
-        tokio::task::spawn_blocking(move || {
-            let mut decoder = zstd::Decoder::new(bytes.as_ref())?;
-            decoder.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))?;
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok::<Vec<u8>, SophonError>(out)
+    let patch_manifest = if meta.manifest_download.is_compressed() {
+        let raw = tokio::task::spawn_blocking(move || {
+            const MAX_ONESHOT_SIZE: u64 = 256 * 1024 * 1024;
+            let src = bytes.as_ref();
+            let content_size = zstd::zstd_safe::get_frame_content_size(src).ok().flatten();
+            if let Some(size) = content_size
+                && size <= MAX_ONESHOT_SIZE
+                && let Ok(size_usize) = usize::try_from(size)
+            {
+                decompress_known_size(src, size, size_usize)
+            } else {
+                decompress_manifest_zstd_streaming(src)
+            }
         })
-        .await??
+        .await??;
+        decode_patch_manifest(raw)
     } else {
-        bytes.to_vec()
-    };
-
-    let patch_manifest = decode_patch_manifest(&raw)
-        .map_err(|err| SophonError::PatchManifestDecode(err.to_string()))?;
+        decode_patch_manifest(bytes)
+    }
+    .map_err(|err| SophonError::PatchManifestDecode(err.to_string()))?;
 
     Ok(PatchManifestWithMeta {
         patch_manifest,
