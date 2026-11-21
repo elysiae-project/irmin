@@ -19,10 +19,20 @@ pub struct CommonArgs {
 /// Parse `<game_id> <vo_lang> <game_dir>` from the command line.
 pub fn parse_common_args(name: &str) -> CommonArgs {
     let mut args = std::env::args().skip(1);
-    let game_id = args.next().unwrap_or_else(|| usage(name, "missing <game_id>"));
-    let vo_lang = args.next().unwrap_or_else(|| usage(name, "missing <vo_lang>"));
-    let game_dir = args.next().unwrap_or_else(|| usage(name, "missing <game_dir>"));
-    CommonArgs { game_id, vo_lang, game_dir: PathBuf::from(game_dir) }
+    let game_id = args
+        .next()
+        .unwrap_or_else(|| usage(name, "missing <game_id>"));
+    let vo_lang = args
+        .next()
+        .unwrap_or_else(|| usage(name, "missing <vo_lang>"));
+    let game_dir = args
+        .next()
+        .unwrap_or_else(|| usage(name, "missing <game_dir>"));
+    CommonArgs {
+        game_id,
+        vo_lang,
+        game_dir: PathBuf::from(game_dir),
+    }
 }
 
 fn usage(name: &str, msg: &str) -> ! {
@@ -38,7 +48,10 @@ pub fn print_progress(p: SophonProgress) {
     use std::io::Write as _;
     match p {
         SophonProgress::FetchingManifest => eprintln!("fetching manifest..."),
-        SophonProgress::CalculatingDownloads { checked_files, total_files } => {
+        SophonProgress::CalculatingDownloads {
+            checked_files,
+            total_files,
+        } => {
             eprintln!("calculating downloads: {checked_files}/{total_files} files");
         }
         SophonProgress::Downloading {
@@ -56,31 +69,54 @@ pub fn print_progress(p: SophonProgress) {
             );
             let _ = std::io::stderr().flush();
         }
-        SophonProgress::Paused { downloaded_bytes, total_bytes } => {
+        SophonProgress::Paused {
+            downloaded_bytes,
+            total_bytes,
+        } => {
             eprintln!(
                 "\npaused at {}/{} MiB (Ctrl-C again to resume, again to cancel)",
                 mib(downloaded_bytes),
                 mib(total_bytes)
             );
         }
-        SophonProgress::Assembling { assembled_files, total_files } => {
+        SophonProgress::Assembling {
+            assembled_files,
+            total_files,
+        } => {
             eprintln!("assembling {assembled_files}/{total_files} files");
         }
-        SophonProgress::CheckingFiles { checked_files, total_files } => {
+        SophonProgress::CheckingFiles {
+            checked_files,
+            total_files,
+        } => {
             eprintln!("checking {checked_files}/{total_files} files");
         }
-        SophonProgress::Verifying { scanned_files, total_files, error_count } => {
+        SophonProgress::Verifying {
+            scanned_files,
+            total_files,
+            error_count,
+        } => {
             eprintln!("verifying {scanned_files}/{total_files} files  {error_count} mismatches");
         }
         SophonProgress::Warning { message } => eprintln!("warning: {message}"),
         SophonProgress::Error { message } => eprintln!("\npipeline error: {message}"),
-        SophonProgress::InstallingPlugins { current_plugin, total_plugins } => {
+        SophonProgress::InstallingPlugins {
+            current_plugin,
+            total_plugins,
+        } => {
             eprintln!("installing plugin {current_plugin}/{total_plugins}");
         }
-        SophonProgress::InstallingSdks { current_sdk, total_sdks } => {
+        SophonProgress::InstallingSdks {
+            current_sdk,
+            total_sdks,
+        } => {
             eprintln!("installing SDK {current_sdk}/{total_sdks}");
         }
-        SophonProgress::DownloadingPlugin { name, downloaded_bytes, total_bytes } => {
+        SophonProgress::DownloadingPlugin {
+            name,
+            downloaded_bytes,
+            total_bytes,
+        } => {
             eprint!(
                 "\rdownloading plugin {name}: {}/{} MiB   ",
                 mib(downloaded_bytes),
@@ -88,7 +124,10 @@ pub fn print_progress(p: SophonProgress) {
             );
             let _ = std::io::stderr().flush();
         }
-        SophonProgress::ApplyingPreinstall { applied_files, total_files } => {
+        SophonProgress::ApplyingPreinstall {
+            applied_files,
+            total_files,
+        } => {
             eprintln!("applying preinstall {applied_files}/{total_files} files");
         }
         SophonProgress::Finished => eprintln!("\ndone."),

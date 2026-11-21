@@ -1,92 +1,51 @@
 use super::HDiff;
 use std::fs;
 
-const OLD_TEXT: &[u8] =
-    b"Hello World! This is the original file content for testing HDiff patching.";
-const NEW_TEXT: &[u8] =
-    b"Hello Universe! This is the modified file content for testing HDiff patching.";
-const DIFF_V13_TEXT: &[u8] = b"HDIFF13&zstd\x00MJ\x01\x03\x00\x04\x00\x08\x00\x0e\x00\x0b\x0e?\x1b\xc7 (\xfe\xfd\xfb\x02\xfd\xfb\x04\xf8Hello Universe";
-
 const NEW_FROM_EMPTY: &[u8] = b"This is brand new content created from nothing!";
 const DIFF_EMPTY_TO_NEW: &[u8] = b"HDIFF13&zstd\x00/\x00\x00\x00\x00\x02\x00\x00\x00/\x00 .This is brand new content created from nothing!";
 
-const SAME: &[u8] = b"Identical content on both sides";
-const DIFF_IDENTITY: &[u8] =
-    b"HDIFF13&zstd\x00\x1f\x1f\x01\x03\x00\x01\x00\x00\x00\x00\x00\x00\x00\x1f\x1e";
+#[test]
+fn hdiff_v13_zstd_empty_original() {
+    let result = hdiff_e2e_apply(b"", DIFF_EMPTY_TO_NEW);
+    assert_eq!(result, NEW_FROM_EMPTY);
+}
 
-fn write_and_apply(old: &[u8], diff: &[u8], expected: &[u8]) -> bool {
+#[test]
+fn hdiff_v13_zstd_zero_cover_outputs_match_declared_size() {
+    let old = vec![0x6d; 512];
+    let mut changed = old.clone();
+    changed[0] ^= 0xff;
+    for (old, new) in [
+        (&[][..], &[][..]),
+        (&[][..], &[0xa5][..]),
+        (old.as_slice(), changed.as_slice()),
+    ] {
+        let patch = build_v13_zstd_patch(old, new);
+        if !old.is_empty() {
+            assert!(patch_has_v13_covers(&patch));
+        }
+        let result = hdiff_e2e_apply(old, &patch);
+        assert_eq!(result, new);
+    }
+}
+
+#[test]
+fn hdiff_existing_empty_source_applies_newfile_patch() {
     let dir = tempfile::tempdir().unwrap();
-    let old_path = dir.path().join("old.bin");
+    let old_path = dir.path().join("empty-old.bin");
     let diff_path = dir.path().join("diff.hdiff");
     let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, b"").unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
 
-    fs::write(&old_path, old).unwrap();
-    fs::write(&diff_path, diff).unwrap();
-
-    let op = old_path.to_string_lossy().to_string();
-    let dp = diff_path.to_string_lossy().to_string();
-    let tp = out_path.to_string_lossy().to_string();
-
-    let mut hdiff = HDiff::new(op, dp, tp);
-    if !hdiff.apply(None) {
-        return false;
-    }
-
-    let result = fs::read(&out_path).unwrap();
-    result == expected
-}
-
-/// Test with synthetic hdiff data - may fail due to invalid synthetic
-/// fixture
-#[test]
-#[ignore = "synthetic hdiff fixture produces invalid patch data"]
-fn hdiff_v13_zstd_text_patch() {
-    assert!(
-        write_and_apply(OLD_TEXT, DIFF_V13_TEXT, NEW_TEXT),
-        "v13 zstd text patch output mismatch"
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
     );
-}
-/// Test with synthetic hdiff data - may fail due to invalid synthetic
-/// fixture
-#[test]
-#[ignore = "synthetic hdiff fixture produces invalid patch data"]
-fn hdiff_v13_zstd_empty_original() {
-    assert!(
-        write_and_apply(b"", DIFF_EMPTY_TO_NEW, NEW_FROM_EMPTY),
-        "empty original patch output mismatch"
-    );
-}
 
-#[test]
-fn hdiff_v13_zstd_large_binary() {
-    let fixture_dir = "/tmp/hdiff_test";
-    let old_path = format!("{fixture_dir}/old_large.bin");
-    let diff_path = format!("{fixture_dir}/large_zstd.hdiff");
-    let out_path = format!("{fixture_dir}/output_large_test.bin");
-
-    if !std::path::Path::new(&old_path).exists() {
-        eprintln!("skipping: large binary test fixtures not present at {fixture_dir}");
-        return;
-    }
-
-    let mut hdiff = HDiff::new(old_path, diff_path, out_path.clone());
-    assert!(hdiff.apply(None), "large binary patch apply failed");
-
-    let result = fs::read(&out_path).unwrap();
-    let expected = fs::read(format!("{fixture_dir}/new_large.bin")).unwrap();
-    assert_eq!(result, expected, "large binary patch output mismatch");
-    let _ = fs::remove_file(&out_path);
-}
-
-/// Test with synthetic hdiff data - may fail due to invalid synthetic
-/// fixture
-#[test]
-#[ignore = "synthetic hdiff fixture produces invalid patch data"]
-fn hdiff_v13_zstd_identity_patch() {
-    assert!(
-        write_and_apply(SAME, DIFF_IDENTITY, SAME),
-        "identity patch output mismatch"
-    );
+    assert!(hdiff.apply(None));
+    assert_eq!(fs::read(out_path).unwrap(), NEW_FROM_EMPTY);
 }
 
 #[test]
@@ -96,8 +55,8 @@ fn hdiff_wrong_old_size_fails() {
     let diff_path = dir.path().join("diff.hdiff");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&old_path, SAME).unwrap();
-    fs::write(&diff_path, DIFF_V13_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
+    fs::write(&diff_path, b"HDIFF13&zstd\0\x80").unwrap();
 
     let op = old_path.to_string_lossy().to_string();
     let dp = diff_path.to_string_lossy().to_string();
@@ -111,13 +70,82 @@ fn hdiff_wrong_old_size_fails() {
 }
 
 #[test]
+fn hdiff_v13_cover_past_source_end_fails_without_replacing_destination() {
+    let old = test_prng_data(87, 16);
+    let cover_buf = [
+        encode_tagged_1bit(0, 1),
+        encode_7bit_varint(0),
+        encode_7bit_varint(old.len() as i64),
+    ]
+    .concat();
+    let rle_ctrl = encode_tagged_2bit(0, old.len() as i64 - 1);
+    let mut patch = b"HDIFF13&nocomp\0".to_vec();
+    for value in [
+        old.len() as i64,
+        old.len() as i64,
+        1,
+        cover_buf.len() as i64,
+        0,
+        rle_ctrl.len() as i64,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ] {
+        patch.extend_from_slice(&encode_7bit_varint(value));
+    }
+    patch.extend_from_slice(&cover_buf);
+    patch.extend_from_slice(&rle_ctrl);
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("bad-cover.hdiff");
+    let out_path = dir.path().join("existing.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, patch).unwrap();
+    fs::write(&out_path, b"keep existing destination").unwrap();
+    let mut patcher = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        patch_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(!patcher.apply(None));
+    assert_eq!(fs::read(out_path).unwrap(), b"keep existing destination");
+}
+
+#[test]
+fn hdiff_rejects_truncated_patch_stream() {
+    let old = test_prng_data(35, 8192);
+    let new = old.clone();
+    let mut patch = build_v13_zstd_patch(&old, &new);
+    let data_start = b"HDIFF13&zstd\0".len() + 2;
+    patch.truncate(data_start + (patch.len() - data_start) / 2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(!hdiff.apply(None));
+    assert!(!out_path.exists(), "incomplete output should be removed");
+}
+
+#[test]
 fn hdiff_invalid_diff_file_fails() {
     let dir = tempfile::tempdir().unwrap();
     let old_path = dir.path().join("old.bin");
     let diff_path = dir.path().join("diff.hdiff");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&old_path, OLD_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
     fs::write(&diff_path, b"NOT_A_HDIFF_FILE_CONTENTS").unwrap();
 
     let op = old_path.to_string_lossy().to_string();
@@ -129,11 +157,72 @@ fn hdiff_invalid_diff_file_fails() {
 }
 
 #[test]
-fn hdiff_detect_hdiff_magic_bytes() {
-    assert!(
-        DIFF_V13_TEXT.starts_with(b"HDIFF"),
-        "diff data should start with HDIFF magic bytes"
+fn hdiff_truncated_header_fails_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+
+    fs::write(&old_path, b"").unwrap();
+    fs::write(&diff_path, b"HDIFF13&zstd\0\x80").unwrap();
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
     );
+
+    assert!(!hdiff.apply(None));
+}
+
+#[test]
+fn hdiff_varint_overflow_in_old_data_size_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, b"").unwrap();
+
+    let mut patch = b"HDIFF13&nocomp\0".to_vec();
+    patch.extend_from_slice(&[
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ]);
+    patch.extend_from_slice(&[0x00; 9]);
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(!hdiff.apply(None));
+}
+
+#[test]
+fn hdiff_varint_overflow_in_new_data_size_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, b"").unwrap();
+
+    let mut patch = b"HDIFF13&nocomp\0".to_vec();
+    patch.extend_from_slice(&[
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x00,
+    ]);
+    patch.extend_from_slice(&[0x00; 9]);
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+    assert!(!hdiff.apply(None));
+}
+
+#[test]
+fn hdiff_detect_hdiff_magic_bytes() {
+    assert!(DIFF_EMPTY_TO_NEW.starts_with(b"HDIFF"));
 }
 
 #[test]
@@ -142,7 +231,7 @@ fn hdiff_nonexistent_source_file_fails() {
     let diff_path = dir.path().join("diff.hdiff");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&diff_path, DIFF_V13_TEXT).unwrap();
+    fs::write(&diff_path, b"HDIFF13&zstd\0\x80").unwrap();
 
     let op = dir
         .path()
@@ -157,6 +246,28 @@ fn hdiff_nonexistent_source_file_fails() {
         !hdiff.apply(None),
         "should fail for nonexistent source file"
     );
+}
+
+#[test]
+fn hdiff_missing_source_with_nonzero_old_size_fails_before_output_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_old_path = dir.path().join("missing.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(
+        &diff_path,
+        b"HDIFF13&nocomp\0\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+    )
+    .unwrap();
+
+    let mut hdiff = HDiff::new(
+        missing_old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert!(!out_path.exists());
 }
 /// Newfile hdiff patches work without a source file.
 #[test]
@@ -181,11 +292,32 @@ fn hdiff_newfile_no_source_file() {
     // old_data_size == 0 means the source is optional; the patcher should
     // not fail due to a missing source file.
     let result = hdiff.apply(None);
-    // Expect success or failure for reasons other than a missing source.
-    if result {
-        let output = fs::read(&out_path).unwrap();
-        assert_eq!(output, NEW_FROM_EMPTY, "newfile hdiff output mismatch");
-    }
+    assert!(result, "valid newfile patch should apply without a source");
+    let output = fs::read(&out_path).unwrap();
+    assert_eq!(output, NEW_FROM_EMPTY, "newfile hdiff output mismatch");
+}
+
+#[cfg(unix)]
+#[test]
+fn hdiff_newfile_dangling_source_symlink_fails() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing_target = dir.path().join("missing-target.bin");
+    let source_link = dir.path().join("source-link.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    symlink(&missing_target, &source_link).unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
+
+    let mut hdiff = HDiff::new(
+        source_link.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert!(!out_path.exists());
 }
 
 #[test]
@@ -194,7 +326,7 @@ fn hdiff_nonexistent_diff_file_fails() {
     let old_path = dir.path().join("old.bin");
     let out_path = dir.path().join("out.bin");
 
-    fs::write(&old_path, OLD_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
 
     let op = old_path.to_string_lossy().to_string();
     let dp = dir
@@ -214,8 +346,8 @@ fn hdiff_same_source_and_dest_fails() {
     let old_path = dir.path().join("file.bin");
     let diff_path = dir.path().join("diff.hdiff");
 
-    fs::write(&old_path, OLD_TEXT).unwrap();
-    fs::write(&diff_path, DIFF_V13_TEXT).unwrap();
+    fs::write(&old_path, b"old content").unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
 
     // Same source and dest path should fail.
     let path_str = old_path.to_string_lossy().to_string();
@@ -228,6 +360,122 @@ fn hdiff_same_source_and_dest_fails() {
         !hdiff.apply(None),
         "should fail when source and destination are the same file"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn hdiff_hardlinked_source_and_destination_fail_without_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let alias_path = dir.path().join("alias.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    fs::write(&old_path, b"source bytes remain intact").unwrap();
+    fs::hard_link(&old_path, &alias_path).unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        alias_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert_eq!(fs::read(&old_path).unwrap(), b"source bytes remain intact");
+    assert_eq!(
+        fs::read(&alias_path).unwrap(),
+        b"source bytes remain intact"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hdiff_symlink_destination_is_rejected_without_changing_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let target_path = dir.path().join("target.bin");
+    let symlink_path = dir.path().join("out.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    fs::write(&old_path, b"source bytes").unwrap();
+    fs::write(&target_path, b"target bytes remain").unwrap();
+    fs::write(&diff_path, DIFF_EMPTY_TO_NEW).unwrap();
+    symlink(&target_path, &symlink_path).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        symlink_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert_eq!(fs::read(&target_path).unwrap(), b"target bytes remain");
+    assert!(
+        fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn hdiff_failed_patch_preserves_existing_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, test_prng_data(91, 8192)).unwrap();
+    fs::write(&out_path, b"previous output stays").unwrap();
+    let mut patch = build_v13_zstd_patch(&test_prng_data(91, 8192), &test_prng_data(91, 8192));
+    patch.truncate(b"HDIFF13&zstd\0".len() + 4);
+    fs::write(&diff_path, patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(!hdiff.apply(None));
+    assert_eq!(fs::read(&out_path).unwrap(), b"previous output stays");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+}
+
+#[test]
+fn hdiff_success_replaces_destination_with_patch_output() {
+    let old = test_prng_data(92, 8192);
+    let new = old.clone();
+    let patch = build_v13_zstd_patch(&old, &new);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let diff_path = dir.path().join("diff.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&diff_path, patch).unwrap();
+    fs::write(&out_path, b"previous output").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().into_owned(),
+        diff_path.to_string_lossy().into_owned(),
+        out_path.to_string_lossy().into_owned(),
+    );
+
+    assert!(hdiff.apply(None));
+    assert_eq!(fs::read(&out_path).unwrap(), new);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&out_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
 }
 
 /// enumerate_cover_headers rejects cover_count > 0 with cover_size == 0.
@@ -461,14 +709,6 @@ fn compression_mode_all_supported_parse() {
     }
 }
 
-/// compress_cover_buf_size == 1 triggers padding (whereas > 1 would not).
-#[test]
-fn cover_padding_with_small_compressed_size() {
-    // Padding logic is exercised by the v20_zstd and v13_zstd end-to-end tests
-    // which use compressed covers. A dedicated regression would require crafting
-    // a patch with exactly compress_cover_buf_size == 1.
-}
-
 /// Verify the padding logic for all compression modes
 #[test]
 fn padding_applies_only_to_zlib_mode() {
@@ -495,28 +735,26 @@ fn padding_applies_only_to_zlib_mode() {
 }
 
 use super::{
-    CompressionMode, CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, RleRefClip,
-    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, MAX_MEM_BUFFER_LIMIT,
+    CompressionMode, CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo,
+    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN, RleRefClip,
 };
 
 #[test]
 fn cover_header_new_and_fields() {
-    let ch = CoverHeader::new(1, 2, 3, 4);
+    let ch = CoverHeader::new(1, 2, 3);
     assert_eq!(ch.old_pos, 1);
     assert_eq!(ch.new_pos, 2);
     assert_eq!(ch.cover_length, 3);
-    assert_eq!(ch.next_cover_index, 4);
 }
 
 #[test]
 fn cover_header_debug_and_clone() {
-    let ch = CoverHeader::new(10, 20, 30, 40);
+    let ch = CoverHeader::new(10, 20, 30);
     let _ = format!("{:?}", ch);
     let cloned = ch;
     assert_eq!(ch.old_pos, cloned.old_pos);
     assert_eq!(ch.new_pos, cloned.new_pos);
     assert_eq!(ch.cover_length, cloned.cover_length);
-    assert_eq!(ch.next_cover_index, cloned.next_cover_index);
 }
 
 #[test]
@@ -615,7 +853,6 @@ fn compression_mode_default_equals_nocomp() {
 #[test]
 fn constants_correct_values() {
     assert_eq!(MAX_MEM_BUFFER_LEN, 1 << 20);
-    assert_eq!(MAX_MEM_BUFFER_LIMIT, 2 << 20);
     assert_eq!(MAX_ARRAY_POOL_LEN, 1 << 20);
     assert_eq!(MAX_ARRAY_POOL_SECOND_OFFSET, MAX_ARRAY_POOL_LEN / 2);
 }
@@ -679,7 +916,7 @@ fn hdiff_is_send_sync() {
 /// happens downstream in enumerate_cover_headers.
 #[test]
 fn cover_header_new_stores_negative_cover_length() {
-    let ch = CoverHeader::new(0, 0, -5, 0);
+    let ch = CoverHeader::new(0, 0, -5);
     assert_eq!(
         ch.cover_length, -5,
         "CoverHeader::new stores negative cover_length as-is"
@@ -689,7 +926,7 @@ fn cover_header_new_stores_negative_cover_length() {
 /// CoverHeader::new stores negative old_pos as-is; no rejection.
 #[test]
 fn cover_header_new_stores_negative_old_pos() {
-    let ch = CoverHeader::new(-10, 0, 1, 0);
+    let ch = CoverHeader::new(-10, 0, 1);
     assert_eq!(
         ch.old_pos, -10,
         "CoverHeader::new stores negative old_pos as-is"
@@ -699,42 +936,51 @@ fn cover_header_new_stores_negative_old_pos() {
 /// CoverHeader::new with valid positive values (positive test).
 #[test]
 fn cover_header_new_accepts_valid_positive_values() {
-    let ch = CoverHeader::new(100, 200, 300, 1);
+    let ch = CoverHeader::new(100, 200, 300);
     assert_eq!(ch.old_pos, 100);
     assert_eq!(ch.new_pos, 200);
     assert_eq!(ch.cover_length, 300);
-    assert_eq!(ch.next_cover_index, 1);
 }
 
 /// CoverHeader::new with extreme i64 values.
 #[test]
 fn cover_header_new_with_extreme_i64_values() {
-    let ch = CoverHeader::new(i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+    let ch = CoverHeader::new(i64::MAX, i64::MIN, i64::MAX);
     assert_eq!(ch.old_pos, i64::MAX);
     assert_eq!(ch.new_pos, i64::MIN);
     assert_eq!(ch.cover_length, i64::MAX);
-    assert_eq!(ch.next_cover_index, i64::MIN);
 }
 
 /// CoverHeader::new with all-zero values (boundary positive test).
 #[test]
 fn cover_header_new_with_zero_values() {
-    let ch = CoverHeader::new(0, 0, 0, 0);
+    let ch = CoverHeader::new(0, 0, 0);
     assert_eq!(ch.old_pos, 0);
     assert_eq!(ch.new_pos, 0);
     assert_eq!(ch.cover_length, 0);
-    assert_eq!(ch.next_cover_index, 0);
 }
 
 /// Empty input returns no headers.
 #[test]
-fn enumerate_cover_headers_rejects_negative_cover_length() {
+fn enumerate_cover_headers_empty_input_with_zero_covers_is_valid() {
     use std::io::Cursor;
 
-    // Empty input succeeds.
     let mut c = Cursor::new(Vec::new());
     let result = super::patch_core::enumerate_cover_headers(&mut c, 0, 0);
     assert!(result.is_ok());
+}
+
+#[test]
+fn enumerate_cover_headers_decodes_minimal_header() {
+    use std::io::Cursor;
+
+    let encoded_header = [0x00, 0x00, 0x02];
+    let mut cursor = Cursor::new(encoded_header);
+    let headers = super::patch_core::enumerate_cover_headers(&mut cursor, 3, 1).unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].old_pos, 0);
+    assert_eq!(headers[0].new_pos, 0);
+    assert_eq!(headers[0].cover_length, 2);
 }
 
 /// enumerate_cover_headers rejects negative old_pos from underflow.
@@ -955,7 +1201,7 @@ fn read_single_file_header_success() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_ok(), "valid header should succeed");
     assert_eq!(header_info.new_data_size, 100);
     assert_eq!(header_info.old_data_size, 50);
@@ -972,8 +1218,40 @@ fn read_single_file_header_truncated_fails() {
     let data = vec![0x64]; // only new_data_size, nothing else
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_err(), "truncated data should fail");
+}
+
+/// A patch embedded at a nonzero container offset parses with every
+/// recorded position rebased to file-absolute coordinates.
+#[test]
+fn read_header_positions_rebase_by_diff_offset() {
+    // A patch embedded at a nonzero container offset must parse with all
+    // recorded positions rebased to file-absolute coordinates.
+    let old = vec![3u8; 512];
+    let mut new = old.clone();
+    new[..16].copy_from_slice(&[5u8; 16]);
+    let patch = build_v20_nocomp_patch(&old, &new);
+
+    const CONTAINER_PREFIX: usize = 37;
+    let mut container = vec![0u8; CONTAINER_PREFIX];
+    container.extend_from_slice(&patch);
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let container_path = dir.path().join("container.bin");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&container_path, &container).unwrap();
+
+    let mut hdiff = HDiff::with_offset(
+        old_path.to_string_lossy().to_string(),
+        container_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+        CONTAINER_PREFIX as u64,
+    );
+    assert!(hdiff.apply(None), "embedded patch failed");
+    assert_eq!(fs::read(&out_path).unwrap(), new);
 }
 
 /// read_single_file_header sets diff_data_pos to the stream position after
@@ -984,7 +1262,7 @@ fn read_single_file_header_sets_diff_data_pos() {
     let data = vec![0x64, 0x32, 0x00, 0x88, 0x00, 0x64, 0x00];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(
         header_info.single_chunk_info.diff_data_pos, 7,
         "diff_data_pos should be at end of header (7 bytes)"
@@ -998,7 +1276,7 @@ fn read_single_file_header_compressed_count_zero() {
     let data = vec![0x64, 0x32, 0x00, 0x88, 0x00, 0x64, 0x00];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(header_info.compressed_count, 0);
 }
 
@@ -1009,7 +1287,7 @@ fn read_single_file_header_compressed_count_one() {
     let data = vec![0x64, 0x32, 0x00, 0x88, 0x00, 0x64, 0x01];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(header_info.compressed_count, 1);
 }
 
@@ -1027,7 +1305,7 @@ fn read_single_file_header_minimal_values() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_ok(), "minimal values should succeed");
     assert_eq!(header_info.new_data_size, 1);
     assert_eq!(header_info.old_data_size, 1);
@@ -1048,7 +1326,7 @@ fn read_non_single_file_header_success() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_non_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_ok(), "valid header should succeed");
     assert_eq!(header_info.new_data_size, 100);
     assert_eq!(header_info.old_data_size, 50);
@@ -1065,7 +1343,7 @@ fn read_non_single_file_header_truncated_fails() {
     let data = vec![0x64, 0x32]; // only sizes, no chunk info
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    let result = HDiff::read_non_single_file_header(&mut cursor, &mut header_info);
+    let result = HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info);
     assert!(result.is_err(), "truncated chunk info should fail");
 }
 
@@ -1079,7 +1357,7 @@ fn read_non_single_file_header_compressed_count_zero() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(header_info.compressed_count, 0);
 }
 
@@ -1103,7 +1381,7 @@ fn read_non_single_file_header_one_compressed_stream() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(
         header_info.compressed_count, 1,
         "one compress field > 1 should give count of 1"
@@ -1131,7 +1409,7 @@ fn read_non_single_file_header_one_byte_compressed_counts() {
     ];
     let mut cursor = Cursor::new(data);
     let mut header_info = HeaderInfo::default();
-    HDiff::read_non_single_file_header(&mut cursor, &mut header_info).unwrap();
+    HDiff::read_non_single_file_header(&mut cursor, 0, &mut header_info).unwrap();
     assert_eq!(
         header_info.compressed_count, 1,
         "compress_cover_buf_size == 1 must count as compressed"
@@ -1423,6 +1701,139 @@ fn build_v13_zstd_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch
 }
 
+fn build_v13_zstd_patch_with_single_cover(
+    old: &[u8],
+    new: &[u8],
+    old_pos: usize,
+    new_pos: usize,
+    cover_length: usize,
+) -> Vec<u8> {
+    assert!(
+        old_pos
+            .checked_add(cover_length)
+            .is_some_and(|end| end <= old.len())
+    );
+    assert!(
+        new_pos
+            .checked_add(cover_length)
+            .is_some_and(|end| end <= new.len())
+    );
+    assert_eq!(
+        &old[old_pos..old_pos + cover_length],
+        &new[new_pos..new_pos + cover_length]
+    );
+    let old_pos_i64 = i64::try_from(old_pos).unwrap();
+    let new_pos_i64 = i64::try_from(new_pos).unwrap();
+    let cover_length_i64 = i64::try_from(cover_length).unwrap();
+    let new_size = i64::try_from(new.len()).unwrap();
+    let old_size = i64::try_from(old.len()).unwrap();
+
+    let cover_buf = [
+        encode_tagged_1bit(0, old_pos_i64),
+        encode_7bit_varint(new_pos_i64),
+        encode_7bit_varint(cover_length_i64),
+    ]
+    .concat();
+
+    let mut rle_ctrl_buf = Vec::new();
+    if new_pos > 0 {
+        rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, new_pos_i64 - 1));
+    }
+    if cover_length > 0 {
+        rle_ctrl_buf.extend_from_slice(&encode_tagged_2bit(0, cover_length_i64 - 1));
+    }
+    assert_eq!(new_pos_i64 + cover_length_i64, new_size);
+
+    let mut new_data_diff = Vec::with_capacity(new.len() - cover_length);
+    new_data_diff.extend_from_slice(&new[..new_pos]);
+    assert_eq!(new_data_diff.len(), new_pos);
+
+    let cover_compressed = zstd::encode_all(cover_buf.as_slice(), 3).unwrap();
+    let rle_ctrl_compressed = zstd::encode_all(rle_ctrl_buf.as_slice(), 3).unwrap();
+    let new_data_compressed = zstd::encode_all(new_data_diff.as_slice(), 3).unwrap();
+    let mut patch = Vec::new();
+    patch.extend_from_slice(b"HDIFF13&zstd\0");
+    for value in [
+        new_size,
+        old_size,
+        1,
+        cover_buf.len() as i64,
+        cover_compressed.len() as i64,
+        rle_ctrl_buf.len() as i64,
+        rle_ctrl_compressed.len() as i64,
+        0,
+        0,
+        new_data_diff.len() as i64,
+        new_data_compressed.len() as i64,
+    ] {
+        patch.extend_from_slice(&encode_7bit_varint(value));
+    }
+    patch.extend_from_slice(&cover_compressed);
+    patch.extend_from_slice(&rle_ctrl_compressed);
+    patch.extend_from_slice(&new_data_compressed);
+    patch
+}
+
+fn build_v13_zstd_single_cover_rle_patch(
+    old: &[u8],
+    rle_type: u8,
+    deltas: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    assert!(matches!(rle_type, 2 | 3));
+    assert!(!old.is_empty());
+    if rle_type == 3 {
+        assert_eq!(deltas.len(), old.len());
+    } else {
+        assert_eq!(deltas.len(), 1);
+    }
+    let new = old
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte.wrapping_add(deltas[if rle_type == 3 { index } else { 0 }]))
+        .collect::<Vec<_>>();
+    let cover_buf = [
+        encode_tagged_1bit(0, 0),
+        encode_7bit_varint(0),
+        encode_7bit_varint(old.len() as i64),
+    ]
+    .concat();
+    let rle_ctrl_buf = encode_tagged_2bit(rle_type, old.len() as i64 - 1);
+    let cover_compressed = zstd::encode_all(cover_buf.as_slice(), 3).unwrap();
+    let rle_ctrl_compressed = zstd::encode_all(rle_ctrl_buf.as_slice(), 3).unwrap();
+    let mut patch = Vec::new();
+    patch.extend_from_slice(b"HDIFF13&zstd\0");
+    for value in [
+        new.len() as i64,
+        old.len() as i64,
+        1,
+        cover_buf.len() as i64,
+        cover_compressed.len() as i64,
+        rle_ctrl_buf.len() as i64,
+        rle_ctrl_compressed.len() as i64,
+        deltas.len() as i64,
+        0,
+        0,
+        0,
+    ] {
+        patch.extend_from_slice(&encode_7bit_varint(value));
+    }
+    patch.extend_from_slice(&cover_compressed);
+    patch.extend_from_slice(&rle_ctrl_compressed);
+    patch.extend_from_slice(deltas);
+    (patch, new)
+}
+
+fn patch_has_v13_covers(patch: &[u8]) -> bool {
+    use super::parser::BinaryExtensions;
+
+    let mut input = std::io::Cursor::new(patch);
+    let header = input.read_string_to_null(512).unwrap();
+    assert!(header.starts_with("HDIFF13&"));
+    let mut info = HeaderInfo::default();
+    HDiff::read_non_single_file_header(&mut input, 0, &mut info).unwrap();
+    info.chunk_info.cover_count > 0
+}
+
 #[test]
 fn hdiff_e2e_v20_nocomp_applies_correctly() {
     let old = test_prng_data(100, 8192);
@@ -1469,6 +1880,365 @@ fn hdiff_e2e_v13_zstd_rle_run_exceeds_buffer_applies_correctly() {
         new,
         "oversized RLE run output mismatch"
     );
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_large_gap_before_cover_applies_correctly() {
+    let old = test_prng_data(4001, 1024);
+    let gap = test_prng_data(4002, 3 * 1024 * 1024 + 17);
+    let mut new = gap.clone();
+    new.extend_from_slice(&old[256..768]);
+    let patch = build_v13_zstd_patch_with_single_cover(&old, &new, 256, gap.len(), 512);
+    let result = hdiff_e2e_apply(&old, &patch);
+    assert_eq!(result, new);
+}
+
+#[test]
+fn hdiff_v13_zero_length_final_cover_flushes_tail_progress() {
+    use super::parser::BinaryExtensions;
+    use super::patch_single::PatchSingle;
+    use std::io::Cursor;
+
+    let old = test_prng_data(4005, 16);
+    let new = test_prng_data(4006, 64 * 1024 + 13);
+    let patch = build_v13_zstd_patch_with_single_cover(&old, &new, old.len(), new.len(), 0);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old-zero-cover.bin");
+    let patch_path = dir.path().join("zero-cover-tail.hdiff");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+    let mut header_reader = Cursor::new(patch.as_slice());
+    header_reader.read_string_to_null(512).unwrap();
+    let mut header_info = HeaderInfo::default();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
+    header_info.comp_mode = super::CompressionMode::Zstd;
+    let patcher = PatchSingle::new(header_info);
+    let mut source = fs::File::open(&old_path).unwrap();
+    let mut output = Cursor::new(Vec::new());
+    let progress = std::sync::Mutex::new(Vec::new());
+    let callback = |written| progress.lock().unwrap().push(written);
+    patcher
+        .patch_with_chunk_size(
+            &mut source,
+            &mut output,
+            patch_path.to_str().unwrap(),
+            256,
+            Some(&callback),
+        )
+        .unwrap();
+    assert_eq!(output.into_inner(), new);
+    assert_eq!(progress.into_inner().unwrap(), [new.len() as u64]);
+}
+
+#[test]
+fn hdiff_v13_chunked_regions_match_across_rle_and_cover_boundaries() {
+    use super::parser::BinaryExtensions;
+    use super::patch_single::PatchSingle;
+    use std::io::Cursor;
+
+    let old = test_prng_data(4010, 1024);
+    let mut new = old.clone();
+    new[256..512].copy_from_slice(&test_prng_data(4011, 256));
+    new.extend_from_slice(&test_prng_data(4012, 13));
+    let patch = build_v13_zstd_patch(&old, &new);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+
+    let mut header_reader = Cursor::new(patch.as_slice());
+    header_reader.read_string_to_null(512).unwrap();
+    let mut header_info = HeaderInfo::default();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
+    header_info.comp_mode = super::CompressionMode::Zstd;
+    assert_eq!(header_info.old_data_size, old.len() as i64);
+    assert_eq!(header_info.new_data_size, new.len() as i64);
+    assert_eq!(header_info.chunk_info.cover_count, 2);
+    let patcher = PatchSingle::new(header_info);
+
+    for chunk_size in [1, 7, 255, 256, 257, 4096] {
+        let mut file_source = fs::File::open(&old_path).unwrap();
+        let mut file_output = Cursor::new(Vec::new());
+        let file_progress = std::sync::Mutex::new(Vec::new());
+        let file_callback = |written| file_progress.lock().unwrap().push(written);
+        patcher
+            .patch_with_chunk_size(
+                &mut file_source,
+                &mut file_output,
+                patch_path.to_str().unwrap(),
+                chunk_size,
+                Some(&file_callback),
+            )
+            .unwrap_or_else(|error| panic!("file chunk={chunk_size}: {error:?}"));
+        assert_eq!(file_output.into_inner(), new, "file chunk={chunk_size}");
+        let file_progress = file_progress.into_inner().unwrap();
+        assert!(file_progress.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(file_progress.last(), Some(&(new.len() as u64)));
+        assert_eq!(
+            file_progress
+                .iter()
+                .filter(|&&written| written == new.len() as u64)
+                .count(),
+            1
+        );
+
+        let mut slice_output = Cursor::new(Vec::new());
+        let slice_progress = std::sync::Mutex::new(Vec::new());
+        let slice_callback = |written| slice_progress.lock().unwrap().push(written);
+        patcher
+            .patch_with_slice_and_chunk_size(
+                &old,
+                &mut slice_output,
+                patch_path.to_str().unwrap(),
+                chunk_size,
+                Some(&slice_callback),
+            )
+            .unwrap_or_else(|error| panic!("slice chunk={chunk_size}: {error:?}"));
+        assert_eq!(slice_output.into_inner(), new, "slice chunk={chunk_size}");
+        let slice_progress = slice_progress.into_inner().unwrap();
+        assert!(slice_progress.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(slice_progress.last(), Some(&(new.len() as u64)));
+        assert_eq!(
+            slice_progress
+                .iter()
+                .filter(|&&written| written == new.len() as u64)
+                .count(),
+            1
+        );
+    }
+    let mut source = fs::File::open(&old_path).unwrap();
+    let error = patcher
+        .patch_with_chunk_size(
+            &mut source,
+            &mut Cursor::new(Vec::new()),
+            patch_path.to_str().unwrap(),
+            0,
+            None,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("region chunk size is zero"));
+    let error = patcher
+        .patch_with_chunk_size(
+            &mut fs::File::open(&old_path).unwrap(),
+            &mut Cursor::new(Vec::new()),
+            patch_path.to_str().unwrap(),
+            4 * 1024 * 1024 + 1,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds the production cache limit")
+    );
+}
+
+#[test]
+fn hdiff_v13_chunked_large_cover_preserves_long_rle_state() {
+    use super::parser::BinaryExtensions;
+    use super::patch_single::PatchSingle;
+    use std::io::{Cursor, Seek};
+
+    let old = test_prng_data(4020, 4 * 1024 * 1024);
+    let patch = build_v13_zstd_patch(&old, &old);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old-large.bin");
+    let patch_path = dir.path().join("identity-large.hdiff");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+    let mut header_reader = Cursor::new(patch.as_slice());
+    header_reader.read_string_to_null(512).unwrap();
+    let mut header_info = HeaderInfo::default();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
+    header_info.comp_mode = super::CompressionMode::Zstd;
+    assert_eq!(header_info.old_data_size, old.len() as i64);
+    assert_eq!(header_info.new_data_size, old.len() as i64);
+    assert_eq!(header_info.chunk_info.cover_count, 1);
+    assert_eq!(
+        header_info.chunk_info.cover_buf_size,
+        (encode_tagged_1bit(0, 0).len()
+            + encode_7bit_varint(0).len()
+            + encode_7bit_varint(old.len() as i64).len()) as i64
+    );
+    let mut cover_clips = PatchSingle::new(header_info.clone())
+        .open_clips(patch_path.to_str().unwrap())
+        .unwrap();
+    let mut decoded_cover = Vec::new();
+    std::io::Read::read_to_end(&mut *cover_clips[0], &mut decoded_cover).unwrap();
+    assert_eq!(
+        decoded_cover,
+        [
+            encode_tagged_1bit(0, 0),
+            encode_7bit_varint(0),
+            encode_7bit_varint(old.len() as i64),
+        ]
+        .concat()
+    );
+    drop(cover_clips);
+    let mut cover_clips = PatchSingle::new(header_info.clone())
+        .open_clips(patch_path.to_str().unwrap())
+        .unwrap();
+    let mut cover_headers = super::patch_core::enumerate_cover_headers_checked(
+        &mut *cover_clips[0],
+        header_info.chunk_info.cover_buf_size,
+        header_info.chunk_info.cover_count,
+    )
+    .unwrap();
+    let cover = cover_headers.next().unwrap().unwrap();
+    assert_eq!(cover.new_pos, 0);
+    assert_eq!(cover.cover_length, old.len() as i64);
+    let patcher = PatchSingle::new(header_info);
+
+    for chunk_size in [512 * 1024, 1024 * 1024] {
+        let mut source = fs::File::open(&old_path).unwrap();
+        let mut output = Cursor::new(Vec::new());
+        let progress = std::sync::Mutex::new(Vec::new());
+        let callback = |written| progress.lock().unwrap().push(written);
+        patcher
+            .patch_with_chunk_size(
+                &mut source,
+                &mut output,
+                patch_path.to_str().unwrap(),
+                chunk_size,
+                Some(&callback),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "large cover chunk={chunk_size}, source_pos={}: {error:?}",
+                    source.stream_position().unwrap()
+                )
+            });
+        assert_eq!(output.into_inner(), old);
+        let progress = progress.into_inner().unwrap();
+        assert_eq!(progress.last(), Some(&(old.len() as u64)));
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|&&value| value == old.len() as u64)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn hdiff_v13_chunked_large_tail_matches_expected_output() {
+    use super::parser::BinaryExtensions;
+    use super::patch_single::PatchSingle;
+    use std::io::Cursor;
+
+    let old = test_prng_data(4021, 3 * 1024 * 1024);
+    let mut new = old.clone();
+    new[256..].fill(0x5a);
+    let patch = build_v13_zstd_patch(&old, &new);
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old-tail.bin");
+    let patch_path = dir.path().join("tail.hdiff");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+    let mut header_reader = Cursor::new(patch.as_slice());
+    header_reader.read_string_to_null(512).unwrap();
+    let mut header_info = HeaderInfo::default();
+    HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
+    header_info.comp_mode = super::CompressionMode::Zstd;
+    let patcher = PatchSingle::new(header_info);
+
+    for chunk_size in [512 * 1024, 1024 * 1024] {
+        let mut source = fs::File::open(&old_path).unwrap();
+        let mut output = Cursor::new(Vec::new());
+        patcher
+            .patch_with_chunk_size(
+                &mut source,
+                &mut output,
+                patch_path.to_str().unwrap(),
+                chunk_size,
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.into_inner(), new);
+    }
+}
+
+#[test]
+fn hdiff_v13_chunked_additive_and_literal_rle_runs_preserve_state() {
+    use super::parser::BinaryExtensions;
+    use super::patch_single::PatchSingle;
+    use std::io::Cursor;
+
+    let old = test_prng_data(4030, 1027);
+    for (rle_type, deltas) in [
+        (2, vec![0x37]),
+        (
+            3,
+            (0..old.len())
+                .map(|index| (index as u8).wrapping_mul(13))
+                .collect(),
+        ),
+    ] {
+        let (patch, expected) = build_v13_zstd_single_cover_rle_patch(&old, rle_type, &deltas);
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old-rle.bin");
+        let patch_path = dir.path().join("rle.hdiff");
+        fs::write(&old_path, &old).unwrap();
+        fs::write(&patch_path, &patch).unwrap();
+        let mut header_reader = Cursor::new(patch.as_slice());
+        header_reader.read_string_to_null(512).unwrap();
+        let mut header_info = HeaderInfo::default();
+        HDiff::read_non_single_file_header(&mut header_reader, 0, &mut header_info).unwrap();
+        header_info.comp_mode = super::CompressionMode::Zstd;
+        let patcher = PatchSingle::new(header_info);
+
+        for chunk_size in [1, 7, 127, 128, 255, 256, 257, 1024] {
+            let mut source = fs::File::open(&old_path).unwrap();
+            let mut output = Cursor::new(Vec::new());
+            patcher
+                .patch_with_chunk_size(
+                    &mut source,
+                    &mut output,
+                    patch_path.to_str().unwrap(),
+                    chunk_size,
+                    None,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("RLE type={rle_type}, chunk={chunk_size}: {error:?}")
+                });
+            assert_eq!(
+                output.into_inner(),
+                expected,
+                "RLE type={rle_type}, chunk={chunk_size}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_identity_patch_applies_correctly() {
+    let original = test_prng_data(31, 16 * 1024);
+    let patch = build_v13_zstd_patch(&original, &original);
+    assert_eq!(hdiff_e2e_apply(&original, &patch), original);
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_sparse_source_covers() {
+    let old = test_prng_data(34, 64 * 1024);
+    let mut new = old.clone();
+    for block in (0..old.len() / 256).step_by(6) {
+        new[block * 256] ^= 0xff;
+    }
+    let patch = build_v13_zstd_patch(&old, &new);
+    assert!(patch_has_v13_covers(&patch));
+    assert_eq!(hdiff_e2e_apply(&old, &patch), new);
+}
+
+#[test]
+fn hdiff_e2e_v13_zstd_handles_new_data_tail() {
+    let old = test_prng_data(32, 8192);
+    let mut new = old.clone();
+    new[4096..].fill(0x5a);
+    new.extend_from_slice(b"partial tail");
+    let patch = build_v13_zstd_patch(&old, &new);
+    assert_eq!(hdiff_e2e_apply(&old, &patch), new);
 }
 
 /// Shared apply helper for e2e tests.
@@ -1530,3 +2300,48 @@ fn hdiff_e2e_v13_zstd_applies_correctly() {
     let result = fs::read(&out_path).unwrap();
     assert_eq!(result, new, "v13 zstd output mismatch");
 }
+
+#[test]
+fn hdiff_header_parses_when_patch_shorter_than_header_limit() {
+    // A minimal valid patch is far shorter than the header slab; the slab
+    // fill loop must stop at EOF and the parse must still succeed.
+    // Two blocks: the first identical (becomes one cover), the second
+    // changed so the fixture has a nonzero step and stays slab-sized.
+    let old = vec![7u8; 512];
+    let mut new = old.clone();
+    new[256..264].copy_from_slice(&[9u8; 8]);
+    let patch = build_v20_nocomp_patch(&old, &new);
+    assert!(patch.len() < 512, "fixture must be smaller than the slab");
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.bin");
+    let patch_path = dir.path().join("patch.hdiff");
+    let out_path = dir.path().join("out.bin");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&patch_path, &patch).unwrap();
+
+    let mut hdiff = HDiff::new(
+        old_path.to_string_lossy().to_string(),
+        patch_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+    );
+    assert!(hdiff.apply(None), "tiny patch failed slab parse");
+    assert_eq!(fs::read(&out_path).unwrap(), new);
+}
+
+#[test]
+fn hdiff_header_rejects_header_without_null_terminator() {
+    // Bytes with no NUL terminator inside the string limit must fail with
+    // the same error the streaming parser produced.
+    let dir = tempfile::tempdir().unwrap();
+    let patch_path = dir.path().join("no-nul.hdiff");
+    fs::write(&patch_path, &[b'H'; 1024]).unwrap();
+    let out_path = dir.path().join("out.bin");
+    let mut hdiff = HDiff::new(
+        dir.path().join("missing-old.bin").to_string_lossy().to_string(),
+        patch_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().to_string(),
+    );
+    assert!(!hdiff.apply(None), "runaway header must be rejected");
+}
+

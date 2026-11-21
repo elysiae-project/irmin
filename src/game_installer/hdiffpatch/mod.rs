@@ -13,19 +13,30 @@ pub(crate) use diff::HDiff;
 pub(crate) use diff::SeekableRead;
 #[allow(unused_imports)]
 pub(crate) use header::{
-    CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, RleRefClip, K_BYTE_RLE_TYPE,
-    K_SIGN_TAG_BIT, MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_MEM_BUFFER_LEN,
-    MAX_MEM_BUFFER_LIMIT,
+    CoverHeader, DiffChunkInfo, DiffSingleChunkInfo, HeaderInfo, K_BYTE_RLE_TYPE, K_SIGN_TAG_BIT,
+    MAX_ARRAY_POOL_LEN, MAX_ARRAY_POOL_SECOND_OFFSET, MAX_HDIFF20_STEP_SIZE, MAX_MEM_BUFFER_LEN,
+    RleRefClip,
 };
 
 #[cfg(feature = "benchmark")]
 pub use diff::HDiff as HDiffPublic;
+#[cfg(feature = "benchmark")]
+pub use diff::SourceBackend as HDiffSourceBackend;
+#[cfg(feature = "benchmark")]
+pub use diff::WindowStats;
 #[cfg(feature = "benchmark")]
 pub use header::MAX_ARRAY_POOL_LEN as BENCH_MAX_ARRAY_POOL_LEN;
 #[cfg(feature = "benchmark")]
 pub use parser::read_long_7bit_from_slice;
 #[cfg(feature = "benchmark")]
 pub use patch_core::enumerate_cover_headers_checked;
+#[cfg(feature = "bench-alloc-stats")]
+pub use patch_sf::{reset_step_buffer_diagnostics, step_buffer_diagnostics};
+
+pub(crate) fn trim_idle_buffers() {
+    patch_core::trim_idle_buffers();
+    patch_sf::trim_idle_buffers();
+}
 
 use std::sync::Mutex;
 
@@ -70,6 +81,14 @@ impl BufferPool {
         if pool.len() < self.max_idle {
             pool.push(buf);
         }
+    }
+
+    /// Drop all currently idle buffers from this pool.
+    pub fn clear(&self) {
+        self.buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     #[cfg(test)]
@@ -133,5 +152,13 @@ mod buffer_pool_tests {
         pool.return_buf_shrunken(small, 256 * 1024);
         let buf = pool.take(1);
         assert!(buf.capacity() >= 100 && buf.capacity() <= 256 * 1024);
+    }
+
+    #[test]
+    fn clear_drops_idle_buffers() {
+        let pool = BufferPool::new(2);
+        pool.return_buf(Vec::with_capacity(1024));
+        pool.clear();
+        assert!(pool.take(1).capacity() < 1024);
     }
 }

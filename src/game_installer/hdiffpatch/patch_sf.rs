@@ -4,14 +4,41 @@ use std::io::Cursor;
 use std::io::{Read, SeekFrom, Write};
 
 use super::compression::get_clip_stream;
-use super::parser::{read_long_7bit_from_slice, BinaryExtensions};
+use super::header::MAX_HDIFF20_STEP_SIZE;
+use super::parser::{BinaryExtensions, read_long_7bit_from_slice};
+use super::patch_core::{wrapping_add_slices, wrapping_add_two_into};
 use super::{BufferPool, HeaderInfo, SeekableRead};
 
-const MAX_STEP_SIZE: usize = 16 * 1024 * 1024;
 const IO_BUF_SIZE: usize = 256 * 1024;
+
+#[cfg(feature = "bench-alloc-stats")]
+static MAX_STEP_BUFFER_CAPACITY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "bench-alloc-stats")]
+static MAX_STEP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "bench-alloc-stats")]
+pub fn reset_step_buffer_diagnostics() {
+    MAX_STEP_BUFFER_CAPACITY.store(0, std::sync::atomic::Ordering::Relaxed);
+    MAX_STEP_END.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "bench-alloc-stats")]
+pub fn step_buffer_diagnostics() -> (usize, usize) {
+    (
+        MAX_STEP_BUFFER_CAPACITY.load(std::sync::atomic::Ordering::Relaxed),
+        MAX_STEP_END.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 
 static WORK_BUF_POOL: BufferPool = BufferPool::new(1);
 static STEP_BUF_POOL: BufferPool = BufferPool::new(1);
+
+pub(super) fn trim_idle_buffers() {
+    WORK_BUF_POOL.clear();
+    STEP_BUF_POOL.clear();
+}
 
 pub(crate) struct PatchSF {
     header_info: HeaderInfo,
@@ -73,7 +100,7 @@ impl PatchSF {
         } else {
             sci.compressed_size as u64
         };
-        let (mut diff, _) = get_clip_stream(
+        let (diff, _) = get_clip_stream(
             File::open(patch_path)?,
             self.header_info.comp_mode,
             diff_start,
@@ -81,6 +108,10 @@ impl PatchSF {
             diff_comp,
             false,
         )?;
+        // patch_loop reads two varints per cover step before the step
+        // body's bulk read; the shared clip buffer removes the per-step
+        // syscall (see its doc for the bypass behavior on large reads).
+        let mut diff: Box<dyn Read> = super::patch_single::buffered_clip(diff);
         if self.header_info.chunk_info.cover_count < 0 {
             return Err(std::io::Error::other("cover_count is negative"));
         }
@@ -96,7 +127,11 @@ impl PatchSF {
         if io_buf.capacity() < IO_BUF_SIZE {
             io_buf = Vec::with_capacity(IO_BUF_SIZE);
         }
-        unsafe { io_buf.set_len(IO_BUF_SIZE) };
+        // SAFETY: capacity >= IO_BUF_SIZE. The buffer is filled via
+        // read_exact before any reads.
+        unsafe {
+            io_buf.set_len(IO_BUF_SIZE);
+        }
         let mut step_buf = STEP_BUF_POOL.take(0);
         let result = patch_loop(
             &mut diff,
@@ -134,24 +169,14 @@ fn patch_loop(
     while cover_count > 0 {
         let buf_cover_size_raw = diff.read_long_7bit()?;
         let buf_rle_size_raw = diff.read_long_7bit()?;
-        if buf_cover_size_raw < 0 || buf_rle_size_raw < 0 {
-            return Err(std::io::Error::other("negative step size in patch"));
+        let (buf_cover_size, step_end) = validate_step_sizes(buf_cover_size_raw, buf_rle_size_raw)?;
+        prepare_step_buffer(step_buf, step_end);
+        #[cfg(feature = "bench-alloc-stats")]
+        {
+            MAX_STEP_END.fetch_max(step_end, std::sync::atomic::Ordering::Relaxed);
+            MAX_STEP_BUFFER_CAPACITY
+                .fetch_max(step_buf.capacity(), std::sync::atomic::Ordering::Relaxed);
         }
-        let buf_cover_size = buf_cover_size_raw as usize;
-        let buf_rle_size = buf_rle_size_raw as usize;
-        let step_end = buf_cover_size
-            .checked_add(buf_rle_size)
-            .ok_or_else(|| std::io::Error::other("step size overflow"))?;
-
-        if step_end > MAX_STEP_SIZE {
-            return Err(std::io::Error::other(
-                "patch step size exceeds maximum allowed",
-            ));
-        }
-        if step_buf.capacity() < step_end {
-            step_buf.reserve_exact(step_end - step_buf.capacity());
-        }
-        unsafe { step_buf.set_len(step_end) };
         diff.read_exact(&mut step_buf[..step_end])?;
 
         let (covers_slice, rle_slice) = step_buf[..step_end].split_at(buf_cover_size);
@@ -244,6 +269,52 @@ fn patch_loop(
     Ok(())
 }
 
+fn prepare_step_buffer(step_buf: &mut Vec<u8>, step_end: usize) {
+    if step_buf.capacity() < step_end {
+        step_buf.reserve_exact(step_end - step_buf.len());
+    }
+    // SAFETY: capacity >= step_end after reserve_exact. The buffer is
+    // filled via read_exact before any reads.
+    unsafe {
+        step_buf.set_len(step_end);
+    }
+}
+
+fn validate_step_sizes(cover_size: i64, rle_size: i64) -> std::io::Result<(usize, usize)> {
+    let invalid_size =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid patch step size");
+    if cover_size < 0 || rle_size < 0 {
+        return Err(invalid_size());
+    }
+    let step_size = (cover_size as u64)
+        .checked_add(rle_size as u64)
+        .ok_or_else(invalid_size)?;
+    if step_size > MAX_HDIFF20_STEP_SIZE as u64 {
+        return Err(std::io::Error::other(
+            "patch step size exceeds maximum allowed",
+        ));
+    }
+    let cover_size = usize::try_from(cover_size).map_err(|_| invalid_size())?;
+    let step_size = usize::try_from(step_size).map_err(|_| invalid_size())?;
+    Ok((cover_size, step_size))
+}
+
+#[cfg(all(test, feature = "bench-alloc-stats"))]
+mod diagnostics_tests {
+    #[test]
+    fn step_buffer_diagnostics_reset_and_report_maxima() {
+        super::reset_step_buffer_diagnostics();
+        super::MAX_STEP_BUFFER_CAPACITY.fetch_max(128, std::sync::atomic::Ordering::Relaxed);
+        super::MAX_STEP_BUFFER_CAPACITY.fetch_max(64, std::sync::atomic::Ordering::Relaxed);
+        super::MAX_STEP_END.fetch_max(96, std::sync::atomic::Ordering::Relaxed);
+        super::MAX_STEP_END.fetch_max(32, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(super::step_buffer_diagnostics(), (128, 96));
+        super::reset_step_buffer_diagnostics();
+        assert_eq!(super::step_buffer_diagnostics(), (0, 0));
+    }
+}
+
+#[inline]
 fn decode_cover(
     covers: &[u8],
     offset: &mut usize,
@@ -313,7 +384,7 @@ impl<'a> Rle0Decoder<'a> {
     /// If the decoder is currently in a zero-run of at least `n` bytes,
     /// consume those bytes (leaving data untouched) and return true.
     /// Otherwise return false and consume nothing.
-    // hot fast-path for large unchanged regions; avoids io_buf chunking entirely.
+    #[inline]
     fn try_skip_zeros(&mut self, n: usize) -> std::io::Result<bool> {
         // Ensure we're in the len0 state. If we just finished a lenv and
         // need_decode0 is true with lenv==0, decode the next len0 first.
@@ -353,10 +424,7 @@ impl<'a> Rle0Decoder<'a> {
                 let to_read = self.lenv.min(rem);
                 let src = &self.buf[self.pos..self.pos + to_read];
                 let dst = &mut data[dp..dp + to_read];
-                // Iter-zip form enables LLVM autovectorization (vpaddb).
-                for (d, s) in dst.iter_mut().zip(src.iter()) {
-                    *d = d.wrapping_add(*s);
-                }
+                wrapping_add_slices(dst, src);
                 self.pos += to_read;
                 self.lenv -= to_read;
                 dp += to_read;
@@ -409,10 +477,7 @@ impl<'a> Rle0Decoder<'a> {
                 let rle_src = &self.buf[self.pos..self.pos + to_read];
                 let old_src = &source[dp..dp + to_read];
                 let dst = &mut out[dp..dp + to_read];
-                // source[i] + rle[i] directly into output, no prior copy needed.
-                for ((d, o), r) in dst.iter_mut().zip(old_src.iter()).zip(rle_src.iter()) {
-                    *d = o.wrapping_add(*r);
-                }
+                wrapping_add_two_into(dst, old_src, rle_src);
                 self.pos += to_read;
                 self.lenv -= to_read;
                 dp += to_read;
@@ -439,6 +504,7 @@ impl<'a> Rle0Decoder<'a> {
     }
 }
 
+#[inline]
 fn rle_varint(buf: &[u8], pos: &mut usize) -> Option<usize> {
     if *pos >= buf.len() {
         return None;
@@ -488,6 +554,33 @@ fn copy_n(
 mod tests {
     use super::super::{CompressionMode, DiffChunkInfo, DiffSingleChunkInfo};
     use super::*;
+
+    #[test]
+    fn prepare_step_buffer_grows_from_reused_capacity_safely() {
+        let mut buffer = Vec::with_capacity(8);
+        buffer.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.capacity(), 8);
+
+        prepare_step_buffer(&mut buffer, 12);
+
+        assert_eq!(buffer.len(), 12);
+        assert!(buffer.capacity() >= 12);
+        // The first 4 bytes are preserved; the rest are uninitialized
+        // but filled by read_exact before any reads.
+        assert_eq!(&buffer[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn prepare_step_buffer_truncates_reused_contents() {
+        let mut buffer = vec![0xA5; 32];
+
+        prepare_step_buffer(&mut buffer, 5);
+
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(buffer, [0xA5; 5]);
+        assert!(buffer.capacity() >= 32);
+    }
 
     #[test]
     fn rle_varint_empty_buffer_returns_none() {
@@ -822,13 +915,13 @@ mod tests {
     }
 
     /// When the step size (buf_cover_size + buf_rle_size) exceeds
-    /// MAX_STEP_SIZE (16 MB), the patch loop should return an error.
+    /// MAX_HDIFF20_STEP_SIZE (16 MiB), the patch loop should return an error.
     #[test]
     fn patch_sf_step_end_exceeds_max_step_size() {
         let dir = tempfile::tempdir().unwrap();
         let patch_path = dir.path().join("patch.hdiff");
 
-        // Varint encode MAX_STEP_SIZE + 1 = 16777217 for buf_cover_size,
+        // Varint encode MAX_HDIFF20_STEP_SIZE + 1 = 16777217 for buf_cover_size,
         // then varint encode 0 for buf_rle_size.
         // 16777217 in 7-bit groups from MSB: 8, 0, 0, 1
         // Encoding: 0x88 0x80 0x80 0x01 (with continuation bits on first 3)
@@ -849,14 +942,17 @@ mod tests {
                 ..Default::default()
             },
             new_data_size: 0,
-            step_mem_size: (16 * 1024 * 1024) as i64, // MAX_STEP_SIZE
+            step_mem_size: MAX_HDIFF20_STEP_SIZE as i64,
             ..Default::default()
         };
         let patcher = PatchSF::new(header);
         let mut input = Cursor::new(Vec::new());
         let mut output = Cursor::new(Vec::new());
         let result = patcher.patch(&mut input, &mut output, patch_path.to_str().unwrap(), None);
-        assert!(result.is_err(), "should fail when step_end > MAX_STEP_SIZE");
+        assert!(
+            result.is_err(),
+            "should fail when step_end > MAX_HDIFF20_STEP_SIZE"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("exceeds maximum"),
@@ -864,22 +960,12 @@ mod tests {
         );
     }
 
-    /// When buf_cover_size or buf_rle_size is negative, patch_loop should
-    /// return an error.
     #[test]
-    fn patch_sf_negative_step_sizes_fails() {
+    fn patch_sf_truncated_step_size_varint_fails() {
         let dir = tempfile::tempdir().unwrap();
         let patch_path = dir.path().join("patch.hdiff");
 
-        // Encoding a negative value in varint is not possible (varints are
-        // unsigned), but we test the check by preparing a minimal diff where
-        // the varint parsing produces unexpectedly large values that don't
-        // lead to negative. Since varints can't be negative, the
-        // buf_cover_size_raw < 0 check is a safety net. We verify it exists
-        // by checking cover_count=1 with valid but insufficient diff data
-        // still triggers an error (truncated read during step).
-        // Instead, test that the negative check path is present by verifying
-        // the function returns error when diff data is insufficient.
+        // The first varint is missing after this continuation marker.
         std::fs::write(&patch_path, b"\x00").unwrap();
 
         let header = HeaderInfo {
@@ -901,12 +987,45 @@ mod tests {
         let mut input = Cursor::new(Vec::new());
         let mut output = Cursor::new(Vec::new());
         let result = patcher.patch(&mut input, &mut output, patch_path.to_str().unwrap(), None);
-        // Should fail because diff data is too short to read both varints
-        assert!(result.is_err(), "should fail with insufficient diff data");
+        let error = result.expect_err("truncated step-size varint must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
-    /// When step_end exceeds both MAX_STEP_SIZE and step_buf capacity, the
-    /// MAX_STEP_SIZE check fires first since it is checked before buffer
+    #[test]
+    fn validate_step_sizes_accepts_inclusive_limit() {
+        assert_eq!(
+            validate_step_sizes(MAX_HDIFF20_STEP_SIZE as i64, 0).unwrap(),
+            (MAX_HDIFF20_STEP_SIZE, MAX_HDIFF20_STEP_SIZE)
+        );
+        assert_eq!(
+            validate_step_sizes(0, MAX_HDIFF20_STEP_SIZE as i64).unwrap(),
+            (0, MAX_HDIFF20_STEP_SIZE)
+        );
+    }
+
+    #[test]
+    fn validate_step_sizes_rejects_values_that_do_not_fit_usize() {
+        for (cover_size, rle_size) in [(i64::MIN, 0), (0, i64::MIN)] {
+            let error = validate_step_sizes(cover_size, rle_size).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn validate_step_sizes_rejects_totals_above_limit() {
+        for (cover_size, rle_size) in [
+            (i64::MAX, 0),
+            (i64::MAX, i64::MAX),
+            (MAX_HDIFF20_STEP_SIZE as i64, 1),
+        ] {
+            let error = validate_step_sizes(cover_size, rle_size).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(error.to_string().contains("exceeds maximum"));
+        }
+    }
+
+    /// When step_end exceeds both MAX_HDIFF20_STEP_SIZE and step_buf capacity,
+    /// the size check fires first since it is checked before buffer
     /// capacity. This variant uses two medium-sized values that sum past
     /// the limit.
     #[test]
@@ -914,11 +1033,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let patch_path = dir.path().join("patch.hdiff");
 
-        // buf_cover_size = 16777217 (MAX_STEP_SIZE + 1)
+        // buf_cover_size = 16777217 (MAX_HDIFF20_STEP_SIZE + 1)
         // 16777217 -> 7-bit groups: 8, 0, 0, 1 -> 0x88 0x80 0x80 0x01
-        // buf_rle_size = 16777216 (MAX_STEP_SIZE)
+        // buf_rle_size = 16777216 (MAX_HDIFF20_STEP_SIZE)
         // 16777216 -> 7-bit groups: 8, 0, 0, 0 -> 0x88 0x80 0x80 0x00
-        // step_end = 16777217 + 16777216 = 33554433 >> MAX_STEP_SIZE
+        // step_end = 16777217 + 16777216 = 33554433 > MAX_HDIFF20_STEP_SIZE
         let diff_data: Vec<u8> = vec![
             0x88, 0x80, 0x80, 0x01, // buf_cover_size = 16777217
             0x88, 0x80, 0x80, 0x00, // buf_rle_size = 16777216
@@ -946,7 +1065,7 @@ mod tests {
         let result = patcher.patch(&mut input, &mut output, patch_path.to_str().unwrap(), None);
         assert!(
             result.is_err(),
-            "sum of step sizes exceeding MAX_STEP_SIZE should fail"
+            "sum of step sizes exceeding MAX_HDIFF20_STEP_SIZE should fail"
         );
         let msg = result.unwrap_err().to_string();
         assert!(

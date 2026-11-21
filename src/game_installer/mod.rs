@@ -5,19 +5,39 @@ pub mod adaptive_download;
 mod api;
 /// Chunk validation, file assembly, and temporary-file cleanup.
 pub mod assembly;
+mod assembly_workers;
+/// Batched durability for assembled files (epoch flush + rename commit).
+pub mod assembly_epochs;
+#[cfg(feature = "benchmark")]
+pub mod assembly_opt;
+#[cfg(not(feature = "benchmark"))]
 mod assembly_opt;
 /// Persistent and in-memory file verification cache.
 pub mod cache;
+/// Per-file SIMD batch hasher for deferred chunk-decompressed MD5 checks
+/// during parallel assembly (VerifyMode::Full).
+pub mod chunk_batch_hasher;
 /// Disk-backed completion bitmap used to resume eager decompression.
 pub mod chunk_bitmap;
 /// Memory-compact columnar manifest representation.
 pub mod compact_manifest;
+pub(crate) mod decompress_oneshot;
 mod download;
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub use download::benchmark as download_benchmark;
+#[cfg(feature = "bench-diagnostics")]
+#[doc(hidden)]
+pub use download::{
+    DownloadHashAlgorithm, DownloadPhaseSamples, DownloadPhaseTimings,
+    benchmark_download_chunk_with_timings,
+};
 /// Streaming decompression directly into output file ranges.
 pub mod eager_decompress;
 mod error;
 mod game_filters;
 mod handle;
+mod snapshot;
 #[cfg(feature = "benchmark")]
 pub mod hdiffpatch;
 #[cfg(not(feature = "benchmark"))]
@@ -26,10 +46,19 @@ mod hdiffpatch;
 pub mod installer;
 /// Output-file preallocation and shared file-handle management.
 pub mod output_allocator;
+/// SIMD multi-buffer MD5 verification for batches of independent files.
+/// Benchmark-only (not compiled into production paths); the production
+/// consumer of the md5-simd kernel is the per-file chunk batch hasher.
+#[cfg(feature = "bench-internals")]
+pub mod md5_multibuffer;
 mod plugin_api;
 mod plugin_install;
-mod preinstall;
+#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+pub mod preinstall;
+#[cfg(not(feature = "bench-internals"))]
 mod update;
+#[cfg(feature = "bench-internals")]
+pub mod update;
 
 mod profiling;
 /// Platform file-copy and preallocation helpers.
@@ -46,7 +75,11 @@ pub const MAX_RETRIES: u32 = 5;
 pub const MAX_HASH_RETRIES: u32 = 5;
 
 /// Hard ceiling for concurrent chunk download workers.
-pub const DOWNLOAD_CONCURRENCY: usize = adaptive_download::MAX_CONCURRENCY;
+/// Maximum download concurrency, derived from CPU count at runtime.
+#[inline]
+pub fn download_concurrency() -> usize {
+    adaptive_download::max_concurrency()
+}
 
 use std::time::Duration;
 
@@ -82,8 +115,29 @@ pub async fn cancelable_sleep(
         } => Err(()),
     }
 }
-/// Fixed assembly worker count while chunk downloads are active.
+/// Assembly worker count while chunk downloads are active. Capped at 4
+/// so assembly never starves download workers, regardless of CPU count.
+#[inline]
+pub fn assembly_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(4)
+}
+/// Backwards-compatible constant; retained because installer.rs is
+/// codegen-sensitive and changing its call sites risks state_save
+/// canary regression. New code should call [`assembly_concurrency`].
 pub const ASSEMBLY_CONCURRENCY: usize = 4;
+/// Parallelism for full-file or cached-chunk MD5 verification passes.
+/// 2x CPU count because verification is I/O-bound; capped at 32 to
+/// avoid memory pressure from concurrent file reads.
+pub fn verify_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2).min(32))
+        .unwrap_or(16)
+}
+/// Backwards-compatible constant; retained because installer.rs is
+/// codegen-sensitive. New code should call [`verify_concurrency`].
+pub const VERIFY_CONCURRENCY: usize = 16;
 /// Installed version marker filename.
 pub const VERSION_FILE_NAME: &str = ".sophon_version";
 /// MD5 verification cache filename.
@@ -105,9 +159,9 @@ pub enum VerifyMode {
 }
 
 /// File write buffer during assembly (zstd streaming input + output).
-pub const FILE_WRITE_BUFFER_SIZE: usize = 256 * 1024;
+pub const FILE_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 /// File write buffer during chunk downloads.
-pub const CHUNK_WRITE_BUFFER_SIZE: usize = 256 * 1024;
+pub const CHUNK_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 
 /// Minimum progress update interval (ms).
 pub const PROGRESS_UPDATE_INTERVAL_MS: u64 = 1000;
@@ -116,6 +170,7 @@ pub const PROGRESS_UPDATE_INTERVAL_MS: u64 = 1000;
 pub const SPEED_SMOOTH_WINDOW_SECS: f64 = 5.0;
 
 /// Update an EWMA-smoothed value stored as a scaled u64.
+#[inline]
 pub fn ewma_update(atomic: &std::sync::atomic::AtomicU64, raw_value: f64, alpha: f64) -> f64 {
     const SCALE: f64 = 1000.0;
     use std::sync::atomic::Ordering;
@@ -176,6 +231,93 @@ pub const SOPHON_BUILD_URL_BASE: &str = concat!(
     "/downloader/sophon_chunk/api/getBuild"
 );
 
+/// Test/bench-only endpoint overrides. When set, `front_door_url()`,
+/// `sophon_build_url_base()`, and `sophon_patch_build_url_base()` return the
+/// override instead of the production constant. This lets end-to-end tests
+/// drive the full `Sophon` public API against a wiremock server without
+/// changing the public API surface. Production builds compile this out.
+#[cfg(any(test, feature = "bench-internals"))]
+pub(crate) mod test_endpoints {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FRONT_DOOR: RefCell<Option<String>> = const { RefCell::new(None) };
+        static BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
+        static PATCH_BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub fn set_front_door(url: Option<String>) {
+        FRONT_DOOR.with(|c| *c.borrow_mut() = url);
+    }
+    pub fn set_build_base(url: Option<String>) {
+        BUILD_BASE.with(|c| *c.borrow_mut() = url);
+    }
+    pub fn set_patch_build_base(url: Option<String>) {
+        PATCH_BUILD_BASE.with(|c| *c.borrow_mut() = url);
+    }
+
+    pub fn front_door() -> Option<String> {
+        FRONT_DOOR.with(|c| c.borrow().clone())
+    }
+    pub fn build_base() -> Option<String> {
+        BUILD_BASE.with(|c| c.borrow().clone())
+    }
+    pub fn patch_build_base() -> Option<String> {
+        PATCH_BUILD_BASE.with(|c| c.borrow().clone())
+    }
+}
+
+/// Re-export the test endpoint setters for integration tests under
+/// `tests/`, gated the same way as the override mechanism itself.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_test_endpoints {
+    pub use super::test_endpoints::{set_build_base, set_front_door, set_patch_build_base};
+}
+
+/// Resolve the front-door URL, honoring test overrides when present.
+pub(crate) fn front_door_url() -> String {
+    #[cfg(any(test, feature = "bench-internals"))]
+    {
+        test_endpoints::front_door().unwrap_or_else(|| FRONT_DOOR_URL.to_string())
+    }
+    #[cfg(not(any(test, feature = "bench-internals")))]
+    {
+        FRONT_DOOR_URL.to_string()
+    }
+}
+
+/// Resolve the build URL base, honoring test overrides when present.
+pub(crate) fn sophon_build_url_base() -> String {
+    #[cfg(any(test, feature = "bench-internals"))]
+    {
+        test_endpoints::build_base().unwrap_or_else(|| SOPHON_BUILD_URL_BASE.to_string())
+    }
+    #[cfg(not(any(test, feature = "bench-internals")))]
+    {
+        SOPHON_BUILD_URL_BASE.to_string()
+    }
+}
+
+/// Base endpoint for patch-build metadata requests.
+pub const SOPHON_PATCH_BUILD_URL_BASE: &str = concat!(
+    "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
+    "/downloader/sophon_chunk/api/getPatchBuild"
+);
+
+/// Resolve the patch-build URL base, honoring test overrides when present.
+pub(crate) fn sophon_patch_build_url_base() -> String {
+    #[cfg(any(test, feature = "bench-internals"))]
+    {
+        test_endpoints::patch_build_base()
+            .unwrap_or_else(|| SOPHON_PATCH_BUILD_URL_BASE.to_string())
+    }
+    #[cfg(not(any(test, feature = "bench-internals")))]
+    {
+        SOPHON_PATCH_BUILD_URL_BASE.to_string()
+    }
+}
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -199,6 +341,7 @@ pub fn write_installed_tag(game_dir: &Path, tag: &str) -> io::Result<()> {
 pub use crate::types::CompletedFiles;
 pub use assembly::validate_asset_name;
 pub use error::SophonError;
+pub use handle::ControlState;
 pub use handle::DownloadHandle;
 pub use installer::{
     InstallCallbacks, InstallOptions, ResumeContext, StateSaver, assign_chunk_offsets,
@@ -206,9 +349,24 @@ pub use installer::{
     intern_old_chunk_offsets, verify_integrity,
 };
 pub use plugin_install::{install_channel_sdks, install_plugins};
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_bounded_drain_stream;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_bounded_pending_stream;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_bounded_stream;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_chunk_future;
+#[cfg(feature = "benchmark")]
+pub use preinstall::benchmark_download_over_future_batch;
+#[cfg(feature = "benchmark")]
+pub use preinstall::prepare_synthetic_apply_state as prepare_benchmark_preinstall_state;
+#[cfg(feature = "benchmark")]
+pub use preinstall::prepare_synthetic_copyover_state as prepare_benchmark_copyover_state;
+#[cfg(feature = "bench-diagnostics")]
+pub use preinstall::{HdiffPhaseTimings, apply_synthetic_hdiff_for_benchmark};
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
 pub use update::{UpdateInfo, check_update};
-pub use handle::ControlState;
 
 /// Advance jemalloc epoch and trigger a background decay pass. Call after
 /// major sophon phase transitions (download → assembly, etc.) to reduce
@@ -217,6 +375,14 @@ pub fn reclaim_memory() {
     #[cfg(feature = "sophon-profiling")]
     {
         let _ = tikv_jemalloc_ctl::epoch::advance();
+    }
+    hdiffpatch::trim_idle_buffers();
+    assembly_opt::trim_thread_local_buffers();
+    assembly::trim_transfer_buffer();
+    // Return freed glibc arena memory to the OS. Without this, freed
+    // allocations stay in per-thread arenas and never get unmapped.
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 

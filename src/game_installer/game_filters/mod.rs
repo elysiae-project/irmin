@@ -4,11 +4,11 @@ mod nap;
 
 pub(crate) use hk4e::is_generated_pkg_version;
 pub use hk4e::{
-    filter_hk4e_asset_list, find_hk4e_persistent_dir,
+    Hk4eFilter, filter_hk4e_asset_list, find_hk4e_persistent_dir,
     write_audio_lang_record as write_hk4e_audio_lang_record, write_pkg_version_from_manifest,
 };
 pub use hkrpg::{
-    filter_hkrpg_asset_list, write_app_info as write_hkrpg_app_info,
+    HkrpgFilter, filter_hkrpg_asset_list, write_app_info as write_hkrpg_app_info,
     write_audio_lang_record as write_hkrpg_audio_lang_record,
     write_binary_version_files as write_hkrpg_binary_version_files,
 };
@@ -27,7 +27,7 @@ pub fn is_sophon_synthesized_asset(game_code: &str, target_file_path: &str) -> b
             name == "pkg_version"
                 || name == "beyond_pkg_version"
                 || name.starts_with("Audio_") && name.ends_with("_pkg_version")
-                || name.to_lowercase().ends_with("ctable_streaming.dat")
+                || name.to_ascii_lowercase().ends_with("ctable_streaming.dat")
         }
         "hkrpg" => name == "app.info",
         _ => false,
@@ -44,8 +44,7 @@ pub(crate) fn write_lang_file(
     mapper: fn(&str) -> Option<&'static str>,
 ) -> std::io::Result<()> {
     let mut existing: Vec<String> = Vec::new();
-    if path.exists()
-        && let Ok(content) = fs::read_to_string(path)
+    if let Ok(content) = fs::read_to_string(path)
     {
         for line in content.lines() {
             let trimmed = line.trim();

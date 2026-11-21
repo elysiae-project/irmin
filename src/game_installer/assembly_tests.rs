@@ -3,6 +3,476 @@ use super::super::profiling::PipelineProfiler;
 use super::*;
 use crate::game_installer::compact_manifest::CompactManifest;
 use crate::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty};
+use std::io::Write;
+
+#[cfg(feature = "bench-diagnostics")]
+fn benchmark_download_over_fused_hash() -> bool {
+    parse_benchmark_fused_hash_flag(
+        std::env::var("IRMIN_DOWNLOAD_OVER_FUSED_HASH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(feature = "bench-diagnostics")]
+fn parse_benchmark_fused_hash_flag(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(all(test, feature = "bench-diagnostics"))]
+#[test]
+fn download_over_fused_hash_benchmark_flag_requires_one() {
+    assert!(!parse_benchmark_fused_hash_flag(None));
+    assert!(!parse_benchmark_fused_hash_flag(Some("0")));
+    assert!(!parse_benchmark_fused_hash_flag(Some("true")));
+    assert!(parse_benchmark_fused_hash_flag(Some("1")));
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "reports DownloadOver-like assembly timing and RSS by hash strategy"]
+fn benchmark_download_over_assembly_hash_strategy() {
+    use std::io::Read as _;
+    use std::time::Instant;
+
+    let fused = benchmark_download_over_fused_hash();
+    let temp_root = std::env::var_os("IRMIN_DOWNLOAD_OVER_TEMP_DIR");
+    let dir = if let Some(temp_root) = temp_root {
+        tempfile::tempdir_in(temp_root).unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let total_mib = std::env::var("IRMIN_DOWNLOAD_OVER_SIZE_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(8);
+    let chunk_size = total_mib.div_ceil(8) * 1024 * 1024;
+    let mut full_hasher = fast_md5::Md5::new();
+    let mut names = Vec::with_capacity(8);
+    let mut chunks = Vec::with_capacity(8);
+    for index in 0..8 {
+        let name = format!("download-over-{index}");
+        let data: Vec<u8> = (0..chunk_size)
+            .map(|offset| (offset.wrapping_mul(31).wrapping_add(index * 17) % 251) as u8)
+            .collect();
+        make_chunk_file(&chunks_dir, &name, &data);
+        full_hasher.update(&data);
+        let mut chunk = make_chunk(&name, (index * chunk_size) as u64, chunk_size as u64);
+        // Manifest hash fields are hex strings; CompactManifest::from
+        // hex-decodes them into the raw digests it compares.
+        chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(&data)).into();
+        names.push(name);
+        chunks.push(chunk);
+    }
+    let file_hash = hex::encode(full_hasher.finalize());
+    let total_size = chunk_size * 8;
+    let file = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("assembled.bin"),
+        asset_chunks: chunks,
+        asset_type: 0,
+        asset_size: total_size as u64,
+        asset_hash_md5: file_hash.clone().into(),
+    };
+    let manifest = CompactManifest::from(vec![file.clone()]);
+    let lookup = ChunkNameLookup::from_arena(StringArena::with_capacity(0, 0));
+    let refcounts: Vec<AtomicU32> = Vec::new();
+    let cache = DashMap::new();
+    let target = game_dir.join("assembled.bin");
+    let expected_hash = file_hash;
+
+    let assemble = || {
+        if fused {
+            let outcome = assemble_file_for_download_over(
+                &manifest,
+                0,
+                &game_dir,
+                &chunks_dir,
+                &temp_dir,
+                &lookup,
+                &refcounts,
+                &cache,
+            )
+            .unwrap();
+            assert!(outcome.file_hash_verified);
+        } else {
+            assemble_test_file(
+                file.clone(),
+                &game_dir,
+                &chunks_dir,
+                &temp_dir,
+                &lookup,
+                &refcounts,
+                &cache,
+            )
+            .unwrap();
+            let actual = super::super::cache::file_md5_digest(&target).unwrap();
+            assert_eq!(hex::encode(actual), expected_hash);
+        }
+    };
+
+    let started = Instant::now();
+    for _ in 0..3 {
+        cache.clear();
+        let _ = fs::remove_file(&target);
+        assemble();
+        if !fused {
+            assert_eq!(
+                hex::encode(super::super::cache::file_md5_digest(&target).unwrap()),
+                expected_hash
+            );
+        }
+    }
+    let elapsed = started.elapsed();
+    let mut rss_status = String::new();
+    fs::File::open("/proc/self/status")
+        .unwrap()
+        .read_to_string(&mut rss_status)
+        .unwrap();
+    let hwm = rss_status
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))
+        .unwrap_or("VmHWM: unavailable");
+    let mut smaps = String::new();
+    fs::File::open("/proc/self/smaps_rollup")
+        .unwrap()
+        .read_to_string(&mut smaps)
+        .unwrap();
+    let rss = smaps
+        .lines()
+        .filter(|line| {
+            line.starts_with("Rss:")
+                || line.starts_with("Pss:")
+                || line.starts_with("Anonymous:")
+                || line.starts_with("Private_Clean:")
+                || line.starts_with("Private_Dirty:")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        hex::encode(super::super::cache::file_md5_digest(&target).unwrap()),
+        expected_hash
+    );
+    println!(
+        "download_over_hash_strategy fused={fused} total_mib={} iterations=3 elapsed_ms={:.3} {hwm} rss={rss}",
+        total_size / (1024 * 1024),
+        elapsed.as_secs_f64() * 1000.0
+    );
+}
+
+/// Measures Deferred assembly and the subsequent repair-style cache-miss hash read.
+/// The per-file cache hint is best effort; timings are diagnostic and warm-cache unless the
+/// filesystem actually drops the advised pages.
+#[cfg(all(feature = "bench-diagnostics", unix))]
+#[test]
+#[ignore = "measures repair-style post-assembly destination verification cost"]
+fn benchmark_repair_post_assembly_hash_reread() {
+    use std::io::Read as _;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Instant;
+
+    let total_mib = std::env::var("IRMIN_REPAIR_HASH_SIZE_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1);
+    assert!(total_mib <= 4096, "benchmark size exceeds 4 GiB");
+    let cold_hint = std::env::var("IRMIN_REPAIR_HASH_COLD_HINT").as_deref() == Ok("1");
+    let iterations = std::env::var("IRMIN_REPAIR_HASH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1);
+    assert!(iterations <= 100, "benchmark iteration count exceeds 100");
+    let temp_root = std::env::var_os("IRMIN_REPAIR_HASH_TEMP_DIR");
+    let dir = if let Some(temp_root) = temp_root {
+        tempfile::tempdir_in(temp_root).unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let total_bytes = total_mib.checked_mul(1024 * 1024).unwrap();
+    let chunk_size = total_bytes.div_ceil(8);
+    let mut file_hasher = fast_md5::Md5::new();
+    let mut chunks = Vec::with_capacity(8);
+    let mut names = Vec::with_capacity(8);
+    for index in 0..8 {
+        let start = index * chunk_size;
+        let len = (total_bytes - start).min(chunk_size);
+        let data: Vec<u8> = (0..len)
+            .map(|offset| (offset.wrapping_mul(31).wrapping_add(index * 17) % 251) as u8)
+            .collect();
+        let name = format!("repair-hash-{index}");
+        make_chunk_file(&chunks_dir, &name, &data);
+        file_hasher.update(&data);
+        let mut chunk = make_chunk(&name, start as u64, len as u64);
+        // Manifest hash fields are hex strings; CompactManifest::from
+        // hex-decodes them into the raw digests it compares.
+        chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(&data)).into();
+        names.push(name);
+        chunks.push(chunk);
+    }
+    let expected_hash = file_hasher.finalize();
+    let file = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("repair-asset.bin"),
+        asset_chunks: chunks,
+        asset_type: 0,
+        asset_size: total_bytes as u64,
+        asset_hash_md5: hex::encode(expected_hash).into(),
+    };
+    let manifest = CompactManifest::from(vec![file]);
+    let lookup = ChunkNameLookup::from_arena(StringArena::from(
+        names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+    ));
+    let remaining_uses = u32::try_from(iterations).unwrap() + 1;
+    let refcounts = (0..8)
+        .map(|_| AtomicU32::new(remaining_uses))
+        .collect::<Vec<_>>();
+    let verify_cache = DashMap::new();
+    let target = game_dir.join("repair-asset.bin");
+    let path_key = "repair-asset.bin";
+    let filesystem_magic = {
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+        assert_eq!(result, 0, "failed to query benchmark filesystem");
+        unsafe { stats.assume_init().f_type as u64 }
+    };
+
+    let mut assembly_times = Vec::with_capacity(iterations);
+    let mut reread_times = Vec::with_capacity(iterations);
+    let mut total_times = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        verify_cache.remove(path_key);
+        let started = Instant::now();
+        assemble_file(
+            &manifest,
+            0,
+            &game_dir,
+            &chunks_dir,
+            &temp_dir,
+            &lookup,
+            &refcounts,
+            &verify_cache,
+            true,
+            crate::game_installer::VerifyMode::Deferred,
+        )
+        .unwrap_or_else(|error| panic!("repair hash fixture assembly failed: {error}"));
+        let assembly_elapsed = started.elapsed();
+
+        let target_file = fs::File::open(&target).unwrap();
+        if cold_hint {
+            super::super::assembly_opt::posix_advise(
+                target_file.as_raw_fd(),
+                0,
+                total_bytes as u64,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        verify_cache.remove(path_key);
+        let verify_started = Instant::now();
+        assert!(
+            super::super::cache::check_file_md5_cached(
+                &target,
+                total_bytes as u64,
+                &expected_hash,
+                &game_dir,
+                &verify_cache,
+            )
+            .unwrap()
+        );
+        let reread_elapsed = verify_started.elapsed();
+        total_times.push(started.elapsed());
+        assembly_times.push(assembly_elapsed);
+        reread_times.push(reread_elapsed);
+        assert_eq!(
+            super::super::cache::file_md5_digest(&target).unwrap(),
+            expected_hash
+        );
+        let expected_mtime = target
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let entry = verify_cache.get(path_key).unwrap();
+            assert_eq!(entry.value().size, total_bytes as u64);
+            assert_eq!(entry.value().md5, expected_hash);
+            assert_eq!(entry.value().mtime_secs, expected_mtime);
+        }
+        verify_cache.remove(path_key);
+    }
+
+    let mut status = String::new();
+    fs::File::open("/proc/self/status")
+        .unwrap()
+        .read_to_string(&mut status)
+        .unwrap();
+    let hwm_kib = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmHWM:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or_default();
+    println!(
+        "repair_hash_baseline filesystem_magic=0x{filesystem_magic:x} size_mib={total_mib} iterations={iterations} cold_hint={cold_hint} assembly_ms={:?} reread_ms={:?} total_ms={:?} VmHWM_kib={hwm_kib}",
+        assembly_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>(),
+        reread_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>(),
+        total_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures cached-target checks in the assembly fast path"]
+fn benchmark_cached_assembly_target_checks() {
+    use std::io::Read as _;
+    use std::time::Instant;
+
+    fn process_hwm_kib() -> u64 {
+        let mut status = String::new();
+        fs::File::open("/proc/self/status")
+            .unwrap()
+            .read_to_string(&mut status)
+            .unwrap();
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmHWM:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or_default()
+    }
+
+    let file_count = std::env::var("IRMIN_CACHE_HIT_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+    assert!(file_count > 0);
+    let temp_root = std::env::var_os("IRMIN_CACHE_HIT_TEMP_DIR");
+    let dir = if let Some(root) = temp_root {
+        tempfile::tempdir_in(root).unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+    // Manifest hash fields hold hex strings (see asset_hash_md5_str); the
+    // raw digest is only needed for cache entries, which compare bytes.
+    let empty_hash = fast_md5::digest(b"");
+    let empty_hash_hex = hex::encode(empty_hash);
+    let mut assets = Vec::with_capacity(file_count);
+    let cache = DashMap::new();
+    for index in 0..file_count {
+        let name = format!("asset-{index:08}.bin");
+        let path = game_dir.join(&name);
+        fs::File::create(&path).unwrap();
+        let mtime_secs = path
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        cache.insert(
+            name.clone(),
+            super::super::cache::VerificationEntry {
+                size: 0,
+                md5: empty_hash,
+                mtime_secs,
+            },
+        );
+        assets.push(SophonManifestAssetProperty {
+            asset_name: name.into(),
+            asset_chunks: Vec::new(),
+            asset_type: 0,
+            asset_size: 0,
+            asset_hash_md5: empty_hash_hex.clone().into(),
+        });
+    }
+    let manifest = CompactManifest::from(assets);
+    std::fs::write("/proc/self/clear_refs", b"5").unwrap();
+    let before_hwm = process_hwm_kib();
+    let run = |metadata_reuse: bool| {
+        let started = Instant::now();
+        for file_idx in 0..manifest.num_files() {
+            let path = game_dir.join(manifest.file_name(file_idx));
+            let already_valid = if metadata_reuse {
+                match path.metadata() {
+                    Ok(metadata) => super::super::cache::check_file_md5_cached_with_metadata(
+                        &path,
+                        manifest.file_size(file_idx),
+                        manifest.file_hash_md5(file_idx),
+                        &game_dir,
+                        &cache,
+                        metadata,
+                    )
+                    .unwrap(),
+                    Err(_) => false,
+                }
+            } else {
+                path.exists()
+                    && super::super::cache::check_file_md5_cached(
+                        &path,
+                        manifest.file_size(file_idx),
+                        manifest.file_hash_md5(file_idx),
+                        &game_dir,
+                        &cache,
+                    )
+                    .unwrap()
+            };
+            assert!(already_valid);
+        }
+        started.elapsed()
+    };
+    let metadata_reuse = std::env::var("IRMIN_CACHE_HIT_MODE").as_deref() == Ok("reuse");
+    let elapsed = run(metadata_reuse);
+    println!(
+        "cached_assembly_target_checks mode={} files={file_count} elapsed_ms={:.3} per_file_us={:.3} hwm_before_kib={before_hwm} hwm_after_kib={}",
+        if metadata_reuse { "reuse" } else { "baseline" },
+        elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1_000_000.0 / file_count as f64,
+        process_hwm_kib(),
+    );
+}
 
 fn make_chunk_names(names: &[&str]) -> Arc<ChunkNameLookup> {
     Arc::new(ChunkNameLookup::from_arena(StringArena::from(names)))
@@ -127,13 +597,13 @@ fn compute_md5_hex(data: &[u8]) -> String {
 
 fn make_chunk(name: &str, offset: u64, decompressed_size: u64) -> SophonManifestAssetChunk {
     SophonManifestAssetChunk {
-        chunk_name: name.to_string(),
-        chunk_decompressed_hash_md5: String::new(),
+        chunk_name: name.to_string().into(),
+        chunk_decompressed_hash_md5: bytes::Bytes::new(),
         chunk_on_file_offset: offset,
         chunk_size: 0,
         chunk_size_decompressed: decompressed_size,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     }
 }
@@ -153,11 +623,11 @@ fn assemble_file_from_single_chunk() {
     let md5 = compute_md5_hex(original_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "output.bin".to_string(),
+        asset_name: bytes::Bytes::from("output.bin"),
         asset_chunks: vec![make_chunk("chunk0", 0, original_data.len() as u64)],
         asset_type: 0,
         asset_size: original_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunk0"]);
@@ -202,14 +672,14 @@ fn assemble_file_from_multiple_chunks() {
     let md5 = compute_md5_hex(&full_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "multi.bin".to_string(),
+        asset_name: bytes::Bytes::from("multi.bin"),
         asset_chunks: vec![
             make_chunk("chunkA", 0, data_a.len() as u64),
             make_chunk("chunkB", data_a.len() as u64, data_b.len() as u64),
         ],
         asset_type: 0,
         asset_size: total_size,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunkA", "chunkB"]);
@@ -251,11 +721,11 @@ fn assemble_file_skips_valid_existing() {
     make_chunk_file(&chunks_dir, "chunk_skip", original_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "existing.bin".to_string(),
+        asset_name: bytes::Bytes::from("existing.bin"),
         asset_chunks: vec![make_chunk("chunk_skip", 0, original_data.len() as u64)],
         asset_type: 0,
         asset_size: original_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunk_skip"]);
@@ -281,6 +751,46 @@ fn assemble_file_skips_valid_existing() {
 }
 
 #[test]
+fn assemble_file_skip_md5_check_does_not_verify_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+    let target = game_dir.join("target.bin");
+    fs::write(&target, b"stale target").unwrap();
+    let correct = b"replacement";
+    make_chunk_file(&chunks_dir, "replacement", correct);
+    let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("target.bin"),
+        asset_chunks: vec![make_chunk("replacement", 0, correct.len() as u64)],
+        asset_type: 0,
+        asset_size: correct.len() as u64,
+        asset_hash_md5: bytes::Bytes::from(compute_md5_hex(correct)),
+    }]);
+    let lookup = make_chunk_names(&["replacement"]);
+    let refcounts = [AtomicU32::new(1)];
+
+    assemble_file(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &DashMap::new(),
+        true,
+        crate::game_installer::VerifyMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&target).unwrap(), correct);
+}
+
+#[test]
 fn assemble_file_reassembles_md5_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let game_dir = dir.path().join("game");
@@ -300,11 +810,11 @@ fn assemble_file_reassembles_md5_mismatch() {
     make_chunk_file(&chunks_dir, "chunk_fix", correct_data);
 
     let file = SophonManifestAssetProperty {
-        asset_name: "mismatch.bin".to_string(),
+        asset_name: bytes::Bytes::from("mismatch.bin"),
         asset_chunks: vec![make_chunk("chunk_fix", 0, correct_data.len() as u64)],
         asset_type: 0,
         asset_size: correct_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&["chunk_fix"]);
@@ -359,11 +869,11 @@ fn assemble_file_parallel_file_hash_passes() {
     let chunk_refcounts: Vec<AtomicU32> = (0..chunks.len()).map(|_| AtomicU32::new(1)).collect();
 
     let file = SophonManifestAssetProperty {
-        asset_name: "parallel_hash.bin".to_string(),
+        asset_name: bytes::Bytes::from("parallel_hash.bin"),
         asset_chunks: chunk_specs,
         asset_type: 0,
         asset_size: full.len() as u64,
-        asset_hash_md5: file_md5,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
     };
 
     let verify_cache = DashMap::new();
@@ -417,11 +927,11 @@ fn assemble_file_parallel_file_hash_mismatch_fails() {
         String::from_utf8((0..32).map(|i| if i == 0 { b'f' } else { b'0' }).collect()).unwrap();
 
     let file = SophonManifestAssetProperty {
-        asset_name: "corrupt.bin".to_string(),
+        asset_name: bytes::Bytes::from("corrupt.bin"),
         asset_chunks: chunk_specs,
         asset_type: 0,
         asset_size: full.len() as u64,
-        asset_hash_md5: corrupt_md5,
+        asset_hash_md5: bytes::Bytes::from(corrupt_md5),
     };
 
     let verify_cache = DashMap::new();
@@ -441,6 +951,160 @@ fn assemble_file_parallel_file_hash_mismatch_fails() {
         SophonError::Md5Mismatch { .. }
     ));
     assert!(!game_dir.join("corrupt.bin").exists());
+}
+
+#[test]
+fn assemble_file_download_over_forces_file_hash_with_chunk_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let chunks: Vec<Vec<u8>> = (0..8)
+        .map(|i| (0..4096).map(|j| ((i * 17 + j) % 251) as u8).collect())
+        .collect();
+    let names: Vec<String> = (0..8).map(|i| format!("fused-{i}")).collect();
+    for (name, data) in names.iter().zip(&chunks) {
+        make_chunk_file(&chunks_dir, name, data);
+    }
+    let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let specs = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, data)| {
+            let mut chunk = make_chunk(
+                &names[index],
+                (index * data.len()) as u64,
+                data.len() as u64,
+            );
+            chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data)).into();
+            chunk
+        })
+        .collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let lookup = ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice()));
+    let refcounts: Vec<AtomicU32> = (0..names.len()).map(|_| AtomicU32::new(1)).collect();
+    let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("fused.bin"),
+        asset_chunks: specs,
+        asset_type: 0,
+        asset_size: expected.len() as u64,
+        asset_hash_md5: bytes::Bytes::from(compute_md5_hex(&expected)),
+    }]);
+    let cache = DashMap::new();
+
+    let outcome = assemble_file_for_download_over(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &cache,
+    )
+    .unwrap();
+
+    assert!(outcome.file_hash_verified);
+    assert_eq!(fs::read(game_dir.join("fused.bin")).unwrap(), expected);
+}
+
+#[test]
+fn assemble_file_download_over_forced_hash_rejects_wrong_file_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let data = b"valid chunk payload";
+    make_chunk_file(&chunks_dir, "single", data);
+    let mut chunk = make_chunk("single", 0, data.len() as u64);
+    chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data)).into();
+    let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("bad-file-hash.bin"),
+        asset_chunks: vec![chunk],
+        asset_type: 0,
+        asset_size: data.len() as u64,
+        asset_hash_md5: bytes::Bytes::from("00000000000000000000000000000000"),
+    }]);
+    let lookup = make_chunk_names(&["single"]);
+    let refcounts = [AtomicU32::new(1)];
+
+    let result = assemble_file_for_download_over(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &DashMap::new(),
+    );
+
+    assert!(matches!(result, Err(SophonError::Md5Mismatch { .. })));
+    assert!(!game_dir.join("bad-file-hash.bin").exists());
+}
+
+#[test]
+fn assemble_file_download_over_forces_sequential_hash_for_small_unaligned_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let chunks = [b"first chunk".as_slice(), b"second tail"];
+    let names = ["small-a", "small-b"];
+    for (name, data) in names.iter().zip(chunks) {
+        make_chunk_file(&chunks_dir, name, data);
+    }
+    let expected: Vec<u8> = chunks.into_iter().flatten().copied().collect();
+    let specs = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, data)| {
+            let mut chunk = make_chunk(
+                names[index],
+                (index * chunks[0].len()) as u64,
+                data.len() as u64,
+            );
+            chunk.chunk_decompressed_hash_md5 = hex::encode(fast_md5::digest(data)).into();
+            chunk
+        })
+        .collect();
+    let manifest = CompactManifest::from(vec![SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("small-unaligned.bin"),
+        asset_chunks: specs,
+        asset_type: 0,
+        asset_size: expected.len() as u64,
+        asset_hash_md5: bytes::Bytes::from(compute_md5_hex(&expected)),
+    }]);
+    let lookup = ChunkNameLookup::from_arena(StringArena::with_capacity(0, 0));
+    let outcome = assemble_file_for_download_over(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &[],
+        &DashMap::new(),
+    )
+    .unwrap();
+
+    assert!(outcome.file_hash_verified);
+    assert_eq!(
+        fs::read(game_dir.join("small-unaligned.bin")).unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -534,6 +1198,15 @@ fn run_assembly_task_out_of_bounds_file_idx() {
         profiler: Arc::new(PipelineProfiler::new()),
         completion_flags: Arc::from(Vec::<AtomicBool>::new()),
         verify_mode: crate::game_installer::VerifyMode::Full,
+        epochs: Arc::new(super::super::assembly_epochs::AssemblyEpochs::new(
+            Arc::new(ChunkNameLookup::from_arena(StringArena::from(
+                [].as_slice(),
+            ))),
+            Arc::new(Vec::new()),
+            Arc::new(dir.path().to_path_buf()),
+            super::super::assembly_epochs::EPOCH_MAX_FILES,
+            super::super::assembly_epochs::EPOCH_MAX_BYTES,
+        )),
     };
 
     let result = run_assembly_task(params, |_| {});
@@ -560,22 +1233,22 @@ fn assemble_file_chunk_md5_passes() {
     let file_md5 = compute_md5_hex(data);
 
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "ck0".to_string(),
-        chunk_decompressed_hash_md5: chunk_md5,
+        chunk_name: bytes::Bytes::from("ck0"),
+        chunk_decompressed_hash_md5: bytes::Bytes::from(chunk_md5),
         chunk_on_file_offset: 0,
         chunk_size: 0,
         chunk_size_decompressed: data.len() as u64,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     };
 
     let file = SophonManifestAssetProperty {
-        asset_name: "verified.bin".to_string(),
+        asset_name: bytes::Bytes::from("verified.bin"),
         asset_chunks: vec![chunk],
         asset_type: 0,
         asset_size: data.len() as u64,
-        asset_hash_md5: file_md5,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
     };
 
     let chunk_names = make_chunk_names(&["ck0"]);
@@ -612,22 +1285,22 @@ fn assemble_file_chunk_md5_mismatch_fails() {
     let file_md5 = compute_md5_hex(data);
 
     let chunk = SophonManifestAssetChunk {
-        chunk_name: "ck1".to_string(),
-        chunk_decompressed_hash_md5: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+        chunk_name: bytes::Bytes::from("ck1"),
+        chunk_decompressed_hash_md5: bytes::Bytes::from("deadbeefdeadbeefdeadbeefdeadbeef"),
         chunk_on_file_offset: 0,
         chunk_size: 0,
         chunk_size_decompressed: data.len() as u64,
         chunk_compressed_hash_xxh: 0,
-        chunk_compressed_hash_md5: String::new(),
+        chunk_compressed_hash_md5: bytes::Bytes::new(),
         chunk_old_offset: -1,
     };
 
     let file = SophonManifestAssetProperty {
-        asset_name: "bad.bin".to_string(),
+        asset_name: bytes::Bytes::from("bad.bin"),
         asset_chunks: vec![chunk],
         asset_type: 0,
         asset_size: data.len() as u64,
-        asset_hash_md5: file_md5,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
     };
 
     let chunk_names = make_chunk_names(&["ck1"]);
@@ -651,15 +1324,201 @@ fn assemble_file_chunk_md5_mismatch_fails() {
     ));
 }
 
+/// Builds a multi-chunk fixture (>= 4 chunks so the parallel path runs)
+/// where every chunk carries a real 16-byte decompressed MD5. With Full
+/// verify and no forced file hash, this drives `batch_hashes` true: the
+/// workers defer the chunk hashes to the per-file SIMD batch hasher
+/// instead of verifying in-worker.
+fn build_deferred_batch_fixture(
+    chunks_dir: &Path,
+    num_chunks: usize,
+    per_chunk: usize,
+    corrupt_chunk: Option<usize>,
+) -> (SophonManifestAssetProperty, Vec<u8>, String) {
+    let mut raw = Vec::with_capacity(num_chunks * per_chunk);
+    let mut chunks = Vec::with_capacity(num_chunks);
+    for i in 0..num_chunks {
+        let data: Vec<u8> = (0..per_chunk).map(|b| (i * 7 + b * 13) as u8).collect();
+        let chunk_hash = if corrupt_chunk == Some(i) {
+            // Digest of different bytes: guarantees a mismatch.
+            compute_md5_hex(&data.iter().map(|b| b ^ 0xff).collect::<Vec<_>>())
+        } else {
+            compute_md5_hex(&data)
+        };
+        make_chunk_file(chunks_dir, &format!("dck{i}"), &data);
+        chunks.push(SophonManifestAssetChunk {
+            chunk_name: bytes::Bytes::from(format!("dck{i}")),
+            chunk_decompressed_hash_md5: bytes::Bytes::from(chunk_hash),
+            chunk_on_file_offset: (i * per_chunk) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: per_chunk as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: -1,
+        });
+        raw.extend_from_slice(&data);
+    }
+    let file_md5 = compute_md5_hex(&raw);
+    let file = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("deferred.bin"),
+        asset_chunks: chunks,
+        asset_type: 0,
+        asset_size: raw.len() as u64,
+        asset_hash_md5: bytes::Bytes::from(file_md5.clone()),
+    };
+    (file, raw, file_md5)
+}
+
+fn deferred_chunk_names(num_chunks: usize) -> Arc<ChunkNameLookup> {
+    let names: Vec<String> = (0..num_chunks).map(|i| format!("dck{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    make_chunk_names(&refs)
+}
+
+#[test]
+fn assemble_file_deferred_batch_hash_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let (file, raw, _file_md5) = build_deferred_batch_fixture(&chunks_dir, 8, 256 * 1024, None);
+    let chunk_names = deferred_chunk_names(8);
+    let chunk_refcounts: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(1)).collect();
+    let verify_cache = DashMap::new();
+
+    assemble_test_file(
+        file,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &chunk_names,
+        &chunk_refcounts,
+        &verify_cache,
+    )
+    .unwrap();
+
+    let result = fs::read(game_dir.join("deferred.bin")).unwrap();
+    assert_eq!(result, raw);
+}
+
+#[test]
+fn assemble_file_deferred_batch_hash_mismatch_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let (file, _raw, _file_md5) = build_deferred_batch_fixture(&chunks_dir, 8, 256 * 1024, Some(3));
+    let chunk_names = deferred_chunk_names(8);
+    let chunk_refcounts: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(1)).collect();
+    let verify_cache = DashMap::new();
+
+    let result = assemble_test_file(
+        file,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &chunk_names,
+        &chunk_refcounts,
+        &verify_cache,
+    );
+
+    let err = result.unwrap_err();
+    let SophonError::Md5Mismatch { item, .. } = &err else {
+        panic!("expected Md5Mismatch, got {err:?}");
+    };
+    // The report must name the chunk file exactly as the in-worker
+    // verification did: the manifest chunk name with the .zstd extension.
+    assert!(
+        item.ends_with("dck3"),
+        "mismatch item '{item}' must end with the chunk name 'dck3'"
+    );
+    // The tmp file must not survive a verification failure.
+    assert!(!game_dir.join("deferred.bin").exists());
+}
+
+#[test]
+fn assemble_file_eight_byte_hash_keeps_in_worker_path() {
+    // 8-byte (xxh64-style) hashes are never deferred; full chunks must
+    // still assemble through the in-worker comparison.
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let num_chunks = 8;
+    let per_chunk = 256 * 1024;
+    let mut raw = Vec::with_capacity(num_chunks * per_chunk);
+    let mut chunks = Vec::with_capacity(num_chunks);
+    for i in 0..num_chunks {
+        let data: Vec<u8> = (0..per_chunk).map(|b| (i * 7 + b * 13) as u8).collect();
+        make_chunk_file(&chunks_dir, &format!("dck{i}"), &data);
+        chunks.push(SophonManifestAssetChunk {
+            chunk_name: bytes::Bytes::from(format!("dck{i}")),
+            // 16 hex chars decode to 8 binary bytes (xxh64 style): never
+            // deferrable, so the worker passes it straight to the
+            // in-worker confirm path.
+            chunk_decompressed_hash_md5: bytes::Bytes::from("deadbeefcafebabe"),
+            chunk_on_file_offset: (i * per_chunk) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: per_chunk as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: -1,
+        });
+        raw.extend_from_slice(&data);
+    }
+    let file_md5 = compute_md5_hex(&raw);
+    let file = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("eightbyte.bin"),
+        asset_chunks: chunks,
+        asset_type: 0,
+        asset_size: raw.len() as u64,
+        asset_hash_md5: bytes::Bytes::from(file_md5),
+    };
+
+    let chunk_names = deferred_chunk_names(num_chunks);
+    let chunk_refcounts: Vec<AtomicU32> = (0..num_chunks).map(|_| AtomicU32::new(1)).collect();
+    let verify_cache = DashMap::new();
+
+    let result = assemble_test_file(
+        file,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &chunk_names,
+        &chunk_refcounts,
+        &verify_cache,
+    );
+
+    // The 8-byte placeholder cannot match the computed decompressed
+    // digest; the in-worker path must reject it (never deferred).
+    assert!(
+        matches!(result, Err(SophonError::Md5Mismatch { .. })),
+        "expected in-worker Md5Mismatch, got {result:?}"
+    );
+    assert!(!game_dir.join("eightbyte.bin").exists());
+}
+
 #[test]
 fn run_assembly_task_out_of_bounds_tmp_dir_idx() {
     let dir = tempfile::tempdir().unwrap();
     let file = SophonManifestAssetProperty {
-        asset_name: "dummy".to_string(),
+        asset_name: bytes::Bytes::from("dummy"),
         asset_chunks: vec![],
         asset_type: 0,
         asset_size: 0,
-        asset_hash_md5: String::new(),
+        asset_hash_md5: bytes::Bytes::new(),
     };
     let params = AssemblyTaskParams {
         file_idx: 0,
@@ -680,6 +1539,15 @@ fn run_assembly_task_out_of_bounds_tmp_dir_idx() {
         profiler: Arc::new(PipelineProfiler::new()),
         completion_flags: Arc::from((0..1).map(|_| AtomicBool::new(false)).collect::<Vec<_>>()),
         verify_mode: crate::game_installer::VerifyMode::Full,
+        epochs: Arc::new(super::super::assembly_epochs::AssemblyEpochs::new(
+            Arc::new(ChunkNameLookup::from_arena(StringArena::from(
+                [].as_slice(),
+            ))),
+            Arc::new(Vec::new()),
+            Arc::new(dir.path().to_path_buf()),
+            super::super::assembly_epochs::EPOCH_MAX_FILES,
+            super::super::assembly_epochs::EPOCH_MAX_BYTES,
+        )),
     };
 
     let result = run_assembly_task(params, |_| {});
@@ -791,7 +1659,9 @@ fn write_from_old_file_reads_correct_offset() {
         4,    // expected_size
         None, // file_hasher
         &mut transfer_buf,
-        "", // chunk_decompressed_hash_md5 (skip verification)
+        b"", // hash_md5 (skip verification)
+        None,
+    0,
     )
     .unwrap();
     drop(output_file);
@@ -836,10 +1706,64 @@ fn write_from_old_file_verifies_chunk_hash() {
         data.len() as u64,
         None,
         &mut transfer_buf,
-        &expected_md5,
+        expected_md5.as_bytes(),
+        None,
+    0,
     );
 
     assert!(result.is_ok(), "should succeed with correct hash");
+}
+
+/// A chunk larger than the transfer buffer must hash correctly across
+/// multiple readback passes.
+#[test]
+fn write_from_old_file_hashes_chunk_larger_than_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_file_path = dir.path().join("old_file.bin");
+
+    // 512 KiB source region (two 256 KiB buffer passes), filled with a
+    // simple deterministic LCG pattern.
+    let mut data = vec![0u8; 512 * 1024];
+    let mut state: u64 = 7;
+    for b in &mut data {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *b = (state >> 33) as u8;
+    }
+    let expected_md5 = hex::encode(fast_md5::digest(&data));
+    fs::write(&old_file_path, &data).unwrap();
+
+    let output_path = dir.path().join("output.bin");
+    let output_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_path)
+        .unwrap();
+    output_file.set_len(data.len() as u64).unwrap();
+
+    let mut transfer_buf = vec![0u8; super::FILE_WRITE_BUFFER_SIZE];
+    let old_file = File::open(&old_file_path).unwrap();
+    let bytes_written = write_from_old_file(
+        &old_file,
+        &old_file_path,
+        &output_file,
+        0,
+        0,
+        data.len() as u64,
+        None,
+        &mut transfer_buf,
+        expected_md5.as_bytes(),
+        None,
+    0,
+    )
+    .unwrap();
+    drop(output_file);
+
+    assert_eq!(bytes_written, data.len() as u64);
+    assert_eq!(fs::read(&output_path).unwrap(), data);
 }
 
 /// Test write_from_old_file fails on hash mismatch
@@ -873,7 +1797,9 @@ fn write_from_old_file_hash_mismatch_fails() {
         data.len() as u64,
         None,
         &mut transfer_buf,
-        wrong_md5,
+        &super::super::assembly_opt::hex_to_bytes(wrong_md5).unwrap()[..],
+        None,
+    0,
     );
 
     assert!(result.is_err(), "should fail with wrong hash");
@@ -913,7 +1839,9 @@ fn write_from_old_file_too_short_fails() {
         10, // expected_size > actual size
         None,
         &mut transfer_buf,
-        "",
+        b"",
+        None,
+    0,
     );
 
     assert!(result.is_err(), "should fail when file is too short");
@@ -960,20 +1888,20 @@ fn assemble_file_reuses_chunk_from_old_file() {
 
     // Asset with chunk_old_offset >= 0.
     let file = SophonManifestAssetProperty {
-        asset_name: "reused.bin".to_string(),
+        asset_name: bytes::Bytes::from("reused.bin"),
         asset_chunks: vec![SophonManifestAssetChunk {
-            chunk_name: "not_used".to_string(), // Won't be used due to old_offset
-            chunk_decompressed_hash_md5: md5.clone(),
+            chunk_name: bytes::Bytes::from("not_used"), // Won't be used due to old_offset
+            chunk_decompressed_hash_md5: md5.clone().into(),
             chunk_on_file_offset: 0,
             chunk_size: 0,
             chunk_size_decompressed: old_data.len() as u64,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: 0, // Reuse from old file at offset 0
         }],
         asset_type: 0,
         asset_size: old_data.len() as u64,
-        asset_hash_md5: md5,
+        asset_hash_md5: bytes::Bytes::from(md5),
     };
 
     let chunk_names = make_chunk_names(&[]);
@@ -1003,6 +1931,251 @@ fn assemble_file_reuses_chunk_from_old_file() {
 
     // No chunk was downloaded.
     assert!(chunk_refcounts.is_empty());
+}
+
+#[test]
+fn assemble_file_reuses_chunks_from_permuted_old_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    const CHUNK_SIZE: usize = 4096;
+    const CHUNK_COUNT: usize = 8;
+    let source_chunks: Vec<Vec<u8>> = (0..CHUNK_COUNT)
+        .map(|index| vec![u8::try_from(index + 1).unwrap(); CHUNK_SIZE])
+        .collect();
+    let old_data: Vec<u8> = source_chunks.iter().flatten().copied().collect();
+    let permutation: Vec<usize> = (0..CHUNK_COUNT)
+        .map(|index| (index * 3) % CHUNK_COUNT)
+        .collect();
+    let expected: Vec<u8> = permutation
+        .iter()
+        .flat_map(|&source_index| source_chunks[source_index].iter().copied())
+        .collect();
+    let expected_hash = compute_md5_hex(&expected);
+    let asset_name = "permuted-reuse.bin";
+    let target_path = game_dir.join(asset_name);
+    fs::write(&target_path, &old_data).unwrap();
+
+    let asset_chunks = permutation
+        .iter()
+        .enumerate()
+        .map(|(index, &source_index)| SophonManifestAssetChunk {
+            chunk_name: format!("old_{index}").into(),
+            chunk_decompressed_hash_md5: compute_md5_hex(&source_chunks[source_index]).into(),
+            chunk_on_file_offset: (index * CHUNK_SIZE) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: CHUNK_SIZE as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: (source_index * CHUNK_SIZE) as i64,
+        })
+        .collect();
+    let asset = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from(asset_name),
+        asset_chunks,
+        asset_type: 0,
+        asset_size: expected.len() as u64,
+        asset_hash_md5: expected_hash.clone().into(),
+    };
+
+    let lookup = make_chunk_names(&[]);
+    let refcounts = Vec::new();
+    let verify_cache = DashMap::new();
+    assemble_test_file(
+        asset,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &verify_cache,
+    )
+    .unwrap();
+
+    let output = fs::read(&target_path).unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(compute_md5_hex(&output), expected_hash);
+}
+
+#[test]
+fn assemble_file_copies_permuted_old_chunks_without_hashing() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_chunks = [
+        b"first chunk".as_slice(),
+        b"second chunk with tail".as_slice(),
+        b"third".as_slice(),
+    ];
+    let old_data: Vec<u8> = source_chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
+    let permutation = [2usize, 0, 1];
+    let expected: Vec<u8> = permutation
+        .iter()
+        .flat_map(|&index| source_chunks[index].iter().copied())
+        .collect();
+    let asset_name = "unverified-permuted-reuse.bin";
+    let target_path = game_dir.join(asset_name);
+    fs::write(&target_path, &old_data).unwrap();
+
+    let mut output_offset = 0u64;
+    let asset_chunks = permutation
+        .iter()
+        .enumerate()
+        .map(|(index, &source_index)| {
+            let chunk = source_chunks[source_index];
+            let manifest_chunk = SophonManifestAssetChunk {
+                chunk_name: format!("unused_{index}").into(),
+                chunk_decompressed_hash_md5: bytes::Bytes::new(),
+                chunk_on_file_offset: output_offset,
+                chunk_size: 0,
+                chunk_size_decompressed: chunk.len() as u64,
+                chunk_compressed_hash_xxh: 0,
+                chunk_compressed_hash_md5: bytes::Bytes::new(),
+                chunk_old_offset: source_chunks[..source_index]
+                    .iter()
+                    .map(|source| source.len() as i64)
+                    .sum(),
+            };
+            output_offset += chunk.len() as u64;
+            manifest_chunk
+        })
+        .collect();
+    let asset = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from(asset_name),
+        asset_chunks,
+        asset_type: 0,
+        asset_size: expected.len() as u64,
+        asset_hash_md5: bytes::Bytes::from("0123456789abcdef0123456789abcdef"),
+    };
+
+    let lookup = make_chunk_names(&[]);
+    let refcounts = Vec::new();
+    let verify_cache = DashMap::new();
+    let manifest = CompactManifest::from(vec![asset]);
+    assemble_file(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &verify_cache,
+        true,
+        crate::game_installer::VerifyMode::None,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&target_path).unwrap(), expected);
+}
+
+#[test]
+fn assemble_file_reuses_large_chunks_from_permuted_old_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::create_dir_all(&chunks_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    const CHUNK_COUNT: usize = 8;
+    let target_path = game_dir.join("permuted-large-reuse.bin");
+    let mut old_file = fs::File::create(&target_path).unwrap();
+    let mut source_chunk = vec![0; CHUNK_SIZE];
+    let mut source_chunk_hashes = Vec::with_capacity(CHUNK_COUNT);
+    for index in 0..CHUNK_COUNT {
+        source_chunk.fill((index + 1) as u8);
+        source_chunk_hashes.push(compute_md5_hex(&source_chunk));
+        old_file.write_all(&source_chunk).unwrap();
+    }
+    old_file.sync_all().unwrap();
+    drop(old_file);
+    let permutation: Vec<usize> = (0..CHUNK_COUNT)
+        .map(|index| (index * 3) % CHUNK_COUNT)
+        .collect();
+    let asset_name = "permuted-large-reuse.bin";
+    assert_eq!(target_path.file_name().unwrap(), asset_name);
+    let mut expected_hasher = fast_md5::Md5::new();
+    for &source_index in &permutation {
+        source_chunk.fill((source_index + 1) as u8);
+        expected_hasher.update(&source_chunk);
+    }
+    let expected_hash = hex::encode(expected_hasher.finalize());
+    drop(source_chunk);
+
+    let asset_chunks = permutation
+        .iter()
+        .enumerate()
+        .map(|(index, &source_index)| SophonManifestAssetChunk {
+            chunk_name: format!("old_{index}").into(),
+            chunk_decompressed_hash_md5: source_chunk_hashes[source_index].clone().into(),
+            chunk_on_file_offset: (index * CHUNK_SIZE) as u64,
+            chunk_size: 0,
+            chunk_size_decompressed: CHUNK_SIZE as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
+            chunk_old_offset: (source_index * CHUNK_SIZE) as i64,
+        })
+        .collect();
+    let asset = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from(asset_name),
+        asset_chunks,
+        asset_type: 0,
+        asset_size: (CHUNK_COUNT * CHUNK_SIZE) as u64,
+        asset_hash_md5: expected_hash.clone().into(),
+    };
+
+    let lookup = make_chunk_names(&[]);
+    let refcounts = Vec::new();
+    let verify_cache = DashMap::new();
+    assemble_test_file(
+        asset,
+        &game_dir,
+        &chunks_dir,
+        &temp_dir,
+        &lookup,
+        &refcounts,
+        &verify_cache,
+    )
+    .unwrap();
+
+    let output = fs::File::open(&target_path).unwrap();
+    let mut output_chunk = vec![0; 256 * 1024];
+    let mut output_hasher = fast_md5::Md5::new();
+    for (index, &source_index) in permutation.iter().enumerate() {
+        let expected_byte = (source_index + 1) as u8;
+        for block_start in (0..CHUNK_SIZE).step_by(output_chunk.len()) {
+            let block_len = output_chunk.len().min(CHUNK_SIZE - block_start);
+            output
+                .read_exact_at(
+                    &mut output_chunk[..block_len],
+                    (index * CHUNK_SIZE + block_start) as u64,
+                )
+                .unwrap();
+            assert!(
+                output_chunk[..block_len]
+                    .iter()
+                    .all(|&byte| byte == expected_byte)
+            );
+            output_hasher.update(&output_chunk[..block_len]);
+        }
+    }
+    assert_eq!(hex::encode(output_hasher.finalize()), expected_hash);
 }
 
 /// Verifies assembled output == decompressed chunk concatenation with PRNG data,
@@ -1052,24 +2225,24 @@ fn assemble_file_prng_data_matches_expected_md5() {
         let offset = expected.len() as u64;
         expected.extend_from_slice(data);
         chunks.push(SophonManifestAssetChunk {
-            chunk_name: names[i].clone(),
-            chunk_decompressed_hash_md5: String::new(),
+            chunk_name: names[i].clone().into(),
+            chunk_decompressed_hash_md5: bytes::Bytes::new(),
             chunk_on_file_offset: offset,
             chunk_size: 0,
             chunk_size_decompressed: data.len() as u64,
             chunk_compressed_hash_xxh: 0,
-            chunk_compressed_hash_md5: String::new(),
+            chunk_compressed_hash_md5: bytes::Bytes::new(),
             chunk_old_offset: -1,
         });
     }
 
     let file_md5 = compute_md5_hex(&expected);
     let file = SophonManifestAssetProperty {
-        asset_name: "assembled_prng.bin".to_string(),
+        asset_name: bytes::Bytes::from("assembled_prng.bin"),
         asset_chunks: chunks,
         asset_type: 0,
         asset_size: expected.len() as u64,
-        asset_hash_md5: file_md5.clone(),
+        asset_hash_md5: file_md5.clone().into(),
     };
 
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
@@ -1098,4 +2271,240 @@ fn assemble_file_prng_data_matches_expected_md5() {
     // Verify the file-level MD5 matches
     let result_md5 = compute_md5_hex(&result);
     assert_eq!(result_md5, file_md5);
+}
+
+// --- Durability epochs -------------------------------------------------------
+
+use super::super::assembly_epochs::{AssemblyEpochs, EPOCH_MAX_BYTES, EPOCH_MAX_FILES};
+use super::EpochStageCtx;
+
+fn staged_file_fixture(dir: &Path, idx: usize, payload: &[u8]) -> SophonManifestAssetProperty {
+    let chunk_name = format!("e{idx}");
+    let comp = zstd::encode_all(payload, 1).unwrap();
+    let chunks_dir = dir.join("chunks");
+    fs::write(chunks_dir.join(super::chunk_filename(&chunk_name)), &comp).unwrap();
+    SophonManifestAssetProperty::from_parts(
+        format!("e{idx}.bin").into(),
+        vec![SophonManifestAssetChunk::from_parts(
+            chunk_name.into(),
+            hex::encode(fast_md5::digest(payload)).into(),
+            0,
+            comp.len() as u64,
+            payload.len() as u64,
+            0,
+            bytes::Bytes::new(),
+            -1,
+        )],
+        0,
+        payload.len() as u64,
+        hex::encode(fast_md5::digest(payload)).into(),
+    )
+}
+
+fn stage_req(
+    manifest: &Arc<CompactManifest>,
+    tmp_path: std::path::PathBuf,
+    target_path: std::path::PathBuf,
+) -> super::super::assembly_epochs::StageRequest {
+    super::super::assembly_epochs::StageRequest {
+        tmp_path,
+        target_path,
+        manifest: Arc::clone(manifest),
+        chunk_start: 0,
+        chunk_end: 0,
+        bytes: 1,
+    }
+}
+
+fn epoch_env(dir: &Path, names: &[&str], refcounts: Vec<u32>) -> Arc<AssemblyEpochs> {
+    Arc::new(AssemblyEpochs::new(
+        make_chunk_names(names),
+        Arc::new(refcounts.into_iter().map(AtomicU32::new).collect()),
+        Arc::new(dir.join("chunks")),
+        EPOCH_MAX_FILES,
+        EPOCH_MAX_BYTES,
+    ))
+}
+
+#[test]
+fn staged_file_not_renamed_until_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("game")).unwrap();
+    fs::create_dir_all(dir.path().join("chunks")).unwrap();
+    fs::create_dir_all(dir.path().join("tmp")).unwrap();
+
+    let file = staged_file_fixture(dir.path(), 0, b"epoch payload");
+    let manifest = Arc::new(CompactManifest::from(vec![file]));
+    let game_dir = dir.path().join("game");
+    let chunks_dir = dir.path().join("chunks");
+    let tmp_dir = dir.path().join("tmp");
+    let lookup = make_chunk_names(&["e0"]);
+    let refcounts = vec![AtomicU32::new(1)];
+    let cache = DashMap::new();
+    let epochs = epoch_env(dir.path(), &["e0"], vec![1]);
+
+    let ctx = EpochStageCtx {
+        epochs: &epochs,
+        manifest: Arc::clone(&manifest),
+    };
+    assemble_file_in_epoch(
+        &manifest,
+        0,
+        &game_dir,
+        &chunks_dir,
+        &tmp_dir,
+        &lookup,
+        &refcounts,
+        &cache,
+        true,
+        crate::game_installer::VerifyMode::Full,
+        &ctx,
+    )
+    .unwrap();
+
+    // Staged, not committed: no target yet, chunk file still present
+    // (its refcount decrement is deferred to the commit).
+    assert!(!game_dir.join("e0.bin").exists());
+    assert!(chunks_dir.join("e0.zstd").exists());
+
+    epochs.commit().unwrap();
+    assert!(game_dir.join("e0.bin").exists());
+    assert_eq!(fs::read(game_dir.join("e0.bin")).unwrap(), b"epoch payload");
+    // Commit releases the last chunk reference.
+    assert!(!chunks_dir.join("e0.zstd").exists());
+}
+
+#[test]
+fn epoch_commit_cadence_matches_thresholds() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("chunks")).unwrap();
+    let manifest = Arc::new(CompactManifest::from(vec![]));
+    let chunks_dir = dir.path().join("chunks");
+    let epochs = AssemblyEpochs::new(
+        make_chunk_names(&[]),
+        Arc::new(Vec::new()),
+        Arc::new(chunks_dir.clone()),
+        2,
+        u64::MAX,
+    );
+    let mut due = 0;
+    for i in 0..5 {
+        let tmp = chunks_dir.join(format!("c{i}.tmp"));
+        let target = chunks_dir.join(format!("c{i}.out"));
+        fs::write(&tmp, b"x").unwrap();
+        let fd = fs::File::open(&tmp).unwrap();
+        if epochs
+            .stage(fd, stage_req(&manifest, tmp, target))
+            .unwrap()
+            .is_due()
+        {
+            due += 1;
+            epochs.commit().unwrap();
+        }
+    }
+    epochs.commit().unwrap();
+    assert_eq!(due, 2, "commit due exactly at each 2-file boundary");
+}
+
+#[test]
+fn epoch_error_is_sticky_and_discards_new_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("chunks")).unwrap();
+    let manifest = Arc::new(CompactManifest::from(vec![]));
+    let epochs = AssemblyEpochs::new(
+        make_chunk_names(&[]),
+        Arc::new(Vec::new()),
+        Arc::new(dir.path().join("chunks")),
+        EPOCH_MAX_FILES,
+        EPOCH_MAX_BYTES,
+    );
+    // Force a commit failure: stage a file whose tmp path vanishes before
+    // the rename (open fd on a deleted file still fdatasyncs fine, but the
+    // rename must fail).
+    let tmp = dir.path().join("chunks").join("gone.tmp");
+    let target = dir.path().join("chunks").join("no-such-dir/out");
+    fs::write(&tmp, b"x").unwrap();
+    let fd = fs::File::open(&tmp).unwrap();
+    fs::remove_file(&tmp).unwrap();
+    epochs
+        .stage(fd, stage_req(&manifest, tmp.clone(), target))
+        .unwrap();
+    assert!(
+        epochs.commit().is_err(),
+        "rename of a deleted tmp must fail"
+    );
+
+    // Sticky: a later stage is discarded and reports the error.
+    let tmp2 = dir.path().join("chunks").join("later.tmp");
+    let target2 = dir.path().join("chunks").join("later.out");
+    fs::write(&tmp2, b"x").unwrap();
+    let fd2 = fs::File::open(&tmp2).unwrap();
+    assert!(
+        epochs
+            .stage(fd2, stage_req(&manifest, tmp2, target2))
+            .is_err()
+    );
+    assert!(epochs.commit().is_err());
+}
+
+#[test]
+fn failed_commit_keeps_chunk_refcounts() {
+    // A rename failure inside commit must NOT release chunk refcounts:
+    // the chunks are the only recoverable copy until the resume sweep
+    // re-assembles the staged files.
+    let dir = tempfile::tempdir().unwrap();
+    let chunks_dir = dir.path().join("chunks");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    // staged_file_fixture writes chunk files named `e{idx}`; the lookup and
+    // assertions must use the same names.
+    let leaked: Vec<Box<str>> = (0..2).map(|i| format!("e{i}").into_boxed_str()).collect();
+    let mut names: Vec<&str> = Vec::new();
+    for b in &leaked {
+        names.push(b.as_ref());
+    }
+    let mut assets = Vec::new();
+    for i in 0..2 {
+        assets.push(staged_file_fixture(dir.path(), i, &[7u8; 512]));
+    }
+    let manifest = Arc::new(CompactManifest::from(assets));
+    let game_dir = dir.path().join("game");
+    fs::create_dir_all(&game_dir).unwrap();
+    let tmp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let lookup = make_chunk_names(&names);
+    let refcounts = vec![AtomicU32::new(1), AtomicU32::new(1)];
+    let cache = DashMap::new();
+    let epochs = epoch_env(dir.path(), &names, vec![1, 1]);
+
+    for i in 0..2 {
+        let ctx = EpochStageCtx {
+            epochs: &epochs,
+            manifest: Arc::clone(&manifest),
+        };
+        assemble_file_in_epoch(
+            &manifest,
+            i,
+            &game_dir,
+            &chunks_dir,
+            &tmp_dir,
+            &lookup,
+            &refcounts,
+            &cache,
+            true,
+            crate::game_installer::VerifyMode::Full,
+            &ctx,
+        )
+        .unwrap();
+    }
+    // Sabotage the second rename: remove the target's parent directory.
+    // (Both files stage into the same game dir; make the FIRST rename
+    // fail instead by removing the game dir entirely.)
+    fs::remove_dir_all(&game_dir).unwrap();
+    assert!(epochs.commit().is_err());
+
+    // Refcounts must be untouched: both chunk files still on disk.
+    assert!(chunks_dir.join("e0.zstd").exists());
+    assert!(chunks_dir.join("e1.zstd").exists());
+    assert_eq!(refcounts[0].load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(refcounts[1].load(std::sync::atomic::Ordering::SeqCst), 1);
 }

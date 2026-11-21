@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, BufRead, Write};
+use std::fs::{self, File, Metadata};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -10,21 +10,81 @@ use dashmap::DashMap;
 pub use dashmap::DashMap as VerificationCache;
 
 pub(crate) const VERIFICATION_CACHE_MAX_ENTRIES: usize = 5_000;
+const MD5_READ_BUFFER_SIZE: usize = 512 * 1024;
 
 #[cfg(test)]
 use fast_md5;
 use serde::{Deserialize, Serialize};
 
 use super::VERIFICATION_CACHE_FILE;
-use super::assembly_opt::md5_hex_eq;
+use super::assembly_opt::{bytes_to_hex, md5_bytes_eq};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 /// Cached proof that a file matched a manifest size and MD5 at a particular
 /// whole-second modification time. A changed size or timestamp forces hashing.
 pub struct VerificationEntry {
     pub size: u64,
-    pub md5: String,
+    pub md5: [u8; 16],
     pub mtime_secs: u64,
+}
+
+impl VerificationEntry {
+    /// Build an entry from a hex MD5 string, storing an all-zero digest when
+    /// the string is not a valid 32-char hex MD5.
+    #[cfg(test)]
+    pub(crate) fn from_hex_md5(size: u64, md5_hex: &str, mtime_secs: u64) -> Self {
+        let mut md5 = [0u8; 16];
+        if let Some(bytes) = super::assembly_opt::hex_to_bytes(md5_hex)
+            && bytes.len() == 16
+        {
+            md5.copy_from_slice(&bytes);
+        }
+        Self {
+            size,
+            md5,
+            mtime_secs,
+        }
+    }
+}
+
+impl Serialize for VerificationEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("VerificationEntry", 3)?;
+        state.serialize_field("size", &self.size)?;
+        state.serialize_field("md5", &bytes_to_hex(&self.md5))?;
+        state.serialize_field("mtime_secs", &self.mtime_secs)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for VerificationEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            size: u64,
+            md5: String,
+            #[serde(alias = "mtime_secs")]
+            mtime_secs: u64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        // Valid 32-char hex MD5 decodes to 16 bytes. Anything else (short,
+        // non-hex, or legacy raw-byte entries) maps to all zeros, which never
+        // matches a real digest and forces a cache miss + re-hash.
+        let mut md5 = [0u8; 16];
+        if let Some(len) = super::assembly_opt::hex_decode_into(&raw.md5, &mut md5)
+            && len == 16
+        {
+            // md5 is already filled by hex_decode_into
+        } else {
+            md5 = [0u8; 16];
+        }
+        Ok(VerificationEntry {
+            size: raw.size,
+            md5,
+            mtime_secs: raw.mtime_secs,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,29 +94,21 @@ struct VerificationCacheSerializable {
 
 /// Load the per-install verification cache, treating missing or malformed
 /// cache files as empty and trimming oversized caches to the configured limit.
+#[inline(never)]
 pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationEntry> {
     let cache_path = game_dir.join(VERIFICATION_CACHE_FILE);
 
-    // Clean up leftover .tmp files from a previous crash.
-    if let Some(parent) = cache_path.parent()
-        && let Ok(entries) = parent.read_dir()
-    {
-        let cache_stem = cache_path.file_stem();
-        for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|ext| ext == "tmp")
-                && cache_stem == entry.path().file_stem()
-            {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
+    // Clean up the temp file a crashed save may have left behind. The save path
+    // uses one fixed name, so remove it directly instead of scanning the whole
+    // game directory.
+    let _ = fs::remove_file(cache_path.with_extension("tmp"));
 
-    let serializable: VerificationCacheSerializable = match File::open(&cache_path) {
-        Ok(f) => serde_json::from_reader(std::io::BufReader::new(f)).unwrap_or_else(|_| {
-            VerificationCacheSerializable {
+    let serializable: VerificationCacheSerializable = match fs::read(&cache_path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| VerificationCacheSerializable {
                 files: HashMap::new(),
-            }
-        }),
+            })
+        }
         Err(_) => VerificationCacheSerializable {
             files: HashMap::new(),
         },
@@ -80,7 +132,8 @@ pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationE
         Vec::new()
     };
 
-    let cache: DashMap<String, VerificationEntry> = DashMap::new();
+    let cache: DashMap<String, VerificationEntry> =
+        DashMap::with_capacity(serializable.files.len());
     for (k, v) in serializable.files {
         cache.insert(k, v);
     }
@@ -105,16 +158,13 @@ pub fn save_verification_cache(
 ) -> io::Result<()> {
     let cache_path = game_dir.join(VERIFICATION_CACHE_FILE);
     let tmp_path = cache_path.with_extension("tmp");
-    let serializable = VerificationCacheSerializable {
-        files: cache
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect::<std::collections::HashMap<_, _>>(),
-    };
     {
         let f = File::create(&tmp_path)?;
         let mut writer = std::io::BufWriter::with_capacity(super::FILE_WRITE_BUFFER_SIZE, f);
-        serde_json::to_writer(&mut writer, &serializable)?;
+        // Serialize directly from the DashMap iterator, avoiding the
+        // intermediate HashMap clone of every entry.
+        let wrapper = SaveWrapper { files: cache };
+        serde_json::to_writer(&mut writer, &wrapper)?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
     }
@@ -124,16 +174,32 @@ pub fn save_verification_cache(
     Ok(())
 }
 
+/// Serialization-only wrapper that borrows a `DashMap` as the `files` field,
+/// producing the same JSON structure as `VerificationCacheSerializable` without
+/// cloning every entry into an intermediate `HashMap`. The field name `files`
+/// must stay in sync with `VerificationCacheSerializable`.
+struct SaveWrapper<'a> {
+    files: &'a DashMap<String, VerificationEntry>,
+}
+
+impl Serialize for SaveWrapper<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("VerificationCacheSerializable", 1)?;
+        state.serialize_field("files", self.files)?;
+        state.end()
+    }
+}
+
 /// Verify a file using a path relative to `game_dir` as its cache key.
 pub fn check_file_md5_cached(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<bool> {
-    let relative = path.strip_prefix(game_dir).unwrap_or(path);
-    let cache_key = relative.to_string_lossy();
+    let cache_key = cache_key_for_path(path, game_dir);
     check_file_md5_with_cache_key(path, expected_size, expected_md5, &cache_key, cache)
 }
 
@@ -141,12 +207,11 @@ pub fn check_file_md5_cached(
 pub fn check_file_md5_cached_with_size(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<(bool, Option<u64>)> {
-    let relative = path.strip_prefix(game_dir).unwrap_or(path);
-    let cache_key = relative.to_string_lossy();
+    let cache_key = cache_key_for_path(path, game_dir);
     check_file_md5_with_cache_key_and_size(path, expected_size, expected_md5, &cache_key, cache)
 }
 
@@ -154,7 +219,7 @@ pub fn check_file_md5_cached_with_size(
 pub fn check_file_md5_with_cache_key(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     cache_key: &str,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<bool> {
@@ -163,10 +228,11 @@ pub fn check_file_md5_with_cache_key(
 }
 
 /// As [`check_file_md5_with_cache_key`], returning `Some(actual_size)` when present.
+#[inline]
 pub fn check_file_md5_with_cache_key_and_size(
     path: &Path,
     expected_size: u64,
-    expected_md5: &str,
+    expected_md5: &[u8],
     cache_key: &str,
     cache: &DashMap<String, VerificationEntry>,
 ) -> io::Result<(bool, Option<u64>)> {
@@ -178,6 +244,51 @@ pub fn check_file_md5_with_cache_key_and_size(
         }
         Err(err) => return Err(err),
     };
+    check_file_md5_with_metadata(
+        path,
+        expected_size,
+        expected_md5,
+        cache_key,
+        cache,
+        metadata,
+    )
+}
+
+pub(crate) fn check_file_md5_cached_with_metadata(
+    path: &Path,
+    expected_size: u64,
+    expected_md5: &[u8],
+    game_dir: &Path,
+    cache: &DashMap<String, VerificationEntry>,
+    metadata: Metadata,
+) -> io::Result<bool> {
+    let cache_key = cache_key_for_path(path, game_dir);
+    check_file_md5_with_metadata(
+        path,
+        expected_size,
+        expected_md5,
+        &cache_key,
+        cache,
+        metadata,
+    )
+    .map(|(ok, _)| ok)
+}
+
+fn cache_key_for_path<'a>(path: &'a Path, game_dir: &Path) -> std::borrow::Cow<'a, str> {
+    path.strip_prefix(game_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+}
+
+#[inline]
+fn check_file_md5_with_metadata(
+    path: &Path,
+    expected_size: u64,
+    expected_md5: &[u8],
+    cache_key: &str,
+    cache: &DashMap<String, VerificationEntry>,
+    metadata: Metadata,
+) -> io::Result<(bool, Option<u64>)> {
     let actual_size = metadata.len();
 
     // Fast rejection: skip DashMap lookup if size doesn't match.
@@ -194,24 +305,31 @@ pub fn check_file_md5_with_cache_key_and_size(
 
     if let Some(entry) = cache.get(cache_key)
         && entry.size == expected_size
-        && entry.md5 == expected_md5
+        && entry.md5.as_slice() == expected_md5
         && entry.mtime_secs == mtime
     {
         return Ok((true, Some(actual_size)));
     }
 
-    let actual = file_md5_digest(path)?;
-    let matches = md5_hex_eq(&actual, expected_md5);
+    let actual = file_md5_digest_with_known_size(path, actual_size)?;
+    let matches = md5_bytes_eq(&actual, expected_md5);
 
     if matches {
         if cache.len() >= VERIFICATION_CACHE_MAX_ENTRIES {
             return Ok((true, Some(actual_size)));
         }
+        // `matches` is true only when `md5_bytes_eq(&actual, expected_md5)`
+        // succeeds, which requires both slices to be 16 bytes. The try_from
+        // guards against a future invariant break by skipping the insert
+        // instead of panicking.
+        let Ok(md5) = <[u8; 16]>::try_from(expected_md5) else {
+            return Ok((true, Some(actual_size)));
+        };
         cache.insert(
             cache_key.to_string(),
             VerificationEntry {
                 size: expected_size,
-                md5: expected_md5.to_string(),
+                md5,
                 mtime_secs: mtime,
             },
         );
@@ -224,9 +342,69 @@ pub fn check_file_md5_with_cache_key_and_size(
 
 /// Compute the raw 16-byte MD5 digest of a file using buffered sequential reads.
 /// Returns an I/O error if opening or reading the file fails.
+#[inline]
 pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
+    file_md5_digest_with_options(path, MD5_READ_BUFFER_SIZE, true)
+}
+
+/// Same as `file_md5_digest` but skips the `fstat` when the caller already
+/// knows the file length from a prior metadata call.
+#[inline]
+pub fn file_md5_digest_with_known_size(path: &Path, known_size: u64) -> io::Result<[u8; 16]> {
+    file_md5_digest_with_options_known(path, MD5_READ_BUFFER_SIZE, true, known_size)
+}
+
+#[inline]
+fn file_md5_digest_with_options(
+    path: &Path,
+    buffer_capacity: usize,
+    advise_page_cache: bool,
+) -> io::Result<[u8; 16]> {
+    // Preserve invalid-capacity precedence over file-open errors.
+    if buffer_capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MD5 read buffer capacity must be nonzero",
+        ));
+    }
     let file = File::open(path)?;
-    let len = file.metadata()?.len();
+    file_md5_digest_with_file(file, buffer_capacity, advise_page_cache, None)
+}
+
+#[inline]
+fn file_md5_digest_with_options_known(
+    path: &Path,
+    buffer_capacity: usize,
+    advise_page_cache: bool,
+    known_size: u64,
+) -> io::Result<[u8; 16]> {
+    if buffer_capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MD5 read buffer capacity must be nonzero",
+        ));
+    }
+    let file = File::open(path)?;
+    file_md5_digest_with_file(file, buffer_capacity, advise_page_cache, Some(known_size))
+}
+
+fn file_md5_digest_with_file(
+    mut file: File,
+    buffer_capacity: usize,
+    advise_page_cache: bool,
+    known_len: Option<u64>,
+) -> io::Result<[u8; 16]> {
+    // Validate independently because benchmark callers can pass a File directly.
+    if buffer_capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MD5 read buffer capacity must be nonzero",
+        ));
+    }
+    let len = match known_len {
+        Some(len) => len,
+        None => file.metadata()?.len(),
+    };
     if len == 0 {
         return Ok([
             0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
@@ -235,31 +413,62 @@ pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     }
 
     let fd = file.as_raw_fd();
-    super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_SEQUENTIAL);
+    if advise_page_cache {
+        super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_SEQUENTIAL);
+    }
+
+    // Start small: don't grow the reusable buffer past what this file needs.
+    let read_capacity = buffer_capacity.min(usize::try_from(len).unwrap_or(usize::MAX));
 
     let mut hasher =
         super::assembly_opt::take_md5().map_err(|e| io::Error::other(e.to_string()))?;
-    let mut reader = io::BufReader::with_capacity(256 * 1024, file);
-    loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            break;
+    let result = (|| {
+        let mut buffer = super::assembly_opt::HashReadBuffer::take(read_capacity);
+        loop {
+            let n = {
+                let slice = buffer.as_mut_slice();
+                file.read(slice)?
+            };
+            if n == 0 {
+                break;
+            }
+            hasher
+                .update(buffer.filled(n))
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
-        hasher
-            .update(buf)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let n = buf.len();
-        reader.consume(n);
+        hasher.finish().map_err(|e| io::Error::other(e.to_string()))
+    })();
+    if advise_page_cache {
+        super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_DONTNEED);
     }
-    super::assembly_opt::posix_advise(fd, 0, len, libc::POSIX_FADV_DONTNEED);
-
-    let digest = hasher
-        .finish()
-        .map_err(|e| io::Error::other(e.to_string()))?;
     super::assembly_opt::return_md5(hasher);
-    Ok(digest)
+    result
 }
 
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod benchmark {
+    use std::fs::File;
+    use std::io;
+    use std::path::Path;
+
+    pub fn file_md5_digest_with_options(
+        path: &Path,
+        capacity: usize,
+        advise_page_cache: bool,
+    ) -> io::Result<[u8; 16]> {
+        super::file_md5_digest_with_options(path, capacity, advise_page_cache)
+    }
+
+    pub fn file_md5_digest_with_file(
+        file: File,
+        capacity: usize,
+        advise_page_cache: bool,
+        known_len: Option<u64>,
+    ) -> io::Result<[u8; 16]> {
+        super::file_md5_digest_with_file(file, capacity, advise_page_cache, known_len)
+    }
+}
 
 #[cfg(test)]
 #[path = "cache_tests.rs"]

@@ -63,11 +63,11 @@ fn plugin_needs_update(
 
     for entry in validation {
         let file_path = game_dir.join(&entry.path);
-        if !file_path.exists() {
+        // Metadata failure means the file is missing or inaccessible.
+        let Ok(meta) = fs::metadata(&file_path) else {
             return true;
-        }
+        };
         if let Some(expected_size) = entry.size
-            && let Ok(meta) = fs::metadata(&file_path)
             && meta.len() != expected_size
         {
             return true;
@@ -167,6 +167,8 @@ const ZIP_MAX_ENTRIES: usize = 8 * 1024;
 /// from a 1 KiB compressed entry is rejected (ratio > 1_000_000).
 const ZIP_MAX_RATIO: u64 = 1_000;
 
+// Large function; keeping it out-of-line preserves hot-path code layout.
+#[inline(never)]
 fn extract_zip(zip_path: &Path, game_dir: &Path) -> SophonResult<()> {
     let file = File::open(zip_path)?;
     let reader = BufReader::new(file);
@@ -296,13 +298,13 @@ fn cleanup_dxsetup(game_dir: &Path) {
 fn verify_validation(game_dir: &Path, validation: &[ValidationEntry]) -> bool {
     for entry in validation {
         let file_path = game_dir.join(&entry.path);
-        if !file_path.exists() {
+        // Metadata failure means the file is missing or inaccessible.
+        let Ok(meta) = fs::metadata(&file_path) else {
             let path = &entry.path;
             log::warn!("Validation file missing: {path}");
             return false;
-        }
+        };
         if let Some(expected_size) = entry.size
-            && let Ok(meta) = fs::metadata(&file_path)
             && meta.len() != expected_size
         {
             log::warn!(
@@ -314,7 +316,7 @@ fn verify_validation(game_dir: &Path, validation: &[ValidationEntry]) -> bool {
         }
         // Verify MD5 hash if provided for stronger integrity guarantee
         if let Some(ref expected_md5) = entry.md5 {
-            let computed = match cache::file_md5_digest(&file_path) {
+            let computed = match cache::file_md5_digest_with_known_size(&file_path, meta.len()) {
                 Ok(d) => d,
                 Err(err) => {
                     let path = &entry.path;

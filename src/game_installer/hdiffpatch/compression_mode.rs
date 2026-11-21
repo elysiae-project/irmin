@@ -11,12 +11,16 @@ pub(crate) enum CompressionMode {
 impl std::str::FromStr for CompressionMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "" | "nocomp" => Ok(CompressionMode::Nocomp),
-            "zstd" => Ok(CompressionMode::Zstd),
-            "zlib" => Ok(CompressionMode::Zlib),
-            "lz4" => Ok(CompressionMode::Lz4),
-            _ => Err(format!("unsupported compression mode: {s}")),
+        if s.eq_ignore_ascii_case("nocomp") || s.is_empty() {
+            Ok(CompressionMode::Nocomp)
+        } else if s.eq_ignore_ascii_case("zstd") {
+            Ok(CompressionMode::Zstd)
+        } else if s.eq_ignore_ascii_case("zlib") {
+            Ok(CompressionMode::Zlib)
+        } else if s.eq_ignore_ascii_case("lz4") {
+            Ok(CompressionMode::Lz4)
+        } else {
+            Err(format!("unsupported compression mode: {s}"))
         }
     }
 }

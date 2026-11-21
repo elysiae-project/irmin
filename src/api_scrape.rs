@@ -26,6 +26,14 @@ pub struct GameBranch {
     pub pre_download: Option<PackageBranch>,
 }
 
+impl GameBranch {
+    /// Split into the main package (when present) and the optional
+    /// pre-download package, moving every string out without cloning.
+    pub fn take_branches(self) -> (Option<PackageBranch>, Option<PackageBranch>) {
+        (self.main, self.pre_download)
+    }
+}
+
 /// Service identifiers used to identify a game and its business variant.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +226,7 @@ impl DownloadInfo {
 
     /// Write the same URL as [`Self::url_for`] into `buf`, clearing its previous
     /// contents first so the allocation can be reused.
+    #[inline]
     pub fn url_for_into(&self, item_name: &str, buf: &mut String) {
         buf.clear();
         let prefix = self.url_prefix.trim_end_matches('/');
@@ -233,6 +242,7 @@ impl DownloadInfo {
 
     /// Whether the caller's chunk-processing path should decompress this
     /// object. Currently only `Zstd` is treated as compressed here.
+    #[inline]
     pub fn is_compressed(&self) -> bool {
         matches!(self.compression, Compression::Zstd)
     }

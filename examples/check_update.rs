@@ -6,8 +6,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use irmin_rs::game_installer::UpdateInfo;
 use irmin_rs::Sophon;
+use irmin_rs::game_installer::UpdateInfo;
 
 #[tokio::main]
 async fn main() {
@@ -31,10 +31,19 @@ fn print_update_info(i: &UpdateInfo) {
     println!("current_tag: {:?}", i.current_tag);
     println!("remote_tag: {}", i.remote_tag);
     println!("update_compressed_size: {} bytes", i.update_compressed_size);
-    println!("update_decompressed_size: {} bytes", i.update_decompressed_size);
+    println!(
+        "update_decompressed_size: {} bytes",
+        i.update_decompressed_size
+    );
     println!("preinstall_available: {}", i.preinstall_available);
     println!("preinstall_downloaded: {}", i.preinstall_downloaded);
     println!("preinstall_tag: {:?}", i.preinstall_tag);
-    println!("preinstall_compressed_size: {} bytes", i.preinstall_compressed_size);
-    println!("preinstall_decompressed_size: {} bytes", i.preinstall_decompressed_size);
+    println!(
+        "preinstall_compressed_size: {} bytes",
+        i.preinstall_compressed_size
+    );
+    println!(
+        "preinstall_decompressed_size: {} bytes",
+        i.preinstall_decompressed_size
+    );
 }

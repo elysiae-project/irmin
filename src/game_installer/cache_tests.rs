@@ -34,41 +34,44 @@ fn save_load_roundtrip() {
     let cache = DashMap::new();
     cache.insert(
         "file1".to_string(),
-        VerificationEntry {
-            size: 100,
-            md5: "abc123".to_string(),
-            mtime_secs: 1000,
-        },
+        VerificationEntry::from_hex_md5(100, "abc12300000000000000000000000000", 1000),
     );
     cache.insert(
         "file2".to_string(),
-        VerificationEntry {
-            size: 200,
-            md5: "def456".to_string(),
-            mtime_secs: 2000,
-        },
+        VerificationEntry::from_hex_md5(200, "def45600000000000000000000000000", 2000),
     );
     cache.insert(
         "file3".to_string(),
-        VerificationEntry {
-            size: 300,
-            md5: "ghi789".to_string(),
-            mtime_secs: 3000,
-        },
+        VerificationEntry::from_hex_md5(300, "abcdef01000000000000000000000000", 3000),
     );
     save_verification_cache(&game_dir, &cache).unwrap();
     let loaded = load_verification_cache(&game_dir);
     assert_eq!(loaded.len(), 3);
     let e1 = loaded.get("file1").unwrap();
     assert_eq!(e1.size, 100);
-    assert_eq!(e1.md5, "abc123");
+    assert_eq!(
+        e1.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("abc12300000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
+    );
     assert_eq!(e1.mtime_secs, 1000);
     let e2 = loaded.get("file2").unwrap();
     assert_eq!(e2.size, 200);
-    assert_eq!(e2.md5, "def456");
+    assert_eq!(
+        e2.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("def45600000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
+    );
     let e3 = loaded.get("file3").unwrap();
     assert_eq!(e3.size, 300);
-    assert_eq!(e3.md5, "ghi789");
+    assert_eq!(
+        e3.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("abcdef01000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
+    );
 }
 
 #[test]
@@ -76,7 +79,7 @@ fn check_file_md5_cached_miss_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let cache = DashMap::new();
     let missing = dir.path().join("nonexistent.dat");
-    let result = check_file_md5_cached(&missing, 10, "abc", dir.path(), &cache).unwrap();
+    let result = check_file_md5_cached(&missing, 10, b"abc", dir.path(), &cache).unwrap();
     assert!(!result);
 }
 
@@ -107,12 +110,141 @@ fn check_file_md5_cached_hit() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: md5.clone(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: mtime,
         },
     );
-    let result = check_file_md5_cached(&file_path, 11, &md5, dir.path(), &cache).unwrap();
+    let result = check_file_md5_cached(
+        &file_path,
+        11,
+        super::super::assembly_opt::hex_to_bytes(&md5)
+            .unwrap_or_default()
+            .as_slice(),
+        dir.path(),
+        &cache,
+    )
+    .unwrap();
     assert!(result);
+}
+
+#[test]
+fn check_file_md5_cached_with_metadata_matches_regular_cache_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.dat");
+    fs::write(&file_path, b"hello world").unwrap();
+    let metadata = fs::metadata(&file_path).unwrap();
+    let mtime = metadata
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let md5 = hex::encode(fast_md5::digest(b"hello world"));
+    let cache = DashMap::new();
+    cache.insert(
+        "test.dat".to_owned(),
+        VerificationEntry {
+            size: 11,
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            mtime_secs: mtime,
+        },
+    );
+
+    assert!(
+        check_file_md5_cached_with_metadata(
+            &file_path,
+            11,
+            super::super::assembly_opt::hex_to_bytes(&md5)
+                .unwrap_or_default()
+                .as_slice(),
+            dir.path(),
+            &cache,
+            metadata,
+        )
+        .unwrap()
+    );
+    assert!(cache.contains_key("test.dat"));
+}
+
+#[test]
+fn check_file_md5_cached_with_metadata_removes_size_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.dat");
+    fs::write(&file_path, b"hello world").unwrap();
+    let metadata = fs::metadata(&file_path).unwrap();
+    let cache = DashMap::new();
+    cache.insert(
+        "test.dat".to_owned(),
+        VerificationEntry::from_hex_md5(
+            11,
+            &hex::encode(fast_md5::digest(b"hello world")),
+            metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        ),
+    );
+
+    assert!(
+        !check_file_md5_cached_with_metadata(
+            &file_path,
+            12,
+            b"unused-on-size-mismatch",
+            dir.path(),
+            &cache,
+            metadata,
+        )
+        .unwrap()
+    );
+    assert!(!cache.contains_key("test.dat"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_file_md5_cached_with_metadata_follows_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.dat");
+    let link = dir.path().join("link.dat");
+    fs::write(&target, b"hello world").unwrap();
+    symlink(&target, &link).unwrap();
+    let metadata = fs::metadata(&link).unwrap();
+    let md5 = hex::encode(fast_md5::digest(b"hello world"));
+    let cache = DashMap::new();
+    cache.insert(
+        "link.dat".to_owned(),
+        VerificationEntry {
+            size: 11,
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            mtime_secs: metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        },
+    );
+    assert!(
+        check_file_md5_cached_with_metadata(
+            &link,
+            11,
+            super::super::assembly_opt::hex_to_bytes(&md5)
+                .unwrap_or_default()
+                .as_slice(),
+            dir.path(),
+            &cache,
+            metadata,
+        )
+        .unwrap()
+    );
+
+    fs::remove_file(&link).unwrap();
+    symlink(dir.path().join("missing.dat"), &link).unwrap();
+    assert!(link.metadata().is_err());
+    assert!(!link.exists());
 }
 
 #[test]
@@ -137,11 +269,11 @@ fn check_file_md5_cached_miss_size_changed() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: "old_md5".to_string(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("old_md5").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: mtime,
         },
     );
-    let result = check_file_md5_cached(&file_path, 20, "old_md5", dir.path(), &cache).unwrap();
+    let result = check_file_md5_cached(&file_path, 20, b"old_md5", dir.path(), &cache).unwrap();
     assert!(!result);
 }
 
@@ -172,13 +304,14 @@ fn check_file_md5_cached_miss_md5_changed() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: "stale_cached_md5".to_string(),
+            md5: { let mut m = [0u8; 16]; let b = b"stale_cached_md5"; if b.len() == 16 { m.copy_from_slice(b); } m },
             mtime_secs: mtime,
         },
     );
     let wrong_expected = "wrong_expected_md5";
     assert_ne!(wrong_expected, &actual_md5);
-    let result = check_file_md5_cached(&file_path, 11, wrong_expected, dir.path(), &cache).unwrap();
+    let result =
+        check_file_md5_cached(&file_path, 11, b"wrong_expected_md5", dir.path(), &cache).unwrap();
     assert!(!result);
 }
 
@@ -201,7 +334,16 @@ fn check_file_md5_cached_populates_on_match() {
         hex::encode(hasher.finalize())
     };
     assert!(cache.is_empty());
-    let result = check_file_md5_cached(&file_path, 11, &md5, dir.path(), &cache).unwrap();
+    let result = check_file_md5_cached(
+        &file_path,
+        11,
+        super::super::assembly_opt::hex_to_bytes(&md5)
+            .unwrap_or_default()
+            .as_slice(),
+        dir.path(),
+        &cache,
+    )
+    .unwrap();
     assert!(result);
     assert_eq!(cache.len(), 1);
     let rel_path = file_path
@@ -211,8 +353,29 @@ fn check_file_md5_cached_populates_on_match() {
         .to_string();
     let entry = cache.get(&rel_path).unwrap();
     assert_eq!(entry.size, 11);
-    assert_eq!(entry.md5, md5);
+    assert_eq!(
+        entry.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice()
+    );
     assert_eq!(entry.mtime_secs, mtime);
+}
+
+#[test]
+fn load_removes_leftover_tmp_from_crashed_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    fs::create_dir_all(&game_dir).unwrap();
+    fs::write(
+        game_dir.join(format!("{VERIFICATION_CACHE_FILE}.tmp")),
+        b"junk",
+    )
+    .unwrap();
+    let _ = load_verification_cache(&game_dir);
+    assert!(
+        !game_dir
+            .join(format!("{VERIFICATION_CACHE_FILE}.tmp"))
+            .exists()
+    );
 }
 
 #[test]
@@ -227,7 +390,7 @@ fn save_verification_cache_atomic_write() {
         "file".to_string(),
         VerificationEntry {
             size: 42,
-            md5: "deadbeef".to_string(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("deadbeef").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: 999,
         },
     );
@@ -250,17 +413,20 @@ fn concurrent_cache_access() {
         handles.push(std::thread::spawn(move || {
             for j in 0..100 {
                 let key = format!("key-{i}-{j}");
+                let mut md5 = [0u8; 16];
+                md5[0] = i as u8;
+                md5[1] = j as u8;
                 c.insert(
                     key.clone(),
                     VerificationEntry {
                         size: i as u64 + j as u64,
-                        md5: format!("md5-{i}-{j}"),
+                        md5,
                         mtime_secs: i as u64 * 100 + j as u64,
                     },
                 );
                 if let Some(entry) = c.get(&key) {
                     assert_eq!(entry.size, i as u64 + j as u64);
-                    assert_eq!(entry.md5, format!("md5-{i}-{j}"));
+                    assert_eq!(entry.md5, md5);
                 }
             }
         }));
@@ -282,7 +448,16 @@ fn check_file_md5_cached_with_zero_size_file() {
         hasher.update(b"");
         hex::encode(hasher.finalize())
     };
-    let result = check_file_md5_cached(&file_path, 0, &md5, dir.path(), &cache).unwrap();
+    let result = check_file_md5_cached(
+        &file_path,
+        0,
+        super::super::assembly_opt::hex_to_bytes(&md5)
+            .unwrap_or_default()
+            .as_slice(),
+        dir.path(),
+        &cache,
+    )
+    .unwrap();
     assert!(result);
 }
 
@@ -297,7 +472,7 @@ fn load_verification_cache_loads_stale_entries() {
             "nonexistent.bin".to_string(),
             VerificationEntry {
                 size: 100,
-                md5: "abc".to_string(),
+                md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
                 mtime_secs: 1000,
             },
         )]),
@@ -320,7 +495,7 @@ fn load_verification_cache_keeps_all_entries() {
                 "a.bin".to_string(),
                 VerificationEntry {
                     size: 1,
-                    md5: "m1".to_string(),
+                    md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("m1").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
                     mtime_secs: 10,
                 },
             ),
@@ -328,7 +503,7 @@ fn load_verification_cache_keeps_all_entries() {
                 "b.bin".to_string(),
                 VerificationEntry {
                     size: 2,
-                    md5: "m2".to_string(),
+                    md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("m2").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
                     mtime_secs: 20,
                 },
             ),
@@ -352,7 +527,7 @@ fn save_verification_cache_writes_to_disk() {
         "f".to_string(),
         VerificationEntry {
             size: 42,
-            md5: "abc".to_string(),
+            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
             mtime_secs: 999,
         },
     );
@@ -384,13 +559,22 @@ fn check_file_md5_cached_skips_insert_at_capacity() {
             format!("fill_{i}"),
             VerificationEntry {
                 size: 0,
-                md5: String::new(),
+                md5: [0u8; 16],
                 mtime_secs: 0,
             },
         );
     }
     assert_eq!(cache.len(), VERIFICATION_CACHE_MAX_ENTRIES);
-    let result = check_file_md5_cached(&file_path, 6, &md5, &game_dir, &cache).unwrap();
+    let result = check_file_md5_cached(
+        &file_path,
+        6,
+        super::super::assembly_opt::hex_to_bytes(&md5)
+            .unwrap_or_default()
+            .as_slice(),
+        &game_dir,
+        &cache,
+    )
+    .unwrap();
     assert!(result, "verification still passes at capacity");
     assert_eq!(
         cache.len(),
@@ -416,7 +600,16 @@ fn check_file_md5_cached_hit_despite_mtime_change_same_size() {
     let cache: DashMap<String, VerificationEntry> = DashMap::new();
 
     // Populate cache via actual verification
-    let result = check_file_md5_cached(&path, size, &md5, &game_dir, &cache).unwrap();
+    let result = check_file_md5_cached(
+        &path,
+        size,
+        super::super::assembly_opt::hex_to_bytes(&md5)
+            .unwrap_or_default()
+            .as_slice(),
+        &game_dir,
+        &cache,
+    )
+    .unwrap();
     assert!(result, "initial verification should pass");
     assert_eq!(cache.len(), 1);
 
@@ -426,6 +619,192 @@ fn check_file_md5_cached_hit_despite_mtime_change_same_size() {
 
     // After fix: mtime changed, so cache entry is stale. Re-hashes the
     // file on disk and detects the content mismatch.
-    let result = check_file_md5_cached(&path, size, &md5, &game_dir, &cache).unwrap();
+    let result = check_file_md5_cached(
+        &path,
+        size,
+        super::super::assembly_opt::hex_to_bytes(&md5)
+            .unwrap_or_default()
+            .as_slice(),
+        &game_dir,
+        &cache,
+    )
+    .unwrap();
     assert!(!result, "cache should detect mtime change and re-verify");
+}
+
+#[test]
+fn file_md5_digest_buffer_capacities_match_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("capacity.bin");
+    let capacities = [1, 63, 64, 257, 4097];
+    let lengths = [0, 1, 63, 64, 65, 256, 257, 4096, 4097, 8193];
+
+    for length in lengths {
+        let data = (0..length)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        fs::write(&path, &data).unwrap();
+        let expected = fast_md5::digest(&data);
+        assert_eq!(file_md5_digest(&path).unwrap(), expected);
+        for capacity in capacities {
+            assert_eq!(
+                file_md5_digest_with_options(&path, capacity, false).unwrap(),
+                expected,
+                "length={length}, capacity={capacity}"
+            );
+        }
+    }
+
+    assert_eq!(
+        file_md5_digest_with_options(&path, 0, false)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+/// Hashes a large file then small files on the same thread to exercise the
+/// retained thread-local read buffer; each digest must still be correct.
+#[test]
+fn file_md5_digest_reuses_buffer_across_mixed_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let large = dir.path().join("large.bin");
+    let small = dir.path().join("small.bin");
+    let tiny = dir.path().join("tiny.bin");
+    let empty = dir.path().join("empty.bin");
+
+    let large_data = vec![0xA5u8; 300 * 1024];
+    let small_data = vec![0x11u8; 1024];
+    let tiny_data = vec![0x7Eu8; 7];
+    fs::write(&large, &large_data).unwrap();
+    fs::write(&small, &small_data).unwrap();
+    fs::write(&tiny, &tiny_data).unwrap();
+    fs::write(&empty, b"").unwrap();
+
+    // Large first (retains a 256 KiB buffer), then progressively smaller files.
+    assert_eq!(
+        file_md5_digest(&large).unwrap(),
+        fast_md5::digest(&large_data)
+    );
+    assert_eq!(
+        file_md5_digest(&small).unwrap(),
+        fast_md5::digest(&small_data)
+    );
+    assert_eq!(
+        file_md5_digest(&tiny).unwrap(),
+        fast_md5::digest(&tiny_data)
+    );
+    assert_eq!(file_md5_digest(&empty).unwrap(), fast_md5::digest(b""));
+    // Large again after small files, to catch stale bytes from the reused buffer.
+    assert_eq!(
+        file_md5_digest(&large).unwrap(),
+        fast_md5::digest(&large_data)
+    );
+}
+
+#[cfg(feature = "bench-diagnostics")]
+#[test]
+#[ignore = "measures verification-cache load startup cost in a large game dir"]
+fn benchmark_load_verification_cache_startup() {
+    use std::time::Instant;
+
+    let files = std::env::var("IRMIN_CACHE_LOAD_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50_000);
+    let rounds = std::env::var("IRMIN_CACHE_LOAD_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(15);
+    assert!(files > 0 && rounds > 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    fs::create_dir_all(&game_dir).unwrap();
+    for index in 0..files {
+        fs::write(game_dir.join(format!("asset-{index:06}.pak")), b"x").unwrap();
+    }
+    // Realistic cache payload: a few thousand entries.
+    let cache = DashMap::new();
+    for index in 0..2000 {
+        cache.insert(
+            format!("asset-{index:06}.pak"),
+            VerificationEntry {
+                size: 1,
+                md5: { let mut m = [0u8; 16]; let b = b"0123456789abcdef0123456789abcdef"; if b.len() == 16 { m.copy_from_slice(b); } m },
+                mtime_secs: index as u64,
+            },
+        );
+    }
+    save_verification_cache(&game_dir, &cache).unwrap();
+    // Leave a crashed temp file behind so load exercises its cleanup path.
+    fs::write(
+        game_dir.join(format!("{VERIFICATION_CACHE_FILE}.tmp")),
+        b"junk",
+    )
+    .unwrap();
+
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        // Recreate the crash leftover each round.
+        fs::write(
+            game_dir.join(format!("{VERIFICATION_CACHE_FILE}.tmp")),
+            b"junk",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let loaded = load_verification_cache(&game_dir);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(loaded.len(), 2000);
+        assert!(
+            !game_dir
+                .join(format!("{VERIFICATION_CACHE_FILE}.tmp"))
+                .exists()
+        );
+    }
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "load_verification_cache files={files} cache_entries=2000 rounds={rounds} median_ms={:.3} range_ms={:.3}-{:.3}",
+        samples[samples.len() / 2],
+        samples[0],
+        samples[samples.len() - 1],
+    );
+}
+
+#[test]
+fn save_and_load_verification_cache_round_trip() {
+    use super::VerificationEntry;
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path();
+    let cache: DashMap<String, VerificationEntry> = DashMap::new();
+    cache.insert(
+        "data/asset.pak".to_string(),
+        VerificationEntry::from_hex_md5(12345, "d41d8cd98f00b204e9800998ecf8427e", 1700000000),
+    );
+    cache.insert(
+        "data/中文.pak".to_string(),
+        VerificationEntry::from_hex_md5(99, "abc12300000000000000000000000000", 1700000001),
+    );
+
+    save_verification_cache(game_dir, &cache).unwrap();
+
+    let loaded = load_verification_cache(game_dir);
+    assert_eq!(loaded.len(), 2);
+    let e1 = loaded.get("data/asset.pak").unwrap();
+    assert_eq!(e1.size, 12345);
+    assert_eq!(
+        e1.md5.as_slice(),
+        &super::super::assembly_opt::hex_to_bytes("d41d8cd98f00b204e9800998ecf8427e")
+            .unwrap_or_default()
+    );
+    assert_eq!(e1.mtime_secs, 1700000000);
+    let e2 = loaded.get("data/中文.pak").unwrap();
+    assert_eq!(e2.size, 99);
+    assert_eq!(
+        e2.md5.as_slice(),
+        super::super::assembly_opt::hex_to_bytes("abc12300000000000000000000000000")
+            .unwrap_or_default()
+            .as_slice()
+    );
+    assert_eq!(e2.mtime_secs, 1700000001);
 }

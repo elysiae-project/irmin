@@ -196,7 +196,7 @@ pub async fn fetch_plugins(client: &Client, game_id: &str) -> SophonResult<Vec<P
                 .rsplit('/')
                 .next()
                 .unwrap_or("")
-                .to_lowercase();
+                .to_ascii_lowercase();
             !filename.contains("dxsetup")
         })
         .collect();
@@ -239,7 +239,7 @@ pub async fn fetch_channel_sdks(
                 .rsplit('/')
                 .next()
                 .unwrap_or("")
-                .to_lowercase();
+                .to_ascii_lowercase();
             !filename.contains("dxsetup")
         })
         .collect();

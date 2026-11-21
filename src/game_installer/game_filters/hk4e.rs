@@ -32,60 +32,84 @@ pub fn find_hk4e_persistent_dir(game_dir: &Path) -> std::path::PathBuf {
     game_dir.join(format!("{GAME_DATA_DIR}/Persistent"))
 }
 
+/// HK4E layout filtering: the audio-language patterns derived from the
+/// on-disk locale state, loaded once per install and applied to each
+/// installer's asset segment.
+pub struct Hk4eFilter {
+    patterns_lower: Vec<String>,
+}
+
+impl Hk4eFilter {
+    /// Derive the excluded audio-language path patterns for this install.
+    pub fn load(game_dir: &Path, vo_langs: &[String]) -> Self {
+        let persistent_dir = find_hk4e_persistent_dir(game_dir);
+
+        let installed_langs = read_installed_audio_langs(&persistent_dir, vo_langs);
+
+        let ignored_langs: Vec<&str> = ALL_AUDIO_LANGUAGES
+            .iter()
+            .filter(|lang| !installed_langs.iter().any(|installed| installed == **lang))
+            .copied()
+            .collect();
+
+        let patterns_lower: Vec<String> = ignored_langs
+            .iter()
+            .map(|lang| format!("/{lang}/").to_ascii_lowercase())
+            .collect();
+        Self { patterns_lower }
+    }
+
+    /// Drop assets excluded for the current HK4E layout; returns how many
+    /// were removed. `ctable_streaming.dat` is always removed; audio files
+    /// for uninstalled languages match the prepared `/lang/` patterns.
+    pub fn apply(&self, assets: &mut Vec<SophonManifestAssetProperty>) -> usize {
+        // Filter ctable_streaming.dat unconditionally (not language-dependent).
+        // Use ASCII case-insensitive comparison to avoid allocating a lowercased String.
+        assets.retain(|asset| {
+            let name = asset.asset_name();
+            if name.len() >= "ctable_streaming.dat".len()
+                && name.as_ref().ends_with(b"ctable_streaming.dat")
+                && name
+                    .as_ref()
+                    .iter()
+                    .rev()
+                    .take("ctable_streaming.dat".len())
+                    .all(|&b: &u8| b.is_ascii_lowercase() || !b.is_ascii_alphabetic())
+            {
+                log::warn!("Filtered ctable asset: {}", asset.asset_name_str());
+                return false;
+            }
+            true
+        });
+
+        let original_len = assets.len();
+        assets.retain(|asset| {
+            let asset_lower = asset.asset_name_str().to_ascii_lowercase();
+
+            for pattern in &self.patterns_lower {
+                if asset_lower.contains(pattern) {
+                    log::warn!(
+                        "Filtered unneeded audio asset: {}",
+                        &asset.asset_name_str()
+                    );
+                    return false;
+                }
+            }
+
+            true
+        });
+
+        original_len - assets.len()
+    }
+}
+
 /// Remove manifest entries that should not be installed for the current HK4E layout.
 pub fn filter_hk4e_asset_list(
     game_dir: &Path,
     assets: &mut Vec<SophonManifestAssetProperty>,
     vo_langs: &[String],
 ) {
-    let persistent_dir = find_hk4e_persistent_dir(game_dir);
-
-    let installed_langs = read_installed_audio_langs(&persistent_dir, vo_langs);
-
-    let ignored_langs: Vec<&str> = ALL_AUDIO_LANGUAGES
-        .iter()
-        .filter(|lang| !installed_langs.iter().any(|installed| installed == **lang))
-        .copied()
-        .collect();
-
-    // Filter ctable_streaming.dat unconditionally (not language-dependent).
-    assets.retain(|asset| {
-        if asset
-            .asset_name
-            .to_lowercase()
-            .ends_with("ctable_streaming.dat")
-        {
-            log::warn!("Filtered ctable asset: {}", asset.asset_name);
-            return false;
-        }
-        true
-    });
-
-    if ignored_langs.is_empty() {
-        return;
-    }
-
-    let patterns_lower: Vec<String> = ignored_langs
-        .iter()
-        .map(|lang| format!("/{lang}/").to_lowercase())
-        .collect();
-
-    let original_len = assets.len();
-    assets.retain(|asset| {
-        let asset_lower = asset.asset_name.to_lowercase();
-
-        for pattern in &patterns_lower {
-            if asset_lower.contains(pattern) {
-                let name = &asset.asset_name;
-                log::warn!("Filtered unneeded audio asset: {name}");
-                return false;
-            }
-        }
-
-        true
-    });
-
-    let filtered = original_len - assets.len();
+    let filtered = Hk4eFilter::load(game_dir, vo_langs).apply(assets);
     if filtered > 0 {
         log::warn!("hk4e filter removed {filtered} assets");
     }
@@ -146,9 +170,9 @@ pub fn write_pkg_version_from_manifest(
     for lang in vo_langs {
         if let Some(lang_name) = locale_code_to_audio_lang_name(lang) {
             let filename = format!("Audio_{lang_name}_pkg_version");
-            let pattern = format!("/{lang_name}/").to_lowercase();
+            let pattern = format!("/{lang_name}/").to_ascii_lowercase();
             let matching_indices: Vec<usize> = (0..assets.num_files())
-                .filter(|&i| assets.file_name(i).to_lowercase().contains(&pattern))
+                .filter(|&i| assets.file_name(i).to_ascii_lowercase().contains(&pattern))
                 .collect();
             write_single_pkg_version_from_indices(game_dir, &filename, assets, &matching_indices)?;
         }
@@ -199,7 +223,7 @@ fn write_single_pkg_version(
         }
         let entry = PkgVersionEntry {
             remoteName: assets.file_name(i).to_string(),
-            md5: assets.file_hash_md5(i).to_string(),
+            md5: super::super::assembly_opt::bytes_to_hex(assets.file_hash_md5(i)),
             file_size: assets.file_size(i),
         };
         let mut line = serde_json::to_string(&entry)?;
@@ -227,7 +251,7 @@ fn write_single_pkg_version_from_indices(
         }
         let entry = PkgVersionEntry {
             remoteName: assets.file_name(i).to_string(),
-            md5: assets.file_hash_md5(i).to_string(),
+            md5: super::super::assembly_opt::bytes_to_hex(assets.file_hash_md5(i)),
             file_size: assets.file_size(i),
         };
         let mut line = serde_json::to_string(&entry)?;
@@ -320,7 +344,7 @@ mod tests {
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "0123456789abcdef0123456789abcdef".into(),
+                asset_hash_md5: bytes::Bytes::from("0123456789abcdef0123456789abcdef"),
             })
             .collect();
 
@@ -329,7 +353,7 @@ mod tests {
             assert_eq!(
                 assets
                     .iter()
-                    .map(|asset| asset.asset_name.as_str())
+                    .map(|asset| asset.asset_name_str())
                     .collect::<Vec<_>>(),
                 [english_path, common_path],
                 "locale={locale}",
@@ -385,39 +409,39 @@ mod tests {
 
         let mut assets = vec![
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Chinese/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Chinese/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/English(US)/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/English(US)/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Japanese/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Japanese/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Korean/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Korean/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/non_audio/file.dat".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/non_audio/file.dat"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
         ];
 
@@ -429,11 +453,27 @@ mod tests {
 
         // Chinese and English(US) kept; Japanese and Korean filtered.
         assert_eq!(assets.len(), 3);
-        assert!(assets.iter().any(|a| a.asset_name.contains("Chinese")));
-        assert!(assets.iter().any(|a| a.asset_name.contains("English(US)")));
-        assert!(assets.iter().any(|a| a.asset_name.contains("non_audio")));
-        assert!(!assets.iter().any(|a| a.asset_name.contains("Japanese")));
-        assert!(!assets.iter().any(|a| a.asset_name.contains("Korean")));
+        assert!(
+            assets
+                .iter()
+                .any(|a| a.asset_name_str().contains("Chinese"))
+        );
+        assert!(
+            assets
+                .iter()
+                .any(|a| a.asset_name_str().contains("English(US)"))
+        );
+        assert!(
+            assets
+                .iter()
+                .any(|a| a.asset_name_str().contains("non_audio"))
+        );
+        assert!(
+            !assets
+                .iter()
+                .any(|a| a.asset_name_str().contains("Japanese"))
+        );
+        assert!(!assets.iter().any(|a| a.asset_name_str().contains("Korean")));
     }
 
     #[test]
@@ -445,18 +485,18 @@ mod tests {
 
         let mut assets = vec![
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Chinese/ctable_streaming.dat".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Chinese/ctable_streaming.dat"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/normal_file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/normal_file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
         ];
 
@@ -464,7 +504,10 @@ mod tests {
 
         // ctable file filtered even when Chinese is installed.
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].asset_name, "data/asset_bundle/normal_file.pck");
+        assert_eq!(
+            assets[0].asset_name_str(),
+            "data/asset_bundle/normal_file.pck"
+        );
     }
 
     #[test]
@@ -480,18 +523,18 @@ mod tests {
 
         let mut assets = vec![
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Chinese/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Chinese/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Japanese/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Japanese/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
         ];
 
@@ -518,18 +561,18 @@ mod tests {
 
         let mut assets = vec![
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Chinese/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Chinese/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/non_audio/file.dat".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/non_audio/file.dat"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "abc".into(),
+                asset_hash_md5: bytes::Bytes::from("abc"),
             },
         ];
 
@@ -537,7 +580,10 @@ mod tests {
 
         // With empty vo_langs, all audio is filtered, only non-audio remains
         assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].asset_name, "data/asset_bundle/non_audio/file.dat");
+        assert_eq!(
+            assets[0].asset_name_str(),
+            "data/asset_bundle/non_audio/file.dat"
+        );
     }
 
     // write_audio_lang_record
@@ -563,33 +609,33 @@ mod tests {
 
         let assets_vec = vec![
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/Chinese/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/Chinese/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 100,
-                asset_hash_md5: "md5_chinese".into(),
+                asset_hash_md5: bytes::Bytes::from("md5_chinese"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/English(US)/file.pck".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/English(US)/file.pck"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 200,
-                asset_hash_md5: "md5_english".into(),
+                asset_hash_md5: bytes::Bytes::from("md5_english"),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/common/data.bin".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/common/data.bin"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 300,
-                asset_hash_md5: "md5_common".into(),
+                asset_hash_md5: bytes::Bytes::from("md5_common"),
             },
             // Directory entry skipped.
             SophonManifestAssetProperty {
-                asset_name: "data/asset_bundle/".into(),
+                asset_name: bytes::Bytes::from("data/asset_bundle/"),
                 asset_chunks: vec![],
                 asset_type: 64,
                 asset_size: 0,
-                asset_hash_md5: String::new(),
+                asset_hash_md5: bytes::Bytes::new(),
             },
         ];
         let assets = Arc::new(CompactManifest::from(assets_vec));
@@ -622,11 +668,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let assets_vec = vec![SophonManifestAssetProperty {
-            asset_name: "data/common.bin".into(),
+            asset_name: bytes::Bytes::from("data/common.bin"),
             asset_chunks: vec![],
             asset_type: 0,
             asset_size: 100,
-            asset_hash_md5: "md5".into(),
+            asset_hash_md5: bytes::Bytes::from("md5"),
         }];
         let assets = Arc::new(CompactManifest::from(assets_vec));
 
@@ -691,18 +737,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let assets_vec = vec![
             SophonManifestAssetProperty {
-                asset_name: "dir/".into(),
+                asset_name: bytes::Bytes::from("dir/"),
                 asset_chunks: vec![],
                 asset_type: 64,
                 asset_size: 0,
-                asset_hash_md5: String::new(),
+                asset_hash_md5: bytes::Bytes::new(),
             },
             SophonManifestAssetProperty {
-                asset_name: "data/file.bin".into(),
+                asset_name: bytes::Bytes::from("data/file.bin"),
                 asset_chunks: vec![],
                 asset_type: 0,
                 asset_size: 50,
-                asset_hash_md5: "hash".into(),
+                asset_hash_md5: bytes::Bytes::from("hash"),
             },
         ];
         let assets = CompactManifest::from(assets_vec);
