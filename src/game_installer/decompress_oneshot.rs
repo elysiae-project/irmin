@@ -22,7 +22,10 @@ use super::error::{SophonError, SophonResult};
 /// not anonymous memory), so the kernel may drop them under pressure rather
 /// than forcing them to swap or triggering the OOM killer.
 #[inline]
-fn map_compressed_chunk(file: &File, len: usize) -> SophonResult<super::assembly_opt::MmapGuard> {
+pub(crate) fn map_compressed_chunk(
+    file: &File,
+    len: usize,
+) -> SophonResult<super::assembly_opt::MmapGuard> {
     // SAFETY: `len` was validated against the file's on-disk length by
     // `resolve_map_len`, and chunk files are written once during download then
     // only read during assembly, so they are not truncated while mapped. This

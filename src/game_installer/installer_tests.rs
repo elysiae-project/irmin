@@ -3026,8 +3026,6 @@ async fn install_update_removes_deleted_files_and_assembles_new_output() {
 /// the resume scan or `resolve_resume_owned` logic.
 #[tokio::test]
 async fn install_resume_phase1_checking_files_does_not_panic_with_matching_state() {
-    use std::io::Write as _;
-
     let dir = tempfile::tempdir().unwrap();
     let game_dir = dir.path().join("game");
     let chunks_dir = game_dir.join("chunks");
@@ -3130,7 +3128,6 @@ async fn install_resume_phase1_checking_files_does_not_panic_with_matching_state
 #[ignore = "requires network access to the live Sophon API"]
 async fn sophon_download_live_api_reaches_install_without_panic() {
     use crate::game_installer::SophonError;
-    use crate::sophon::ProgressFn;
     use crate::{DownloadHandle, Sophon, SophonProgress, VerifyMode};
 
     // nap game id (matches biz "nap_global" via starts_with("nap_")).

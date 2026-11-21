@@ -2031,7 +2031,7 @@ mod tests {
         assert_eq!(value, h.digest());
     }
 
-    #[cfg(feature = "bench-diagnostics")]
+    #[cfg(all(feature = "bench-diagnostics", feature = "bench-internals"))]
     #[tokio::test]
     #[ignore = "diagnostic download phase breakdown; run with --ignored"]
     async fn diagnose_download_phase_breakdown() {

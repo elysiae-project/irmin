@@ -973,21 +973,24 @@ fn decompress_chunk_with_window(
 pub mod bench_internals {
     pub use super::decompress_chunk_optimized;
 
+    #[cfg(feature = "bench-diagnostics")]
+    use crate::game_installer::decompress_oneshot::{map_compressed_chunk, resolve_map_len};
+
     /// Per-phase timing breakdown for one chunk's decompress+verify cycle.
     /// All fields are nanoseconds spent in that phase. Returned by
     /// [`decompress_chunk_optimized_timed`].
     #[cfg(feature = "bench-diagnostics")]
     #[derive(Clone, Copy, Debug, Default)]
     pub struct ChunkPhaseTimings {
-        /// File open + metadata + pread of compressed data.
+        /// File open + metadata + read-only mmap of the compressed chunk.
         pub read_ns: u64,
         /// mmap of the output region.
         pub mmap_ns: u64,
-        /// zstd DCtx take + reset + decompress.
+        /// zstd DCtx take + parameter setup + decompress.
         pub decompress_ns: u64,
         /// Chunk MD5 hash (when not deferred).
         pub hash_ns: u64,
-        /// mmap flush + evict + munmap + compressed fadvise.
+        /// Unmap + compressed fadvise + output flush + evict.
         pub evict_ns: u64,
         /// Total wall time of the call.
         pub total_ns: u64,
@@ -1007,7 +1010,6 @@ pub mod bench_internals {
     ) -> super::SophonResult<(u64, ChunkPhaseTimings)> {
         use std::time::Instant;
 
-        use std::os::unix::fs::FileExt;
         use std::os::unix::io::AsRawFd;
 
         let wall = Instant::now();
@@ -1026,20 +1028,12 @@ pub mod bench_internals {
 
         let t = Instant::now();
         let f = std::fs::File::open(chunk_path)?;
-        let cs = match compressed_size {
-            Some(s) => s as usize,
-            None => f.metadata()?.len() as usize,
-        };
+        let cs = resolve_map_len(compressed_size, f.metadata()?.len(), chunk_path)?;
         if cs == 0 {
             return Err(super::SophonError::Io(std::io::Error::other("empty chunk")));
         }
-        let mut compressed_buf = super::take_compressed_buf(cs);
-        let n = f.read_at(&mut compressed_buf[..cs], 0)?;
-        if n != cs {
-            super::return_compressed_buf(compressed_buf);
-            return Err(super::SophonError::Io(std::io::Error::other("short read")));
-        }
-        let compressed = &compressed_buf[..cs];
+        let compressed_map = map_compressed_chunk(&f, cs)?;
+        let compressed = compressed_map.as_slice();
         timings.read_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
@@ -1052,7 +1046,6 @@ pub mod bench_internals {
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
                     if e.raw_os_error() != Some(libc::EINVAL) {
-                        super::return_compressed_buf(compressed_buf);
                         return Err(super::SophonError::Io(e));
                     }
                 }
@@ -1064,11 +1057,18 @@ pub mod bench_internals {
         let t = Instant::now();
         let result = (|| {
             let mut ctx = super::take_dctx();
-            ctx.reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
-                .map_err(|_| super::SophonError::Io(std::io::Error::other("zstd DCtx reset")))?;
-            if super::chunk_hash_required(chunk_decompressed_hash_md5) {
-                let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
-            }
+            // zstd DCtx parameters are sticky across decompress calls, so a
+            // pooled DCtx only needs parameters toggled, not a full
+            // session+parameter reset after every completed frame. Set the
+            // window large enough for any chunk: a prior hdiffpatch clip on
+            // the same thread may have left a smaller WindowLogMax sticky.
+            let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                super::MAX_WINDOW_LOG,
+            ));
+            let skip_checksum = super::chunk_hash_required(chunk_decompressed_hash_md5);
+            let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(
+                skip_checksum,
+            ));
             let written = ctx
                 .decompress(output, compressed)
                 .map_err(|e| super::SophonError::Io(std::io::Error::other(e.to_string())))?;
@@ -1093,7 +1093,7 @@ pub mod bench_internals {
             let digest = chunk_hasher.finish()?;
             super::return_md5(chunk_hasher);
             if !super::md5_bytes_eq(&digest, chunk_decompressed_hash_md5) {
-                super::return_compressed_buf(compressed_buf);
+                drop(compressed_map);
                 super::posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
                 drop(f);
                 out_mmap.flush_and_evict();
@@ -1107,7 +1107,7 @@ pub mod bench_internals {
         timings.hash_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
-        super::return_compressed_buf(compressed_buf);
+        drop(compressed_map);
         super::posix_advise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
         drop(f);
         out_mmap.flush_and_evict();
@@ -1421,8 +1421,6 @@ mod tests {
     #[test]
     #[ignore = "diagnostic assembly phase breakdown; run with --ignored"]
     fn diagnose_assembly_phase_breakdown() {
-        use std::os::unix::fs::FileExt;
-
         let chunk_mib = 1;
         let num_chunks = 100;
         let chunk_size = chunk_mib * 1024 * 1024;
