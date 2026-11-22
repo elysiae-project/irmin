@@ -204,7 +204,8 @@ fn patch_loop(
             cover_count -= 1;
 
             // length==0 covers are near-nonexistent in real patches;
-            // keeping the branch for correctness but the predictor will skip it.
+            // keeping the branch for correctness but the predictor will skip
+            // it.
             if length > 0 {
                 if let Some(slice) = old_data {
                     // Direct slice access — no seek, no vtable dispatch.
@@ -217,10 +218,12 @@ fn patch_loop(
                     }
                     let src = &slice[start..end];
                     if length <= usize::MAX as u64 && rle0.try_skip_zeros(length as usize)? {
-                        // Zero-run: write old data directly without io_buf copy.
+                        // Zero-run: write old data directly without io_buf
+                        // copy.
                         out.write_all(src)?;
                     } else {
-                        // XOR from source slice into io_buf without prior memcpy.
+                        // XOR from source slice into io_buf without prior
+                        // memcpy.
                         let mut off = 0usize;
                         let len = length as usize;
                         while off < len {
@@ -450,9 +453,10 @@ impl<'a> Rle0Decoder<'a> {
         Ok(())
     }
 
-    /// Apply RLE decoding from a read-only source into a separate output buffer.
-    /// Equivalent to copying `source` into `out` then calling `add(out)`, but
-    /// avoids the initial memcpy for the zero-run (len0) regions.
+    /// Apply RLE decoding from a read-only source into a separate output
+    /// buffer. Equivalent to copying `source` into `out` then calling
+    /// `add(out)`, but avoids the initial memcpy for the zero-run (len0)
+    /// regions.
     fn add_from_source(&mut self, source: &[u8], out: &mut [u8]) -> std::io::Result<()> {
         debug_assert_eq!(source.len(), out.len());
         let mut dp = 0usize;
@@ -460,8 +464,8 @@ impl<'a> Rle0Decoder<'a> {
         while rem > 0 {
             if self.len0 > 0 {
                 let take = self.len0.min(rem);
-                // Zero-run: output = source unchanged, no copy_from_slice needed
-                // if caller writes out[..] to the writer.
+                // Zero-run: output = source unchanged, no copy_from_slice
+                // needed if caller writes out[..] to the writer.
                 out[dp..dp + take].copy_from_slice(&source[dp..dp + take]);
                 self.len0 -= take;
                 dp += take;
@@ -610,8 +614,8 @@ mod tests {
 
     #[test]
     fn rle_varint_truncated_multi_byte_returns_none() {
-        // Truncated multi-byte varint (continuation set on first byte but no second
-        // byte)
+        // Truncated multi-byte varint (continuation set on first byte but no
+        // second byte)
         let buf = [0x80];
         let mut pos = 0;
         assert_eq!(rle_varint(&buf, &mut pos), None);
@@ -921,8 +925,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let patch_path = dir.path().join("patch.hdiff");
 
-        // Varint encode MAX_HDIFF20_STEP_SIZE + 1 = 16777217 for buf_cover_size,
-        // then varint encode 0 for buf_rle_size.
+        // Varint encode MAX_HDIFF20_STEP_SIZE + 1 = 16777217 for
+        // buf_cover_size, then varint encode 0 for buf_rle_size.
         // 16777217 in 7-bit groups from MSB: 8, 0, 0, 1
         // Encoding: 0x88 0x80 0x80 0x01 (with continuation bits on first 3)
         // 0 -> byte: 0x00

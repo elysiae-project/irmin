@@ -27,11 +27,15 @@ impl HkrpgFilter {
         let file = match File::open(&blacklist_path) {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Self { blacklist_lower: blacklist };
+                return Self {
+                    blacklist_lower: blacklist,
+                };
             }
             Err(err) => {
                 log::warn!("Failed to open DownloadBlacklist.json: {err}");
-                return Self { blacklist_lower: blacklist };
+                return Self {
+                    blacklist_lower: blacklist,
+                };
             }
         };
 

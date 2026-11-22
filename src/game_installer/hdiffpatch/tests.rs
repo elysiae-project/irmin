@@ -2338,10 +2338,12 @@ fn hdiff_header_rejects_header_without_null_terminator() {
     fs::write(&patch_path, &[b'H'; 1024]).unwrap();
     let out_path = dir.path().join("out.bin");
     let mut hdiff = HDiff::new(
-        dir.path().join("missing-old.bin").to_string_lossy().to_string(),
+        dir.path()
+            .join("missing-old.bin")
+            .to_string_lossy()
+            .to_string(),
         patch_path.to_string_lossy().to_string(),
         out_path.to_string_lossy().to_string(),
     );
     assert!(!hdiff.apply(None), "runaway header must be rejected");
 }
-

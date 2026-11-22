@@ -56,7 +56,8 @@ impl BufferPool {
     }
 
     /// Remove the smallest pooled buffer with sufficient capacity, or allocate
-    /// a new vector with at least `min_capacity`; returned contents are retained.
+    /// a new vector with at least `min_capacity`; returned contents are
+    /// retained.
     pub fn take(&self, min_capacity: usize) -> Vec<u8> {
         let mut pool = self.buffers.lock().unwrap();
         let mut best_idx = None;

@@ -410,8 +410,8 @@ fn benchmark_eager_loopback_concurrent_rss() {
 /// `IRMIN_EAGER_BENCH_MODE` selects streaming, one-shot, or the production
 /// threshold; `IRMIN_EAGER_BENCH_PATTERN` selects payload compressibility, and
 /// `IRMIN_EAGER_BENCH_FS_LABEL` supplies the output filesystem label.
-/// `IRMIN_EAGER_BENCH_DECODED_THRESHOLD_MIB` opts into the decoded-size selector
-/// experiment for the production-threshold mode. The server
+/// `IRMIN_EAGER_BENCH_DECODED_THRESHOLD_MIB` opts into the decoded-size
+/// selector experiment for the production-threshold mode. The server
 /// applies one response delay per request and an optional shared no-credit
 /// body-rate limit. It does not model TCP windowing, loss, jitter, or a remote
 /// CDN. Process RSS includes both client and server tasks, so use the reset
@@ -1423,7 +1423,10 @@ fn eager_stream_timing_counters_record_real_work() {
         Arc::clone(&timings),
     )
     .unwrap();
-    assert_eq!(std::fs::read(dir.path().join("timed-output.bin")).unwrap(), data);
+    assert_eq!(
+        std::fs::read(dir.path().join("timed-output.bin")).unwrap(),
+        data
+    );
 
     // The decoder-phase counters must observe the stream: they used to be
     // threaded through but never recorded, so every diagnostic print was

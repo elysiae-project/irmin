@@ -64,7 +64,8 @@ impl Hk4eFilter {
     /// for uninstalled languages match the prepared `/lang/` patterns.
     pub fn apply(&self, assets: &mut Vec<SophonManifestAssetProperty>) -> usize {
         // Filter ctable_streaming.dat unconditionally (not language-dependent).
-        // Use ASCII case-insensitive comparison to avoid allocating a lowercased String.
+        // Use ASCII case-insensitive comparison to avoid allocating a
+        // lowercased String.
         assets.retain(|asset| {
             let name = asset.asset_name();
             if name.len() >= "ctable_streaming.dat".len()
@@ -88,10 +89,7 @@ impl Hk4eFilter {
 
             for pattern in &self.patterns_lower {
                 if asset_lower.contains(pattern) {
-                    log::warn!(
-                        "Filtered unneeded audio asset: {}",
-                        &asset.asset_name_str()
-                    );
+                    log::warn!("Filtered unneeded audio asset: {}", &asset.asset_name_str());
                     return false;
                 }
             }
@@ -103,7 +101,8 @@ impl Hk4eFilter {
     }
 }
 
-/// Remove manifest entries that should not be installed for the current HK4E layout.
+/// Remove manifest entries that should not be installed for the current HK4E
+/// layout.
 pub fn filter_hk4e_asset_list(
     game_dir: &Path,
     assets: &mut Vec<SophonManifestAssetProperty>,

@@ -12,12 +12,10 @@ use std::time::{Duration, Instant};
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-
 #[inline]
 fn now_nanos() -> u64 {
     EPOCH.elapsed().as_nanos() as u64
 }
-
 
 use futures_util::StreamExt;
 use futures_util::future::{Future, ready, try_join_all};
@@ -88,7 +86,8 @@ impl DiffRefGuard {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Strategy used to produce or remove a target file during preinstall application.
+/// Strategy used to produce or remove a target file during preinstall
+/// application.
 pub enum PatchMethod {
     CopyOver,
     Patch,
@@ -128,7 +127,8 @@ pub struct PatchChunkInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Persisted preinstall package state, including payload references and target metadata.
+/// Persisted preinstall package state, including payload references and target
+/// metadata.
 pub struct PreinstallState {
     pub tag: String,
     pub game_id: String,
@@ -144,10 +144,12 @@ pub struct PreinstallState {
     pub target_snapshot: Option<TargetSnapshot>,
 }
 
-/// Immutable metadata for a completed package. Payload chunks may still need the CDN.
+/// Immutable metadata for a completed package. Payload chunks may still need
+/// the CDN.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Sealed snapshot of exact target manifests retained for later package application.
+/// Sealed snapshot of exact target manifests retained for later package
+/// application.
 pub struct TargetSnapshot {
     version: u32,
     game_id: String,
@@ -155,7 +157,8 @@ pub struct TargetSnapshot {
     installed_tag: String,
     tag: String,
     build_id: String,
-    // Legacy packages retain their historical matching fields, not today's selector.
+    // Legacy packages retain their historical matching fields, not today's
+    // selector.
     legacy_coverage: bool,
     manifests: Vec<TargetManifest>,
     digest: String,
@@ -383,7 +386,8 @@ impl TargetSnapshot {
                     asset.target_file_path
                 )));
             }
-            // Patch-only files/fields are legitimate; they need not have a normal entry.
+            // Patch-only files/fields are legitimate; they need not have a
+            // normal entry.
             if !self
                 .manifests
                 .iter()
@@ -432,7 +436,8 @@ impl PreinstallState {
                 }
             }
         } else {
-            // Legacy packages have no full target size metadata; use their recorded scope.
+            // Legacy packages have no full target size metadata; use their
+            // recorded scope.
             for asset in &self.patch_assets {
                 decompressed = decompressed.saturating_add(asset.target_file_size);
                 if !asset.patch_name.is_empty()
@@ -598,7 +603,8 @@ fn prepare_synthetic_apply_state_with_method(
         encryption: 0,
         password: String::new(),
         compression: crate::api_scrape::Compression::None,
-        // Port zero has no listener, so an unexpected DownloadOver fallback fails locally.
+        // Port zero has no listener, so an unexpected DownloadOver fallback
+        // fails locally.
         url_prefix: "http://127.0.0.1:0/unused".to_owned(),
         url_suffix: String::new(),
     };
@@ -1412,8 +1418,8 @@ pub async fn preinstall_download(
 
     let unique_chunks: Arc<[PatchChunkInfo]> = plan.unique_chunks.into();
     let chunk_sizes: Arc<ChunkSizes> = Arc::new(ChunkSizes::new(unique_chunks.len()));
-    // Generic progress state is only a hint. Populate readiness exclusively from
-    // fresh on-disk size/hash checks, including on resumed downloads.
+    // Generic progress state is only a hint. Populate readiness exclusively
+    // from fresh on-disk size/hash checks, including on resumed downloads.
 
     // Phase 1 — checking existing files. Files that already exist with a
     // matching hash are folded into the baseline offset, NOT into
@@ -1470,8 +1476,10 @@ pub async fn preinstall_download(
                 Ok::<(), SophonError>(())
             }
         });
-        let first_error =
-            first_stream_error(futures_util::stream::iter(futures).buffer_unordered(super::verify_concurrency())).await;
+        let first_error = first_stream_error(
+            futures_util::stream::iter(futures).buffer_unordered(super::verify_concurrency()),
+        )
+        .await;
         if let Some(err) = first_error {
             return Err(err);
         }
@@ -1522,8 +1530,8 @@ pub async fn preinstall_download(
 
     let diff_downloads = plan.diff_downloads.clone();
 
-    // Background timer emits progress every second regardless of chunk completion
-    // rate.
+    // Background timer emits progress every second regardless of chunk
+    // completion rate.
     let progress_done = Arc::new(AtomicBool::new(false));
     {
         let db_atomic = Arc::clone(&downloaded_bytes);
@@ -1641,13 +1649,9 @@ pub async fn preinstall_download(
                             .cloned()
                             .expect("diff_downloads must not be empty")
                     });
-                let result = process_preinstall_chunk(
-                    *chunk_idx as usize,
-                    chunk_info,
-                    &ctx,
-                    &diff_download,
-                )
-                .await;
+                let result =
+                    process_preinstall_chunk(*chunk_idx as usize, chunk_info, &ctx, &diff_download)
+                        .await;
                 if let Err(err) = result {
                     if matches!(err, SophonError::Cancelled) {
                         cancelled.store(1, Ordering::Relaxed);
@@ -1771,8 +1775,7 @@ pub async fn preinstall_download(
     }
 
     // Persist all downloaded chunks.
-    let downloaded_chunks =
-        snapshot_downloaded_chunks(chunk_sizes, unique_chunks, &state_saver);
+    let downloaded_chunks = snapshot_downloaded_chunks(chunk_sizes, unique_chunks, &state_saver);
 
     updater(SophonProgress::Downloading {
         downloaded_bytes: total_bytes,
@@ -2094,13 +2097,17 @@ async fn download_patch_chunk_inner(
 
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 pub fn verify_chunk_md5(path: &Path, expected_md5: &[u8]) -> bool {
-    verify_chunk_md5_inner(path, |digest| super::assembly_opt::md5_bytes_eq(digest, expected_md5))
+    verify_chunk_md5_inner(path, |digest| {
+        super::assembly_opt::md5_bytes_eq(digest, expected_md5)
+    })
 }
 
 /// Verifies a file's MD5 against a hex-encoded expected hash,
 /// avoiding the `Vec<u8>` allocation from `hex_to_bytes`.
 pub fn verify_chunk_md5_hex(path: &Path, expected_hex: &str) -> bool {
-    verify_chunk_md5_inner(path, |digest| super::assembly_opt::md5_hex_eq(digest, expected_hex))
+    verify_chunk_md5_inner(path, |digest| {
+        super::assembly_opt::md5_hex_eq(digest, expected_hex)
+    })
 }
 
 fn verify_chunk_md5_inner<F: Fn(&[u8; 16]) -> bool>(path: &Path, verify: F) -> bool {
@@ -2202,11 +2209,7 @@ fn verify_chunk_xxh64_inner<F: Fn(u64) -> bool>(path: &Path, verify: F) -> bool 
             hasher.update(buffer.filled(n));
         }
         posix_advise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-        if ok {
-            verify(hasher.digest())
-        } else {
-            false
-        }
+        if ok { verify(hasher.digest()) } else { false }
     };
     super::assembly_opt::return_xxh64(hasher);
     result
@@ -2300,14 +2303,16 @@ where
             "Exact metadata for legacy preinstall {} is unavailable ({err}). Keep the cached package; retry when that release metadata is available, or use a normal update/repair.", state.tag
         )))?;
         state.target_snapshot = Some(snapshot);
-        // Migration is durable before any file changes, including filtered assets.
+        // Migration is durable before any file changes, including filtered
+        // assets.
         save_preinstall_state(game_dir, &state)?;
     }
     let snapshot = state.target_snapshot.as_ref().expect("resolved snapshot");
     snapshot.validate(&state)?;
     let legacy_coverage = snapshot.legacy_coverage;
     // Generators accept canonical locales, not decorated manifest field names.
-    // Non-VO fields such as `cutscenes` must not satisfy English's `en` matcher.
+    // Non-VO fields such as `cutscenes` must not satisfy English's `en`
+    // matcher.
     let represented_vo: Vec<String> = ["zh-cn", "en-us", "ja-jp", "ko-kr"]
         .into_iter()
         .filter(|locale| {
@@ -2339,9 +2344,8 @@ where
     let last_apply_update = Arc::new(AtomicU64::new(0));
 
     let game_dir_owned = game_dir.to_path_buf();
-    let filter_cache = Arc::new(
-        tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned)).await?,
-    );
+    let filter_cache =
+        Arc::new(tokio::task::spawn_blocking(move || FilterCache::new(&game_dir_owned)).await?);
     filter_patch_assets_for_removed_features(&filter_cache, &mut state.patch_assets);
 
     // State is immutable from here on; share it with in-flight patch
@@ -2463,7 +2467,8 @@ where
     }
     if let Some(context) = regenerate_pkg_version {
         let gd = game_dir.to_path_buf();
-        // Never overwrite an omitted VO pack's index with an empty target index.
+        // Never overwrite an omitted VO pack's index with an empty target
+        // index.
         tokio::task::spawn_blocking(move || {
             regenerate_hk4e_pkg_version(&gd, &context, &represented_vo)
         })
@@ -2490,7 +2495,8 @@ where
     }
 
     // Legacy deleted_files lack matching-field provenance. Preserve them rather
-    // than risk removing an unrepresented VO pack; a normal update can reconcile.
+    // than risk removing an unrepresented VO pack; a normal update can
+    // reconcile.
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
     }
@@ -2499,9 +2505,10 @@ where
         let tag = state.tag.clone();
         tokio::task::spawn_blocking(move || {
             super::write_installed_tag(&gd, &tag)?;
-            // patching/chunk is shared with other (including incomplete) packages.
-            // Without per-package ownership, deleting it here can destroy their payload.
-            // Only this package's state and compatibility marker are owned by apply.
+            // patching/chunk is shared with other (including incomplete)
+            // packages. Without per-package ownership, deleting it here can
+            // destroy their payload. Only this package's state and
+            // compatibility marker are owned by apply.
             delete_preinstall_state(&gd, &tag);
             Ok::<(), SophonError>(())
         })
@@ -2861,7 +2868,8 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
 
     let safe_hash = asset.target_file_hash.replace(['/', '\\', '\0'], "_");
     let safe_path = asset.target_file_path.replace(['/', '\\', '\0', ':'], "_");
-    // Use both hash and path to avoid collisions when target_file_hash is empty.
+    // Use both hash and path to avoid collisions when target_file_hash is
+    // empty.
     let temp_path = game_dir.join(format!("patching/copyover_{safe_path}_{safe_hash}.tmp"));
     {
         let file = fs::File::create(&temp_path)?;
@@ -2968,12 +2976,7 @@ async fn process_patch_asset(ctx: PatchTaskContext) -> SophonResult<()> {
             .map_err(SophonError::JoinError)?
     };
     if already_patched {
-        report_apply_progress(
-            &applied_files,
-            &last_apply_update,
-            &updater,
-            total_files,
-        );
+        report_apply_progress(&applied_files, &last_apply_update, &updater, total_files);
         return Ok(());
     }
 
@@ -3285,10 +3288,7 @@ fn apply_hdiff_patch_impl(
                 fs::create_dir_all(parent)?;
             }
             fs::File::create(&diff_ref)?;
-            if !verify_file_hash_hex(
-                &diff_ref,
-                BLANK_FILE_MD5,
-            ) {
+            if !verify_file_hash_hex(&diff_ref, BLANK_FILE_MD5) {
                 return Err(SophonError::HDiffPatchFailed {
                     file: asset.target_file_path.clone(),
                     error: format!(
@@ -3355,10 +3355,7 @@ fn apply_hdiff_patch_impl(
         && diff_ref_guard.0.is_none()
         && original_path.exists()
         && !expected_md5.is_empty()
-        && !verify_file_hash_hex(
-            &original_path,
-            expected_md5,
-        )
+        && !verify_file_hash_hex(&original_path, expected_md5)
     {
         if is_filtered_asset(cache, asset) {
             log::warn!(
@@ -3441,10 +3438,7 @@ fn apply_hdiff_patch_impl(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash_hex(
-                    &temp_output,
-                    &asset.target_file_hash,
-                )
+                && !verify_file_hash_hex(&temp_output, &asset.target_file_hash)
             {
                 let _ = fs::remove_file(&temp_output);
                 return Err(SophonError::Md5Mismatch {
@@ -3502,10 +3496,7 @@ fn apply_hdiff_patch_from_files(
         }
         fs::File::create(&empty_original_path)?;
         // Verify the freshly-created diff_ref is empty before proceeding.
-        if !verify_file_hash_hex(
-            &empty_original_path,
-            BLANK_FILE_MD5,
-        ) {
+        if !verify_file_hash_hex(&empty_original_path, BLANK_FILE_MD5) {
             let _ = fs::remove_file(&empty_original_path);
             return Err(SophonError::HDiffPatchFailed {
                 file: asset.target_file_path.clone(),
@@ -3550,10 +3541,7 @@ fn apply_hdiff_patch_from_files(
                 });
             }
             if !asset.target_file_hash.is_empty()
-                && !verify_file_hash_hex(
-                    &temp_output,
-                    &asset.target_file_hash,
-                )
+                && !verify_file_hash_hex(&temp_output, &asset.target_file_hash)
             {
                 let _ = fs::remove_file(&temp_output);
                 return Err(SophonError::Md5Mismatch {
@@ -3616,7 +3604,11 @@ impl DownloadOverContext {
                     }
                     (
                         entry.matching_field.clone(),
-                        (entry.chunk_download.clone(), Arc::new(manifest), asset_index),
+                        (
+                            entry.chunk_download.clone(),
+                            Arc::new(manifest),
+                            asset_index,
+                        ),
                     )
                 })
                 .collect(),
@@ -3661,7 +3653,8 @@ where
                 return Err(invalid_state("Server substituted a different target tag"));
             }
             let mut manifests = Vec::with_capacity(state.main_manifest_ids.len());
-            // Saved IDs, NOT the corrected locale selector, define legacy scope.
+            // Saved IDs, NOT the corrected locale selector, define legacy
+            // scope.
             for (field, id) in &state.main_manifest_ids {
                 let meta = build
                     .manifests
@@ -3777,12 +3770,13 @@ async fn apply_download_over(
         .get(&asset.matching_field)
         .ok_or_else(|| SophonError::NoVoiceManifest(asset.matching_field.clone()))?;
 
-    let file_index = *asset_index
-        .get(&asset.target_file_path)
-        .ok_or_else(|| SophonError::AssemblyFailed {
-            file: asset.target_file_path.clone(),
-            error: "File not found in main manifest for DownloadOver".to_string(),
-        })?;
+    let file_index =
+        *asset_index
+            .get(&asset.target_file_path)
+            .ok_or_else(|| SophonError::AssemblyFailed {
+                file: asset.target_file_path.clone(),
+                error: "File not found in main manifest for DownloadOver".to_string(),
+            })?;
     let file_entry = &manifest.assets[file_index];
 
     let chunks_dir = game_dir.join("chunks");
@@ -4046,7 +4040,7 @@ pub fn legacy_dashmap_snapshot(map: &dashmap::DashMap<String, u64>) -> Vec<(Stri
 }
 
 pub mod bench_internals {
-    pub use super::{verify_chunk_md5, verify_chunk_xxh64, verify_file_hash};
     #[cfg(feature = "benchmark")]
     pub use super::{ChunkSizes, legacy_dashmap_snapshot, save_state_snapshot};
+    pub use super::{verify_chunk_md5, verify_chunk_xxh64, verify_file_hash};
 }

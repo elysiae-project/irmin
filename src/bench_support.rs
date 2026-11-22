@@ -186,7 +186,8 @@ pub const HDIFF20_STEP_STRESS_MAX_SIZE_MIB: usize = 8;
 const HDIFF20_STEP_STRESS_BYTES_PER_COVER: usize = 5;
 const HDIFF20_STEP_STRESS_SMALL_STEP_COVERS: usize = 4096;
 
-/// Per-step cover plus RLE section lengths for a synthetic one-byte-cover stress fixture with a changed leading literal.
+/// Per-step cover plus RLE section lengths for a synthetic one-byte-cover
+/// stress fixture with a changed leading literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hdiff20StepFixtureShape {
     pub output_bytes: usize,
@@ -320,7 +321,8 @@ pub fn uncovered_prefix_fixture_sizes(size_mib: usize) -> Result<(usize, usize),
     if aligned_size < BLOCK_SIZE * 2 {
         return Err("uncovered-prefix fixture requires at least two 64 KiB blocks".to_owned());
     }
-    // Keep a copied suffix while leaving most output in the uncovered-data path.
+    // Keep a copied suffix while leaving most output in the uncovered-data
+    // path.
     let suffix_size = (aligned_size / 16).max(BLOCK_SIZE);
     let suffix_size = suffix_size / BLOCK_SIZE * BLOCK_SIZE;
     let prefix_size = aligned_size - suffix_size;

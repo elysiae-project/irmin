@@ -10,7 +10,8 @@ use super::error::{SophonError, SophonResult};
 /// `copy_file_range(2)`: copies up to `len` bytes from `src_fd` at
 /// `src_off` to `dst_fd` at `dst_off`. Returns the number of bytes copied.
 /// Loops if the kernel copies fewer than requested per call.
-/// Copy a byte range between file descriptors using the platform copy-range facility.
+/// Copy a byte range between file descriptors using the platform copy-range
+/// facility.
 #[inline(always)]
 pub fn copy_file_range(
     src_fd: RawFd,
@@ -94,7 +95,8 @@ pub fn copy_file_region_to(
 /// Pre-allocate disk blocks for `file` up to `len` bytes using
 /// `fallocate(2)` with `FALLOC_FL_KEEP_SIZE`. Allocates extents without
 /// zeroing or changing file size. Silently ignores unsupported filesystems.
-/// Reserve space for `len` bytes in `file`, returning the operating-system error.
+/// Reserve space for `len` bytes in `file`, returning the operating-system
+/// error.
 pub fn preallocate(file: &File, len: u64) -> std::io::Result<()> {
     if len == 0 {
         return Ok(());

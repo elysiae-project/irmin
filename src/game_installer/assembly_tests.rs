@@ -167,9 +167,9 @@ fn benchmark_download_over_assembly_hash_strategy() {
     );
 }
 
-/// Measures Deferred assembly and the subsequent repair-style cache-miss hash read.
-/// The per-file cache hint is best effort; timings are diagnostic and warm-cache unless the
-/// filesystem actually drops the advised pages.
+/// Measures Deferred assembly and the subsequent repair-style cache-miss hash
+/// read. The per-file cache hint is best effort; timings are diagnostic and
+/// warm-cache unless the filesystem actually drops the advised pages.
 #[cfg(all(feature = "bench-diagnostics", unix))]
 #[test]
 #[ignore = "measures repair-style post-assembly destination verification cost"]
@@ -1661,7 +1661,7 @@ fn write_from_old_file_reads_correct_offset() {
         &mut transfer_buf,
         b"", // hash_md5 (skip verification)
         None,
-    0,
+        0,
     )
     .unwrap();
     drop(output_file);
@@ -1708,7 +1708,7 @@ fn write_from_old_file_verifies_chunk_hash() {
         &mut transfer_buf,
         expected_md5.as_bytes(),
         None,
-    0,
+        0,
     );
 
     assert!(result.is_ok(), "should succeed with correct hash");
@@ -1757,7 +1757,7 @@ fn write_from_old_file_hashes_chunk_larger_than_buffer() {
         &mut transfer_buf,
         expected_md5.as_bytes(),
         None,
-    0,
+        0,
     )
     .unwrap();
     drop(output_file);
@@ -1799,7 +1799,7 @@ fn write_from_old_file_hash_mismatch_fails() {
         &mut transfer_buf,
         &super::super::assembly_opt::hex_to_bytes(wrong_md5).unwrap()[..],
         None,
-    0,
+        0,
     );
 
     assert!(result.is_err(), "should fail with wrong hash");
@@ -1841,7 +1841,7 @@ fn write_from_old_file_too_short_fails() {
         &mut transfer_buf,
         b"",
         None,
-    0,
+        0,
     );
 
     assert!(result.is_err(), "should fail when file is too short");
@@ -2178,9 +2178,9 @@ fn assemble_file_reuses_large_chunks_from_permuted_old_offsets() {
     assert_eq!(hex::encode(output_hasher.finalize()), expected_hash);
 }
 
-/// Verifies assembled output == decompressed chunk concatenation with PRNG data,
-/// and that the file MD5 matches the manifest. Guards against decompression or
-/// offset calculation regressions.
+/// Verifies assembled output == decompressed chunk concatenation with PRNG
+/// data, and that the file MD5 matches the manifest. Guards against
+/// decompression or offset calculation regressions.
 #[test]
 fn assemble_file_prng_data_matches_expected_md5() {
     let dir = tempfile::tempdir().unwrap();

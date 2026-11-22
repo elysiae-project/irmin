@@ -29,9 +29,10 @@ impl OutputAllocator {
         }
     }
 
-    /// Pre-allocates an output file at its full size. Creates parent directories.
-    /// Stores the open fd in the handle cache for later pwrite access.
-    /// Thread-safe: only the first caller for a given file_idx creates the file.
+    /// Pre-allocates an output file at its full size. Creates parent
+    /// directories. Stores the open fd in the handle cache for later pwrite
+    /// access. Thread-safe: only the first caller for a given file_idx creates
+    /// the file.
     pub fn preallocate_file(
         &self,
         file_idx: usize,

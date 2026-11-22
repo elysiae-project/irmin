@@ -38,7 +38,8 @@ pub struct Md5 {
 }
 
 impl Md5 {
-    /// Initialize a reusable MD5 context, returning an error if backend setup fails.
+    /// Initialize a reusable MD5 context, returning an error if backend setup
+    /// fails.
     pub fn new() -> SophonResult<Self> {
         Ok(Self {
             inner: fast_md5::Md5::new(),
@@ -102,7 +103,8 @@ pub(crate) struct HashReadBuffer {
     buffer: Vec<u8>,
     /// Length handed to each `read`, bounded by the caller's request.
     read_len: usize,
-    /// Whether `buffer` came from the thread-local pool and should return to it.
+    /// Whether `buffer` came from the thread-local pool and should return to
+    /// it.
     pooled: bool,
 }
 
@@ -357,7 +359,8 @@ pub(crate) fn trim_thread_local_buffers() {
     });
 }
 
-/// Takes a zstd decompression context, creating a fresh one if the pool is empty.
+/// Takes a zstd decompression context, creating a fresh one if the pool is
+/// empty.
 #[inline]
 pub(crate) fn take_dctx() -> zstd::zstd_safe::DCtx<'static> {
     ZSTD_DCTX.with(|cell| {
@@ -447,11 +450,13 @@ impl Drop for MmapGuard {
     }
 }
 
-/// Map the prefix of a file for read-only access with kernel-default paging behavior.
+/// Map the prefix of a file for read-only access with kernel-default paging
+/// behavior.
 ///
 /// # Safety
-/// The caller must ensure `len` does not exceed the file size and no process modifies or truncates
-/// the file while the mapping is used. Truncation can cause `SIGBUS` when mapped pages are read.
+/// The caller must ensure `len` does not exceed the file size and no process
+/// modifies or truncates the file while the mapping is used. Truncation can
+/// cause `SIGBUS` when mapped pages are read.
 pub(crate) unsafe fn mmap_read_only_unchecked(file: &File, len: usize) -> io::Result<MmapGuard> {
     if len == 0 {
         return Err(io::Error::other("empty file"));
@@ -559,7 +564,8 @@ pub(crate) fn mmap_read_write(file: &File, offset: u64, len: usize) -> io::Resul
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        // Hint transparent hugepages for regions >= 2 MiB to reduce TLB pressure.
+        // Hint transparent hugepages for regions >= 2 MiB to reduce TLB
+        // pressure.
         if map_len >= 2 * 1024 * 1024 {
             libc::madvise(base, map_len, libc::MADV_HUGEPAGE);
         }
@@ -684,7 +690,8 @@ pub fn write_chunk_from_mmap(
         buf
     });
 
-    // mmap requires the output region to be pre-sized; fall back to pwrite otherwise.
+    // mmap requires the output region to be pre-sized; fall back to pwrite
+    // otherwise.
     let mmap_result = if out_file_len >= new_offset + expected_size {
         mmap_read_write(out_file, new_offset, expected_size_u)
     } else {
@@ -819,10 +826,12 @@ pub fn decompress_chunk_optimized(
         );
         match &result {
             Ok(_) => return result,
-            // Hash/size mismatches are data-integrity failures; streaming won't fix them.
+            // Hash/size mismatches are data-integrity failures; streaming won't
+            // fix them.
             Err(SophonError::Md5Mismatch { .. }) => return result,
             Err(SophonError::SizeMismatch { .. }) => return result,
-            // Decompression/IO errors may recover via streaming with a different window.
+            // Decompression/IO errors may recover via streaming with a
+            // different window.
             Err(_) => {}
         }
     }
@@ -1017,8 +1026,14 @@ pub mod bench_internals {
 
         if expected_size == 0 || expected_size > super::ONESHOT_MAX_SIZE as u64 {
             let r = super::decompress_chunk_optimized(
-                chunk_path, out_file, offset, expected_size, None,
-                chunk_decompressed_hash_md5, false, compressed_size,
+                chunk_path,
+                out_file,
+                offset,
+                expected_size,
+                None,
+                chunk_decompressed_hash_md5,
+                false,
+                compressed_size,
             );
             timings.total_ns = wall.elapsed().as_nanos() as u64;
             return r.map(|b| (b, timings));
@@ -1041,7 +1056,9 @@ pub mod bench_internals {
         if out_mmap.map_len >= 2 * 1024 * 1024 {
             unsafe {
                 let ret = libc::madvise(
-                    out_mmap.map_base, out_mmap.map_len, libc::MADV_POPULATE_WRITE,
+                    out_mmap.map_base,
+                    out_mmap.map_len,
+                    libc::MADV_POPULATE_WRITE,
                 );
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
@@ -1277,7 +1294,8 @@ mod tests {
         assert_eq!(bytes, raw.len() as u64);
         assert_eq!(std::fs::read(&dst_path).unwrap(), raw);
 
-        // The Some(compressed_size) path skips the fstat and produces identical output.
+        // The Some(compressed_size) path skips the fstat and produces identical
+        // output.
         let dst2 = dir.path().join("out2.bin");
         let out2 = write_at_new(&dst2);
         out2.set_len(raw.len() as u64).unwrap();
@@ -1462,8 +1480,14 @@ mod tests {
         for (i, (p, cs)) in chunk_paths.iter().enumerate() {
             let offset = (i * chunk_size) as u64;
             decompress_chunk_optimized(
-                p, &out_file, offset, chunk_size as u64, None,
-                &hashes[i], false, Some(*cs),
+                p,
+                &out_file,
+                offset,
+                chunk_size as u64,
+                None,
+                &hashes[i],
+                false,
+                Some(*cs),
             )
             .unwrap();
         }
@@ -1480,8 +1504,12 @@ mod tests {
         for (i, (p, cs)) in chunk_paths.iter().enumerate() {
             let offset = (i * chunk_size) as u64;
             let (_, t) = decompress_chunk_optimized_timed(
-                p, &out_file, offset, chunk_size as u64,
-                &hashes[i], Some(*cs),
+                p,
+                &out_file,
+                offset,
+                chunk_size as u64,
+                &hashes[i],
+                Some(*cs),
             )
             .unwrap();
             total_read += t.read_ns;
@@ -1497,10 +1525,30 @@ mod tests {
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         println!("=== ASSEMBLY PHASE BREAKDOWN ({num_chunks}×{chunk_mib}MiB) ===");
         println!("total:        {total_ms:.2} ms");
-        println!("read:         {:.2} ms ({:.0}%)", ms(total_read), pct(total_read));
-        println!("mmap:         {:.2} ms ({:.0}%)", ms(total_mmap), pct(total_mmap));
-        println!("decompress:   {:.2} ms ({:.0}%)", ms(total_decompress), pct(total_decompress));
-        println!("hash:         {:.2} ms ({:.0}%)", ms(total_hash), pct(total_hash));
-        println!("evict:        {:.2} ms ({:.0}%)", ms(total_evict), pct(total_evict));
+        println!(
+            "read:         {:.2} ms ({:.0}%)",
+            ms(total_read),
+            pct(total_read)
+        );
+        println!(
+            "mmap:         {:.2} ms ({:.0}%)",
+            ms(total_mmap),
+            pct(total_mmap)
+        );
+        println!(
+            "decompress:   {:.2} ms ({:.0}%)",
+            ms(total_decompress),
+            pct(total_decompress)
+        );
+        println!(
+            "hash:         {:.2} ms ({:.0}%)",
+            ms(total_hash),
+            pct(total_hash)
+        );
+        println!(
+            "evict:        {:.2} ms ({:.0}%)",
+            ms(total_evict),
+            pct(total_evict)
+        );
     }
 }

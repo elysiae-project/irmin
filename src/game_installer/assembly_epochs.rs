@@ -88,7 +88,8 @@ pub struct StageRequest {
 }
 
 impl CommitDirective {
-    /// True when this directive requires an immediate [`AssemblyEpochs::commit`].
+    /// True when this directive requires an immediate
+    /// [`AssemblyEpochs::commit`].
     pub fn is_due(&self) -> bool {
         matches!(self, CommitDirective::Due)
     }
@@ -171,8 +172,12 @@ impl AssemblyEpochs {
             std::mem::take(&mut state.staged)
         };
         let n = staged.len();
-        let result =
-            commit_staged(staged, &self.chunk_lookup, &self.chunk_refcounts, &self.chunks_dir);
+        let result = commit_staged(
+            staged,
+            &self.chunk_lookup,
+            &self.chunk_refcounts,
+            &self.chunks_dir,
+        );
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match (&state.status, result) {
             (Err(sticky), _) => Err(clone_sticky(sticky)),

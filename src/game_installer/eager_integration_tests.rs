@@ -147,7 +147,8 @@ fn eager_mixed_mode_coexistence() {
     let alloc = OutputAllocator::new(&game_dir);
     let bitmap_path = game_dir.join(".sophon_bitmap");
 
-    // 10 total chunks: first 6 are eager (2 files × 3 chunks), last 4 are traditional
+    // 10 total chunks: first 6 are eager (2 files × 3 chunks), last 4 are
+    // traditional
     let total_chunks = 10;
     let bitmap = ChunkBitmap::create(&bitmap_path, total_chunks).unwrap();
 
@@ -197,8 +198,8 @@ fn eager_mixed_mode_coexistence() {
         bitmap.mark_complete(chunk_idx);
     }
 
-    // Traditional chunks 6-9 are NOT processed here (they'd go through assembly)
-    // Verify only eager chunks are marked
+    // Traditional chunks 6-9 are NOT processed here (they'd go through
+    // assembly) Verify only eager chunks are marked
     assert!(bitmap.all_complete_for_range(0, 6));
     assert!(!bitmap.is_complete(6));
     assert!(!bitmap.is_complete(9));

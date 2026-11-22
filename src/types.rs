@@ -24,7 +24,8 @@ pub enum DownloadType {
 /// freshly loaded manifest. Future saves always write `Indices`.
 #[derive(Debug, Clone)]
 pub enum CompletedFiles {
-    /// Current compact representation: indices into the freshly loaded manifest.
+    /// Current compact representation: indices into the freshly loaded
+    /// manifest.
     Indices(Vec<usize>),
     /// Older representation containing asset paths, migrated during install.
     /// Serializing this variant deliberately writes an empty index array.
@@ -269,8 +270,8 @@ mod tests {
         }
     }
 
-    /// Backward compatibility: a committed JSON shape deserializes to known values.
-    /// If field names or casing change, this test breaks.
+    /// Backward compatibility: a committed JSON shape deserializes to known
+    /// values. If field names or casing change, this test breaks.
     #[test]
     fn download_state_golden_json_backward_compat() {
         let golden = r#"{

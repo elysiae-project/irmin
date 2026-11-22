@@ -3,11 +3,11 @@
 //!
 //! `elysiae` (and any other real GTK/Tokio consumer) drives irmin by spawning
 //! each `Sophon` method's future on a multi-threaded runtime via
-//! `tokio::spawn` (or an equivalent helper requiring `Future + Send + 'static`).
-//! A borrow of `&self`, `&str`, `&Path`, or `&DownloadHandle` that survives
-//! across an `await` point makes the returned future `Send` only for one
-//! specific lifetime — not for *all* lifetimes — so the spawn fails with the
-//! classic "implementation of `Send` is not general enough" error.
+//! `tokio::spawn` (or an equivalent helper requiring `Future + Send +
+//! 'static`). A borrow of `&self`, `&str`, `&Path`, or `&DownloadHandle` that
+//! survives across an `await` point makes the returned future `Send` only for
+//! one specific lifetime — not for *all* lifetimes — so the spawn fails with
+//! the classic "implementation of `Send` is not general enough" error.
 //!
 //! These tests spawn each public `Sophon` method's future on a fresh
 //! multi-threaded runtime and assert that the future type-checks as
@@ -20,10 +20,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use irmin_rs::{
-    DownloadHandle, Sophon, SophonProgress,
-    game_installer::SophonError,
-};
+use irmin_rs::{DownloadHandle, Sophon, SophonProgress, game_installer::SophonError};
 
 /// Build a `Sophon` pointed at a nonexistent install dir and game id.
 ///
@@ -32,9 +29,12 @@ use irmin_rs::{
 /// survive the type-checker. Every method below fails fast (network or
 /// manifest error) without touching disk beyond reading the (missing) tag.
 fn sophon_fixture() -> Sophon {
-    Sophon::builder("test-game-id", PathBuf::from("/tmp/irmin-send-tests-nonexistent"))
-        .vo_lang("en-US")
-        .build()
+    Sophon::builder(
+        "test-game-id",
+        PathBuf::from("/tmp/irmin-send-tests-nonexistent"),
+    )
+    .vo_lang("en-US")
+    .build()
 }
 
 /// Cheap progress callback satisfying `ProgressFn` (`Send + Sync + 'static`).
@@ -61,8 +61,7 @@ where
         .build()
         .expect("failed to build multi-thread runtime");
     let handle = rt.spawn(f);
-    rt.block_on(handle)
-        .expect("spawned future panicked")
+    rt.block_on(handle).expect("spawned future panicked")
 }
 
 /// `check_update` must be spawnable on a multi-thread runtime even though it

@@ -275,7 +275,8 @@ fn extract_zip(zip_path: &Path, game_dir: &Path) -> SophonResult<()> {
             let mut out_file = File::create(&out_path)?;
             std::io::copy(&mut entry, &mut out_file)?;
 
-            // Preserve Unix mode bits from the ZIP entry so executables retain +x.
+            // Preserve Unix mode bits from the ZIP entry so executables retain
+            // +x.
             if let Some(mode) = entry.unix_mode() {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(mode & 0o7777));
@@ -401,7 +402,8 @@ async fn install_single_plugin(
     Ok(())
 }
 
-/// Download, validate, and install the selected plugin archives into the game directory.
+/// Download, validate, and install the selected plugin archives into the game
+/// directory.
 pub async fn install_plugins(
     client: &Client,
     game_dir: &Path,
@@ -504,7 +506,8 @@ async fn install_single_sdk(
     Ok(())
 }
 
-/// Download, validate, and install channel SDK archives into the game directory.
+/// Download, validate, and install channel SDK archives into the game
+/// directory.
 pub async fn install_channel_sdks(
     client: &Client,
     game_dir: &Path,
@@ -837,8 +840,8 @@ mod tests {
         src.write_all(fname).unwrap();
         src.write_all(payload).unwrap();
 
-        // Central-directory offset equals the size of the local header entry plus
-        // payload.
+        // Central-directory offset equals the size of the local header entry
+        // plus payload.
         let local_header_size: u32 = 30 + (fname.len() as u32) + (payload.len() as u32);
         let cd_offset: u32 = local_header_size;
 

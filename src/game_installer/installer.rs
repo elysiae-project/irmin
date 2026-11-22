@@ -90,9 +90,8 @@ impl ChunkNameLookup {
     pub fn from_arena(arena: super::compact_manifest::StringArena) -> Self {
         let n = arena.len();
         let manifest = Arc::new(CompactManifest::wrap_arena(arena));
-        let name_locs: Vec<(u32, u32)> = (0..n as u32)
-            .map(|i| manifest.str_offsets_at(i))
-            .collect();
+        let name_locs: Vec<(u32, u32)> =
+            (0..n as u32).map(|i| manifest.str_offsets_at(i)).collect();
         let bytes = manifest.arena_str().as_bytes();
         let mut sorted: Vec<u32> = (0..n as u32).collect();
         sorted.sort_unstable_by(|&a, &b| {
@@ -121,7 +120,8 @@ impl ChunkNameLookup {
         let hint = upper.unwrap_or(lower);
         let arena_bytes = manifest.arena_str().as_bytes();
         let arena_len = arena_bytes.len();
-        let mut seen: FxHashMap<&[u8], u32> = FxHashMap::with_capacity_and_hasher(hint, Default::default());
+        let mut seen: FxHashMap<&[u8], u32> =
+            FxHashMap::with_capacity_and_hasher(hint, Default::default());
         let mut name_locs: Vec<(u32, u32)> = Vec::with_capacity(hint);
         for (file_idx, chunk_idx) in items {
             let id = manifest.file_chunk_name_id_at(file_idx as usize, chunk_idx as usize);
@@ -185,7 +185,8 @@ impl ChunkNameLookup {
 }
 
 type ProgressUpdater = Arc<dyn Fn(SophonProgress) + Send + Sync>;
-/// Thread-safe callback receiving the current downloaded-chunk size map for persistence.
+/// Thread-safe callback receiving the current downloaded-chunk size map for
+/// persistence.
 pub type StateSaver = Arc<dyn Fn(&[(&str, u64)]) + Send + Sync>;
 
 /// Coalescing single-flight slot for background state saves.
@@ -222,7 +223,10 @@ impl SaveSlot {
             return;
         }
         if let Some(prev) = guard.take() {
-            debug_assert!(prev.is_finished(), "unfinished handle took the early return");
+            debug_assert!(
+                prev.is_finished(),
+                "unfinished handle took the early return"
+            );
             // Surface a panic from the finished save rather than dropping
             // its JoinError.
             if let Some(Err(err)) = futures_util::future::FutureExt::now_or_never(prev) {
@@ -738,7 +742,8 @@ fn new_download_items_index<'a>(
         .then(|| FxHashMap::with_capacity_and_hasher(total_chunks, Default::default()))
 }
 
-/// One manifest category together with its chunk download endpoint and identity.
+/// One manifest category together with its chunk download endpoint and
+/// identity.
 pub struct SophonInstaller {
     pub manifest: SophonManifestProto,
     pub chunk_download: DownloadInfo,
@@ -935,7 +940,8 @@ fn compute_diff_files(
 /// `(u32, u32) -> offset` table from an old manifest. Extracted so the
 /// interning logic is unit-testable without a network round-trip.
 #[allow(clippy::type_complexity)]
-/// Intern old chunk metadata and offset mappings for reuse during update planning.
+/// Intern old chunk metadata and offset mappings for reuse during update
+/// planning.
 pub fn intern_old_chunk_offsets<'a>(
     manifest: &'a SophonManifestProto,
 ) -> (
@@ -974,7 +980,8 @@ pub fn intern_old_chunk_offsets<'a>(
 /// Stamp each chunk's `chunk_old_offset` with the matching old-file offset
 /// using the interned reverse maps. Chunks with no old match get `-1`.
 #[allow(clippy::type_complexity)]
-/// Assign reusable source-file offsets to matching chunks in the update installers.
+/// Assign reusable source-file offsets to matching chunks in the update
+/// installers.
 pub fn assign_chunk_offsets(
     diff_files: &mut [SophonManifestAssetProperty],
     offsets: &FxHashMap<(u32, u32), u64>,
@@ -1270,8 +1277,9 @@ fn register_chunks_for_file<'a>(
         let name = chunk.chunk_name;
         let is_pre = pre_downloaded.contains_key(&(global_chunk_idx as u32));
 
-        // When force_eager, skip dedup — create independent DownloadItems per file.
-        // Shared chunks get downloaded multiple times but avoid .zstd intermediates.
+        // When force_eager, skip dedup — create independent DownloadItems per
+        // file. Shared chunks get downloaded multiple times but avoid .zstd
+        // intermediates.
         let item_idx = if !force_eager {
             let index = download_items_index
                 .as_mut()
@@ -1280,7 +1288,8 @@ fn register_chunks_for_file<'a>(
                 if is_pre {
                     download_items[idx as usize].is_pre_downloaded = true;
                 }
-                // Shared chunk: both the original file and this file are tainted.
+                // Shared chunk: both the original file and this file are
+                // tainted.
                 let original_file = download_items[idx as usize].file_idx;
                 eager_tainted_files.insert(original_file);
                 eager_tainted_files.insert(file_idx as u32);
@@ -1349,7 +1358,8 @@ async fn build_download_state(
     let mut download_items: Vec<DownloadItem> = Vec::with_capacity(total_chunks);
     let force_eager = !uses_chunk_deduplication(ctx.verify_mode);
     let mut download_items_index = new_download_items_index(ctx.verify_mode, total_chunks);
-    // Each download item originates from a chunk occurrence, so total_chunks bounds item IDs.
+    // Each download item originates from a chunk occurrence, so total_chunks
+    // bounds item IDs.
     let mut chunk_entries = ChunkEntryCollector::with_capacity(total_chunks, total_chunks)?;
     let mut chunk_refcounts: Vec<AtomicU32> = Vec::with_capacity(total_chunks);
     let mut pending_counts: Vec<AtomicU32> = Vec::with_capacity(total_files);
@@ -1562,7 +1572,8 @@ fn spawn_assembly_coordinator(
                                 total_files,
                             });
                         }
-                        let params = make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
+                        let params =
+                            make_assembly_params(&ctx, file_idx, tmp_dir_idx, &assembly_epochs);
                         let updater = Arc::clone(&ctx.updater);
                         join_set.spawn(spawn_assembly_task(params, move |p| updater(p)));
                     }
@@ -1796,8 +1807,9 @@ async fn download_chunk_with_retry_policy(
     }
 }
 
-/// Eager decompression path: downloads compressed data into memory, decompresses
-/// inline, and writes directly to the output file. Skips .zstd intermediate.
+/// Eager decompression path: downloads compressed data into memory,
+/// decompresses inline, and writes directly to the output file. Skips .zstd
+/// intermediate.
 #[allow(clippy::too_many_arguments)]
 async fn process_eager_item(
     item: &DownloadItem,
@@ -1936,11 +1948,13 @@ fn should_stream_eager(compressed_size: u64, forced: Option<bool>) -> bool {
     forced.unwrap_or(compressed_size >= EAGER_STREAM_THRESHOLD)
 }
 
-/// Applies the optional decoded-size rule used by selector tests and the ignored
-/// benchmark diagnostic. Production callers retain the compressed-size selector.
+/// Applies the optional decoded-size rule used by selector tests and the
+/// ignored benchmark diagnostic. Production callers retain the compressed-size
+/// selector.
 ///
-/// Streaming is selected when the compressed-size rule or the optional decoded-size
-/// hint reaches its threshold. Missing or zero decoded sizes do not affect selection.
+/// Streaming is selected when the compressed-size rule or the optional
+/// decoded-size hint reaches its threshold. Missing or zero decoded sizes do
+/// not affect selection.
 #[cfg(any(test, feature = "bench-diagnostics"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn should_stream_eager_with_decoded_size(
@@ -2534,7 +2548,8 @@ async fn finish_eager_item(
 
     emit_download_progress(ctx, db);
 
-    // Eager files are already fully written — skip assembly, just track completion.
+    // Eager files are already fully written — skip assembly, just track
+    // completion.
     notify_eager_file_complete(
         item_idx,
         chunk_entries,
@@ -2968,7 +2983,8 @@ async fn process_download_item(
             ctx.last_update.store(now, Ordering::Relaxed);
             ctx.smooth_speed_bps.store(0, Ordering::Relaxed);
             ctx.eta_speed_history.lock().unwrap().clear();
-            // Reclaim thread-local pools and evict open-file page cache on resume.
+            // Reclaim thread-local pools and evict open-file page cache on
+            // resume.
             ctx.output_allocator.evict_all_open_pages();
             super::reclaim_memory();
         }
@@ -3510,7 +3526,8 @@ fn chunk_still_valid_for_resume(chunk_name: &str, chunk_size: u64, chunks_dir: &
 
 /// Download required chunks, assemble files, apply removals, and write the
 /// installed tag. Errors stop the operation and are returned without claiming
-/// successful completion; cancellation is reported as [`SophonError::Cancelled`].
+/// successful completion; cancellation is reported as
+/// [`SophonError::Cancelled`].
 #[allow(clippy::too_many_arguments)]
 pub async fn install(
     installers: Vec<SophonInstaller>,
@@ -3569,7 +3586,8 @@ pub async fn install(
     let manifest_changed = prev_manifest_hash != current_manifest_hash;
     if options.is_resume {
         // Drop stale entries where the chunk file no longer exists on disk.
-        // Keeping them would inflate the resume offset and skip needed downloads.
+        // Keeping them would inflate the resume offset and skip needed
+        // downloads.
         {
             let chunks_dir_validate = Arc::clone(&chunks_dir);
             prev_downloaded_chunks = tokio::task::spawn_blocking(move || {
@@ -3595,8 +3613,8 @@ pub async fn install(
             log::warn!(
                 "Manifest changed on resume (old={prev_manifest_hash}, new={current_manifest_hash}), re-verifying all chunks",
             );
-            // Only keep cached chunks whose names still exist in the new manifest.
-            // Avoids MD5-validating chunks with no consumer.
+            // Only keep cached chunks whose names still exist in the new
+            // manifest. Avoids MD5-validating chunks with no consumer.
             let manifest_chunk_names: rustc_hash::FxHashSet<&str> = installers
                 .iter()
                 .flat_map(|inst| inst.manifest.assets.iter())
@@ -3757,8 +3775,9 @@ pub async fn install(
                             .await
                             .map(|m| m.len() == file_size)
                             .unwrap_or(false);
-                        // For eager files (preallocated to full size), size alone is
-                        // insufficient — verify bitmap confirms all chunks were written.
+                        // For eager files (preallocated to full size), size
+                        // alone is insufficient — verify bitmap confirms all
+                        // chunks were written.
                         let is_eager = (chunk_range.start..chunk_range.end)
                             .all(|ci| all_files.chunk_old_offset_at(ci as usize) < 0);
                         if size_ok && is_eager {
@@ -4084,7 +4103,11 @@ pub async fn install(
     // but this synchronous construction cannot. See the regression test
     // `install_does_not_panic_on_fresh_download_epoch_construction`.
     let assembly_epochs = Arc::new(super::assembly_epochs::AssemblyEpochs::new(
-        Arc::clone(ctx.chunk_names.get().expect("chunk_names set before assembly")),
+        Arc::clone(
+            ctx.chunk_names
+                .get()
+                .expect("chunk_names set before assembly"),
+        ),
         Arc::clone(
             ctx.chunk_refcounts
                 .get()
@@ -4164,7 +4187,8 @@ pub async fn install(
     // bitmap write of the install.
     ctx.bitmap_save_slot.drain().await;
     debug_assert!(!ctx.bitmap_save_slot.is_in_flight());
-    // Final bitmap flush — covers the tail that didn't hit the periodic interval.
+    // Final bitmap flush — covers the tail that didn't hit the periodic
+    // interval.
     if let Err(e) = ctx.chunk_bitmap.sync() {
         log::warn!("Failed final chunk bitmap sync: {e}");
     }
@@ -4270,7 +4294,8 @@ async fn verify_installers(
             has_binary_version |=
                 asset.asset_name_str() == "StarRail_Data/StreamingAssets/BinaryVersion.bytes";
             if game_code == "hk4e" {
-                // Package indexes need file metadata, not a second copy of all chunks.
+                // Package indexes need file metadata, not a second copy of all
+                // chunks.
                 index_assets.push(SophonManifestAssetProperty::from_parts(
                     (*asset.asset_name()).clone(),
                     vec![],
@@ -4377,7 +4402,9 @@ async fn repair_assets(
     let total_files = all_assets.len() as u64;
     // Explicit repair hashes bytes, never persisted size/mtime cache hits.
     let verify_cache = Arc::new(DashMap::with_capacity(
-        all_assets.len().min(super::cache::VERIFICATION_CACHE_MAX_ENTRIES),
+        all_assets
+            .len()
+            .min(super::cache::VERIFICATION_CACHE_MAX_ENTRIES),
     ));
     let chunks_dir = game_dir.join("chunks");
     let mut last_emit = Instant::now();
@@ -4715,7 +4742,8 @@ async fn repair_assets(
                 &repair_cache,
                 true,
                 // Force whole-file hashing BEFORE the staged file replaces the
-                // destination, even when all individual chunk hashes are present.
+                // destination, even when all individual chunk hashes are
+                // present.
                 super::VerifyMode::Deferred,
             )?;
             let name = manifest.file_name(file_idx);
@@ -4994,9 +5022,7 @@ mod bench_legacy {
             m
         };
         match game_code {
-            "hkrpg" => {
-                super::game_filters::filter_hkrpg_asset_list(game_dir, &mut all_files_vec)
-            }
+            "hkrpg" => super::game_filters::filter_hkrpg_asset_list(game_dir, &mut all_files_vec),
             "hk4e" => {
                 super::game_filters::filter_hk4e_asset_list(game_dir, &mut all_files_vec, vo_langs)
             }
@@ -5050,8 +5076,8 @@ mod bench_legacy {
 /// wrappers exist on both sides.
 #[cfg(all(test, feature = "benchmark"))]
 mod bench_legacy_tests {
-    use super::bench_legacy::{legacy_plan_counts, positional_plan_counts};
     use super::SophonInstaller;
+    use super::bench_legacy::{legacy_plan_counts, positional_plan_counts};
     use crate::api_scrape::{Compression, DownloadInfo};
     use crate::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
     use std::path::Path;
@@ -5119,7 +5145,7 @@ pub mod bench_internals {
     pub use super::bench_legacy::{
         legacy_await_then_spawn_save, legacy_plan_counts, positional_plan_counts,
     };
-    pub use super::{snapshot_downloaded_chunks, ChunkNameLookup, SaveSlot};
+    pub use super::{ChunkNameLookup, SaveSlot, snapshot_downloaded_chunks};
 
     /// Drive `boundary_hits` reclaim-boundary hits through a dispatch policy
     /// on the calling (runtime) thread and return how long the runtime

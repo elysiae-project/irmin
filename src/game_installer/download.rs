@@ -27,7 +27,8 @@ pub(crate) trait ChunkHasher {
 #[cfg(feature = "bench-diagnostics")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DownloadPhaseTimings {
-    /// Time spent inside the streaming loop, including waiting for response data.
+    /// Time spent inside the streaming loop, including waiting for response
+    /// data.
     pub total: std::time::Duration,
     /// Time awaiting each next response body chunk.
     pub stream_wait: std::time::Duration,
@@ -37,9 +38,11 @@ pub struct DownloadPhaseTimings {
     pub hash: std::time::Duration,
     /// Time spent flushing and advising the kernel after integrity checks.
     pub final_flush_and_evict: std::time::Duration,
-    /// Sum of per-chunk time measurements, separate from accumulated phase totals.
+    /// Sum of per-chunk time measurements, separate from accumulated phase
+    /// totals.
     pub per_chunk: DownloadPhaseSamples,
-    /// Fixed buckets for response body chunk lengths: <=4, <=16, <=64, <=256 KiB, >256 KiB.
+    /// Fixed buckets for response body chunk lengths: <=4, <=16, <=64, <=256
+    /// KiB, >256 KiB.
     pub chunk_size_buckets: [u64; 5],
     /// Hash algorithm selected for this stream.
     pub hash_algorithm: DownloadHashAlgorithm,
@@ -185,8 +188,7 @@ pub mod benchmark {
             super::super::assembly_opt::take_md5()?
         ));
         let mut xxh = None;
-        let hash_bytes = super::super::assembly_opt::hex_to_bytes(expected_md5)
-            .unwrap_or_default();
+        let hash_bytes = super::super::assembly_opt::hex_to_bytes(expected_md5).unwrap_or_default();
         super::stream_and_verify(
             &mut writer,
             resp,
@@ -207,7 +209,8 @@ pub mod benchmark {
     }
 
     /// Timed variant of [`download_and_verify_md5`] for benchmark diagnostics.
-    /// Returns the phase timings so benchmarks can decompose where time is spent.
+    /// Returns the phase timings so benchmarks can decompose where time is
+    /// spent.
     #[cfg(feature = "bench-diagnostics")]
     pub async fn download_and_verify_md5_timed(
         client: &reqwest::Client,
@@ -223,8 +226,7 @@ pub mod benchmark {
             super::super::assembly_opt::take_md5()?
         ));
         let mut xxh = None;
-        let hash_bytes = super::super::assembly_opt::hex_to_bytes(expected_md5)
-            .unwrap_or_default();
+        let hash_bytes = super::super::assembly_opt::hex_to_bytes(expected_md5).unwrap_or_default();
         let mut timings = super::DownloadPhaseTimings::default();
         super::stream_and_verify(
             &mut writer,
@@ -779,10 +781,7 @@ enum HashPipeline {
 impl HashPipeline {
     /// Build a pipeline for the given hashers. When an MD5 hasher is present,
     /// spawns a dedicated hash thread; otherwise uses the sync path.
-    fn new(
-        md5: Option<PooledMd5>,
-        xxh64: Option<xxhash_rust::xxh64::Xxh64>,
-    ) -> Self {
+    fn new(md5: Option<PooledMd5>, xxh64: Option<xxhash_rust::xxh64::Xxh64>) -> Self {
         if let Some(md5) = md5 {
             // Channel capacity 2: bounds in-flight hash frames to 2 per
             // chunk. The hash thread processes at ~647 MiB/s (5× typical
@@ -820,9 +819,7 @@ impl HashPipeline {
                 update_download_hashes(bytes, md5.as_mut(), xxh64.as_mut())
             }
             HashPipeline::Pipelined {
-                md5_sender,
-                xxh64,
-                ..
+                md5_sender, xxh64, ..
             } => {
                 // Send clones the Bytes refcount (cheap, no data copy).
                 md5_sender
@@ -1341,17 +1338,15 @@ mod tests {
                             Ok::<_, Infallible>(Frame::data(first_frame))
                         })
                         .chain(futures_util::stream::pending::<Result<_, Infallible>>());
-                        let mut response =
-                            HyperResponse::new(StreamBody::new(body));
-                        response.headers_mut().insert(
-                            hyper::header::CONTENT_LENGTH,
-                            "1048576".parse().unwrap(),
-                        );
+                        let mut response = HyperResponse::new(StreamBody::new(body));
+                        response
+                            .headers_mut()
+                            .insert(hyper::header::CONTENT_LENGTH, "1048576".parse().unwrap());
                         Ok::<_, Infallible>(response)
                     }
                 });
-                let connection = http1::Builder::new()
-                    .serve_connection(TokioIo::new(socket), service);
+                let connection =
+                    http1::Builder::new().serve_connection(TokioIo::new(socket), service);
                 let _ = connection.await;
             }
         });
@@ -1410,7 +1405,6 @@ mod tests {
     ) -> SophonResult<()> {
         download_full_file_with_response(resp, chunk, dest, Some(handle), false).await
     }
-
 
     #[tokio::test]
     async fn create_preallocated_file_truncates_and_keeps_logical_length() {
@@ -2117,7 +2111,8 @@ mod tests {
             let count = pattern.len().min(total_bytes - offset);
             expected_hasher.update(&pattern[..count]);
         }
-        let expected_md5_hex = crate::game_installer::assembly_opt::md5_to_hex(&expected_hasher.finalize());
+        let expected_md5_hex =
+            crate::game_installer::assembly_opt::md5_to_hex(&expected_hasher.finalize());
 
         // warmup
         super::benchmark::download_and_verify_md5_timed(
@@ -2144,10 +2139,26 @@ mod tests {
         let pct = |d: std::time::Duration| d.as_secs_f64() / timings.total.as_secs_f64() * 100.0;
         println!("=== DOWNLOAD PHASE BREAKDOWN (16MiB) ===");
         println!("total:              {:.2} ms", total_ms);
-        println!("stream_wait:        {:.2} ms ({:.0}%)", timings.stream_wait.as_secs_f64() * 1000.0, pct(timings.stream_wait));
-        println!("write:              {:.2} ms ({:.0}%)", timings.write.as_secs_f64() * 1000.0, pct(timings.write));
-        println!("hash:               {:.2} ms ({:.0}%)", timings.hash.as_secs_f64() * 1000.0, pct(timings.hash));
-        println!("final_flush_evict:  {:.2} ms ({:.0}%)", timings.final_flush_and_evict.as_secs_f64() * 1000.0, pct(timings.final_flush_and_evict));
+        println!(
+            "stream_wait:        {:.2} ms ({:.0}%)",
+            timings.stream_wait.as_secs_f64() * 1000.0,
+            pct(timings.stream_wait)
+        );
+        println!(
+            "write:              {:.2} ms ({:.0}%)",
+            timings.write.as_secs_f64() * 1000.0,
+            pct(timings.write)
+        );
+        println!(
+            "hash:               {:.2} ms ({:.0}%)",
+            timings.hash.as_secs_f64() * 1000.0,
+            pct(timings.hash)
+        );
+        println!(
+            "final_flush_evict:  {:.2} ms ({:.0}%)",
+            timings.final_flush_and_evict.as_secs_f64() * 1000.0,
+            pct(timings.final_flush_and_evict)
+        );
         println!("stream_chunks:      {}", timings.stream_chunks);
         println!("bytes:              {}", timings.bytes);
         println!("chunk_size_buckets: {:?}", timings.chunk_size_buckets);
@@ -2157,10 +2168,10 @@ mod tests {
     }
 
     /// `check_available_space` returns `NoSpaceAvailable` (not panic) when the
-    /// requested size exceeds the available space on the destination filesystem.
-    /// Guards the disk-full / resource-exhaustion integration-error class: the
-    /// download path calls this before each chunk write and must surface a clean
-    /// error, not a crash, when the disk fills during assembly.
+    /// requested size exceeds the available space on the destination
+    /// filesystem. Guards the disk-full / resource-exhaustion integration-error
+    /// class: the download path calls this before each chunk write and must
+    /// surface a clean error, not a crash, when the disk fills during assembly.
     #[test]
     fn check_available_space_returns_error_not_panic_when_disk_full() {
         let dir = tempfile::tempdir().unwrap();
@@ -2176,8 +2187,8 @@ mod tests {
     }
 
     /// `check_available_space` returns `Ok(())` when the destination has no
-    /// parent (e.g. root). Guards against a crash on the `dest.parent() == None`
-    /// edge case.
+    /// parent (e.g. root). Guards against a crash on the `dest.parent() ==
+    /// None` edge case.
     #[test]
     fn check_available_space_ok_when_dest_has_no_parent() {
         // A path with no parent component.
@@ -2187,5 +2198,4 @@ mod tests {
             "check_available_space with root dest should return Ok, got: {result:?}"
         );
     }
-
 }

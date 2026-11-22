@@ -3,14 +3,16 @@
 //! Preinstall (run days before release):
 //!   `cargo run --example preinstall -- <game_id> <vo_lang> <game_dir>`
 //! Apply (run on release day):
-//!   `cargo run --example preinstall -- <game_id> <vo_lang> <game_dir> --apply <tag>`
+//!   `cargo run --example preinstall -- <game_id> <vo_lang> <game_dir> --apply
+//! <tag>`
 //!
-//! `preinstall` downloads the patch package in the background; `apply_preinstall`
-//! writes it into the install on release. Completed packages retain the exact
-//! target metadata, so release-day apply needs no live pre-download manifest.
-//! Payload chunks for new files or fallback repairs may still need the CDN.
-//! Legacy packages recover only their saved version; unavailable historical
-//! metadata returns an error without deleting the package. Ctrl-C cancels either.
+//! `preinstall` downloads the patch package in the background;
+//! `apply_preinstall` writes it into the install on release. Completed packages
+//! retain the exact target metadata, so release-day apply needs no live
+//! pre-download manifest. Payload chunks for new files or fallback repairs may
+//! still need the CDN. Legacy packages recover only their saved version;
+//! unavailable historical metadata returns an error without deleting the
+//! package. Ctrl-C cancels either.
 
 #[path = "common/mod.rs"]
 mod common;

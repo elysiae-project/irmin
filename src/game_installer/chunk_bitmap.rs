@@ -503,7 +503,10 @@ mod tests {
 
         // Append trailing bytes; load still accepts the file.
         let tail = b"TRAILING-JUNK".to_vec();
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(&tail).unwrap();
         drop(f);
 
