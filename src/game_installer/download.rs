@@ -778,6 +778,13 @@ enum HashPipeline {
     },
 }
 
+/// Test-only per-frame stall applied inside the hash thread, in milliseconds.
+/// Lets regression tests force the "consumer falls behind" condition
+/// deterministically without relying on CPU contention.
+#[cfg(test)]
+pub(crate) static HASH_THREAD_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl HashPipeline {
     /// Build a pipeline for the given hashers. When an MD5 hasher is present,
     /// spawns a dedicated hash thread; otherwise uses the sync path.
@@ -793,6 +800,14 @@ impl HashPipeline {
                 .spawn(move || {
                     let mut md5 = md5;
                     for bytes in rx {
+                        #[cfg(test)]
+                        {
+                            let stall_ms =
+                                HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
+                            if stall_ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(stall_ms));
+                            }
+                        }
                         md5.get_mut().update(&bytes)?;
                     }
                     Ok(Some(md5.finish()?))
@@ -1404,6 +1419,163 @@ mod tests {
         handle: &DownloadHandle,
     ) -> SophonResult<()> {
         download_full_file_with_response(resp, chunk, dest, Some(handle), false).await
+    }
+
+    /// Regression for PR #15: a stalled hash consumer must not block the
+    /// Tokio runtime worker running the download loop. On unfixed code the
+    /// blocking `SyncSender::send` parks the sole worker of this
+    /// current-thread runtime, starving the heartbeat task for the whole
+    /// stall window. The fixed pipeline hands off without blocking, so the
+    /// heartbeat keeps ticking at its 10 ms cadence.
+    #[test]
+    fn stalled_hash_consumer_does_not_block_runtime_worker() {
+        use http_body_util::StreamBody;
+        use hyper::body::{Frame, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request as HyperRequest, Response as HyperResponse};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const FRAME: usize = 64 * 1024;
+        const FRAMES: usize = 32;
+        const STALL_MS: u64 = 150;
+
+        let payload: Vec<u8> = (0..FRAME * FRAMES)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let digest = fast_md5::digest(&payload);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let max_gap_ms = runtime.block_on(async move {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let address = listener.local_addr().unwrap();
+
+            let server_payload = payload.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let body_bytes = server_payload;
+                let service = service_fn(move |_: HyperRequest<Incoming>| {
+                    let body_bytes = body_bytes.clone();
+                    async move {
+                        let frames: Vec<_> = (0..FRAMES)
+                            .map(|i| {
+                                Ok::<_, Infallible>(Frame::data(bytes::Bytes::from(
+                                    body_bytes[i * FRAME..(i + 1) * FRAME].to_vec(),
+                                )))
+                            })
+                            .collect();
+                        let body = StreamBody::new(futures_util::stream::iter(frames));
+                        let mut response = HyperResponse::new(body);
+                        response.headers_mut().insert(
+                            hyper::header::CONTENT_LENGTH,
+                            (FRAME * FRAMES).to_string().parse().unwrap(),
+                        );
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                let connection =
+                    http1::Builder::new().serve_connection(TokioIo::new(socket), service);
+                let _ = connection.await;
+            });
+
+            // Heartbeat: records the largest scheduling gap it observes.
+            let max_gap = Arc::new(AtomicU64::new(0));
+            let heartbeat_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let heartbeat = {
+                let max_gap = Arc::clone(&max_gap);
+                let flag = Arc::clone(&heartbeat_flag);
+                tokio::spawn(async move {
+                    let mut last = std::time::Instant::now();
+                    while !flag.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        let gap = last.elapsed().as_millis() as u64;
+                        max_gap.fetch_max(gap, Ordering::Relaxed);
+                        last = std::time::Instant::now();
+                    }
+                })
+            };
+
+            HASH_THREAD_STALL_MS.store(STALL_MS, Ordering::Relaxed);
+            let client = Client::new();
+            let resp = client
+                .get(format!("http://{address}/payload"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("payload");
+            let chunk = ChunkRef {
+                chunk_name: "payload",
+                chunk_decompressed_hash_md5: b"",
+                chunk_size: (FRAME * FRAMES) as u64,
+                chunk_size_decompressed: (FRAME * FRAMES) as u64,
+                chunk_compressed_hash_md5: &digest,
+                chunk_old_offset: -1,
+            };
+            let handle = DownloadHandle::new();
+            let result = stream_and_verify_directly(resp, chunk, &dest, &handle).await;
+            HASH_THREAD_STALL_MS.store(0, Ordering::Relaxed);
+            heartbeat_flag.store(true, Ordering::Relaxed);
+            let _ = heartbeat.await;
+            server.abort();
+            assert!(result.is_ok(), "download must verify: {result:?}");
+            max_gap.load(Ordering::Relaxed)
+        });
+
+        assert!(
+            max_gap_ms < STALL_MS,
+            "runtime worker blocked for {max_gap_ms} ms while hash consumer \
+             stalled {STALL_MS} ms per frame; download hand-off must not park \
+             the runtime worker"
+        );
+    }
+
+    /// Differential preservation: with a healthy consumer, the pipelined
+    /// digest must equal the scalar digest for randomized frame-size
+    /// sequences spanning the channel-capacity boundaries. Seeded PRNG keeps
+    /// the sequences reproducible.
+    #[test]
+    fn pipelined_digest_matches_scalar_for_random_frame_sequences() {
+        fn next_rand(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        for seed in [1u64, 42, 1337, 90210] {
+            let mut state = seed;
+            let mut payload = Vec::new();
+            let mut frames = Vec::new();
+            for _ in 0..24 {
+                let len = (next_rand(&mut state) % (128 * 1024)) as usize + 1;
+                let start = payload.len();
+                for _ in 0..len {
+                    payload.push((next_rand(&mut state) & 0xff) as u8);
+                }
+                frames.push(bytes::Bytes::from(payload[start..].to_vec()));
+            }
+            let expected = fast_md5::digest(&payload);
+
+            let mut pipeline = HashPipeline::new(Some(PooledMd5::new(take_md5().unwrap())), None);
+            assert!(matches!(pipeline, HashPipeline::Pipelined { .. }));
+            for frame in &frames {
+                pipeline.update(frame).unwrap();
+            }
+            let (md5, xxh64) = pipeline.finish().unwrap();
+            assert_eq!(md5.unwrap(), expected, "seed {seed}");
+            assert!(xxh64.is_none());
+        }
     }
 
     #[tokio::test]
