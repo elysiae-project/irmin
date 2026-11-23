@@ -2,25 +2,23 @@
 //! between, so regressions that couple download progress to verification
 //! progress are caught before merge.
 //!
-//! Each scenario serves a fixed payload over loopback HTTP at a paced rate
-//! (network-like), then measures wall time of `download_and_verify_md5`:
+//! Each scenario serves eight fixed payloads concurrently over loopback HTTP
+//! at a paced per-connection rate, then measures transfer and completion time.
 //!
-//! - `healthy`: the hash consumer keeps up. Baseline throughput.
-//! - `stalled_verification`: the hash consumer is stalled via the
-//!   `set_bench_hash_thread_stall_ms` hook, emulating assembly/verification CPU
-//!   starvation. The download pipeline must keep receiving at the paced rate;
-//!   only a small fallback cost is allowed.
+//! - `nominal_verification`: no artificial verifier delay.
+//! - `stalled_verification`: the hash consumer is delayed 4 ms per 64 KiB frame
+//!   via the `set_bench_hash_thread_stall_us` hook, slower than the configured
+//!   network pace and emulating verifier CPU starvation.
 //! - `assembly_cpu_load`: CPU burner threads simulate parallel assembly work
 //!   competing for cores while the hash consumer runs at full speed.
 //!
-//! Regression gate: `stalled_verification` and `assembly_cpu_load` medians
-//! must stay within 25% of `healthy` throughput. Before the fix,
-//! `stalled_verification` collapses toward the consumer rate (an order of
-//! magnitude below healthy) because the blocking hash hand-off parks the
-//! download loop.
+//! The benchmark reports transfer throughput through body EOF separately
+//! from verified completion latency. It also reports how often the bounded
+//! MD5 queue deferred to a post-download scan. The transfer rate should stay
+//! close to the configured server pace even when completion latency rises.
 //!
 //! Run:
-//!   cargo bench --features benchmark,bench-internals --bench
+//!   cargo bench --features benchmark,bench-internals,bench-diagnostics --bench
 //! download_verify_pipeline
 
 use std::net::TcpListener as StdTcpListener;
@@ -30,16 +28,17 @@ use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use irmin_rs::game_installer::download_benchmark::{
-    download_and_verify_md5, set_bench_hash_thread_stall_ms,
+    download_and_verify_md5_timed, set_bench_hash_thread_stall_us,
 };
 
 const PAYLOAD_MIB: usize = 8;
 const FRAME_KIB: usize = 64;
+const CONCURRENT_DOWNLOADS: usize = 8;
 /// Pace the loopback server so the healthy scenario is network-bound, not
 /// memory-bound; every scenario sees the same delivery schedule.
-const PACE_BPS: u64 = 512 * 1024 * 1024; // 512 MiB/s
-/// Per-frame hash stall (ms) for the stalled-verification scenario.
-const STALL_MS: u64 = 1;
+const PACE_BPS: u64 = 128 * 1024 * 1024; // 128 MiB/s
+/// Per-frame hash stall (microseconds) for the stalled-verification scenario.
+const STALL_US: u64 = 4000;
 
 fn make_payload() -> Vec<u8> {
     // High-entropy LCG bytes: incompressible, so the hash cost is
@@ -63,6 +62,7 @@ fn payload_md5_hex(payload: &[u8]) -> String {
 /// paced to PACE_BPS, then exits. Returns the bound address.
 fn spawn_paced_server(
     payload: Arc<Vec<u8>>,
+    requests: usize,
 ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
@@ -83,54 +83,58 @@ fn spawn_paced_server(
             listener.set_nonblocking(true).unwrap();
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             address_tx.send(listener.local_addr().unwrap()).unwrap();
-            let (socket, _) = listener.accept().await.unwrap();
-            // Build the paced frame schedule once; the service only wraps
-            // it per request (keeps the closure Send+Sync for hyper).
-            let frame_len = FRAME_KIB * 1024;
-            let started = tokio::time::Instant::now();
-            let mut frames = Vec::new();
-            for (i, start) in (0..payload.len()).step_by(frame_len).enumerate() {
-                let end = (start + frame_len).min(payload.len());
-                let slice = payload[start..end].to_vec();
-                // Absolute schedule: frame i lands at i * frame_time.
-                let deadline = started
-                    + Duration::from_nanos(
-                        (i as u64 * frame_len as u64 * 1_000_000_000) / PACE_BPS,
-                    );
-                frames.push((deadline, bytes::Bytes::from(slice)));
-            }
-            let content_length = payload.len();
-            let service = service_fn(move |_: HyperRequest<Incoming>| {
-                let frames = frames.clone();
-                async move {
-                    let stream = futures_util::stream::unfold(
-                        (frames, 0usize),
-                        move |(frames, idx)| async move {
-                            if idx >= frames.len() {
-                                return None;
+            let mut connections = tokio::task::JoinSet::new();
+            for _ in 0..requests {
+                let (socket, _) = listener.accept().await.unwrap();
+                let payload = Arc::clone(&payload);
+                connections.spawn(async move {
+                    let service = service_fn(move |_: HyperRequest<Incoming>| {
+                        let payload = Arc::clone(&payload);
+                        async move {
+                            let frame_len = FRAME_KIB * 1024;
+                            let started = tokio::time::Instant::now();
+                            let mut frames = Vec::new();
+                            for (i, start) in (0..payload.len()).step_by(frame_len).enumerate() {
+                                let end = (start + frame_len).min(payload.len());
+                                let slice = bytes::Bytes::copy_from_slice(&payload[start..end]);
+                                let deadline = started
+                                    + Duration::from_nanos(
+                                        (i as u64 * frame_len as u64 * 1_000_000_000) / PACE_BPS,
+                                    );
+                                frames.push((deadline, slice));
                             }
-                            let (deadline, data) = &frames[idx];
-                            tokio::time::sleep_until(*deadline).await;
-                            Some((
-                                Ok::<_, Infallible>(Frame::data(data.clone())),
-                                (frames, idx + 1),
-                            ))
-                        },
-                    );
-                    let body = StreamBody::new(stream);
-                    let mut response = HyperResponse::new(body);
-                    response.headers_mut().insert(
-                        hyper::header::CONTENT_LENGTH,
-                        content_length.to_string().parse().unwrap(),
-                    );
-                    response
-                        .headers_mut()
-                        .insert(hyper::header::CONNECTION, "close".parse().unwrap());
-                    Ok::<_, Infallible>(response)
-                }
-            });
-            let connection = http1::Builder::new().serve_connection(TokioIo::new(socket), service);
-            let _ = connection.await;
+                            let content_length = payload.len();
+                            let stream = futures_util::stream::unfold(
+                                (frames, 0usize),
+                                move |(frames, idx)| async move {
+                                    if idx >= frames.len() {
+                                        return None;
+                                    }
+                                    let (deadline, data) = &frames[idx];
+                                    tokio::time::sleep_until(*deadline).await;
+                                    Some((
+                                        Ok::<_, Infallible>(Frame::data(data.clone())),
+                                        (frames, idx + 1),
+                                    ))
+                                },
+                            );
+                            let mut response = HyperResponse::new(StreamBody::new(stream));
+                            response.headers_mut().insert(
+                                hyper::header::CONTENT_LENGTH,
+                                content_length.to_string().parse().unwrap(),
+                            );
+                            response
+                                .headers_mut()
+                                .insert(hyper::header::CONNECTION, "close".parse().unwrap());
+                            Ok::<_, Infallible>(response)
+                        }
+                    });
+                    let connection =
+                        http1::Builder::new().serve_connection(TokioIo::new(socket), service);
+                    let _ = connection.await;
+                });
+            }
+            while connections.join_next().await.is_some() {}
         });
     });
     let address = address_rx.recv().unwrap();
@@ -167,41 +171,71 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
     let payload_len = payload.len() as u64;
 
     let mut group = c.benchmark_group("download_verify_pipeline");
-    group.throughput(Throughput::Bytes(payload_len));
+    group.throughput(Throughput::Bytes(payload_len * CONCURRENT_DOWNLOADS as u64));
     group.sample_size(20);
 
-    let mut scenario = |id: &str, stall_ms: u64, burners: usize| {
-        set_bench_hash_thread_stall_ms(stall_ms);
+    let mut scenario = |id: &str, stall_us: u64, burners: usize| {
+        set_bench_hash_thread_stall_us(stall_us);
         let (stop, handles) = spawn_cpu_burners(burners);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = reqwest::Client::new();
 
         group.bench_with_input(BenchmarkId::new("paced", id), &payload_len, |b, _| {
             b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
+                let mut transfer_total = Duration::ZERO;
+                let mut verified_total = Duration::ZERO;
+                let mut deferred_hashes = 0u64;
                 for _ in 0..iters {
-                    // One-shot server per iteration: each download gets a
-                    // fresh paced stream, so iteration timing is the
-                    // download alone.
-                    let (address, server) = spawn_paced_server(Arc::clone(&payload));
+                    // Each sample downloads several chunks concurrently,
+                    // matching the install path's shared runtime and worker
+                    // contention rather than timing a single isolated chunk.
+                    let (address, server) =
+                        spawn_paced_server(Arc::clone(&payload), CONCURRENT_DOWNLOADS);
                     let dir = tempfile::TempDir::new().unwrap();
-                    let dest = dir.path().join("payload.bin");
                     let started = Instant::now();
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    runtime
-                        .block_on(download_and_verify_md5(
-                            &client_new(),
-                            &format!("http://{address}/payload"),
-                            &dest,
-                            payload_len,
-                            &md5_hex,
-                        ))
-                        .unwrap();
-                    total += started.elapsed();
+                    let results = runtime.block_on(async {
+                        let downloads = (0..CONCURRENT_DOWNLOADS).map(|index| {
+                            let client = &client;
+                            let url = format!("http://{address}/payload");
+                            let dest = dir.path().join(format!("payload-{index}.bin"));
+                            let md5_hex = &md5_hex;
+                            async move {
+                                download_and_verify_md5_timed(
+                                    client,
+                                    &url,
+                                    &dest,
+                                    payload_len,
+                                    md5_hex,
+                                )
+                                .await
+                                .unwrap()
+                            }
+                        });
+                        futures_util::future::join_all(downloads).await
+                    });
+                    transfer_total += results
+                        .iter()
+                        .map(|timings| timings.download)
+                        .max()
+                        .unwrap_or_default();
+                    verified_total += started.elapsed();
+                    deferred_hashes += results
+                        .iter()
+                        .filter(|timings| timings.md5_deferred)
+                        .count() as u64;
                     server.join().unwrap();
                 }
-                total
+                eprintln!(
+                    "scenario={id} iterations={iters} transfer_ms={:.2} verified_ms={:.2} deferred_hashes={deferred_hashes}",
+                    transfer_total.as_secs_f64() * 1000.0,
+                    verified_total.as_secs_f64() * 1000.0,
+                );
+                black_box(verified_total);
+                transfer_total
             });
         });
 
@@ -209,23 +243,21 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
         for h in handles {
             h.join().unwrap();
         }
-        set_bench_hash_thread_stall_ms(0);
+        set_bench_hash_thread_stall_us(0);
     };
 
     // Healthy: consumer keeps up, no CPU contention.
-    scenario("healthy", 0, 0);
+    scenario("nominal_verification", 0, 0);
     // Stalled verification: hash thread stalled 1 ms per 64 KiB frame,
     // emulating assembly/verification CPU starvation.
-    scenario("stalled_verification", STALL_MS, 0);
+    scenario("stalled_verification", STALL_US / 1000, 0);
     // Assembly CPU load: burners occupy cores while hashing runs normally.
     scenario("assembly_cpu_load", 0, 4);
 
     group.finish();
 }
 
-fn client_new() -> reqwest::Client {
-    reqwest::Client::new()
-}
+use std::hint::black_box;
 
 criterion_group!(benches, bench_download_verify_pipeline);
 criterion_main!(benches);

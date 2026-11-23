@@ -103,7 +103,7 @@ required-features = ["benchmark", "bench-internals"]
 [[bench]]
 name = "download_verify_pipeline"
 harness = false
-required-features = ["benchmark", "bench-internals"]
+required-features = ["benchmark", "bench-internals", "bench-diagnostics"]
 
 [[bin]]
 name = "bench_memory"
