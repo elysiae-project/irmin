@@ -477,8 +477,7 @@ fn eager_stream_producer_continues_while_decoder_stalls() {
                                 break;
                             }
                             let end = ((i + 1) * frame_len).min(compressed.len());
-                            let slice =
-                                bytes::Bytes::from(compressed[begin..end].to_vec());
+                            let slice = bytes::Bytes::from(compressed[begin..end].to_vec());
                             let stall_started = Arc::clone(&stall_started);
                             let counter = Arc::clone(&frames_during_stall);
                             let deadline =
@@ -493,9 +492,8 @@ fn eager_stream_producer_continues_while_decoder_stalls() {
                                 Ok::<_, Infallible>(Frame::data(slice))
                             });
                         }
-                        let body = StreamBody::new(futures_util::stream::iter(frames).then(
-                            |fut| fut,
-                        ));
+                        let body =
+                            StreamBody::new(futures_util::stream::iter(frames).then(|fut| fut));
                         let mut response = HyperResponse::new(body);
                         response.headers_mut().insert(
                             hyper::header::CONTENT_LENGTH,
@@ -557,8 +555,7 @@ fn eager_stream_producer_continues_while_decoder_stalls() {
             })
         };
 
-        super::super::eager_decompress::DECODER_START_STALL_MS
-            .store(STALL_MS, Ordering::Relaxed);
+        super::super::eager_decompress::DECODER_START_STALL_MS.store(STALL_MS, Ordering::Relaxed);
         *stall_started.lock().unwrap() = Some(Instant::now());
         let result = process_eager_item_with_mode(
             &eager_item(),
@@ -589,7 +586,6 @@ fn eager_stream_producer_continues_while_decoder_stalls() {
         )
     });
 
-    eprintln!("frames_during_stall={frames_during_stall} max_gap_ms={max_gap_ms}");
     assert!(
         max_gap_ms < STALL_MS,
         "runtime worker blocked for {max_gap_ms} ms during decoder stall"
@@ -1527,6 +1523,7 @@ fn chunk_stream_reader_requires_verified_completion() {
         current: None,
         offset: 0,
         complete: false,
+        byte_budget: None,
         #[cfg(feature = "bench-diagnostics")]
         timings: None,
     };
@@ -1562,6 +1559,7 @@ fn chunk_stream_reader_skips_empty_frames() {
         current: None,
         offset: 0,
         complete: false,
+        byte_budget: None,
         #[cfg(feature = "bench-diagnostics")]
         timings: None,
     };
@@ -1588,6 +1586,7 @@ fn chunk_stream_reader_fill_buf_serves_slices_without_copying() {
         current: None,
         offset: 0,
         complete: false,
+        byte_budget: None,
         #[cfg(feature = "bench-diagnostics")]
         timings: None,
     };
