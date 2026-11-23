@@ -245,6 +245,14 @@ pub mod benchmark {
         writer.flush_and_evict_all().await.ok();
         Ok(timings)
     }
+
+    /// Per-frame stall applied inside the hash thread, in milliseconds.
+    /// Benchmarks use it to simulate verification/assembly CPU starvation
+    /// and measure how much download throughput survives; the stall is
+    /// process-global, so benchmarks and tests must not run concurrently.
+    pub fn set_bench_hash_thread_stall_ms(stall_ms: u64) {
+        super::BENCH_HASH_THREAD_STALL_MS.store(stall_ms, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl PooledMd5 {
@@ -782,6 +790,7 @@ enum HashPipeline {
     /// xxh64 (if present) stays synchronous because it is negligible.
     Pipelined {
         md5_sender: std::sync::mpsc::SyncSender<HashFrame>,
+        reclaim_sender: std::sync::mpsc::Sender<tokio::sync::oneshot::Sender<std::io::Result<Md5>>>,
         join: std::thread::JoinHandle<()>,
         digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
@@ -803,7 +812,6 @@ enum HashPipeline {
 /// final digest when no reply slot is provided at EOF).
 enum HashFrame {
     Data(bytes::Bytes),
-    Reclaim(tokio::sync::oneshot::Sender<std::io::Result<Md5>>),
 }
 
 /// Test-only per-frame stall applied inside the hash thread, in milliseconds.
@@ -811,6 +819,17 @@ enum HashFrame {
 /// deterministically without relying on CPU contention.
 #[cfg(test)]
 pub(crate) static HASH_THREAD_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) static HASH_THREAD_STALL_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Process-global per-frame stall applied inside the hash thread, in
+/// milliseconds; benchmarks use it to simulate a verification consumer that
+/// cannot keep up with the network. Set it only from single-threaded bench
+/// drivers — the stall is global and would leak across parallel tests.
+#[cfg(feature = "bench-internals")]
+pub(crate) static BENCH_HASH_THREAD_STALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 impl HashPipeline {
@@ -822,24 +841,27 @@ impl HashPipeline {
             // chunk. A full channel triggers the non-blocking reclaim
             // fallback instead of parking the download loop.
             let (tx, rx) = std::sync::mpsc::sync_channel::<HashFrame>(2);
+            let (reclaim_tx, reclaim_rx) =
+                std::sync::mpsc::channel::<tokio::sync::oneshot::Sender<std::io::Result<Md5>>>();
             let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
             let join = std::thread::Builder::new()
                 .stack_size(64 * 1024)
                 .spawn(move || {
                     let mut md5 = md5;
                     let mut digest_tx = Some(digest_tx);
-                    for frame in &rx {
-                        match frame {
-                            HashFrame::Data(bytes) => {
+                    loop {
+                        match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                            Ok(HashFrame::Data(bytes)) => {
                                 #[cfg(test)]
-                                {
-                                    let stall_ms = HASH_THREAD_STALL_MS
-                                        .load(std::sync::atomic::Ordering::Relaxed);
-                                    if stall_ms > 0 {
-                                        std::thread::sleep(std::time::Duration::from_millis(
-                                            stall_ms,
-                                        ));
-                                    }
+                                let stall_ms =
+                                    HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
+                                #[cfg(all(not(test), feature = "bench-internals"))]
+                                let stall_ms = BENCH_HASH_THREAD_STALL_MS
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                #[cfg(all(not(test), not(feature = "bench-internals")))]
+                                let stall_ms = 0;
+                                if stall_ms > 0 {
+                                    std::thread::sleep(std::time::Duration::from_millis(stall_ms));
                                 }
                                 if let Err(err) = md5.get_mut().update(&bytes) {
                                     if let Some(tx) = digest_tx.take() {
@@ -851,15 +873,22 @@ impl HashPipeline {
                                     return;
                                 }
                             }
-                            HashFrame::Reclaim(state_tx) => {
-                                // Queued frames were hashed in order above;
-                                // hand the live state back so the download
-                                // loop can continue inline. EOF afterwards
-                                // (sender dropped) exits the loop.
-                                let hasher =
-                                    md5.hasher.take().expect("pooled MD5 hasher is available");
-                                let _ = state_tx.send(Ok(hasher));
-                                return;
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if let Ok(state_tx) = reclaim_rx.try_recv() {
+                                    let hasher =
+                                        md5.hasher.take().expect("pooled MD5 hasher is available");
+                                    let _ = state_tx.send(Ok(hasher));
+                                    return;
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                if let Ok(state_tx) = reclaim_rx.try_recv() {
+                                    let hasher =
+                                        md5.hasher.take().expect("pooled MD5 hasher is available");
+                                    let _ = state_tx.send(Ok(hasher));
+                                    return;
+                                }
+                                break;
                             }
                         }
                     }
@@ -870,6 +899,7 @@ impl HashPipeline {
                 .expect("spawn hash thread");
             HashPipeline::Pipelined {
                 md5_sender: tx,
+                reclaim_sender: reclaim_tx,
                 join,
                 digest_rx,
                 xxh64,
@@ -892,7 +922,10 @@ impl HashPipeline {
                 update_download_hashes(bytes, md5.as_mut(), xxh64.as_mut())
             }
             HashPipeline::Pipelined {
-                md5_sender, xxh64, ..
+                md5_sender,
+                reclaim_sender,
+                xxh64,
+                ..
             } => {
                 // Send clones the Bytes refcount (cheap, no data copy).
                 match md5_sender.try_send(HashFrame::Data(bytes.clone())) {
@@ -903,26 +936,13 @@ impl HashPipeline {
                         Ok(())
                     }
                     Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                        // Hash thread fell behind. Ask it to finish queued
-                        // frames in order and return the hasher state. The
-                        // request rides the same bounded channel, so try_send
-                        // may also find it full; the thread drains constantly,
-                        // so retry with yields (never a blocking send, which
-                        // would park this runtime worker).
+                        // Hash thread fell behind. Request its state through
+                        // a separate control channel so a full data queue
+                        // cannot make this runtime worker spin or block.
                         let (state_tx, state_rx) = tokio::sync::oneshot::channel();
-                        let mut reclaim = HashFrame::Reclaim(state_tx);
-                        loop {
-                            match md5_sender.try_send(reclaim) {
-                                Ok(()) => break,
-                                Err(std::sync::mpsc::TrySendError::Full(r)) => {
-                                    reclaim = r;
-                                    std::thread::yield_now();
-                                }
-                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                    return Err(std::io::Error::other("hash thread died"));
-                                }
-                            }
-                        }
+                        reclaim_sender
+                            .send(state_tx)
+                            .map_err(|_| std::io::Error::other("hash thread died"))?;
                         if let Some(xxh64) = xxh64 {
                             xxh64.update(bytes);
                         }
@@ -1011,6 +1031,7 @@ impl HashPipeline {
                 join,
                 digest_rx,
                 xxh64,
+                ..
             } => {
                 // Drop the sender to signal the hash thread that no more
                 // frames are coming.
@@ -1555,7 +1576,6 @@ mod tests {
         let result = stream_and_verify_directly(resp, chunk, &dest, &handle).await;
         assert!(matches!(result, Err(SophonError::Cancelled)));
         assert!(!dest.exists());
-        drop(&handle);
         server.abort();
     }
 
@@ -1602,6 +1622,9 @@ mod tests {
         const FRAME: usize = 64 * 1024;
         const FRAMES: usize = 32;
         const STALL_MS: u64 = 150;
+        let _stall_guard = HASH_THREAD_STALL_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
 
         let payload: Vec<u8> = (0..FRAME * FRAMES)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))

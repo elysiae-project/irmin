@@ -2925,6 +2925,9 @@ async fn install_with_stalled_hash_verification_keeps_download_pace() {
     const CHUNKS: usize = 4;
     const CHUNK_RAW: usize = 256 * 1024;
     const STALL_MS: u64 = 100;
+    let _stall_guard = super::download::HASH_THREAD_STALL_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
 
     let server = MockServer::start().await;
     let mut payload = Vec::new();
