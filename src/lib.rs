@@ -1,5 +1,21 @@
 //! Sophon game downloader. Manifest-based chunk downloads with zstd
 //! compression.
+//!
+//! # Features
+//!
+//! All operations are enabled by default. Disable default features and
+//! select only what you need to shrink the build:
+//!
+//! - `download`: fresh install via [`Sophon::download`].
+//! - `update`: `update` and `check_update` (implies `download`, `preinstall`).
+//! - `verify`: post-install integrity repair via `verify_integrity`.
+//! - `preinstall`: preinstall download and apply (implies `download`, `patch`).
+//! - `patch`: HDiff patch engine used by preinstall apply.
+//! - `plugins`: plugin and channel SDK installation.
+//!
+//! The chunk download/assembly engine, per-chunk MD5 verification, and resume
+//! state are always compiled because every operation shares them. The
+//! `benchmark*` and `sophon-profiling` features are development-only.
 
 /// Wire-format models for game branches, builds, and download metadata.
 pub mod api_scrape;

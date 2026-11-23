@@ -80,6 +80,28 @@ Supported game codes: `hk4e`, `hkrpg`, `nap`, `bh3`. Supported voice locales: `e
 
 `VerifyMode::Full` hashes chunks and supports crash resume. `Deferred` checks completed files and restarts incomplete files from scratch after interruption. `None` checks sizes without hashing and also restarts incomplete files from scratch. Keep `Full` unless your application has a specific reason to trade integrity checks or resume support for lower CPU use.
 
+## Feature flags
+
+All operations are enabled by default. To compile only what you use, turn off the default features and select the ones you need:
+
+```toml
+[dependencies]
+irmin = { package = "irmin_rs", version = "1.1", default-features = false, features = ["download"] }
+```
+
+| Feature | Enables | Depends on |
+| --- | --- | --- |
+| `download` | Fresh install (`Sophon::download`). | — |
+| `update` | `update`, `check_update`. | `download`, `preinstall` |
+| `verify` | `verify_integrity` repair. | `download` |
+| `preinstall` | `preinstall`, `apply_preinstall`. | `download`, `patch` |
+| `patch` | HDiff patch engine used when applying preinstall packages. | — |
+| `plugins` | Plugin and channel SDK installation. | — |
+
+The chunk download and assembly engine, including per-chunk MD5 verification and resume state, is always compiled because every operation shares it. `verify` only gates the explicit post-install repair scan. Selecting `download` alone drops the patch codecs (`lz4`, `flate2`) and the plugin archive reader (`zip`) from the build.
+
+The `benchmark`, `bench-internals`, `bench-diagnostics`, `benchmark-jemalloc`, `bench-alloc-stats`, and `sophon-profiling` features are development-only and stay off by default.
+
 ## Pause, resume, and cancel
 
 Clone the handle before starting an operation, then use the clone from your UI or another task:

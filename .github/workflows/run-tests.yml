@@ -47,3 +47,14 @@ jobs:
               run: |
                 cargo check --all-targets --features bench-diagnostics
                 cargo check --all-targets --features benchmark,bench-internals
+
+            - name: Check runtime feature combinations
+              # Each operation must compile on its own and in combination,
+              # with and without the default feature set.
+              run: |
+                cargo check --all-targets --no-default-features
+                for f in download update verify preinstall patch plugins; do
+                  cargo check --all-targets --no-default-features --features "$f"
+                done
+                cargo check --all-targets --no-default-features --features download,verify
+                cargo check --all-targets --no-default-features --features download,plugins
