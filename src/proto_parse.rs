@@ -85,8 +85,8 @@ impl SophonManifestAssetProperty {
         }
     }
 
-    /// Returns true when the wire type is nonzero or the asset has no file hash.
-    /// This accommodates directory records whose type/hash fields vary.
+    /// Returns true when the wire type is nonzero or the asset has no file
+    /// hash. This accommodates directory records whose type/hash fields vary.
     #[inline]
     pub fn is_directory(&self) -> bool {
         self.asset_type != 0 || self.asset_hash_md5().is_empty()
@@ -248,8 +248,9 @@ impl SophonManifestAssetChunk {
     }
 }
 
-/// Normal manifests describe CDN data, not reusable offsets in an old installation.
-/// Keep this separate from protobuf decoding, where omitted int64 fields remain zero.
+/// Normal manifests describe CDN data, not reusable offsets in an old
+/// installation. Keep this separate from protobuf decoding, where omitted int64
+/// fields remain zero.
 pub(crate) fn normalize_full_download_manifest(manifest: &mut SophonManifestProto) {
     for asset in &mut manifest.assets {
         for chunk in &mut asset.asset_chunks {
@@ -272,7 +273,8 @@ pub(crate) fn normalize_full_download_manifest(manifest: &mut SophonManifestProt
 /// field-level error.
 #[allow(deprecated)]
 fn validate_manifest_utf8(manifest: &SophonManifestProto) -> Result<(), prost::DecodeError> {
-    // Pre-size to a typical asset's batch size to avoid the first-iteration grow.
+    // Pre-size to a typical asset's batch size to avoid the first-iteration
+    // grow.
     let mut batch: Vec<u8> = Vec::with_capacity(256);
     for asset in &manifest.assets {
         batch.clear();
@@ -310,9 +312,8 @@ fn validate_asset_fields(asset: &SophonManifestAssetProperty) -> Result<(), pros
         std::str::from_utf8(&chunk.chunk_decompressed_hash_md5).map_err(|_| {
             prost::DecodeError::new("chunk_decompressed_hash_md5 is not valid UTF-8")
         })?;
-        std::str::from_utf8(&chunk.chunk_compressed_hash_md5).map_err(|_| {
-            prost::DecodeError::new("chunk_compressed_hash_md5 is not valid UTF-8")
-        })?;
+        std::str::from_utf8(&chunk.chunk_compressed_hash_md5)
+            .map_err(|_| prost::DecodeError::new("chunk_compressed_hash_md5 is not valid UTF-8"))?;
     }
     Ok(())
 }
@@ -324,7 +325,8 @@ fn validate_asset_fields(asset: &SophonManifestAssetProperty) -> Result<(), pros
 /// asset paths, hashes, or semantic field combinations.
 ///
 /// For zero-copy decode, prefer [`decode_manifest_from_bytes`] which keeps the
-/// input buffer alive via `Bytes` refcounts instead of copying each string field.
+/// input buffer alive via `Bytes` refcounts instead of copying each string
+/// field.
 #[inline]
 pub fn decode_manifest(buf: impl AsRef<[u8]>) -> Result<SophonManifestProto, prost::DecodeError> {
     let manifest = SophonManifestProto::decode(buf.as_ref())?;
@@ -1013,5 +1015,4 @@ mod tests {
         let via_bytes = decode_manifest_from_bytes(bytes::Bytes::from(buf)).unwrap();
         assert_eq!(via_slice, via_bytes);
     }
-
 }

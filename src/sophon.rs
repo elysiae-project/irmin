@@ -89,8 +89,9 @@ impl SophonBuilder {
         self
     }
 
-    /// Consume the builder and create a downloader. Defaults the state directory
-    /// to the game directory and constructs a tuned client unless one was set.
+    /// Consume the builder and create a downloader. Defaults the state
+    /// directory to the game directory and constructs a tuned client unless one
+    /// was set.
     pub fn build(self) -> Sophon {
         Sophon {
             client: self.client.unwrap_or_else(|| DownloadClient::new().0),
@@ -289,21 +290,21 @@ impl Sophon {
         let handle = handle.clone();
 
         async move {
-            let plan = game_installer::build_preinstall_plan(
-                &client,
-                &game_id,
-                &vo_lang,
-                &game_dir,
-            )
-            .await?;
+            let plan =
+                game_installer::build_preinstall_plan(&client, &game_id, &vo_lang, &game_dir)
+                    .await?;
 
             let prev_chunks: HashMap<String, u64> = Self::load_state_owned(&state_dir, &game_id)
                 .filter(|s| s.game_id == game_id && s.download_type == DownloadType::Preinstall)
                 .map(|s| s.downloaded_chunks)
                 .unwrap_or_default();
 
-            let state_saver =
-                Self::build_preinstall_saver_owned(state_file.clone(), game_id.clone(), vo_lang.clone(), game_dir.clone());
+            let state_saver = Self::build_preinstall_saver_owned(
+                state_file.clone(),
+                game_id.clone(),
+                vo_lang.clone(),
+                game_dir.clone(),
+            );
 
             game_installer::preinstall_download(
                 &client,
@@ -342,18 +343,13 @@ impl Sophon {
         let handle = handle.clone();
 
         async move {
-            game_installer::apply_preinstall(
-                &client,
-                &game_dir,
-                &preinstall_tag,
-                progress,
-                &handle,
-            )
-            .await
+            game_installer::apply_preinstall(&client, &game_dir, &preinstall_tag, progress, &handle)
+                .await
         }
     }
 
-    /// Query update and preinstall availability and sizes without mutating disk.
+    /// Query update and preinstall availability and sizes without mutating
+    /// disk.
     ///
     /// The returned future is `Send` and owns its data, so it can be spawned on
     /// a multi-threaded runtime. The borrow of `&self` ends at the call site.
@@ -364,17 +360,16 @@ impl Sophon {
         let game_id = self.game_id.clone();
         let vo_lang = self.vo_lang.clone();
         let game_dir = self.game_dir.clone();
-        async move {
-            game_installer::check_update(&client, &game_id, &vo_lang, &game_dir).await
-        }
+        async move { game_installer::check_update(&client, &game_id, &vo_lang, &game_dir).await }
     }
 
     /// Hash installed files and re-download missing or damaged files.
     ///
     /// This explicit repair bypasses persisted verification-cache hits, honors
-    /// the selected voice language and game resource exclusions, and regenerates
-    /// launcher-owned metadata. `Ok(())` and `Finished` are emitted only after
-    /// successful repair and regeneration. Plugins/SDKs are outside this scope.
+    /// the selected voice language and game resource exclusions, and
+    /// regenerates launcher-owned metadata. `Ok(())` and `Finished` are emitted
+    /// only after successful repair and regeneration. Plugins/SDKs are outside
+    /// this scope.
     pub fn verify_integrity(
         &self,
         on_progress: impl ProgressFn,
@@ -384,14 +379,8 @@ impl Sophon {
         let vo_lang = self.vo_lang.clone();
         let game_dir = self.game_dir.clone();
         async move {
-            game_installer::verify_integrity(
-                &client,
-                &game_id,
-                &vo_lang,
-                &game_dir,
-                on_progress,
-            )
-            .await
+            game_installer::verify_integrity(&client, &game_id, &vo_lang, &game_dir, on_progress)
+                .await
         }
     }
 
@@ -488,7 +477,8 @@ impl Sophon {
             )
         } else {
             if prev.is_some() {
-                // ponytail: removes whole chunks dir on hash mismatch; tolerates missing dir
+                // ponytail: removes whole chunks dir on hash mismatch;
+                // tolerates missing dir
                 let _ = std::fs::remove_dir_all(game_dir.join("chunks"));
             }
             (empty_resume(), false)
@@ -504,8 +494,8 @@ impl Sophon {
     }
 
     /// Static variant of [`build_callbacks`](Self::build_callbacks) taking the
-    /// `Sophon` fields by value/clone so the public `Send`-returning methods can
-    /// call it from inside an `async move` block.
+    /// `Sophon` fields by value/clone so the public `Send`-returning methods
+    /// can call it from inside an `async move` block.
     #[allow(clippy::too_many_arguments)]
     fn build_callbacks_owned(
         state_file: PathBuf,
@@ -728,7 +718,8 @@ fn atomic_write_serialized<T: serde::Serialize>(target: &Path, value: &T) {
     let temp_file = StateTempFile::new(tmp);
     let write_result = (|| -> std::io::Result<()> {
         let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
-        // Resume state is machine-readable; compact JSON reduces checkpoint writes.
+        // Resume state is machine-readable; compact JSON reduces checkpoint
+        // writes.
         serde_json::to_writer(&mut writer, value).map_err(std::io::Error::other)?;
         writer.flush()?;
         Ok(())

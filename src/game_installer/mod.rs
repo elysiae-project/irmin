@@ -5,13 +5,13 @@ pub mod adaptive_download;
 mod api;
 /// Chunk validation, file assembly, and temporary-file cleanup.
 pub mod assembly;
-mod assembly_workers;
 /// Batched durability for assembled files (epoch flush + rename commit).
 pub mod assembly_epochs;
 #[cfg(feature = "benchmark")]
 pub mod assembly_opt;
 #[cfg(not(feature = "benchmark"))]
 mod assembly_opt;
+mod assembly_workers;
 /// Persistent and in-memory file verification cache.
 pub mod cache;
 /// Per-file SIMD batch hasher for deferred chunk-decompressed MD5 checks
@@ -37,24 +37,24 @@ pub mod eager_decompress;
 mod error;
 mod game_filters;
 mod handle;
-mod snapshot;
 #[cfg(feature = "benchmark")]
 pub mod hdiffpatch;
 #[cfg(not(feature = "benchmark"))]
 mod hdiffpatch;
 /// Manifest planning and download/assembly orchestration.
 pub mod installer;
-/// Output-file preallocation and shared file-handle management.
-pub mod output_allocator;
 /// SIMD multi-buffer MD5 verification for batches of independent files.
 /// Benchmark-only (not compiled into production paths); the production
 /// consumer of the md5-simd kernel is the per-file chunk batch hasher.
 #[cfg(feature = "bench-internals")]
 pub mod md5_multibuffer;
+/// Output-file preallocation and shared file-handle management.
+pub mod output_allocator;
 mod plugin_api;
 mod plugin_install;
 #[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
 pub mod preinstall;
+mod snapshot;
 #[cfg(not(feature = "bench-internals"))]
 mod update;
 #[cfg(feature = "bench-internals")]

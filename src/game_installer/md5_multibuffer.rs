@@ -33,8 +33,7 @@ pub(crate) const MAX_MAPPED_LANE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Digest of the empty message (RFC 1321).
 const EMPTY_MD5: [u8; 16] = [
-    0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42,
-    0x7e,
+    0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42, 0x7e,
 ];
 
 /// Lanes per SIMD dispatch: AVX2 8, NEON 4/8, or 1 when only scalar is
@@ -166,7 +165,19 @@ mod tests {
         let dir = tmpdir();
         // Adversarial sizes: empty, sub-block, exact block, many blocks,
         // near-block-boundary, and lanes beyond one dispatch.
-        let sizes = [0usize, 1, 31, 63, 64, 65, 127, 128, 192, 4096, 8 * 1024 * 1024];
+        let sizes = [
+            0usize,
+            1,
+            31,
+            63,
+            64,
+            65,
+            127,
+            128,
+            192,
+            4096,
+            8 * 1024 * 1024,
+        ];
         let mut items = Vec::new();
         let mut expected_results = Vec::new();
         for (i, &size) in sizes.iter().enumerate() {
@@ -191,10 +202,7 @@ mod tests {
         let dir = tmpdir();
         let (good, digest) = write_and_digest(dir.path(), "good.bin", b"present");
         let missing = dir.path().join("missing.bin");
-        let items = vec![
-            (good, digest),
-            (missing, digest),
-        ];
+        let items = vec![(good, digest), (missing, digest)];
         let results = verify_md5_batch(&items).unwrap();
         assert_eq!(results, vec![true, false]);
     }

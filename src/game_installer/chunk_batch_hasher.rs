@@ -21,14 +21,14 @@
 //!
 //! Error and eviction semantics match the in-worker layout:
 //! - The hasher records into the assembly's own `first_error` slot
-//!   (first-recorded wins, same as worker errors) and sets the shared
-//!   abort flag, so error precedence is unchanged. Deferred chunks keep
-//!   the zstd frame checksum ignored, exactly as the in-worker MD5 path
-//!   did (see `decompress_chunk_optimized_with_defer`).
-//! - The hasher owns eviction for deferred ranges: workers skip their
-//!   per-chunk `sync_and_evict_range`, and the hasher issues that call
-//!   after each verified range — one eviction owner per file, and only
-//!   when the worker path would have evicted (`skip_evict` false).
+//!   (first-recorded wins, same as worker errors) and sets the shared abort
+//!   flag, so error precedence is unchanged. Deferred chunks keep the zstd
+//!   frame checksum ignored, exactly as the in-worker MD5 path did (see
+//!   `decompress_chunk_optimized_with_defer`).
+//! - The hasher owns eviction for deferred ranges: workers skip their per-chunk
+//!   `sync_and_evict_range`, and the hasher issues that call after each
+//!   verified range — one eviction owner per file, and only when the worker
+//!   path would have evicted (`skip_evict` false).
 //!
 //! Only 16-byte (MD5) decompressed hashes are deferred; other lengths
 //! keep the in-worker comparison, preserving existing behavior exactly.
@@ -36,9 +36,9 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::Mutex;
 
 use md5_simd::Md5Engine;
 
@@ -134,17 +134,49 @@ pub(crate) fn run<F>(
                 Ok(job) => pending.push(job),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
+                    flush(
+                        &map,
+                        fd,
+                        &engine,
+                        &mut pending,
+                        first_error,
+                        has_error,
+                        &name_fn,
+                    );
                     return;
                 }
             }
             if pending.len() >= QUEUE_CAP {
-                flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
+                flush(
+                    &map,
+                    fd,
+                    &engine,
+                    &mut pending,
+                    first_error,
+                    has_error,
+                    &name_fn,
+                );
             }
         }
-        flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
+        flush(
+            &map,
+            fd,
+            &engine,
+            &mut pending,
+            first_error,
+            has_error,
+            &name_fn,
+        );
     }
-    flush(&map, fd, &engine, &mut pending, first_error, has_error, &name_fn);
+    flush(
+        &map,
+        fd,
+        &engine,
+        &mut pending,
+        first_error,
+        has_error,
+        &name_fn,
+    );
 }
 
 /// Verify one batch of jobs through the SIMD engine, then release each
@@ -237,11 +269,7 @@ fn flush<F>(
 }
 
 #[cold]
-fn record(
-    first_error: &Mutex<Option<SophonError>>,
-    has_error: &AtomicBool,
-    err: SophonError,
-) {
+fn record(first_error: &Mutex<Option<SophonError>>, has_error: &AtomicBool, err: SophonError) {
     let mut guard = first_error.lock().unwrap();
     if guard.is_none() {
         *guard = Some(err);
@@ -336,19 +364,24 @@ mod tests {
         }
         let (path, _dir) = temp_file(&content);
 
-        let err = drive(&path, content.len() as u64, |tx| {
-            let mut offset = 0u64;
-            for (i, &len) in lens.iter().enumerate() {
-                tx.send(HashJob {
-                    chunk_idx: i as u32,
-                    offset,
-                    len: len as u64,
-                    expected: expected[i],
-                })
-                .unwrap();
-                offset += len as u64;
-            }
-        }, false);
+        let err = drive(
+            &path,
+            content.len() as u64,
+            |tx| {
+                let mut offset = 0u64;
+                for (i, &len) in lens.iter().enumerate() {
+                    tx.send(HashJob {
+                        chunk_idx: i as u32,
+                        offset,
+                        len: len as u64,
+                        expected: expected[i],
+                    })
+                    .unwrap();
+                    offset += len as u64;
+                }
+            },
+            false,
+        );
         assert!(err.is_none());
     }
 
@@ -359,15 +392,21 @@ mod tests {
         let bytes = fake_bytes(7, 3 * 4096);
         let (path, _dir) = temp_file(&bytes);
 
-        let err = drive_with_name(&path, bytes.len() as u64, |tx| {
-            tx.send(HashJob {
-                chunk_idx: 0,
-                offset: 0,
-                len: bytes.len() as u64,
-                expected: [0x42; 16],
-            })
-            .unwrap();
-        }, false, |_| "evil.zstd".to_string());
+        let err = drive_with_name(
+            &path,
+            bytes.len() as u64,
+            |tx| {
+                tx.send(HashJob {
+                    chunk_idx: 0,
+                    offset: 0,
+                    len: bytes.len() as u64,
+                    expected: [0x42; 16],
+                })
+                .unwrap();
+            },
+            false,
+            |_| "evil.zstd".to_string(),
+        );
         match err {
             Some(SophonError::Md5Mismatch { item, .. }) => assert_eq!(item, "evil.zstd"),
             other => panic!("expected Md5Mismatch, got {other:?}"),
@@ -388,19 +427,24 @@ mod tests {
         }
         let (path, _dir) = temp_file(&content);
 
-        let err = drive(&path, content.len() as u64, |tx| {
-            let mut offset = 0u64;
-            for (i, &len) in lens.iter().enumerate() {
-                tx.send(HashJob {
-                    chunk_idx: i as u32,
-                    offset,
-                    len: len as u64,
-                    expected: expected[i],
-                })
-                .unwrap();
-                offset += len as u64;
-            }
-        }, false);
+        let err = drive(
+            &path,
+            content.len() as u64,
+            |tx| {
+                let mut offset = 0u64;
+                for (i, &len) in lens.iter().enumerate() {
+                    tx.send(HashJob {
+                        chunk_idx: i as u32,
+                        offset,
+                        len: len as u64,
+                        expected: expected[i],
+                    })
+                    .unwrap();
+                    offset += len as u64;
+                }
+            },
+            false,
+        );
         assert!(err.is_none());
     }
 
@@ -411,17 +455,23 @@ mod tests {
         let bytes = fake_bytes(3, 8192);
         let (path, _dir) = temp_file(&bytes);
 
-        let err = drive_with_name(&path, 8192, |tx| {
-            for i in 0..QUEUE_CAP + 4 {
-                tx.send(HashJob {
-                    chunk_idx: i as u32,
-                    offset: 0,
-                    len: 8192,
-                    expected: [i as u8; 16],
-                })
-                .unwrap();
-            }
-        }, false, |ci| format!("bad{ci}.zstd"));
+        let err = drive_with_name(
+            &path,
+            8192,
+            |tx| {
+                for i in 0..QUEUE_CAP + 4 {
+                    tx.send(HashJob {
+                        chunk_idx: i as u32,
+                        offset: 0,
+                        len: 8192,
+                        expected: [i as u8; 16],
+                    })
+                    .unwrap();
+                }
+            },
+            false,
+            |ci| format!("bad{ci}.zstd"),
+        );
         let SophonError::Md5Mismatch { item, .. } = err.unwrap() else {
             panic!("expected Md5Mismatch")
         };
@@ -435,15 +485,20 @@ mod tests {
         let bytes = fake_bytes(11, 4096);
         let (path, _dir) = temp_file(&bytes);
 
-        let err = drive(&path, 4096, |tx| {
-            tx.send(HashJob {
-                chunk_idx: 0,
-                offset: 4096,
-                len: 4096,
-                expected: [0; 16],
-            })
-            .unwrap();
-        }, false);
+        let err = drive(
+            &path,
+            4096,
+            |tx| {
+                tx.send(HashJob {
+                    chunk_idx: 0,
+                    offset: 4096,
+                    len: 4096,
+                    expected: [0; 16],
+                })
+                .unwrap();
+            },
+            false,
+        );
         assert!(matches!(err, Some(SophonError::Io(_))));
     }
 
@@ -471,17 +526,22 @@ mod tests {
         }
         let (path, _dir) = temp_file(&content);
 
-        let err = drive(&path, content.len() as u64, |tx| {
-            for (i, e) in expected.iter().enumerate() {
-                tx.send(HashJob {
-                    chunk_idx: i as u32,
-                    offset: (i * per) as u64,
-                    len: per as u64,
-                    expected: *e,
-                })
-                .unwrap();
-            }
-        }, false);
+        let err = drive(
+            &path,
+            content.len() as u64,
+            |tx| {
+                for (i, e) in expected.iter().enumerate() {
+                    tx.send(HashJob {
+                        chunk_idx: i as u32,
+                        offset: (i * per) as u64,
+                        len: per as u64,
+                        expected: *e,
+                    })
+                    .unwrap();
+                }
+            },
+            false,
+        );
         assert!(err.is_none());
     }
 
@@ -565,4 +625,3 @@ mod tests {
         assert!(first_error.into_inner().unwrap().is_none());
     }
 }
-

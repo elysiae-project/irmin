@@ -110,7 +110,14 @@ fn check_file_md5_cached_hit() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default();
+                if b.len() == 16 {
+                    m.copy_from_slice(&b);
+                }
+                m
+            },
             mtime_secs: mtime,
         },
     );
@@ -145,7 +152,14 @@ fn check_file_md5_cached_with_metadata_matches_regular_cache_hit() {
         "test.dat".to_owned(),
         VerificationEntry {
             size: 11,
-            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default();
+                if b.len() == 16 {
+                    m.copy_from_slice(&b);
+                }
+                m
+            },
             mtime_secs: mtime,
         },
     );
@@ -218,7 +232,14 @@ fn check_file_md5_cached_with_metadata_follows_symlink() {
         "link.dat".to_owned(),
         VerificationEntry {
             size: 11,
-            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default();
+                if b.len() == 16 {
+                    m.copy_from_slice(&b);
+                }
+                m
+            },
             mtime_secs: metadata
                 .modified()
                 .unwrap()
@@ -269,7 +290,14 @@ fn check_file_md5_cached_miss_size_changed() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("old_md5").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = super::super::assembly_opt::hex_to_bytes("old_md5").unwrap_or_default();
+                if b.len() == 16 {
+                    m.copy_from_slice(&b);
+                }
+                m
+            },
             mtime_secs: mtime,
         },
     );
@@ -304,7 +332,14 @@ fn check_file_md5_cached_miss_md5_changed() {
         rel_path,
         VerificationEntry {
             size: 11,
-            md5: { let mut m = [0u8; 16]; let b = b"stale_cached_md5"; if b.len() == 16 { m.copy_from_slice(b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = b"stale_cached_md5";
+                if b.len() == 16 {
+                    m.copy_from_slice(b);
+                }
+                m
+            },
             mtime_secs: mtime,
         },
     );
@@ -355,7 +390,9 @@ fn check_file_md5_cached_populates_on_match() {
     assert_eq!(entry.size, 11);
     assert_eq!(
         entry.md5.as_slice(),
-        super::super::assembly_opt::hex_to_bytes(&md5).unwrap_or_default().as_slice()
+        super::super::assembly_opt::hex_to_bytes(&md5)
+            .unwrap_or_default()
+            .as_slice()
     );
     assert_eq!(entry.mtime_secs, mtime);
 }
@@ -390,7 +427,14 @@ fn save_verification_cache_atomic_write() {
         "file".to_string(),
         VerificationEntry {
             size: 42,
-            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("deadbeef").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = super::super::assembly_opt::hex_to_bytes("deadbeef").unwrap_or_default();
+                if b.len() == 16 {
+                    m.copy_from_slice(&b);
+                }
+                m
+            },
             mtime_secs: 999,
         },
     );
@@ -472,7 +516,14 @@ fn load_verification_cache_loads_stale_entries() {
             "nonexistent.bin".to_string(),
             VerificationEntry {
                 size: 100,
-                md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+                md5: {
+                    let mut m = [0u8; 16];
+                    let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default();
+                    if b.len() == 16 {
+                        m.copy_from_slice(&b);
+                    }
+                    m
+                },
                 mtime_secs: 1000,
             },
         )]),
@@ -495,7 +546,14 @@ fn load_verification_cache_keeps_all_entries() {
                 "a.bin".to_string(),
                 VerificationEntry {
                     size: 1,
-                    md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("m1").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+                    md5: {
+                        let mut m = [0u8; 16];
+                        let b = super::super::assembly_opt::hex_to_bytes("m1").unwrap_or_default();
+                        if b.len() == 16 {
+                            m.copy_from_slice(&b);
+                        }
+                        m
+                    },
                     mtime_secs: 10,
                 },
             ),
@@ -503,7 +561,14 @@ fn load_verification_cache_keeps_all_entries() {
                 "b.bin".to_string(),
                 VerificationEntry {
                     size: 2,
-                    md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("m2").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+                    md5: {
+                        let mut m = [0u8; 16];
+                        let b = super::super::assembly_opt::hex_to_bytes("m2").unwrap_or_default();
+                        if b.len() == 16 {
+                            m.copy_from_slice(&b);
+                        }
+                        m
+                    },
                     mtime_secs: 20,
                 },
             ),
@@ -527,7 +592,14 @@ fn save_verification_cache_writes_to_disk() {
         "f".to_string(),
         VerificationEntry {
             size: 42,
-            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = super::super::assembly_opt::hex_to_bytes("abc").unwrap_or_default();
+                if b.len() == 16 {
+                    m.copy_from_slice(&b);
+                }
+                m
+            },
             mtime_secs: 999,
         },
     );
@@ -695,7 +767,8 @@ fn file_md5_digest_reuses_buffer_across_mixed_sizes() {
         fast_md5::digest(&tiny_data)
     );
     assert_eq!(file_md5_digest(&empty).unwrap(), fast_md5::digest(b""));
-    // Large again after small files, to catch stale bytes from the reused buffer.
+    // Large again after small files, to catch stale bytes from the reused
+    // buffer.
     assert_eq!(
         file_md5_digest(&large).unwrap(),
         fast_md5::digest(&large_data)
@@ -731,7 +804,14 @@ fn benchmark_load_verification_cache_startup() {
             format!("asset-{index:06}.pak"),
             VerificationEntry {
                 size: 1,
-                md5: { let mut m = [0u8; 16]; let b = b"0123456789abcdef0123456789abcdef"; if b.len() == 16 { m.copy_from_slice(b); } m },
+                md5: {
+                    let mut m = [0u8; 16];
+                    let b = b"0123456789abcdef0123456789abcdef";
+                    if b.len() == 16 {
+                        m.copy_from_slice(b);
+                    }
+                    m
+                },
                 mtime_secs: index as u64,
             },
         );

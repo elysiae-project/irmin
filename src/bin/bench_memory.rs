@@ -185,11 +185,13 @@ mod allocation_stats {
 
     #[derive(Clone, Copy, Debug, serde::Serialize)]
     pub struct AllocationSnapshot {
-        /// Maximum positive live requested-byte growth over the operation baseline.
+        /// Maximum positive live requested-byte growth over the operation
+        /// baseline.
         pub peak_live_bytes: u64,
         /// Live requested-byte growth still present when the operation ended.
         pub live_bytes_at_end: u64,
-        /// Successful alloc/zeroed sizes plus successful realloc destination sizes.
+        /// Successful alloc/zeroed sizes plus successful realloc destination
+        /// sizes.
         pub allocation_request_bytes: u64,
     }
 
@@ -3192,7 +3194,11 @@ fn prepare_install_context(
             let valid = irmin_rs::game_installer::cache::check_file_md5_cached_with_size(
                 &cached_path,
                 chunk.chunk_size,
-                irmin_rs::game_installer::assembly_opt::hex_to_bytes(chunk.chunk_compressed_hash_md5_str()).unwrap_or_default().as_slice(),
+                irmin_rs::game_installer::assembly_opt::hex_to_bytes(
+                    chunk.chunk_compressed_hash_md5_str(),
+                )
+                .unwrap_or_default()
+                .as_slice(),
                 &game_dir,
                 &cache,
             )
