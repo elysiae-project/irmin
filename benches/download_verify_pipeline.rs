@@ -9,8 +9,9 @@
 //! - `stalled_verification`: the hash consumer is delayed 80 ms per response
 //!   frame via the `set_bench_hash_thread_stall_us` hook, slower than the
 //!   configured network pace and emulating verifier CPU starvation.
-//! - `assembly_cpu_load`: CPU burner threads simulate parallel assembly work
-//!   competing for cores while the hash consumer runs at full speed.
+//! The nominal and stalled scenarios run in both fixed and legacy modes to
+//! compare transfer rates directly under identical inputs.
+//! Set `IRMIN_BENCH_ASSEMBLY=1` to add assembly-like CPU contention.
 //!
 //! The benchmark reports transfer throughput through body EOF separately
 //! from verified completion latency. It also reports how often the bounded
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use irmin_rs::game_installer::download_benchmark::{
-    download_and_verify_md5_timed, set_bench_hash_thread_stall_us,
+    download_and_verify_md5_timed, set_bench_hash_thread_stall_us, set_bench_legacy_hash_blocking,
 };
 
 const PAYLOAD_MIB: usize = 1;
@@ -171,9 +172,10 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(payload_len * CONCURRENT_DOWNLOADS as u64));
     group.sample_size(20);
 
-    let mut scenario = |id: &str, stall_us: u64, burners: usize| {
+    let mut scenario = |id: &str, stall_us: u64, burners: usize, legacy_blocking: bool| {
         let require_deferred = stall_us > 0;
         set_bench_hash_thread_stall_us(stall_us);
+        set_bench_legacy_hash_blocking(legacy_blocking);
         let (stop, handles) = spawn_cpu_burners(burners);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -232,10 +234,12 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
                     transfer_total.as_secs_f64() * 1000.0,
                     verified_total.as_secs_f64() * 1000.0,
                 );
-                if id == "nominal_verification" {
+                if id.ends_with("nominal") {
                     assert_eq!(deferred_hashes, 0, "nominal verifier must keep up");
-                } else if require_deferred {
+                } else if require_deferred && !legacy_blocking {
                     assert_eq!(deferred_hashes, iters * CONCURRENT_DOWNLOADS as u64);
+                } else if legacy_blocking {
+                    assert_eq!(deferred_hashes, 0, "legacy path does not defer hashes");
                 }
                 black_box(verified_total);
                 transfer_total
@@ -247,16 +251,18 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
             h.join().unwrap();
         }
         set_bench_hash_thread_stall_us(0);
+        set_bench_legacy_hash_blocking(false);
     };
 
-    // Healthy: consumer keeps up, no CPU contention.
-    scenario("nominal_verification", 0, 0);
-    // Stalled verification: hash thread stalled 80 ms per response frame,
-    // emulating assembly/verification CPU starvation.
-    scenario("stalled_verification", STALL_US, 0);
-    // Assembly CPU load: burners occupy cores while hashing runs normally.
-    scenario("assembly_cpu_load", 0, 4);
-
+    // Run both hand-off implementations under identical nominal and stalled
+    // verifier scenarios for a direct old-versus-fixed comparison.
+    scenario("fixed_nominal", 0, 0, false);
+    scenario("fixed_stalled", STALL_US, 0, false);
+    scenario("legacy_nominal", 0, 0, true);
+    scenario("legacy_stalled", STALL_US, 0, true);
+    if std::env::var_os("IRMIN_BENCH_ASSEMBLY").is_some() {
+        scenario("fixed_assembly_cpu_load", 0, 4, false);
+    }
     group.finish();
 }
 

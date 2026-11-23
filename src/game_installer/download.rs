@@ -269,6 +269,12 @@ pub mod benchmark {
     pub fn set_bench_hash_thread_stall_us(stall_us: u64) {
         super::BENCH_HASH_THREAD_STALL_US.store(stall_us, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Selects the legacy blocking hash hand-off for paired benchmark
+    /// comparisons. Production callers cannot enable this path.
+    pub fn set_bench_legacy_hash_blocking(enabled: bool) {
+        super::BENCH_LEGACY_BLOCKING_HASH.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl PooledMd5 {
@@ -818,6 +824,8 @@ enum HashPipeline {
     /// xxh64 (if present) stays synchronous because it is negligible.
     Pipelined {
         md5_sender: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        #[cfg(feature = "bench-internals")]
+        legacy_blocking_sender: Option<std::sync::mpsc::SyncSender<bytes::Bytes>>,
         join: std::thread::JoinHandle<()>,
         digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
@@ -826,6 +834,8 @@ enum HashPipeline {
     /// then verifies the complete file on the blocking pool after EOF.
     DeferredMd5 {
         md5_sender: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        #[cfg(feature = "bench-internals")]
+        legacy_blocking_sender: Option<std::sync::mpsc::SyncSender<bytes::Bytes>>,
         join: std::thread::JoinHandle<()>,
         digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
@@ -854,6 +864,10 @@ pub(crate) static BENCH_HASH_THREAD_STALL_MS: std::sync::atomic::AtomicU64 =
 pub(crate) static BENCH_HASH_THREAD_STALL_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(feature = "bench-internals")]
+pub(crate) static BENCH_LEGACY_BLOCKING_HASH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn deferred_hash_stall_per_64k() -> std::time::Duration {
     #[cfg(test)]
     {
@@ -873,6 +887,25 @@ fn deferred_hash_stall_per_64k() -> std::time::Duration {
     std::time::Duration::ZERO
 }
 
+fn update_hash_worker(md5: &mut PooledMd5, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(all(not(test), feature = "bench-internals"))]
+    let stall_duration = std::time::Duration::from_millis(
+        BENCH_HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    ) + std::time::Duration::from_micros(
+        BENCH_HASH_THREAD_STALL_US.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    #[cfg(all(not(test), not(feature = "bench-internals")))]
+    let stall_duration = std::time::Duration::ZERO;
+    #[cfg(test)]
+    let stall_duration = std::time::Duration::from_millis(
+        HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if !stall_duration.is_zero() {
+        std::thread::sleep(stall_duration);
+    }
+    md5.get_mut().update(bytes)
+}
+
 impl HashPipeline {
     /// Build a pipeline for the given hashers. When an MD5 hasher is present,
     /// spawns a dedicated hash thread; otherwise uses the sync path.
@@ -880,29 +913,46 @@ impl HashPipeline {
         if let Some(md5) = md5 {
             // Channel capacity 2 bounds in-flight hash frames per chunk.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
+            #[cfg(feature = "bench-internals")]
+            let legacy_mode = BENCH_LEGACY_BLOCKING_HASH.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "bench-internals")]
+            let (legacy_sender, legacy_receiver) = if legacy_mode {
+                let (sender, receiver) = std::sync::mpsc::sync_channel::<bytes::Bytes>(2);
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
             let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
             let join = std::thread::Builder::new()
                 .stack_size(64 * 1024)
                 .spawn(move || {
                     let mut md5 = md5;
                     let mut digest_tx = Some(digest_tx);
-                    while let Some(bytes) = rx.blocking_recv() {
-                        #[cfg(all(not(test), feature = "bench-internals"))]
-                        let stall_duration = std::time::Duration::from_millis(
-                            BENCH_HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
-                        ) + std::time::Duration::from_micros(
-                            BENCH_HASH_THREAD_STALL_US.load(std::sync::atomic::Ordering::Relaxed),
-                        );
-                        #[cfg(all(not(test), not(feature = "bench-internals")))]
-                        let stall_duration = std::time::Duration::ZERO;
-                        #[cfg(test)]
-                        let stall_duration = std::time::Duration::from_millis(
-                            HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
-                        );
-                        if !stall_duration.is_zero() {
-                            std::thread::sleep(stall_duration);
+                    #[cfg(feature = "bench-internals")]
+                    let hash_frames = legacy_receiver;
+                    #[cfg(feature = "bench-internals")]
+                    if let Some(hash_frames) = hash_frames {
+                        for bytes in hash_frames {
+                            if let Err(err) = update_hash_worker(&mut md5, &bytes) {
+                                if let Some(tx) = digest_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                return;
+                            }
                         }
-                        if let Err(err) = md5.get_mut().update(&bytes) {
+                    } else {
+                        while let Some(bytes) = rx.blocking_recv() {
+                            if let Err(err) = update_hash_worker(&mut md5, &bytes) {
+                                if let Some(tx) = digest_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "bench-internals"))]
+                    while let Some(bytes) = rx.blocking_recv() {
+                        if let Err(err) = update_hash_worker(&mut md5, &bytes) {
                             if let Some(tx) = digest_tx.take() {
                                 let _ = tx.send(Err(err));
                             }
@@ -916,6 +966,8 @@ impl HashPipeline {
                 .expect("spawn hash thread");
             HashPipeline::Pipelined {
                 md5_sender: tx,
+                #[cfg(feature = "bench-internals")]
+                legacy_blocking_sender: legacy_sender,
                 join,
                 digest_rx,
                 xxh64,
@@ -932,6 +984,21 @@ impl HashPipeline {
     /// chunk file so the download stream does not wait for the hash worker.
     #[inline]
     async fn update(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
+        #[cfg(feature = "bench-internals")]
+        if let HashPipeline::Pipelined {
+            legacy_blocking_sender: Some(sender),
+            xxh64,
+            ..
+        } = self
+        {
+            sender
+                .send(bytes.clone())
+                .map_err(|_| std::io::Error::other("hash thread died"))?;
+            if let Some(xxh64) = xxh64 {
+                xxh64.update(bytes);
+            }
+            return Ok(());
+        }
         if let HashPipeline::Pipelined {
             md5_sender, xxh64, ..
         } = self
@@ -989,6 +1056,8 @@ impl HashPipeline {
         let old = std::mem::replace(self, HashPipeline::None);
         let HashPipeline::Pipelined {
             md5_sender,
+            #[cfg(feature = "bench-internals")]
+            legacy_blocking_sender,
             join,
             digest_rx,
             mut xxh64,
@@ -1002,6 +1071,8 @@ impl HashPipeline {
         }
         *self = HashPipeline::DeferredMd5 {
             md5_sender,
+            #[cfg(feature = "bench-internals")]
+            legacy_blocking_sender,
             join,
             digest_rx,
             xxh64,
@@ -1029,6 +1100,8 @@ impl HashPipeline {
             }
             HashPipeline::Pipelined {
                 md5_sender,
+                #[cfg(feature = "bench-internals")]
+                legacy_blocking_sender,
                 join,
                 digest_rx,
                 xxh64,
@@ -1037,6 +1110,8 @@ impl HashPipeline {
                 // Drop the sender to signal the hash thread that no more
                 // frames are coming.
                 drop(md5_sender);
+                #[cfg(feature = "bench-internals")]
+                drop(legacy_blocking_sender);
                 let md5_digest = Some(
                     digest_rx
                         .await
@@ -1052,6 +1127,7 @@ impl HashPipeline {
                 join,
                 digest_rx,
                 xxh64,
+                ..
             } => {
                 drop(md5_sender);
                 let _partial_digest = digest_rx
