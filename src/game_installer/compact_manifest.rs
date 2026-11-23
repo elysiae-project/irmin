@@ -641,6 +641,7 @@ impl CompactManifest {
     }
 
     /// Builds a compact manifest containing one borrowed asset property.
+    #[cfg(any(test, feature = "preinstall"))]
     pub(crate) fn try_from_property_ref(
         property: &SophonManifestAssetProperty,
     ) -> Result<Self, CompactManifestLimitError> {

@@ -17,9 +17,9 @@ use prost::Message as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use irmin_rs::game_installer::bench_test_endpoints::{
-    set_build_base, set_front_door, set_patch_build_base,
-};
+use irmin_rs::game_installer::bench_test_endpoints::{set_build_base, set_front_door};
+#[cfg(feature = "preinstall")]
+use irmin_rs::game_installer::bench_test_endpoints::set_patch_build_base;
 use irmin_rs::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto};
 use irmin_rs::{DownloadHandle, Sophon, SophonProgress, VerifyMode};
 
@@ -195,6 +195,7 @@ impl E2eFixture {
         // Point the test endpoint overrides at the mock server.
         set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
         set_build_base(Some(format!("{}/getBuild", server.uri())));
+        #[cfg(feature = "preinstall")]
         set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
         Self {
@@ -210,6 +211,7 @@ impl E2eFixture {
     fn teardown(&self) {
         set_front_door(None);
         set_build_base(None);
+        #[cfg(feature = "preinstall")]
         set_patch_build_base(None);
     }
 }
@@ -464,6 +466,7 @@ async fn sophon_update_e2e_mocked_http_full_pipeline() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -495,6 +498,7 @@ async fn sophon_update_e2e_mocked_http_full_pipeline() {
     // Clear overrides.
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
 }
 
@@ -625,6 +629,7 @@ async fn sophon_preinstall_e2e_mocked_http_empty_patch() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -664,6 +669,7 @@ async fn sophon_preinstall_e2e_mocked_http_empty_patch() {
     // Clear overrides.
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
     let _ = HashMap::<u8, u8>::new(); // suppress unused import in some cfgs
 }
@@ -807,6 +813,7 @@ async fn sophon_apply_preinstall_e2e_mocked_http_empty_patch() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -842,6 +849,7 @@ async fn sophon_apply_preinstall_e2e_mocked_http_empty_patch() {
     // Clear overrides.
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
     let _ = HashMap::<u8, u8>::new();
 }
@@ -932,6 +940,7 @@ async fn sophon_download_e2e_chunk_hash_mismatch_returns_error_not_panic() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -950,6 +959,7 @@ async fn sophon_download_e2e_chunk_hash_mismatch_returns_error_not_panic() {
 
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
     let _ = corrupt_hash; // suppress unused in some paths
 
@@ -1052,6 +1062,7 @@ async fn sophon_download_e2e_truncated_chunk_returns_error_not_panic() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -1070,6 +1081,7 @@ async fn sophon_download_e2e_truncated_chunk_returns_error_not_panic() {
 
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
 
     assert!(
@@ -1130,6 +1142,7 @@ async fn sophon_download_e2e_corrupt_manifest_returns_error_not_panic() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -1148,6 +1161,7 @@ async fn sophon_download_e2e_corrupt_manifest_returns_error_not_panic() {
 
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
 
     assert!(
@@ -1247,6 +1261,7 @@ async fn sophon_download_e2e_chunk_server_error_returns_error_not_panic() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -1265,6 +1280,7 @@ async fn sophon_download_e2e_chunk_server_error_returns_error_not_panic() {
 
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
 
     assert!(
@@ -1319,6 +1335,7 @@ async fn sophon_download_e2e_manifest_not_found_returns_error_not_panic() {
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -1337,6 +1354,7 @@ async fn sophon_download_e2e_manifest_not_found_returns_error_not_panic() {
 
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
 
     assert!(
@@ -1445,6 +1463,7 @@ async fn sophon_download_e2e_connection_drop_mid_stream_returns_error_not_panic(
 
     set_front_door(Some(format!("{}/api/getGameBranches", server.uri())));
     set_build_base(Some(format!("{}/getBuild", server.uri())));
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(Some(format!("{}/getPatchBuild", server.uri())));
 
     let dir = tempfile::tempdir().unwrap();
@@ -1465,6 +1484,7 @@ async fn sophon_download_e2e_connection_drop_mid_stream_returns_error_not_panic(
 
     set_front_door(None);
     set_build_base(None);
+    #[cfg(feature = "preinstall")]
     set_patch_build_base(None);
 
     // Must not hang (timeout) and must return an error (not Ok or panic).

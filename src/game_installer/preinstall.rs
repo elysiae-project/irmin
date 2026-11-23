@@ -416,6 +416,7 @@ impl PreinstallState {
         game_dir.join(format!(".sophon_preinstall_{tag}"))
     }
 
+    #[cfg_attr(not(feature = "update"), allow(dead_code))]
     pub(super) fn cached_sizes(&self) -> (u64, u64) {
         let mut compressed = 0u64;
         let mut decompressed = 0u64;
@@ -446,6 +447,7 @@ impl PreinstallState {
     }
 }
 
+#[cfg_attr(not(feature = "update"), allow(dead_code))]
 pub(super) fn cached_preinstall(
     game_dir: &Path,
     tag: &str,
@@ -2279,6 +2281,7 @@ where
     F: FnOnce(PreinstallState) -> Fut,
     Fut: std::future::Future<Output = SophonResult<TargetSnapshot>>,
 {
+    #[cfg(feature = "patch")]
     let _buffer_pool_trim = HdiffPoolTrimGuard;
     if handle.is_cancelled() {
         return Err(SophonError::Cancelled);
@@ -2511,8 +2514,10 @@ where
     Ok(())
 }
 
+#[cfg(feature = "patch")]
 struct HdiffPoolTrimGuard;
 
+#[cfg(feature = "patch")]
 impl Drop for HdiffPoolTrimGuard {
     fn drop(&mut self) {
         super::hdiffpatch::trim_idle_buffers();
@@ -2833,23 +2838,26 @@ fn apply_copy_over(game_dir: &Path, chunks_dir: &Path, asset: &PatchAssetInfo) -
     posix_advise(chunk_fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
     chunk_file.seek(SeekFrom::Start(asset.patch_offset))?;
 
-    // Check if this is an HDiff patch by reading just the magic bytes
-    let mut magic_buf = [0u8; HDIFF_MAGIC.len()];
-    if asset.patch_chunk_length >= HDIFF_MAGIC.len() as u64 {
-        chunk_file.read_exact(&mut magic_buf)?;
-    }
-    if magic_buf == HDIFF_MAGIC.as_ref() {
-        let patch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_hdiff_patch_from_files(game_dir, &chunk_path, asset.patch_offset, asset)
-        }));
-        posix_advise(chunk_fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-        match patch_result {
-            Ok(result) => return result,
-            Err(_) => {
-                return Err(SophonError::HDiffPatchFailed {
-                    file: asset.target_file_path.clone(),
-                    error: "HDiff patch panicked".to_string(),
-                });
+    #[cfg(feature = "patch")]
+    {
+        // Check if this is an HDiff patch by reading just the magic bytes
+        let mut magic_buf = [0u8; HDIFF_MAGIC.len()];
+        if asset.patch_chunk_length >= HDIFF_MAGIC.len() as u64 {
+            chunk_file.read_exact(&mut magic_buf)?;
+        }
+        if magic_buf == HDIFF_MAGIC.as_ref() {
+            let patch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                apply_hdiff_patch_from_files(game_dir, &chunk_path, asset.patch_offset, asset)
+            }));
+            posix_advise(chunk_fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+            match patch_result {
+                Ok(result) => return result,
+                Err(_) => {
+                    return Err(SophonError::HDiffPatchFailed {
+                        file: asset.target_file_path.clone(),
+                        error: "HDiff patch panicked".to_string(),
+                    });
+                }
             }
         }
     }
@@ -3052,6 +3060,7 @@ async fn process_patch_asset(ctx: PatchTaskContext) -> SophonResult<()> {
                 .await?;
             }
         }
+        #[cfg(feature = "patch")]
         PatchMethod::Patch => {
             const PATCH_MAX_RETRIES: usize = 4;
             let mut fallback_to_download = false;
@@ -3120,6 +3129,24 @@ async fn process_patch_asset(ctx: PatchTaskContext) -> SophonResult<()> {
                 .await?;
             }
         }
+        #[cfg(not(feature = "patch"))]
+        PatchMethod::Patch => {
+            // The HDiff engine is not compiled in; fall back to a full
+            // download of the target file.
+            log::warn!(
+                "HDiff engine unavailable, downloading {path} in full",
+                path = asset.target_file_path,
+            );
+            apply_download_over_with_retry(
+                &client,
+                &game_dir,
+                &state,
+                &asset,
+                &download_over_context,
+                &handle,
+            )
+            .await?;
+        }
         PatchMethod::DownloadOver => {
             apply_download_over_with_retry(
                 &client,
@@ -3187,6 +3214,7 @@ fn handle_asset_result(
     }
 }
 
+#[cfg(feature = "patch")]
 fn apply_hdiff_patch(
     game_dir: &Path,
     chunks_dir: &Path,
@@ -3232,7 +3260,7 @@ impl TimingHdiffPhaseObserver {
     }
 }
 
-#[cfg(feature = "bench-diagnostics")]
+#[cfg(all(feature = "bench-diagnostics", feature = "patch"))]
 pub fn apply_synthetic_hdiff_for_benchmark(
     game_dir: &Path,
     preinstall_tag: &str,
@@ -3259,6 +3287,7 @@ pub fn apply_synthetic_hdiff_for_benchmark(
 
 // Large function; keeping it out-of-line preserves hot-path code layout.
 #[inline(never)]
+#[cfg(feature = "patch")]
 fn apply_hdiff_patch_impl(
     game_dir: &Path,
     chunks_dir: &Path,
@@ -3486,6 +3515,7 @@ fn apply_hdiff_patch_impl(
 
 // Large function; keeping it out-of-line preserves hot-path code layout.
 #[inline(never)]
+#[cfg(feature = "patch")]
 fn apply_hdiff_patch_from_files(
     game_dir: &Path,
     diff_path: &Path,

@@ -4,6 +4,7 @@ use std::path::Path;
 use super::write_lang_file;
 use crate::game_installer::api::normalize_vo_locale;
 use crate::game_installer::installer::SophonInstaller;
+#[cfg(any(test, feature = "verify"))]
 use crate::proto_parse::SophonManifestAssetProperty;
 
 const GAME_DATA_DIR: &str =
@@ -14,6 +15,7 @@ const KDEL_RESOURCE_FILE: &str = "KDelResource";
 const KDEL_SEPARATORS: &[char] = &['|', ';', ',', '$', '#', '@', '+', ' '];
 
 /// Nap asset filtering is a no-op; handled at the installer level.
+#[cfg(any(test, feature = "verify"))]
 pub fn filter_nap_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestAssetProperty>) {
     let _ = (game_dir, assets);
 }

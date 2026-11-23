@@ -8,8 +8,11 @@ mod patch_core;
 mod patch_sf;
 mod patch_single;
 
+#[cfg_attr(not(feature = "preinstall"), allow(dead_code))]
 pub(crate) use compression_mode::CompressionMode;
+#[cfg_attr(not(feature = "preinstall"), allow(unused_imports, dead_code))]
 pub(crate) use diff::HDiff;
+#[cfg_attr(not(feature = "preinstall"), allow(dead_code))]
 pub(crate) use diff::SeekableRead;
 #[allow(unused_imports)]
 pub(crate) use header::{

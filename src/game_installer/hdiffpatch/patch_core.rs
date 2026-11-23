@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(test, feature = "preinstall")),
+    allow(dead_code, unused_imports)
+)]
+
 use std::io::{Cursor, Read, SeekFrom, Write};
 
 use super::{

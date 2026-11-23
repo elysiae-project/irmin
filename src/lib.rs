@@ -18,7 +18,7 @@ pub mod sophon;
 /// Persisted download and resume-state models.
 pub mod types;
 
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "patch"))]
 pub mod bench_support;
 
 /// Tuned HTTP client used for chunk transfers.

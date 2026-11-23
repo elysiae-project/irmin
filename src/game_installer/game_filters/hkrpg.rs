@@ -85,6 +85,7 @@ impl HkrpgFilter {
 }
 
 /// Remove manifest entries excluded for the current HKRPG installation.
+#[cfg(any(test, feature = "verify"))]
 pub fn filter_hkrpg_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestAssetProperty>) {
     let filtered = HkrpgFilter::load(game_dir).apply(assets);
     if filtered > 0 {

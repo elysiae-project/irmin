@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(test, feature = "preinstall")),
+    allow(dead_code, unused_imports)
+)]
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CompressionMode {

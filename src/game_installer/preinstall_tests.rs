@@ -1271,6 +1271,7 @@ fn apply_copy_over_with_offset_non_hdiff_seeks_back() {
     assert_eq!(written, target_data);
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_copy_over_detects_hdiff_magic() {
     let dir = tempfile::tempdir().unwrap();
@@ -1305,6 +1306,7 @@ fn apply_copy_over_detects_hdiff_magic() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_copy_over_cleans_up_diff_temp_on_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -1344,6 +1346,7 @@ fn apply_copy_over_cleans_up_diff_temp_on_failure() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_size_mismatch_returns_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -1395,6 +1398,7 @@ fn apply_hdiff_patch_size_mismatch_returns_error() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_original_hash_mismatch_returns_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -1430,6 +1434,7 @@ fn apply_hdiff_patch_original_hash_mismatch_returns_error() {
     assert!(matches!(error, SophonError::OriginalFileMissing(_)));
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_filtered_original_hash_mismatch_skips() {
     let dir = tempfile::tempdir().unwrap();
@@ -1460,6 +1465,7 @@ fn apply_hdiff_patch_filtered_original_hash_mismatch_skips() {
     apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &cache).unwrap();
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_blank_original_creates_diff_ref() {
     let dir = tempfile::tempdir().unwrap();
@@ -1504,6 +1510,7 @@ fn apply_hdiff_patch_blank_original_creates_diff_ref() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_blank_original_by_size() {
     let dir = tempfile::tempdir().unwrap();
@@ -1548,6 +1555,7 @@ fn apply_hdiff_patch_blank_original_by_size() {
 }
 /// BLANK_FILE_MD5 triggers blank-file handling even when
 /// original_file_size is non-zero. Hash takes precedence over size.
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_blank_original_by_hash_ignores_size() {
     let dir = tempfile::tempdir().unwrap();
@@ -1594,6 +1602,7 @@ fn apply_hdiff_patch_blank_original_by_hash_ignores_size() {
 /// New subdirectories introduced by a patch must be created before the
 /// temp output is renamed into place; otherwise fs::rename fails with
 /// ENOENT ("No such file or directory").
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_creates_nested_target_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -1635,6 +1644,7 @@ fn apply_hdiff_patch_creates_nested_target_dir() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_from_files_blank_diff_ref_hash_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -3092,6 +3102,7 @@ async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
     assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("1.0"));
 }
 
+#[cfg(feature = "update")]
 #[tokio::test]
 async fn discovery_prefers_valid_live_package_and_keeps_its_sizes_when_queries_fail() {
     let dir = tempfile::tempdir().unwrap();
@@ -3134,6 +3145,7 @@ async fn discovery_prefers_valid_live_package_and_keeps_its_sizes_when_queries_f
     }
 }
 
+#[cfg(feature = "update")]
 #[tokio::test]
 async fn discovery_rejects_markers_arbitrary_json_corrupt_snapshots_and_wrong_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -3244,6 +3256,7 @@ async fn successful_apply_removes_only_its_package_state_not_shared_patch_payloa
     );
 }
 
+#[cfg(feature = "update")]
 #[tokio::test]
 async fn cached_package_discovery_accepts_equivalent_voice_aliases() {
     let dir = tempfile::tempdir().unwrap();
