@@ -6,9 +6,9 @@
 //! at a paced per-connection rate, then measures transfer and completion time.
 //!
 //! - `nominal_verification`: no artificial verifier delay.
-//! - `stalled_verification`: the hash consumer is delayed 4 ms per 64 KiB frame
-//!   via the `set_bench_hash_thread_stall_us` hook, slower than the configured
-//!   network pace and emulating verifier CPU starvation.
+//! - `stalled_verification`: the hash consumer is delayed 80 ms per response
+//!   frame via the `set_bench_hash_thread_stall_us` hook, slower than the
+//!   configured network pace and emulating verifier CPU starvation.
 //! - `assembly_cpu_load`: CPU burner threads simulate parallel assembly work
 //!   competing for cores while the hash consumer runs at full speed.
 //!
@@ -31,14 +31,14 @@ use irmin_rs::game_installer::download_benchmark::{
     download_and_verify_md5_timed, set_bench_hash_thread_stall_us,
 };
 
-const PAYLOAD_MIB: usize = 8;
-const FRAME_KIB: usize = 64;
+const PAYLOAD_MIB: usize = 1;
+const FRAME_KIB: usize = 1024;
 const CONCURRENT_DOWNLOADS: usize = 8;
 /// Pace the loopback server so the healthy scenario is network-bound, not
 /// memory-bound; every scenario sees the same delivery schedule.
-const PACE_BPS: u64 = 128 * 1024 * 1024; // 128 MiB/s
+const PACE_BPS: u64 = 16 * 1024 * 1024; // 16 MiB/s
 /// Per-frame hash stall (microseconds) for the stalled-verification scenario.
-const STALL_US: u64 = 4000;
+const STALL_US: u64 = 80_000;
 
 fn make_payload() -> Vec<u8> {
     // High-entropy LCG bytes: incompressible, so the hash cost is
@@ -92,29 +92,26 @@ fn spawn_paced_server(
                         let payload = Arc::clone(&payload);
                         async move {
                             let frame_len = FRAME_KIB * 1024;
-                            let started = tokio::time::Instant::now();
                             let mut frames = Vec::new();
-                            for (i, start) in (0..payload.len()).step_by(frame_len).enumerate() {
+                            for start in (0..payload.len()).step_by(frame_len) {
                                 let end = (start + frame_len).min(payload.len());
                                 let slice = bytes::Bytes::copy_from_slice(&payload[start..end]);
-                                let deadline = started
-                                    + Duration::from_nanos(
-                                        (i as u64 * frame_len as u64 * 1_000_000_000) / PACE_BPS,
-                                    );
-                                frames.push((deadline, slice));
+                                frames.push(slice);
                             }
+                            let frame_period =
+                                Duration::from_nanos((frame_len as u64 * 1_000_000_000) / PACE_BPS);
                             let content_length = payload.len();
                             let stream = futures_util::stream::unfold(
-                                (frames, 0usize),
-                                move |(frames, idx)| async move {
+                                (frames, 0usize, frame_period),
+                                move |(frames, idx, frame_period)| async move {
                                     if idx >= frames.len() {
                                         return None;
                                     }
-                                    let (deadline, data) = &frames[idx];
-                                    tokio::time::sleep_until(*deadline).await;
+                                    tokio::time::sleep(frame_period).await;
+                                    let data = &frames[idx];
                                     Some((
                                         Ok::<_, Infallible>(Frame::data(data.clone())),
-                                        (frames, idx + 1),
+                                        (frames, idx + 1, frame_period),
                                     ))
                                 },
                             );
@@ -175,6 +172,7 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
     group.sample_size(20);
 
     let mut scenario = |id: &str, stall_us: u64, burners: usize| {
+        let require_deferred = stall_us > 0;
         set_bench_hash_thread_stall_us(stall_us);
         let (stop, handles) = spawn_cpu_burners(burners);
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -234,6 +232,11 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
                     transfer_total.as_secs_f64() * 1000.0,
                     verified_total.as_secs_f64() * 1000.0,
                 );
+                if id == "nominal_verification" {
+                    assert_eq!(deferred_hashes, 0, "nominal verifier must keep up");
+                } else if require_deferred {
+                    assert_eq!(deferred_hashes, iters * CONCURRENT_DOWNLOADS as u64);
+                }
                 black_box(verified_total);
                 transfer_total
             });
@@ -248,9 +251,9 @@ fn bench_download_verify_pipeline(c: &mut Criterion) {
 
     // Healthy: consumer keeps up, no CPU contention.
     scenario("nominal_verification", 0, 0);
-    // Stalled verification: hash thread stalled 1 ms per 64 KiB frame,
+    // Stalled verification: hash thread stalled 80 ms per response frame,
     // emulating assembly/verification CPU starvation.
-    scenario("stalled_verification", STALL_US / 1000, 0);
+    scenario("stalled_verification", STALL_US, 0);
     // Assembly CPU load: burners occupy cores while hashing runs normally.
     scenario("assembly_cpu_load", 0, 4);
 

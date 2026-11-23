@@ -817,7 +817,7 @@ enum HashPipeline {
     /// Pipelined MD5 on a dedicated thread. Only the MD5 path is pipelined;
     /// xxh64 (if present) stays synchronous because it is negligible.
     Pipelined {
-        md5_sender: std::sync::mpsc::SyncSender<HashFrame>,
+        md5_sender: tokio::sync::mpsc::Sender<bytes::Bytes>,
         join: std::thread::JoinHandle<()>,
         digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
@@ -825,16 +825,11 @@ enum HashPipeline {
     /// The MD5 worker fell behind. The download continues writing the chunk,
     /// then verifies the complete file on the blocking pool after EOF.
     DeferredMd5 {
-        md5_sender: std::sync::mpsc::SyncSender<HashFrame>,
+        md5_sender: tokio::sync::mpsc::Sender<bytes::Bytes>,
         join: std::thread::JoinHandle<()>,
         digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
     },
-}
-
-/// One data frame to hash in arrival order.
-enum HashFrame {
-    Data(bytes::Bytes),
 }
 
 /// Test-only per-frame stall applied inside the hash thread, in milliseconds.
@@ -884,43 +879,34 @@ impl HashPipeline {
     fn new(md5: Option<PooledMd5>, xxh64: Option<xxhash_rust::xxh64::Xxh64>) -> Self {
         if let Some(md5) = md5 {
             // Channel capacity 2 bounds in-flight hash frames per chunk.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<HashFrame>(2);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
             let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
             let join = std::thread::Builder::new()
                 .stack_size(64 * 1024)
                 .spawn(move || {
                     let mut md5 = md5;
                     let mut digest_tx = Some(digest_tx);
-                    for frame in &rx {
-                        match frame {
-                            HashFrame::Data(bytes) => {
-                                #[cfg(all(not(test), feature = "bench-internals"))]
-                                let stall_duration = std::time::Duration::from_millis(
-                                    BENCH_HASH_THREAD_STALL_MS
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                ) + std::time::Duration::from_micros(
-                                    BENCH_HASH_THREAD_STALL_US
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                );
-                                #[cfg(all(not(test), not(feature = "bench-internals")))]
-                                let stall_duration = std::time::Duration::ZERO;
-                                #[cfg(test)]
-                                let stall_duration = std::time::Duration::from_millis(
-                                    HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
-                                );
-                                if !stall_duration.is_zero() {
-                                    std::thread::sleep(stall_duration);
-                                }
-                                if let Err(err) = md5.get_mut().update(&bytes) {
-                                    if let Some(tx) = digest_tx.take() {
-                                        let _ = tx.send(Err(err));
-                                    }
-                                    // Drain so producers never block on a
-                                    // full queue after the error.
-                                    for _ in &rx {}
-                                    return;
-                                }
+                    while let Some(bytes) = rx.blocking_recv() {
+                        #[cfg(all(not(test), feature = "bench-internals"))]
+                        let stall_duration = std::time::Duration::from_millis(
+                            BENCH_HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+                        ) + std::time::Duration::from_micros(
+                            BENCH_HASH_THREAD_STALL_US.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        #[cfg(all(not(test), not(feature = "bench-internals")))]
+                        let stall_duration = std::time::Duration::ZERO;
+                        #[cfg(test)]
+                        let stall_duration = std::time::Duration::from_millis(
+                            HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        if !stall_duration.is_zero() {
+                            std::thread::sleep(stall_duration);
+                        }
+                        if let Err(err) = md5.get_mut().update(&bytes) {
+                            if let Some(tx) = digest_tx.take() {
+                                let _ = tx.send(Err(err));
                             }
+                            return;
                         }
                     }
                     if let Some(tx) = digest_tx.take() {
@@ -945,52 +931,47 @@ impl HashPipeline {
     /// switches MD5 verification to a bounded-memory scan of the completed
     /// chunk file so the download stream does not wait for the hash worker.
     #[inline]
-    fn update(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
-        match self {
-            HashPipeline::None => Ok(()),
-            HashPipeline::Sync { md5, xxh64 } => {
-                update_download_hashes(bytes, md5.as_mut(), xxh64.as_mut())
-            }
-            HashPipeline::Pipelined {
-                md5_sender, xxh64, ..
-            } => {
-                // Send clones the Bytes refcount (cheap, no data copy).
-                match md5_sender.try_send(HashFrame::Data(bytes.clone())) {
-                    Ok(()) => {
-                        if let Some(xxh64) = xxh64 {
-                            xxh64.update(bytes);
-                        }
-                        Ok(())
+    async fn update(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
+        if let HashPipeline::Pipelined {
+            md5_sender, xxh64, ..
+        } = self
+        {
+            let sender = md5_sender.clone();
+            match sender.try_send(bytes.clone()) {
+                Ok(()) => {
+                    if let Some(xxh64) = xxh64 {
+                        xxh64.update(bytes);
                     }
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                        // The bytes are already written to the chunk file.
-                        // Stop feeding the lagging worker and verify the full
-                        // file after download instead of waiting for its queue.
-                        if let Some(xxh64) = xxh64 {
-                            xxh64.update(bytes);
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(std::io::Error::other("hash thread died"));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(pending)) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(2),
+                        sender.reserve(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => {
+                            permit.send(pending);
+                            if let HashPipeline::Pipelined { xxh64: Some(h), .. } = self {
+                                h.update(bytes);
+                            }
+                            return Ok(());
                         }
-                        let old = std::mem::replace(self, HashPipeline::None);
-                        let HashPipeline::Pipelined {
-                            md5_sender,
-                            join,
-                            digest_rx,
-                            xxh64,
-                        } = old
-                        else {
-                            unreachable!("matched Pipelined above");
-                        };
-                        *self = HashPipeline::DeferredMd5 {
-                            md5_sender,
-                            join,
-                            digest_rx,
-                            xxh64,
-                        };
-                        Ok(())
-                    }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        Err(std::io::Error::other("hash thread died"))
+                        Ok(Err(_)) => return Err(std::io::Error::other("hash thread died")),
+                        Err(_) => self.defer_md5(bytes)?,
                     }
                 }
+            }
+        }
+        match self {
+            HashPipeline::None => Ok(()),
+            HashPipeline::Pipelined { .. } => unreachable!("pipelined updates return above"),
+            HashPipeline::Sync { md5, xxh64 } => {
+                update_download_hashes(bytes, md5.as_mut(), xxh64.as_mut())
             }
             HashPipeline::DeferredMd5 { xxh64, .. } => {
                 if let Some(xxh64) = xxh64 {
@@ -999,6 +980,33 @@ impl HashPipeline {
                 Ok(())
             }
         }
+    }
+
+    /// Switch a saturated MD5 pipeline to verification from the completed
+    /// chunk file. The current frame is already on disk and needs no queue
+    /// ownership.
+    fn defer_md5(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
+        let old = std::mem::replace(self, HashPipeline::None);
+        let HashPipeline::Pipelined {
+            md5_sender,
+            join,
+            digest_rx,
+            mut xxh64,
+        } = old
+        else {
+            *self = old;
+            return Ok(());
+        };
+        if let Some(xxh64) = xxh64.as_mut() {
+            xxh64.update(bytes);
+        }
+        *self = HashPipeline::DeferredMd5 {
+            md5_sender,
+            join,
+            digest_rx,
+            xxh64,
+        };
+        Ok(())
     }
 
     /// Finalize: drop the sender (signals EOF to the hash thread), await the
@@ -1188,7 +1196,7 @@ async fn stream_and_verify(
                 }
                 #[cfg(feature = "bench-diagnostics")]
                 let hash_started = std::time::Instant::now();
-                let hash_result = pipeline.update(&bytes);
+                let hash_result = pipeline.update(&bytes).await;
                 #[cfg(feature = "bench-diagnostics")]
                 if let Some(timings) = timings.as_deref_mut() {
                     let elapsed = hash_started.elapsed();
@@ -1763,7 +1771,7 @@ mod tests {
         let _stall_guard = HASH_THREAD_STALL_GUARD
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        HASH_THREAD_STALL_MS.store(1, std::sync::atomic::Ordering::Relaxed);
+        HASH_THREAD_STALL_MS.store(10, std::sync::atomic::Ordering::Relaxed);
         fn next_rand(state: &mut u64) -> u64 {
             *state ^= *state << 13;
             *state ^= *state >> 7;
@@ -1790,7 +1798,7 @@ mod tests {
             let mut pipeline = HashPipeline::new(Some(PooledMd5::new(take_md5().unwrap())), None);
             assert!(matches!(pipeline, HashPipeline::Pipelined { .. }));
             for frame in &frames {
-                pipeline.update(frame).unwrap();
+                pipeline.update(frame).await.unwrap();
             }
             assert!(matches!(pipeline, HashPipeline::DeferredMd5 { .. }));
             let (md5, xxh64, deferred) =
