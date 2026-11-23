@@ -758,13 +758,22 @@ pub async fn benchmark_download_chunk_with_timings(
 /// is being hashed. The hash is chained (state depends on frame order), so
 /// frames are hashed strictly in arrival order via a bounded channel.
 ///
+/// The hand-off never blocks the calling (Tokio runtime) worker: when the
+/// bounded channel is full because the hash thread fell behind, the pipeline
+/// asks the thread to finish its queued frames in order and ship the hasher
+/// state back over a oneshot, awaits that reply asynchronously, and continues
+/// hashing inline ([`HashPipeline::Sync`]) for the rest of the chunk. Inline
+/// hashing consumes CPU proportionally in the download task — the pre-PR
+/// behavior — instead of parking a runtime worker and stalling every other
+/// download scheduled on it.
+///
 /// When no hasher is present (skip_hash or empty compressed_hash), the
 /// pipeline is a no-op: [`HashPipeline::None`] skips all hashing.
 enum HashPipeline {
     /// No hashing needed; frames are dropped.
     None,
-    /// Synchronous in-loop hashing (no pipeline). Used when the hash thread
-    /// cannot be spawned or for the xxh64-only path.
+    /// Synchronous in-loop hashing (no pipeline). Used for the xxh64-only
+    /// path and as the fallback after the hash thread hands its state back.
     Sync {
         md5: Option<PooledMd5>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
@@ -772,10 +781,29 @@ enum HashPipeline {
     /// Pipelined MD5 on a dedicated thread. Only the MD5 path is pipelined;
     /// xxh64 (if present) stays synchronous because it is negligible.
     Pipelined {
-        md5_sender: std::sync::mpsc::SyncSender<bytes::Bytes>,
-        join: std::thread::JoinHandle<std::io::Result<Option<[u8; 16]>>>,
+        md5_sender: std::sync::mpsc::SyncSender<HashFrame>,
+        join: std::thread::JoinHandle<()>,
+        digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
     },
+    /// The hash thread is finishing its queued frames and will return the
+    /// hasher state; the download loop awaits the reply without blocking the
+    /// runtime worker, then hashes `pending` (the frame that did not fit)
+    /// and all later frames inline.
+    Reclaiming {
+        state_rx: tokio::sync::oneshot::Receiver<std::io::Result<Md5>>,
+        join: std::thread::JoinHandle<()>,
+        xxh64: Option<xxhash_rust::xxh64::Xxh64>,
+        pending: bytes::Bytes,
+    },
+}
+
+/// One message to the hash thread: a data frame to hash in arrival order, or
+/// a request to finish queued frames and return the hasher state (or the
+/// final digest when no reply slot is provided at EOF).
+enum HashFrame {
+    Data(bytes::Bytes),
+    Reclaim(tokio::sync::oneshot::Sender<std::io::Result<Md5>>),
 }
 
 /// Test-only per-frame stall applied inside the hash thread, in milliseconds.
@@ -791,31 +819,59 @@ impl HashPipeline {
     fn new(md5: Option<PooledMd5>, xxh64: Option<xxhash_rust::xxh64::Xxh64>) -> Self {
         if let Some(md5) = md5 {
             // Channel capacity 2: bounds in-flight hash frames to 2 per
-            // chunk. The hash thread processes at ~647 MiB/s (5× typical
-            // download speed), so the channel rarely fills. Reducing from
-            // 4 to 2 saves ~512 KiB per active chunk with no throughput loss.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(2);
+            // chunk. A full channel triggers the non-blocking reclaim
+            // fallback instead of parking the download loop.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<HashFrame>(2);
+            let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
             let join = std::thread::Builder::new()
                 .stack_size(64 * 1024)
                 .spawn(move || {
                     let mut md5 = md5;
-                    for bytes in rx {
-                        #[cfg(test)]
-                        {
-                            let stall_ms =
-                                HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
-                            if stall_ms > 0 {
-                                std::thread::sleep(std::time::Duration::from_millis(stall_ms));
+                    let mut digest_tx = Some(digest_tx);
+                    for frame in &rx {
+                        match frame {
+                            HashFrame::Data(bytes) => {
+                                #[cfg(test)]
+                                {
+                                    let stall_ms = HASH_THREAD_STALL_MS
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    if stall_ms > 0 {
+                                        std::thread::sleep(std::time::Duration::from_millis(
+                                            stall_ms,
+                                        ));
+                                    }
+                                }
+                                if let Err(err) = md5.get_mut().update(&bytes) {
+                                    if let Some(tx) = digest_tx.take() {
+                                        let _ = tx.send(Err(err));
+                                    }
+                                    // Drain so producers never block on a
+                                    // full queue after the error.
+                                    for _ in &rx {}
+                                    return;
+                                }
+                            }
+                            HashFrame::Reclaim(state_tx) => {
+                                // Queued frames were hashed in order above;
+                                // hand the live state back so the download
+                                // loop can continue inline. EOF afterwards
+                                // (sender dropped) exits the loop.
+                                let hasher =
+                                    md5.hasher.take().expect("pooled MD5 hasher is available");
+                                let _ = state_tx.send(Ok(hasher));
+                                return;
                             }
                         }
-                        md5.get_mut().update(&bytes)?;
                     }
-                    Ok(Some(md5.finish()?))
+                    if let Some(tx) = digest_tx.take() {
+                        let _ = tx.send(md5.finish());
+                    }
                 })
                 .expect("spawn hash thread");
             HashPipeline::Pipelined {
                 md5_sender: tx,
                 join,
+                digest_rx,
                 xxh64,
             }
         } else if xxh64.is_some() {
@@ -826,6 +882,8 @@ impl HashPipeline {
     }
 
     /// Send a frame to the hash thread (pipelined) or hash synchronously.
+    /// Never blocks the runtime worker: a full channel starts the reclaim
+    /// fallback, which the caller resolves with [`Self::resolve_reclaim`].
     #[inline]
     fn update(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
         match self {
@@ -837,20 +895,107 @@ impl HashPipeline {
                 md5_sender, xxh64, ..
             } => {
                 // Send clones the Bytes refcount (cheap, no data copy).
-                md5_sender
-                    .send(bytes.clone())
-                    .map_err(|_| std::io::Error::other("hash thread died"))?;
-                if let Some(xxh64) = xxh64 {
-                    xxh64.update(bytes);
+                match md5_sender.try_send(HashFrame::Data(bytes.clone())) {
+                    Ok(()) => {
+                        if let Some(xxh64) = xxh64 {
+                            xxh64.update(bytes);
+                        }
+                        Ok(())
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        // Hash thread fell behind. Ask it to finish queued
+                        // frames in order and return the hasher state. The
+                        // request rides the same bounded channel, so try_send
+                        // may also find it full; the thread drains constantly,
+                        // so retry with yields (never a blocking send, which
+                        // would park this runtime worker).
+                        let (state_tx, state_rx) = tokio::sync::oneshot::channel();
+                        let mut reclaim = HashFrame::Reclaim(state_tx);
+                        loop {
+                            match md5_sender.try_send(reclaim) {
+                                Ok(()) => break,
+                                Err(std::sync::mpsc::TrySendError::Full(r)) => {
+                                    reclaim = r;
+                                    std::thread::yield_now();
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    return Err(std::io::Error::other("hash thread died"));
+                                }
+                            }
+                        }
+                        if let Some(xxh64) = xxh64 {
+                            xxh64.update(bytes);
+                        }
+                        let old = std::mem::replace(self, HashPipeline::None);
+                        let HashPipeline::Pipelined { join, xxh64, .. } = old else {
+                            unreachable!("matched Pipelined above");
+                        };
+                        *self = HashPipeline::Reclaiming {
+                            state_rx,
+                            join,
+                            xxh64,
+                            pending: bytes.clone(),
+                        };
+                        Ok(())
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        Err(std::io::Error::other("hash thread died"))
+                    }
                 }
-                Ok(())
+            }
+            HashPipeline::Reclaiming { .. } => {
+                // Caller must resolve the reclaim before updating again.
+                Err(std::io::Error::other(
+                    "hash pipeline reclaim not resolved before next frame",
+                ))
             }
         }
     }
 
-    /// Finalize: drop the sender (signals EOF to the hash thread), wait for
-    /// the digest, and return the MD5 digest and xxh64 digest.
-    fn finish(self) -> std::io::Result<(Option<[u8; 16]>, Option<u64>)> {
+    /// True while a reclaim is in flight; the caller must await
+    /// [`Self::resolve_reclaim`] before the next update or finish.
+    #[inline]
+    fn needs_reclaim(&self) -> bool {
+        matches!(self, HashPipeline::Reclaiming { .. })
+    }
+
+    /// Await the hash thread's state hand-back (asynchronously: the runtime
+    /// worker yields instead of parking), then switch to inline hashing and
+    /// hash the frame that triggered the reclaim. Runs at most once per chunk.
+    async fn resolve_reclaim(&mut self) -> std::io::Result<()> {
+        let old = std::mem::replace(self, HashPipeline::None);
+        let HashPipeline::Reclaiming {
+            state_rx,
+            join,
+            mut xxh64,
+            pending,
+        } = old
+        else {
+            *self = old;
+            return Ok(());
+        };
+        let hasher = state_rx
+            .await
+            .map_err(|_| std::io::Error::other("hash thread died"))??;
+        // The thread returned right after sending the state; joining here
+        // cannot park for longer than thread teardown.
+        join.join()
+            .map_err(|_| std::io::Error::other("hash thread panicked"))?;
+        let mut md5 = Some(PooledMd5::new(hasher));
+        update_download_hashes(&pending, md5.as_mut(), None)?;
+        // xxh64 already covered the pending frame in update().
+        let _ = &mut xxh64;
+        *self = HashPipeline::Sync { md5, xxh64 };
+        Ok(())
+    }
+
+    /// Finalize: drop the sender (signals EOF to the hash thread), await the
+    /// digest without blocking the runtime worker, and return the MD5 digest
+    /// and xxh64 digest.
+    async fn finish(mut self) -> std::io::Result<(Option<[u8; 16]>, Option<u64>)> {
+        if self.needs_reclaim() {
+            self.resolve_reclaim().await?;
+        }
         match self {
             HashPipeline::None => Ok((None, None)),
             HashPipeline::Sync { mut md5, xxh64 } => {
@@ -864,16 +1009,24 @@ impl HashPipeline {
             HashPipeline::Pipelined {
                 md5_sender,
                 join,
+                digest_rx,
                 xxh64,
             } => {
                 // Drop the sender to signal the hash thread that no more
                 // frames are coming.
                 drop(md5_sender);
-                let md5_digest = join
-                    .join()
-                    .map_err(|_| std::io::Error::other("hash thread panicked"))??;
+                let md5_digest = Some(
+                    digest_rx
+                        .await
+                        .map_err(|_| std::io::Error::other("hash thread died"))??,
+                );
+                join.join()
+                    .map_err(|_| std::io::Error::other("hash thread panicked"))?;
                 let xxh64_digest = xxh64.map(|h| h.digest());
                 Ok((md5_digest, xxh64_digest))
+            }
+            HashPipeline::Reclaiming { .. } => {
+                unreachable!("reclaim resolved at the top of finish")
             }
         }
     }
@@ -997,6 +1150,13 @@ async fn stream_and_verify(
                 #[cfg(feature = "bench-diagnostics")]
                 let hash_started = std::time::Instant::now();
                 let hash_result = pipeline.update(&bytes);
+                // A full hash channel started a reclaim; await the state
+                // hand-back asynchronously so the runtime worker keeps
+                // serving other downloads while the hash thread catches up.
+                let hash_result = match hash_result {
+                    Ok(()) if pipeline.needs_reclaim() => pipeline.resolve_reclaim().await,
+                    other => other,
+                };
                 #[cfg(feature = "bench-diagnostics")]
                 if let Some(timings) = timings.as_deref_mut() {
                     let elapsed = hash_started.elapsed();
@@ -1050,7 +1210,7 @@ async fn stream_and_verify(
 
     // Finalize the hash pipeline: drop the sender to signal the hash thread
     // that no more frames are coming, wait for the digest, and verify.
-    let (md5_digest, xxh64_digest) = pipeline.finish().map_err(SophonError::Io)?;
+    let (md5_digest, xxh64_digest) = pipeline.finish().await.map_err(SophonError::Io)?;
 
     if !compressed_hash.is_empty() {
         match compressed_hash.len() {
@@ -1545,8 +1705,8 @@ mod tests {
     /// digest must equal the scalar digest for randomized frame-size
     /// sequences spanning the channel-capacity boundaries. Seeded PRNG keeps
     /// the sequences reproducible.
-    #[test]
-    fn pipelined_digest_matches_scalar_for_random_frame_sequences() {
+    #[tokio::test]
+    async fn pipelined_digest_matches_scalar_for_random_frame_sequences() {
         fn next_rand(state: &mut u64) -> u64 {
             *state ^= *state << 13;
             *state ^= *state >> 7;
@@ -1571,8 +1731,11 @@ mod tests {
             assert!(matches!(pipeline, HashPipeline::Pipelined { .. }));
             for frame in &frames {
                 pipeline.update(frame).unwrap();
+                if pipeline.needs_reclaim() {
+                    pipeline.resolve_reclaim().await.unwrap();
+                }
             }
-            let (md5, xxh64) = pipeline.finish().unwrap();
+            let (md5, xxh64) = pipeline.finish().await.unwrap();
             assert_eq!(md5.unwrap(), expected, "seed {seed}");
             assert!(xxh64.is_none());
         }
