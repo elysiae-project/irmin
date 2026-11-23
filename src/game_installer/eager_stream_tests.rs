@@ -1,6 +1,7 @@
 use super::*;
 use crate::api_scrape::Compression;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 
 fn eager_context(
     root: &Path,
@@ -373,6 +374,234 @@ async fn eager_streaming_download_verifies_hashes_and_marks_bitmap() {
     .unwrap();
     assert!(ctx.chunk_bitmap.is_complete(0));
     assert_eq!(fs::read(dir.path().join("eager.bin")).unwrap(), data);
+}
+
+/// Regression for PR #15: while the eager decoder is stalled, the producer
+/// must keep receiving network bytes (within its bounded memory budget)
+/// instead of pausing at the old fixed 8-frame channel window. A paced
+/// loopback server delivers one frame every 10 ms; the decoder stalls for
+/// 500 ms before reading. The heartbeat on the same current-thread runtime
+/// must keep ticking, and most frames must arrive during the stall window.
+#[test]
+fn eager_stream_producer_continues_while_decoder_stalls() {
+    use http_body_util::StreamBody;
+    use hyper::body::{Frame, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request as HyperRequest, Response as HyperResponse};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+
+    const FRAMES: usize = 40;
+    const PACE_MS: u64 = 10;
+    const STALL_MS: u64 = 500;
+
+    // High-entropy payload (full-period LCG) so the compressed stream stays
+    // large enough to span many frames.
+    let data: Vec<u8> = {
+        let mut state = 0x853c49e6748fea9bu64;
+        (0..2 * 1024 * 1024)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    };
+    let compressed = {
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(20).unwrap();
+        encoder.write_all(&data).unwrap();
+        encoder.finish().unwrap()
+    };
+    assert!(compressed.len() > FRAMES * 4096, "need a multi-frame body");
+    let compressed_hash = hex::encode(fast_md5::digest(&compressed));
+    let decompressed_hash = hex::encode(fast_md5::digest(&data));
+
+    // Absolute schedule: frame i is emitted at start + i * PACE_MS, so the
+    // delivery rate stays paced even when the consumer reads in bursts.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let (frames_during_stall, max_gap_ms) = runtime.block_on(async move {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Tiny receive buffer: once the producer stops reading (channel
+        // full), TCP backpressure must reach the server within a few frames
+        // instead of letting the whole body hide in kernel buffers.
+        unsafe {
+            let buf: libc::c_int = 8 * 1024;
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let stall_started = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let frames_during_stall = Arc::new(AtomicU64::new(0));
+        let server = {
+            let compressed = compressed.clone();
+            let stall_started = Arc::clone(&stall_started);
+            let frames_during_stall = Arc::clone(&frames_during_stall);
+            tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                unsafe {
+                    let buf: libc::c_int = 8 * 1024;
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &buf as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+                let service = service_fn(move |_: HyperRequest<Incoming>| {
+                    let compressed = compressed.clone();
+                    let stall_started = Arc::clone(&stall_started);
+                    let frames_during_stall = Arc::clone(&frames_during_stall);
+                    async move {
+                        let frame_len = compressed.len().div_ceil(FRAMES);
+                        let start = tokio::time::Instant::now();
+                        let mut frames = Vec::new();
+                        for i in 0..FRAMES {
+                            let begin = i * frame_len;
+                            if begin >= compressed.len() {
+                                break;
+                            }
+                            let end = ((i + 1) * frame_len).min(compressed.len());
+                            let slice =
+                                bytes::Bytes::from(compressed[begin..end].to_vec());
+                            let stall_started = Arc::clone(&stall_started);
+                            let counter = Arc::clone(&frames_during_stall);
+                            let deadline =
+                                start + std::time::Duration::from_millis(PACE_MS * i as u64);
+                            frames.push(async move {
+                                tokio::time::sleep_until(deadline).await;
+                                if let Some(started) = *stall_started.lock().unwrap()
+                                    && started.elapsed().as_millis() < STALL_MS as u128
+                                {
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok::<_, Infallible>(Frame::data(slice))
+                            });
+                        }
+                        let body = StreamBody::new(futures_util::stream::iter(frames).then(
+                            |fut| fut,
+                        ));
+                        let mut response = HyperResponse::new(body);
+                        response.headers_mut().insert(
+                            hyper::header::CONTENT_LENGTH,
+                            compressed.len().to_string().parse().unwrap(),
+                        );
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                let connection =
+                    http1::Builder::new().serve_connection(TokioIo::new(socket), service);
+                let _ = connection.await;
+            })
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let allocator = Arc::new(super::output_allocator::OutputAllocator::new(dir.path()));
+        allocator
+            .preallocate_file(0, "eager.bin", data.len() as u64)
+            .unwrap();
+        let chunk = SophonManifestAssetChunk {
+            chunk_name: bytes::Bytes::from("eager"),
+            chunk_decompressed_hash_md5: decompressed_hash.into(),
+            chunk_on_file_offset: 0,
+            chunk_size: compressed.len() as u64,
+            chunk_size_decompressed: data.len() as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: compressed_hash.into(),
+            chunk_old_offset: -1,
+        };
+        let download = Arc::new(DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: format!("http://{address}/"),
+            url_suffix: "chunks".into(),
+        });
+        let ctx = eager_context(
+            dir.path(),
+            download,
+            Arc::new(Client::new()),
+            allocator,
+            chunk,
+            data.len() as u64,
+            &hex::encode(fast_md5::digest(&data)),
+        );
+
+        let max_gap = Arc::new(AtomicU64::new(0));
+        let heartbeat_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat = {
+            let max_gap = Arc::clone(&max_gap);
+            let flag = Arc::clone(&heartbeat_flag);
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                while !flag.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    max_gap.fetch_max(last.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    last = Instant::now();
+                }
+            })
+        };
+
+        super::super::eager_decompress::DECODER_START_STALL_MS
+            .store(STALL_MS, Ordering::Relaxed);
+        *stall_started.lock().unwrap() = Some(Instant::now());
+        let result = process_eager_item_with_mode(
+            &eager_item(),
+            0,
+            ctx.all_files.file_chunk(0, 0),
+            &ctx,
+            &[(0, 0, 0)],
+            &[0, 1],
+            &[AtomicU32::new(1)],
+            &DownloadHandle::new(),
+            Some(true),
+            Some(8),
+            None,
+            None,
+            #[cfg(feature = "bench-diagnostics")]
+            None,
+        )
+        .await;
+        super::super::eager_decompress::DECODER_START_STALL_MS.store(0, Ordering::Relaxed);
+        heartbeat_flag.store(true, Ordering::Relaxed);
+        let _ = heartbeat.await;
+        server.abort();
+        result.unwrap();
+        assert_eq!(fs::read(dir.path().join("eager.bin")).unwrap(), data);
+        (
+            frames_during_stall.load(Ordering::Relaxed),
+            max_gap.load(Ordering::Relaxed),
+        )
+    });
+
+    eprintln!("frames_during_stall={frames_during_stall} max_gap_ms={max_gap_ms}");
+    assert!(
+        max_gap_ms < STALL_MS,
+        "runtime worker blocked for {max_gap_ms} ms during decoder stall"
+    );
+    // Old 8-slot window plus kernel buffers allows ~20 frames during the
+    // stall; the decoupled budget must let the paced server keep delivering
+    // nearly the whole body while the decoder is still stalled.
+    assert!(
+        frames_during_stall >= 32,
+        "only {frames_during_stall} frames received during the {STALL_MS} ms \
+         decoder stall; producer is throttled to decoder progress"
+    );
 }
 
 #[cfg(feature = "bench-diagnostics")]
