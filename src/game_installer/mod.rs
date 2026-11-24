@@ -43,13 +43,13 @@ pub mod hdiffpatch;
 mod hdiffpatch;
 /// Manifest planning and download/assembly orchestration.
 pub mod installer;
-/// Output-file preallocation and shared file-handle management.
-pub mod output_allocator;
 /// SIMD multi-buffer MD5 verification for batches of independent files.
 /// Benchmark-only (not compiled into production paths); the production
 /// consumer of the md5-simd kernel is the per-file chunk batch hasher.
 #[cfg(feature = "bench-internals")]
 pub mod md5_multibuffer;
+/// Output-file preallocation and shared file-handle management.
+pub mod output_allocator;
 #[cfg(feature = "plugins")]
 mod plugin_api;
 #[cfg(feature = "plugins")]

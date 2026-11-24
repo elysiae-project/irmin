@@ -647,7 +647,8 @@ fn assemble_file_inner(
         chunks_dir,
     };
 
-    // Verify total decompressed size, check chunk hashes, and detect old chunks in one pass.
+    // Verify total decompressed size, check chunk hashes, and detect old chunks
+    // in one pass.
     let mut total_decompressed: u64 = 0;
     let mut all_chunks_have_hashes = true;
     let mut has_old_chunks = false;
@@ -783,14 +784,9 @@ fn assemble_file_inner(
                 let err_flag = &has_error;
                 let files = all_files;
                 s.spawn(move || {
-                    chunk_batch_hasher::run(
-                        tmp_path,
-                        file_size,
-                        rx,
-                        err_slot,
-                        err_flag,
-                        |ci| files.chunk_name_at(ci as usize).to_string(),
-                    );
+                    chunk_batch_hasher::run(tmp_path, file_size, rx, err_slot, err_flag, |ci| {
+                        files.chunk_name_at(ci as usize).to_string()
+                    });
                 });
             }
             if parallel_hashed_file {
@@ -820,8 +816,9 @@ fn assemble_file_inner(
                         }
                     };
                     let mut last_evicted = 0usize;
-                    // MAP_SHARED read-only mmap sees concurrent pwrite_at updates
-                    // to the page cache, eliminating per-chunk read_at syscalls.
+                    // MAP_SHARED read-only mmap sees concurrent pwrite_at
+                    // updates to the page cache, eliminating per-chunk read_at
+                    // syscalls.
                     let map = match super::assembly_opt::mmap_shared_read_only(
                         &file,
                         map_len,
@@ -1140,7 +1137,8 @@ fn assemble_file_inner(
         }
     }
 
-    // Set permissions on the tmp file before syncing; avoids a stat after rename.
+    // Set permissions on the tmp file before syncing; avoids a stat after
+    // rename.
     let _ = unsafe { libc::fchmod(out_file.as_raw_fd(), 0o644) };
 
     // Staged (epoch) mode: the assembled bytes get their correctness checks
@@ -1248,7 +1246,8 @@ fn assemble_file_inner(
         }
     }
 
-    // Only evict the full file when per-chunk eviction was skipped (hasher needs pages resident).
+    // Only evict the full file when per-chunk eviction was skipped (hasher
+    // needs pages resident).
     if parallel_hashed_file {
         super::assembly_opt::posix_advise(
             out_file.as_raw_fd(),

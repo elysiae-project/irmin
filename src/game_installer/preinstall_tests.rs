@@ -140,7 +140,8 @@ fn benchmark_download_over_context_clone() {
             });
         }
         assets.push(SophonManifestAssetProperty {
-            asset_name: format!("GameData/StreamingAssets/Persistent/{asset_index:08}.bundle").into(),
+            asset_name: format!("GameData/StreamingAssets/Persistent/{asset_index:08}.bundle")
+                .into(),
             asset_chunks: chunks,
             asset_type: 0,
             asset_size: (chunks_per_asset * 1024 * 1024) as u64,
@@ -307,10 +308,8 @@ fn snapshot_downloaded_chunks_saves_sizes_and_names() {
 
 #[test]
 fn snapshot_downloaded_chunks_with_nothing_completed_saves_nothing() {
-    let unique_chunks: Arc<[PatchChunkInfo]> = Arc::from(vec![
-        chunk_info("chunk-a", 11),
-        chunk_info("chunk-b", 22),
-    ]);
+    let unique_chunks: Arc<[PatchChunkInfo]> =
+        Arc::from(vec![chunk_info("chunk-a", 11), chunk_info("chunk-b", 22)]);
     let sizes = Arc::new(ChunkSizes::new(2));
     let (saved, saver) = capture_saver();
 
@@ -797,7 +796,8 @@ fn validate_patch_name_rejects_parent_component_in_middle() {
 
 #[test]
 fn validate_patch_name_accepts_consecutive_dots_in_filename() {
-    // Consecutive dots within a single filename component are not path traversal.
+    // Consecutive dots within a single filename component are not path
+    // traversal.
     assert!(validate_patch_name("foo..bar").is_ok());
 }
 
@@ -1495,14 +1495,15 @@ fn apply_hdiff_patch_blank_original_creates_diff_ref() {
     let cache = FilterCache::new(dir.path());
     let result = apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &cache);
 
-    // Should not return OriginalFileMissing; creates blank diff_ref and proceeds.
+    // Should not return OriginalFileMissing; creates blank diff_ref and
+    // proceeds.
     assert!(
         !matches!(result, Err(SophonError::OriginalFileMissing(_))),
         "Should not return OriginalFileMissing for blank original: {:?}",
         result
     );
-    // Patch fails because the chunk is not a real HDiff, but the blank-file check
-    // passes.
+    // Patch fails because the chunk is not a real HDiff, but the blank-file
+    // check passes.
     let diff_ref_path = dir.path().join("patching/patch_chunk.bin.diff_ref");
     assert!(
         !diff_ref_path.exists(),
@@ -1540,7 +1541,8 @@ fn apply_hdiff_patch_blank_original_by_size() {
     let cache = FilterCache::new(dir.path());
     let result = apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &cache);
 
-    // Should not return OriginalFileMissing; creates blank diff_ref and proceeds.
+    // Should not return OriginalFileMissing; creates blank diff_ref and
+    // proceeds.
     assert!(
         !matches!(result, Err(SophonError::OriginalFileMissing(_))),
         "Should not return OriginalFileMissing for blank original (size=0): {:?}",
@@ -1565,7 +1567,8 @@ fn apply_hdiff_patch_blank_original_by_hash_ignores_size() {
     // Dummy chunk file so the patch chunk exists check passes.
     fs::write(chunks_dir.join("patch_chunk3.bin"), b"dummy chunk data").unwrap();
 
-    // Original file does not exist; hash indicates blank but size is inconsistent.
+    // Original file does not exist; hash indicates blank but size is
+    // inconsistent.
     let asset = PatchAssetInfo {
         target_file_path: "new_file2.bin".to_string(),
         target_file_size: 0,
@@ -2445,7 +2448,8 @@ async fn publication_saves_valid_state_before_marker_and_rejects_changed_source(
     let dir = tempfile::tempdir().unwrap();
     super::super::write_installed_tag(dir.path(), "1.0").unwrap();
     let state = snapshot_state(&[("game", "empty", b"")], "http://localhost");
-    // No patch bytes required. State publication failure must not create a marker.
+    // No patch bytes required. State publication failure must not create a
+    // marker.
     let state_path = PreinstallState::state_file_path(dir.path(), &state.tag);
     fs::create_dir(&state_path).unwrap();
     let result = preinstall_download(
@@ -2881,7 +2885,8 @@ async fn legacy_exact_recovery_preserves_en_us_omitted_voice_and_migrates_before
     snapshot.vo_lang = "en-US".into();
     snapshot.game_id = "hk4e".into();
     serve_target_chunks(&server, &mut state, fields).await;
-    // An available English target must not broaden this old package's historical scope.
+    // An available English target must not broaden this old package's
+    // historical scope.
     let extra = snapshot_state(
         &[("game", "unused", b""), ("en-us", "voice.bin", b"new")],
         &server.uri(),
@@ -2921,8 +2926,8 @@ async fn legacy_exact_recovery_preserves_en_us_omitted_voice_and_migrates_before
     save_preinstall_state(dir.path(), &state).unwrap();
     let requests = Mutex::new(Vec::new());
     let client = Client::new();
-    // Cancel immediately after exact recovery: migration must persist before the
-    // first game-file mutation, and the retry must need no metadata at all.
+    // Cancel immediately after exact recovery: migration must persist before
+    // the first game-file mutation, and the retry must need no metadata at all.
     let handle = DownloadHandle::new();
     let result = apply_preinstall_with_resolver(
         &client,
@@ -3033,7 +3038,8 @@ async fn missing_legacy_metadata_and_failed_migration_keep_payloads_and_version(
             .to_string()
             .contains("normal update/repair")
     );
-    // Force the atomic migration write to fail without touching the original JSON.
+    // Force the atomic migration write to fail without touching the original
+    // JSON.
     fs::create_dir(PreinstallState::state_file_path(dir.path(), "2.0").with_extension("json.tmp"))
         .unwrap();
     assert!(
@@ -3645,7 +3651,9 @@ async fn download_over_bounded_scheduler_deduplicates_and_assembles_exact_output
     let mut asset_index: rustc_hash::FxHashMap<String, usize> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(manifest.assets.len(), Default::default());
     for (i, a) in manifest.assets.iter().enumerate() {
-        asset_index.entry(a.asset_name_str().to_string()).or_insert(i);
+        asset_index
+            .entry(a.asset_name_str().to_string())
+            .or_insert(i);
     }
     let context = DownloadOverContext {
         manifests: [(

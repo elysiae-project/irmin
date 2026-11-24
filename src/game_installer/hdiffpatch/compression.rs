@@ -115,7 +115,8 @@ pub(crate) fn get_clip_stream(
                     // instead of resetting. ForceIgnoreChecksum(true) skips
                     // the zstd frame checksum — hdiffpatch data is trusted.
                     let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(tight_log));
-                    let _ = ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
+                    let _ =
+                        ctx.set_parameter(zstd::zstd_safe::DParameter::ForceIgnoreChecksum(true));
                     let mut decoder = zstd::stream::read::Decoder::with_context(
                         std::io::BufReader::with_capacity(256 * 1024, limited),
                         &mut ctx,

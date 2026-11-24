@@ -20,8 +20,8 @@ use super::assembly_opt::{
 };
 use super::error::{SophonError, SophonResult};
 
-/// Buffer size for reading from the zstd decoder and writing to the output file.
-/// Buffer size used by eager streaming decompression.
+/// Buffer size for reading from the zstd decoder and writing to the output
+/// file. Buffer size used by eager streaming decompression.
 pub const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[cfg(feature = "bench-diagnostics")]
@@ -63,7 +63,8 @@ fn thread_cpu_time_ns() -> u64 {
 /// decompressed output directly to `out_file` at `chunk_offset`.
 ///
 /// Returns the number of decompressed bytes written on success.
-/// Decompress a chunk directly into output storage without retaining a `.zstd` intermediate.
+/// Decompress a chunk directly into output storage without retaining a `.zstd`
+/// intermediate.
 pub fn eager_decompress_chunk(
     compressed_data: &[u8],
     out_file: &File,
@@ -414,9 +415,10 @@ fn stream_decompress_to_file_inner(
             .map_err(|error| SophonError::Io(io::Error::other(error.to_string())))?;
         #[cfg(feature = "bench-diagnostics")]
         if let Some(timings) = timings.as_ref() {
-            timings
-                .decoder_thread_cpu_ns
-                .fetch_add(thread_cpu_time_ns().saturating_sub(decoder_thread_started), Ordering::Relaxed);
+            timings.decoder_thread_cpu_ns.fetch_add(
+                thread_cpu_time_ns().saturating_sub(decoder_thread_started),
+                Ordering::Relaxed,
+            );
         }
         #[cfg(not(feature = "bench-diagnostics"))]
         let _ = decoder.finish();

@@ -1,4 +1,7 @@
-#![cfg_attr(not(any(test, feature = "preinstall")), allow(dead_code, unused_imports))]
+#![cfg_attr(
+    not(any(test, feature = "preinstall")),
+    allow(dead_code, unused_imports)
+)]
 
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -52,7 +55,8 @@ impl HDiff {
         Self::with_offset(source_path, diff_path, dest_path, 0)
     }
 
-    /// Create a patch operation with explicit source, diff, and destination offsets.
+    /// Create a patch operation with explicit source, diff, and destination
+    /// offsets.
     pub fn with_offset(
         source_path: String,
         diff_path: String,
@@ -262,8 +266,9 @@ impl HDiff {
                 )
                 .into());
             }
-            // mmap avoids per-cover seek/read calls while kernel readahead stays adaptive.
-            // Falls back to File if mmap fails; page residency stays demand-driven.
+            // mmap avoids per-cover seek/read calls while kernel readahead
+            // stays adaptive. Falls back to File if mmap fails; page residency
+            // stays demand-driven.
             let use_mmap = matches!(source_backend, SourceBackend::Mmap);
             if old_len > 0 && use_mmap {
                 let map_len = usize::try_from(old_len).map_err(|_| {
@@ -355,7 +360,8 @@ impl HDiff {
             };
 
             if header_info.is_single_compressed_diff {
-                // Direct slice path avoids seek+read_exact vtable dispatch per cover chunk.
+                // Direct slice path avoids seek+read_exact vtable dispatch per
+                // cover chunk.
                 let old_slice = source_mmap.as_ref().map(|g| g.as_slice());
                 if let Some(slice) = old_slice {
                     super::patch_sf::PatchSF::new(header_info).patch_with_slice(
@@ -624,7 +630,8 @@ impl BackgroundFlushWriter {
     fn submit_pending(&mut self) {
         #[cfg(unix)]
         {
-            let ready_end = self.next_offset / BACKGROUND_FLUSH_INTERVAL * BACKGROUND_FLUSH_INTERVAL;
+            let ready_end =
+                self.next_offset / BACKGROUND_FLUSH_INTERVAL * BACKGROUND_FLUSH_INTERVAL;
             if ready_end > self.submitted_until {
                 let len = ready_end - self.submitted_until;
                 unsafe {
@@ -656,7 +663,7 @@ impl std::io::Write for BackgroundFlushWriter {
 
 #[cfg(test)]
 mod output_tests {
-    use super::{BackgroundFlushWriter, CountingWriter, BACKGROUND_FLUSH_INTERVAL};
+    use super::{BACKGROUND_FLUSH_INTERVAL, BackgroundFlushWriter, CountingWriter};
     use std::io::{Cursor, Write};
 
     #[test]
@@ -727,7 +734,8 @@ mod output_tests {
         // Small writes below the next boundary submit nothing further.
         writer.write_all(&[1, 2, 3, 4]).unwrap();
         assert_eq!(
-            writer.submitted_until, BACKGROUND_FLUSH_INTERVAL * 2,
+            writer.submitted_until,
+            BACKGROUND_FLUSH_INTERVAL * 2,
             "sub-interval writes must not advance the submitted range"
         );
         writer.flush().unwrap();
@@ -776,7 +784,10 @@ mod output_tests {
         );
         let half = (BACKGROUND_FLUSH_INTERVAL / 2) as usize;
         writer.write_all(&vec![1u8; half]).unwrap();
-        assert_eq!(writer.submitted_until, 0, "half an interval submits nothing");
+        assert_eq!(
+            writer.submitted_until, 0,
+            "half an interval submits nothing"
+        );
         writer.write_all(&vec![2u8; half]).unwrap();
         assert_eq!(
             writer.submitted_until, BACKGROUND_FLUSH_INTERVAL,

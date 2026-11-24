@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-
 /// Interval between adaptive scaling checks (milliseconds).
 const ADJUST_INTERVAL_MS: u64 = 500;
 /// Minimum interval between actual adjustments to let throughput stabilize.
@@ -15,7 +14,9 @@ const SCALE_UP_FACTOR: f64 = 1.5;
 /// Scale-down multiplier when a bottleneck is detected.
 const SCALE_DOWN_FACTOR: f64 = 0.5;
 /// Minimum concurrency during adaptive phase (same as during download).
-fn min_adaptive_target() -> usize { super::assembly_concurrency() }
+fn min_adaptive_target() -> usize {
+    super::assembly_concurrency()
+}
 
 /// Assembly concurrency controller.
 ///
@@ -79,7 +80,9 @@ impl AdaptiveAssembly {
         if self.download_active.load(Ordering::Relaxed) {
             super::assembly_concurrency()
         } else {
-            self.target.load(Ordering::Relaxed).max(min_adaptive_target())
+            self.target
+                .load(Ordering::Relaxed)
+                .max(min_adaptive_target())
         }
     }
 

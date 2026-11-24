@@ -475,7 +475,11 @@ fn from_manifest_dedups_shared_chunk_names_across_files() {
     let items = [(0, 0), (1, 0)];
     let lookup = ChunkNameLookup::from_manifest(Arc::clone(&manifest), items.into_iter());
 
-    assert_eq!(lookup.name_locs.len(), 1, "shared chunk name must dedup to one dense index");
+    assert_eq!(
+        lookup.name_locs.len(),
+        1,
+        "shared chunk name must dedup to one dense index"
+    );
     let idx = lookup
         .lookup("shared")
         .expect("shared chunk name is findable");
@@ -513,7 +517,9 @@ fn from_arena_empty_lookup_returns_none() {
 #[test]
 fn eytzinger_lookup_matches_brute_force_across_sizes() {
     use super::super::compact_manifest::StringArena;
-    for n in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 127, 128, 129] {
+    for n in [
+        0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 127, 128, 129,
+    ] {
         let names: Vec<String> = (0..n).map(|i| format!("chunk_{i:04}")).collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let arena = StringArena::from(name_refs.as_slice());
@@ -527,7 +533,11 @@ fn eytzinger_lookup_matches_brute_force_across_sizes() {
             );
         }
         // Misses should return None.
-        assert_eq!(lookup.lookup("chunk_9999"), None, "n={n}: miss should be None");
+        assert_eq!(
+            lookup.lookup("chunk_9999"),
+            None,
+            "n={n}: miss should be None"
+        );
         assert_eq!(lookup.lookup(""), None, "n={n}: empty miss should be None");
         // Boundary misses near existing names.
         if n > 0 {
@@ -1306,7 +1316,14 @@ async fn check_needs_download_valid_cached_file() {
         rel_path,
         VerificationEntry {
             size: data.len() as u64,
-            md5: { let mut m = [0u8; 16]; let b = super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default(); if b.len() == 16 { m.copy_from_slice(&b); } m },
+            md5: {
+                let mut m = [0u8; 16];
+                let b = super::super::assembly_opt::hex_to_bytes(&md5_hex).unwrap_or_default();
+                if b.len() == 16 {
+                    m.copy_from_slice(&b);
+                }
+                m
+            },
             mtime_secs: mtime,
         },
     );
@@ -1398,7 +1415,14 @@ async fn benchmark_resume_chunk_check_dispatch() {
                 name,
                 VerificationEntry {
                     size: data.len() as u64,
-                    md5: { let mut m = [0u8; 16]; let raw = hex::decode(&md5).unwrap(); if raw.len() == 16 { m.copy_from_slice(&raw); } m },
+                    md5: {
+                        let mut m = [0u8; 16];
+                        let raw = hex::decode(&md5).unwrap();
+                        if raw.len() == 16 {
+                            m.copy_from_slice(&raw);
+                        }
+                        m
+                    },
                     mtime_secs,
                 },
             );
@@ -1817,12 +1841,7 @@ fn build_installer_data_filters_directories() {
     };
 
     let game_dir = tempfile::tempdir().unwrap();
-    let (data, all_files) = build_installer_data(
-        vec![installer],
-        "unknown",
-        game_dir.path(),
-        &[],
-    );
+    let (data, all_files) = build_installer_data(vec![installer], "unknown", game_dir.path(), &[]);
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].file_count, 1);
     assert_eq!(all_files.len(), 1);
@@ -1870,15 +1889,14 @@ fn build_installer_data_counts_surviving_assets_per_installer() {
     let game_dir = tempfile::tempdir().unwrap();
     write_hkrpg_blacklist(game_dir.path(), "totally_unrelated_name");
 
-    let (data, all_files) = build_installer_data(
-        vec![first, second],
-        "hkrpg",
-        game_dir.path(),
-        &[],
-    );
+    let (data, all_files) =
+        build_installer_data(vec![first, second], "hkrpg", game_dir.path(), &[]);
     assert_eq!(data.len(), 2);
     assert_eq!(data[0].file_count, 2);
-    assert_eq!(data[1].file_count, 2, "non-matching blacklist removes nothing");
+    assert_eq!(
+        data[1].file_count, 2,
+        "non-matching blacklist removes nothing"
+    );
     assert_eq!(all_files.len(), 4);
 
     // A removal inside one segment must decrement only that segment.
@@ -1907,14 +1925,13 @@ fn build_installer_data_counts_surviving_assets_per_installer() {
         matching_field: "game".into(),
         manifest_hash: "h2".into(),
     };
-    let (data, all_files) = build_installer_data(
-        vec![first, second],
-        "hkrpg",
-        game_dir.path(),
-        &[],
-    );
+    let (data, all_files) =
+        build_installer_data(vec![first, second], "hkrpg", game_dir.path(), &[]);
     assert_eq!(data[0].file_count, 2, "first segment untouched");
-    assert_eq!(data[1].file_count, 1, "blacklisted asset must not be counted");
+    assert_eq!(
+        data[1].file_count, 1,
+        "blacklisted asset must not be counted"
+    );
     assert_eq!(all_files.len(), 3);
     assert_eq!(all_files[2].asset_name, "mix_b.pak");
 }
@@ -2828,7 +2845,9 @@ async fn install_downloads_assembles_and_commits_single_eager_chunk() {
         asset_hash_md5: file_md5.clone().into(),
     };
     let installer = SophonInstaller {
-        manifest: SophonManifestProto { assets: vec![asset] },
+        manifest: SophonManifestProto {
+            assets: vec![asset],
+        },
         chunk_download: DownloadInfo {
             encryption: 0,
             password: String::new(),
@@ -2975,7 +2994,9 @@ async fn install_update_removes_deleted_files_and_assembles_new_output() {
         asset_hash_md5: decompressed_hash.into(),
     };
     let installer = SophonInstaller {
-        manifest: SophonManifestProto { assets: vec![asset] },
+        manifest: SophonManifestProto {
+            assets: vec![asset],
+        },
         chunk_download: DownloadInfo {
             encryption: 0,
             password: String::new(),
@@ -3018,11 +3039,7 @@ async fn install_update_removes_deleted_files_and_assembles_new_output() {
     )
     .await;
 
-    assert!(
-        result.is_ok(),
-        "update install failed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "update install failed: {:?}", result.err());
     // The stale file must be removed by the deleted-files cleanup branch.
     assert!(
         !stale_file.exists(),
@@ -3055,8 +3072,7 @@ async fn install_resume_phase1_checking_files_does_not_panic_with_matching_state
     // persisted DownloadState so resolve_resume_owned sets is_resume=true.
     let chunk_name = "resumable-chunk";
     let chunk_data = b"resume payload bytes";
-    std::fs::write(chunks_dir.join(format!("{chunk_name}.zstd")), chunk_data)
-        .unwrap();
+    std::fs::write(chunks_dir.join(format!("{chunk_name}.zstd")), chunk_data).unwrap();
 
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -3136,7 +3152,8 @@ async fn install_resume_phase1_checking_files_does_not_panic_with_matching_state
 ///
 /// This test requires network access to the live Sophon API and is
 /// `#[ignore]`'d so it does not run in CI by default. Run with:
-///   cargo test --lib -- --ignored sophon_download_live_api_reaches_install_without_panic
+///   cargo test --lib -- --ignored
+/// sophon_download_live_api_reaches_install_without_panic
 ///
 /// DO NOT delete: this is the only test that exercises the full
 /// `Sophon::download` → `build_installers` → `install()` path with a real
@@ -3199,4 +3216,3 @@ async fn sophon_download_live_api_reaches_install_without_panic() {
         "FetchingManifest event must be emitted; got: {events:?}"
     );
 }
-

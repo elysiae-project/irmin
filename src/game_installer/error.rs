@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Errors returned by API fetching, chunk transfer, patching, assembly, and verification.
+/// Errors returned by API fetching, chunk transfer, patching, assembly, and
+/// verification.
 ///
 /// Variants preserve structured values where callers may need to distinguish
 /// retryable failures or report expected and actual file properties.
@@ -137,9 +138,10 @@ pub enum SophonError {
 }
 
 impl SophonError {
-    /// Whether retrying the failed operation may succeed without changing inputs.
-    /// Network/I/O, checksum, size, resume, download, and decompression failures
-    /// are retryable; cancellation and deterministic validation/API failures are not.
+    /// Whether retrying the failed operation may succeed without changing
+    /// inputs. Network/I/O, checksum, size, resume, download, and decompression
+    /// failures are retryable; cancellation and deterministic validation/API
+    /// failures are not.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(_)

@@ -117,8 +117,8 @@ pub(crate) async fn fetch_manifest_proto(
     let manifest: SophonManifestProto = if dl.is_compressed() {
         let raw = tokio::task::spawn_blocking(move || {
             let src = bytes.as_ref();
-            // Use one-shot DCtx::decompress when the frame content size is known
-            // and reasonable. This is significantly faster than streaming
+            // Use one-shot DCtx::decompress when the frame content size is
+            // known and reasonable. This is significantly faster than streaming
             // Decoder + read_to_end for typical manifest sizes.
             const MAX_ONESHOT_SIZE: u64 = 256 * 1024 * 1024;
             let content_size = zstd::zstd_safe::get_frame_content_size(src).ok().flatten();
@@ -355,7 +355,8 @@ pub async fn fetch_patch_build(
     unreachable!()
 }
 
-/// Decoded patch manifest together with the build metadata needed to resolve its entries.
+/// Decoded patch manifest together with the build metadata needed to resolve
+/// its entries.
 #[cfg(feature = "preinstall")]
 pub struct PatchManifestWithMeta {
     pub patch_manifest: SophonPatchProto,
@@ -427,7 +428,8 @@ pub fn vo_lang_matches(matching_field: &str, vo_lang: &str) -> bool {
     let Some(locale) = normalize_vo_locale(vo_lang) else {
         return false;
     };
-    // Preserve language-prefix substring matching for decorated manifest fields.
+    // Preserve language-prefix substring matching for decorated manifest
+    // fields.
     matching_field.to_ascii_lowercase().contains(&locale[..2])
 }
 
@@ -444,7 +446,8 @@ pub fn is_known_vo_locale(matching_field: &str) -> bool {
 
 #[cfg(feature = "update")]
 #[inline]
-/// Parse the service size representation into bytes; malformed input returns an error.
+/// Parse the service size representation into bytes; malformed input returns an
+/// error.
 pub fn parse_size(s: &str) -> SophonResult<u64> {
     s.parse()
         .map_err(|_| SophonError::InvalidSizeString(s.to_string()))

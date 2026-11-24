@@ -54,8 +54,7 @@ pub(crate) fn write_lang_file(
     mapper: fn(&str) -> Option<&'static str>,
 ) -> std::io::Result<()> {
     let mut existing: Vec<String> = Vec::new();
-    if let Ok(content) = fs::read_to_string(path)
-    {
+    if let Ok(content) = fs::read_to_string(path) {
         for line in content.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {

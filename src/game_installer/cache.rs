@@ -146,12 +146,14 @@ pub fn load_verification_cache(game_dir: &Path) -> DashMap<String, VerificationE
         log::debug!("Trimmed verification cache to {cache_len} entries");
     }
 
-    // Stale entries are pruned lazily during the next check_file_md5_cached call.
+    // Stale entries are pruned lazily during the next check_file_md5_cached
+    // call.
 
     cache
 }
 
-/// Atomically replace the on-disk verification cache via a synced temporary file.
+/// Atomically replace the on-disk verification cache via a synced temporary
+/// file.
 pub fn save_verification_cache(
     game_dir: &Path,
     cache: &DashMap<String, VerificationEntry>,
@@ -203,7 +205,8 @@ pub fn check_file_md5_cached(
     check_file_md5_with_cache_key(path, expected_size, expected_md5, &cache_key, cache)
 }
 
-/// As [`check_file_md5_cached`], also returning the observed size when the file exists.
+/// As [`check_file_md5_cached`], also returning the observed size when the file
+/// exists.
 pub fn check_file_md5_cached_with_size(
     path: &Path,
     expected_size: u64,
@@ -215,7 +218,8 @@ pub fn check_file_md5_cached_with_size(
     check_file_md5_with_cache_key_and_size(path, expected_size, expected_md5, &cache_key, cache)
 }
 
-/// Verify a file using an explicit cache key; returns false for missing or mismatched files.
+/// Verify a file using an explicit cache key; returns false for missing or
+/// mismatched files.
 pub fn check_file_md5_with_cache_key(
     path: &Path,
     expected_size: u64,
@@ -227,7 +231,8 @@ pub fn check_file_md5_with_cache_key(
         .map(|(ok, _)| ok)
 }
 
-/// As [`check_file_md5_with_cache_key`], returning `Some(actual_size)` when present.
+/// As [`check_file_md5_with_cache_key`], returning `Some(actual_size)` when
+/// present.
 #[inline]
 pub fn check_file_md5_with_cache_key_and_size(
     path: &Path,
@@ -340,8 +345,8 @@ fn check_file_md5_with_metadata(
     Ok((matches, Some(actual_size)))
 }
 
-/// Compute the raw 16-byte MD5 digest of a file using buffered sequential reads.
-/// Returns an I/O error if opening or reading the file fails.
+/// Compute the raw 16-byte MD5 digest of a file using buffered sequential
+/// reads. Returns an I/O error if opening or reading the file fails.
 #[inline]
 pub fn file_md5_digest(path: &Path) -> io::Result<[u8; 16]> {
     file_md5_digest_with_options(path, MD5_READ_BUFFER_SIZE, true)
@@ -394,7 +399,8 @@ fn file_md5_digest_with_file(
     advise_page_cache: bool,
     known_len: Option<u64>,
 ) -> io::Result<[u8; 16]> {
-    // Validate independently because benchmark callers can pass a File directly.
+    // Validate independently because benchmark callers can pass a File
+    // directly.
     if buffer_capacity == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

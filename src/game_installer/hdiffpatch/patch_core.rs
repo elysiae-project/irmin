@@ -668,8 +668,8 @@ pub(super) fn wrapping_add_slices(dst: &mut [u8], src: &[u8]) {
     wrapping_add_slices_generic(dst, src);
 }
 
-/// Element-wise wrapping add of two source slices into `dst` (`dst[i] = a[i] + b[i]`).
-/// Uses AVX2 when available at runtime, falling back to a generic loop.
+/// Element-wise wrapping add of two source slices into `dst` (`dst[i] = a[i] +
+/// b[i]`). Uses AVX2 when available at runtime, falling back to a generic loop.
 #[inline]
 pub(super) fn wrapping_add_two_into(dst: &mut [u8], a: &[u8], b: &[u8]) {
     let n = dst.len();
@@ -892,8 +892,9 @@ pub(crate) fn tbytes_set_rle_single(
         .min(shared_buffer.len() as i64);
 
     if rle_loader.mem_set_value != 0 {
-        // Operate directly on the cache Vec — avoids two memcpys through shared_buffer.
-        // The broadcast add is SIMD-accelerated when AVX2 is available.
+        // Operate directly on the cache Vec — avoids two memcpys through
+        // shared_buffer. The broadcast add is SIMD-accelerated when AVX2 is
+        // available.
         let pos = out_cache.position() as usize;
         let len = mem_set_step as usize;
         let cache_data = out_cache.get_mut();
@@ -1389,8 +1390,8 @@ mod tests {
         );
 
         assert!(result.is_ok(), "tbytes_set_rle_single should succeed");
-        // 0xFF + 0x01 = 0x00 (wrapped), 0xFF + 0x01 = 0x00, 0x00 + 0x01 = 0x01, 0x7F +
-        // 0x01 = 0x80
+        // 0xFF + 0x01 = 0x00 (wrapped), 0xFF + 0x01 = 0x00, 0x00 + 0x01 = 0x01,
+        // 0x7F + 0x01 = 0x80
         let data = cache.get_ref();
         assert_eq!(data[0], 0x00, "0xFF + 0x01 should wrap to 0x00");
         assert_eq!(data[1], 0x00, "0xFF + 0x01 should wrap to 0x00");

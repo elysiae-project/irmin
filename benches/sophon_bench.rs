@@ -44,9 +44,10 @@ fn fill_file(path: &std::path::Path, mib: usize, fill: u8) {
     f.sync_all().expect("sync");
 }
 
-/// Generate pseudo-random data with realistic compression ratio (~2-3:1 at zstd level 3).
-/// Uses xoshiro256** seeded deterministically. Every 4th 1 KiB block is a repeat of the
-/// previous block, giving zstd something to match without collapsing to trivial ratios.
+/// Generate pseudo-random data with realistic compression ratio (~2-3:1 at zstd
+/// level 3). Uses xoshiro256** seeded deterministically. Every 4th 1 KiB block
+/// is a repeat of the previous block, giving zstd something to match without
+/// collapsing to trivial ratios.
 fn gen_prng_data(seed: u64, len: usize) -> Vec<u8> {
     let mut s = [
         seed,
@@ -125,7 +126,8 @@ fn bench_io_copy(c: &mut Criterion) {
         });
     });
 
-    // `pread` + `pwrite` + MD5 is the actual assembly hot path (`write_all_at`).
+    // `pread` + `pwrite` + MD5 is the actual assembly hot path
+    // (`write_all_at`).
     group.bench_function(BenchmarkId::new("pread_pwrite_md5", COPY_MIB), |b| {
         b.iter(|| {
             evict_page_cache(&src);
@@ -199,7 +201,11 @@ fn bench_md5_multibuffer(c: &mut Criterion) {
         let expect = fast_md5::digest(m);
         assert_eq!(outputs[i], expect, "lane {i} digest mismatch");
         let _ = simd_digest; // keep import honest: also compare crate one-shot
-        assert_eq!(simd_digest(&inputs[i]), expect, "lane {i} one-shot mismatch");
+        assert_eq!(
+            simd_digest(&inputs[i]),
+            expect,
+            "lane {i} one-shot mismatch"
+        );
     }
 
     group.finish();
@@ -225,7 +231,8 @@ fn bench_md5_resident(c: &mut Criterion) {
     group.finish();
 }
 
-/// MD5 throughput of a 50 MiB file via the `md-5` crate (the verification hasher).
+/// MD5 throughput of a 50 MiB file via the `md-5` crate (the verification
+/// hasher).
 fn bench_md5(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("md5.bin");
@@ -261,8 +268,8 @@ const ZSTD_MIB: u64 = 8;
 
 /// zstd decompression throughput with varying input (BufReader) buffer sizes
 /// while keeping a fixed 1 MiB output buffer to match the production path in
-/// `assembly_opt.rs` (`ASSEMBLY_BUFFER_SIZE` = 1 MiB output, `FILE_WRITE_BUFFER_SIZE`
-/// = 256 KiB input).
+/// `assembly_opt.rs` (`ASSEMBLY_BUFFER_SIZE` = 1 MiB output,
+/// `FILE_WRITE_BUFFER_SIZE` = 256 KiB input).
 fn bench_zstd_decompress(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let raw = gen_prng_data(0xBEEF, ZSTD_MIB as usize * 1024 * 1024);
@@ -307,8 +314,9 @@ fn bench_zstd_decompress(c: &mut Criterion) {
     group.finish();
 }
 
-/// lz4 and deflate decompression throughput with varying input (BufReader) buffer sizes.
-/// Measures the hdiffpatch decompression path for lz4- and deflate-compressed clips.
+/// lz4 and deflate decompression throughput with varying input (BufReader)
+/// buffer sizes. Measures the hdiffpatch decompression path for lz4- and
+/// deflate-compressed clips.
 fn bench_lz4_deflate_decompress(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let raw = gen_prng_data(0xBEEF, ZSTD_MIB as usize * 1024 * 1024);
@@ -639,7 +647,6 @@ fn bench_assembly_e2e(c: &mut Criterion) {
     group.finish();
 }
 
-
 /// Assembly with many small chunks — exercises the worker loop's per-chunk
 /// accessor calls, hash lookups, and sync_and_evict_range overhead. Uses
 /// 1000 chunks of 64 KiB to amplify per-chunk costs relative to I/O.
@@ -702,7 +709,6 @@ fn bench_assembly_many_chunks(c: &mut Criterion) {
     });
     group.finish();
 }
-
 
 /// Many-small-files fixture: `files` assets, each `chunks_per_file` zstd
 /// chunks of `chunk_kib` KiB — the shape where per-file durability barriers
@@ -785,7 +791,9 @@ fn bench_assembly_epoch_durability(c: &mut Criterion) {
         .map(|n| n.into_boxed_str())
         .collect();
     let name_refs: Vec<&str> = names.iter().map(|n| n.as_ref()).collect();
-    let lookup = Arc::new(ChunkNameLookup::from_arena(StringArena::from(name_refs.as_slice())));
+    let lookup = Arc::new(ChunkNameLookup::from_arena(StringArena::from(
+        name_refs.as_slice(),
+    )));
     let shared_refcounts: Arc<Vec<AtomicU32>> = Arc::new(
         (0..FILES * CHUNKS_PER_FILE)
             .map(|_| AtomicU32::new(1000))
@@ -1275,8 +1283,8 @@ fn bench_verify_file_md5(c: &mut Criterion) {
             }
         });
     });
-    // Same files, but only open + read + hash: excludes cache bookkeeping so the
-    // read-buffer allocation is the dominant per-file variable.
+    // Same files, but only open + read + hash: excludes cache bookkeeping so
+    // the read-buffer allocation is the dominant per-file variable.
     tiny_group.bench_function(BenchmarkId::new("digest_only", tiny_files.len()), |b| {
         let tiny_files = &tiny_files;
         b.iter(|| {
@@ -1325,7 +1333,8 @@ fn bench_file_md5_buffer_capacity(c: &mut Criterion) {
 }
 
 #[cfg(feature = "bench-internals")]
-// The fixture is read during setup, so digest cases exercise warm page-cache data.
+// The fixture is read during setup, so digest cases exercise warm page-cache
+// data.
 fn bench_file_metadata_cost(c: &mut Criterion) {
     use irmin_rs::game_installer::cache::benchmark::{
         file_md5_digest_with_file, file_md5_digest_with_options,
@@ -1512,7 +1521,8 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_zstd_oneshot(c: &mut Criterion) {    let dir = tempfile::tempdir().expect("tempdir");
+fn bench_zstd_oneshot(c: &mut Criterion) {
+    let dir = tempfile::tempdir().expect("tempdir");
     let raw = gen_prng_data(0xCAFE, ONESHOT_MIB as usize * 1024 * 1024);
     let comp = zstd::encode_all(&raw[..], 3).unwrap();
     let comp_path = dir.path().join("oneshot.zst");
@@ -1901,7 +1911,8 @@ use irmin_rs::game_installer::hdiffpatch::enumerate_cover_headers_checked;
 use irmin_rs::proto_parse::SophonManifestProto;
 use prost::Message;
 /// Encode a tagged varint (tag_bit=1) into a p_sign byte + continuation bytes.
-/// Returns (p_sign_byte, continuation_bytes). `sign` is 0 (positive) or 1 (negative).
+/// Returns (p_sign_byte, continuation_bytes). `sign` is 0 (positive) or 1
+/// (negative).
 fn encode_cover_header_entry(
     sign: u8,
     inc_old_pos: i64,
@@ -1909,11 +1920,13 @@ fn encode_cover_header_entry(
     cover_length: i64,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    // p_sign byte: bit 7 = sign, bit 6 = continuation, bits 0-5 = first 6 bits of inc_old_pos
+    // p_sign byte: bit 7 = sign, bit 6 = continuation, bits 0-5 = first 6 bits
+    // of inc_old_pos
     if inc_old_pos < 64 {
         out.push((sign << 7) | (inc_old_pos as u8));
     } else {
-        // Need continuation bytes. First byte: sign | 0x40 (continuation set) | top 6 bits
+        // Need continuation bytes. First byte: sign | 0x40 (continuation set) |
+        // top 6 bits
         let bits = 64 - (inc_old_pos as u64).leading_zeros() as usize;
         let groups = (bits.saturating_sub(6) + 6) / 7 + 1; // 1 for first 6-bit group
         let shift = (groups - 1) * 7;
@@ -1984,7 +1997,8 @@ fn bench_cover_stream_decode(c: &mut Criterion) {
 const PROTO_FILES: usize = 5000;
 const PROTO_CHUNKS_PER_FILE: usize = 50;
 
-/// Generate a prost-encoded SophonManifestProto with `files` assets, each with `chunks` chunks.
+/// Generate a prost-encoded SophonManifestProto with `files` assets, each with
+/// `chunks` chunks.
 fn gen_protobuf_manifest(files: usize, chunks: usize) -> Vec<u8> {
     let assets: Vec<SophonManifestAssetProperty> = (0..files)
         .map(|f| {
@@ -2015,7 +2029,8 @@ fn gen_protobuf_manifest(files: usize, chunks: usize) -> Vec<u8> {
     manifest.encode_to_vec()
 }
 
-/// Protobuf manifest decode throughput: prost decode of 5000 assets x 50 chunks.
+/// Protobuf manifest decode throughput: prost decode of 5000 assets x 50
+/// chunks.
 fn bench_protobuf_decode(c: &mut Criterion) {
     let encoded = gen_protobuf_manifest(PROTO_FILES, PROTO_CHUNKS_PER_FILE);
     let encoded_bytes = bytes::Bytes::from(encoded.clone());
@@ -2101,7 +2116,8 @@ use irmin_rs::game_installer::hdiffpatch::{BENCH_MAX_ARRAY_POOL_LEN, BufferPool}
 
 const POOL_OPS: u64 = 1000;
 
-/// BufferPool take/return cycle throughput (the actual allocation path in hdiffpatch).
+/// BufferPool take/return cycle throughput (the actual allocation path in
+/// hdiffpatch).
 fn bench_buffer_pool(c: &mut Criterion) {
     let mut group = c.benchmark_group("buffer_pool");
     group.throughput(Throughput::Elements(POOL_OPS));
@@ -2126,11 +2142,13 @@ fn bench_buffer_pool(c: &mut Criterion) {
 // HDiffPatch E2E benchmark
 // ---------------------------------------------------------------------------
 
-/// Encode a tagged varint with tag_bit=1 (used for cover header delta encoding in v20/PatchSF).
-/// Returns bytes for the first byte (with sign in bit 7) + continuation.
+/// Encode a tagged varint with tag_bit=1 (used for cover header delta encoding
+/// in v20/PatchSF). Returns bytes for the first byte (with sign in bit 7) +
+/// continuation.
 fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
     debug_assert!(value >= 0);
-    // tag_bit=1: bit 7 = sign, bit 6 = continuation flag, bits 0-5 = first 6 bits of value
+    // tag_bit=1: bit 7 = sign, bit 6 = continuation flag, bits 0-5 = first 6
+    // bits of value
     let mut out = Vec::new();
     if value < 64 {
         out.push((sign << 7) | (value as u8));
@@ -2155,8 +2173,8 @@ fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
 }
 
 /// Generate a valid HDIFF20&nocomp patch file.
-/// Creates a patch where ~10% of 4 KiB blocks are "modified" (replaced with new data).
-/// The rest are copied from old via covers.
+/// Creates a patch where ~10% of 4 KiB blocks are "modified" (replaced with new
+/// data). The rest are copied from old via covers.
 fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let block_size = 4096usize;
     let num_blocks = old.len() / block_size;
@@ -2191,7 +2209,8 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let new_data_size = new.len() as i64;
     let old_data_size = old.len() as i64;
 
-    // Encode covers for PatchSF format (same as PatchSingle cover encoding: sign+delta, gap, length)
+    // Encode covers for PatchSF format (same as PatchSingle cover encoding:
+    // sign+delta, gap, length)
     let mut cover_buf = Vec::new();
     let mut last_old_end = 0u64;
     let mut last_new_end = 0u64;
@@ -2213,7 +2232,8 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
         last_new_end = new_pos + length;
     }
 
-    // RLE buffer: for each cover, (len0=cover_length, lenv=0) — no XOR modification
+    // RLE buffer: for each cover, (len0=cover_length, lenv=0) — no XOR
+    // modification
     let mut rle_buf = Vec::new();
     for &(_, _, length) in &covers {
         rle_buf.extend_from_slice(&encode_7bit_varint(length as i64)); // len0
@@ -2234,15 +2254,16 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
         gap_data.extend_from_slice(&new[prev_new_end as usize..]);
     }
 
-    // Build the diff stream: [buf_cover_size][buf_rle_size][covers][rle][gap_data_interleaved]
-    // For simplicity: single step with all covers, then all gap/tail data at the end.
-    // The gap data must be interspersed at the right points in the stream.
-    // PatchSF reads gaps between covers inline from the diff stream.
+    // Build the diff stream:
+    // [buf_cover_size][buf_rle_size][covers][rle][gap_data_interleaved]
+    // For simplicity: single step with all covers, then all gap/tail data at
+    // the end. The gap data must be interspersed at the right points in the
+    // stream. PatchSF reads gaps between covers inline from the diff stream.
     // So: step header + step data, then gap bytes interleaved per cover.
 
-    // Actually, patch_loop reads: step_header, step_data (covers+rle), then for each cover
-    // it checks if there's a gap and reads from diff. So the stream must be:
-    // [step_header][step_data][gap0_data][gap1_data]...[tail_data]
+    // Actually, patch_loop reads: step_header, step_data (covers+rle), then for
+    // each cover it checks if there's a gap and reads from diff. So the stream
+    // must be: [step_header][step_data][gap0_data][gap1_data]...[tail_data]
     // where gapN appears between covers where new_pos > prev_new_end.
 
     let mut diff_stream = Vec::new();
@@ -2631,8 +2652,8 @@ fn mutate_blocks(data: &[u8], mutation_rate_pct: usize) -> Vec<u8> {
     out
 }
 
-/// Encode a tagged varint with tag_bit=2 (used for RLE ctrl entries in v13 PatchSingle).
-/// rle_type occupies bits 7-6 of the first byte.
+/// Encode a tagged varint with tag_bit=2 (used for RLE ctrl entries in v13
+/// PatchSingle). rle_type occupies bits 7-6 of the first byte.
 fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
     debug_assert!(value >= 0);
     debug_assert!(rle_type < 4);
@@ -2659,7 +2680,8 @@ fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
     out
 }
 
-/// Generate a valid HDIFF13&nocomp patch file (PatchSingle format with 4 streams).
+/// Generate a valid HDIFF13&nocomp patch file (PatchSingle format with 4
+/// streams).
 fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let block_size = 4096usize;
     let num_blocks = old.len() / block_size;
@@ -2692,8 +2714,9 @@ fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     let new_data_size = new.len() as i64;
     let old_data_size = old.len() as i64;
 
-    // Build cover buffer (same encoding as used in write_cover_stream_to_output)
-    // Each cover: p_sign (tagged varint for inc_old_pos with sign), copy_length varint, cover_length varint
+    // Build cover buffer (same encoding as used in
+    // write_cover_stream_to_output) Each cover: p_sign (tagged varint for
+    // inc_old_pos with sign), copy_length varint, cover_length varint
     let mut cover_buf = Vec::new();
     let mut last_old_pos_back = 0i64;
     let mut last_new_pos_back = 0i64;
@@ -2714,8 +2737,8 @@ fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
         last_new_pos_back = new_pos + length;
     }
 
-    // Build rle_ctrl buffer: for each gap + cover, one type-0 entry covering full length
-    // Order: gap0_rle, cover0_rle, gap1_rle, cover1_rle, ...
+    // Build rle_ctrl buffer: for each gap + cover, one type-0 entry covering
+    // full length Order: gap0_rle, cover0_rle, gap1_rle, cover1_rle, ...
     let mut rle_ctrl_buf = Vec::new();
     let mut prev_new_end = 0i64;
     for &(_, new_pos, length) in &covers {
@@ -2779,7 +2802,8 @@ fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
     patch
 }
 
-/// Generate an HDIFF13 patch whose covers exercise additive or literal RLE runs.
+/// Generate an HDIFF13 patch whose covers exercise additive or literal RLE
+/// runs.
 fn gen_hdiff_v13_rle_patch(old: &[u8], run_kind: u8) -> (Vec<u8>, Vec<u8>) {
     let run_len = old.len();
     let new = old
@@ -2874,7 +2898,8 @@ fn bench_v13_large_uncovered_prefix(c: &mut Criterion) {
     group.finish();
 }
 
-/// Generate a valid HDIFF13&zstd patch (each stream section individually zstd-compressed).
+/// Generate a valid HDIFF13&zstd patch (each stream section individually
+/// zstd-compressed).
 fn gen_hdiff_v13_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     // Reuse the same cover/rle logic as nocomp variant
     let block_size = 4096usize;
@@ -2979,7 +3004,8 @@ fn gen_hdiff_v13_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
 
     patch.extend_from_slice(&cover_compressed);
     patch.extend_from_slice(&rle_ctrl_compressed);
-    // rle_code: 0 bytes (empty, compress_size=0 so reads rle_code_buf_size=0 raw)
+    // rle_code: 0 bytes (empty, compress_size=0 so reads rle_code_buf_size=0
+    // raw)
     patch.extend_from_slice(&new_data_compressed);
 
     patch
@@ -3323,15 +3349,18 @@ fn bench_planner_attribution(c: &mut Criterion) {
     };
     for (label, game_code, dir) in [
         ("unknown_game", "unknown", game_dir.path().to_path_buf()),
-        ("hkrpg_blacklist", "hkrpg", hkrpg_blacklist_dir.path().to_path_buf()),
+        (
+            "hkrpg_blacklist",
+            "hkrpg",
+            hkrpg_blacklist_dir.path().to_path_buf(),
+        ),
     ] {
         group.bench_function(BenchmarkId::new("legacy_name_map", label), |b| {
             b.iter_batched(
                 || plan_args(planner_fixture_installers(), game_code, &dir),
                 |(installers, game_code, dir, langs)| {
-                    let counts = bench_internals::legacy_plan_counts(
-                        installers, &game_code, &dir, &langs,
-                    );
+                    let counts =
+                        bench_internals::legacy_plan_counts(installers, &game_code, &dir, &langs);
                     std::hint::black_box(counts);
                 },
                 BatchSize::PerIteration,
@@ -3424,9 +3453,7 @@ fn bench_assembly_small_old_chunk_hash(c: &mut Criterion) {
         // Rotating destinations so each iteration covers a different region
         // of the sparse output; sources rotate inside the real old file.
         let dests: Vec<u64> = (0..CHUNKS_PER_SAMPLE)
-            .map(|i| {
-                ((i as u64) * chunk_len as u64 * 7 + 17) % (OUT_LEN - chunk_len as u64 * 8)
-            })
+            .map(|i| ((i as u64) * chunk_len as u64 * 7 + 17) % (OUT_LEN - chunk_len as u64 * 8))
             .collect();
         let srcs: Vec<u64> = (0..CHUNKS_PER_SAMPLE)
             .map(|i| ((i as u64) * chunk_len as u64 * 3) % (SRC_LEN as u64 - chunk_len as u64))
@@ -3495,7 +3522,7 @@ fn bench_assembly_small_old_chunk_hash(c: &mut Criterion) {
 
 #[cfg(feature = "benchmark")]
 fn bench_chunk_bitmap_sync(c: &mut Criterion) {
-    use irmin_rs::game_installer::chunk_bitmap::{legacy_truncate_sync_replica, ChunkBitmap};
+    use irmin_rs::game_installer::chunk_bitmap::{ChunkBitmap, legacy_truncate_sync_replica};
 
     // 100k chunks = 12.5 KiB body. The periodic saver syncs every 500
     // chunk completions, so each round marks 500 fresh bits then syncs
@@ -3517,10 +3544,9 @@ fn bench_chunk_bitmap_sync(c: &mut Criterion) {
     group.bench_function("legacy_truncate_reopen", |b| {
         b.iter_batched(
             || {
-                let path = dir.path().join(format!(
-                    "legacy-{}.bitmap",
-                    std::process::id()
-                ));
+                let path = dir
+                    .path()
+                    .join(format!("legacy-{}.bitmap", std::process::id()));
                 let bm = ChunkBitmap::create(&path, TOTAL_CHUNKS).unwrap();
                 (path, bm)
             },
@@ -3545,10 +3571,9 @@ fn bench_chunk_bitmap_sync(c: &mut Criterion) {
     group.bench_function("in_place", |b| {
         b.iter_batched(
             || {
-                let path = dir.path().join(format!(
-                    "inplace-{}.bitmap",
-                    std::process::id()
-                ));
+                let path = dir
+                    .path()
+                    .join(format!("inplace-{}.bitmap", std::process::id()));
                 let bm = ChunkBitmap::create(&path, TOTAL_CHUNKS).unwrap();
                 (path, bm)
             },
@@ -3596,10 +3621,8 @@ fn bench_eager_stream_input_chain(c: &mut Criterion) {
     }
     let compressed = zstd::encode_all(std::io::Cursor::new(&data), 3).unwrap();
     drop(data);
-    let decompressed_hash = fast_md5::digest(
-        &zstd::decode_all(std::io::Cursor::new(&compressed)).unwrap(),
-    )
-    .to_vec();
+    let decompressed_hash =
+        fast_md5::digest(&zstd::decode_all(std::io::Cursor::new(&compressed)).unwrap()).to_vec();
 
     /// Yields the compressed stream in FRAME_KIB slices, like the
     /// channel frames production feeds the chunk reader.
@@ -3631,7 +3654,6 @@ fn bench_eager_stream_input_chain(c: &mut Criterion) {
             Ok(count)
         }
     }
-
 
     let mut group = c.benchmark_group("eager_stream_input_chain");
     group.throughput(Throughput::Bytes(DATA_MIB as u64 * 1024 * 1024));
@@ -3695,11 +3717,11 @@ fn bench_eager_stream_input_chain(c: &mut Criterion) {
 #[cfg(feature = "bench-internals")]
 fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
     use dashmap::DashMap;
+    use irmin_rs::game_installer::installer::StateSaver;
+    use irmin_rs::game_installer::preinstall::PatchChunkInfo;
     use irmin_rs::game_installer::preinstall::bench_internals::{
         ChunkSizes, legacy_dashmap_snapshot, save_state_snapshot,
     };
-    use irmin_rs::game_installer::installer::StateSaver;
-    use irmin_rs::game_installer::preinstall::PatchChunkInfo;
 
     const COUNT: usize = 200_000;
     let names: Vec<String> = (0..COUNT)
@@ -3792,8 +3814,8 @@ fn bench_preinstall_chunk_tracking(c: &mut Criterion) {
 #[cfg(feature = "bench-internals")]
 fn bench_preinstall_save_offload(c: &mut Criterion) {
     use irmin_rs::game_installer::installer::{SaveSlot, StateSaver};
-    use irmin_rs::game_installer::preinstall::bench_internals::{ChunkSizes, save_state_snapshot};
     use irmin_rs::game_installer::preinstall::PatchChunkInfo;
+    use irmin_rs::game_installer::preinstall::bench_internals::{ChunkSizes, save_state_snapshot};
     use irmin_rs::sophon::bench_write_state_file;
 
     // 50k entries keeps blocking-pool background work bounded while the
@@ -3887,10 +3909,10 @@ fn bench_installer_save_offload(c: &mut Criterion) {
     use std::sync::OnceLock;
 
     use irmin_rs::game_installer::compact_manifest::StringArena;
-    use irmin_rs::game_installer::installer::bench_internals::{
-        legacy_await_then_spawn_save, snapshot_downloaded_chunks, ChunkNameLookup, SaveSlot,
-    };
     use irmin_rs::game_installer::installer::StateSaver;
+    use irmin_rs::game_installer::installer::bench_internals::{
+        ChunkNameLookup, SaveSlot, legacy_await_then_spawn_save, snapshot_downloaded_chunks,
+    };
     use irmin_rs::sophon::bench_write_state_file;
     use std::sync::atomic::{AtomicU32, AtomicUsize};
 
@@ -3945,8 +3967,13 @@ fn bench_installer_save_offload(c: &mut Criterion) {
                 let saves_at_start = saves.load(std::sync::atomic::Ordering::Relaxed);
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
-                    legacy_await_then_spawn_save(&last_save, &downloaded, &save_chunk_names, &saver)
-                        .await;
+                    legacy_await_then_spawn_save(
+                        &last_save,
+                        &downloaded,
+                        &save_chunk_names,
+                        &saver,
+                    )
+                    .await;
                     total += start.elapsed();
                 }
                 // Untimed final drain. Timed region = await of the
@@ -4022,8 +4049,9 @@ fn bench_installer_save_offload(c: &mut Criterion) {
                 .build()
                 .expect("bench runtime");
             runtime.block_on(async {
-                let last_save: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-                    Arc::new(std::sync::Mutex::new(None));
+                let last_save: std::sync::Arc<
+                    std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+                > = Arc::new(std::sync::Mutex::new(None));
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let saves_before = saves.load(std::sync::atomic::Ordering::Relaxed);
@@ -4207,8 +4235,8 @@ fn bench_reclaim_dispatch(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                total += runtime
-                    .block_on(run_reclaim_dispatch(true, BOUNDARY_HITS, RECLAIM_INTERVAL));
+                total +=
+                    runtime.block_on(run_reclaim_dispatch(true, BOUNDARY_HITS, RECLAIM_INTERVAL));
             }
             total
         })
@@ -4217,8 +4245,8 @@ fn bench_reclaim_dispatch(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                total += runtime
-                    .block_on(run_reclaim_dispatch(false, BOUNDARY_HITS, RECLAIM_INTERVAL));
+                total +=
+                    runtime.block_on(run_reclaim_dispatch(false, BOUNDARY_HITS, RECLAIM_INTERVAL));
             }
             total
         })
@@ -4586,15 +4614,12 @@ fn bench_state_save(c: &mut Criterion) {
         if count == *chunk_counts.last().expect("non-empty") {
             let state_dir = tempfile::tempdir().expect("tempdir");
             let state_file = state_dir.path().join("state.json");
-            group.bench_function(
-                BenchmarkId::new("end_to_end", count),
-                |b| {
-                    b.iter(|| {
-                        let entries = snapshot_downloaded_chunks(&downloaded, &lookup);
-                        irmin_rs::sophon::bench_write_state_file(&state_file, &entries);
-                    });
-                },
-            );
+            group.bench_function(BenchmarkId::new("end_to_end", count), |b| {
+                b.iter(|| {
+                    let entries = snapshot_downloaded_chunks(&downloaded, &lookup);
+                    irmin_rs::sophon::bench_write_state_file(&state_file, &entries);
+                });
+            });
             group.bench_function(BenchmarkId::new("serialize_only", count), |b| {
                 b.iter(|| {
                     let entries = snapshot_downloaded_chunks(&downloaded, &lookup);
@@ -4624,8 +4649,7 @@ fn bench_assembly_hash_gate(c: &mut Criterion) {
     const CHUNK_MIB: usize = 8;
     const CHUNKS_PER_WORKER: usize = 8;
     const WORKERS: usize = 6;
-    const TOTAL_BYTES: u64 =
-        (CHUNK_MIB * CHUNKS_PER_WORKER * WORKERS) as u64 * 1024 * 1024;
+    const TOTAL_BYTES: u64 = (CHUNK_MIB * CHUNKS_PER_WORKER * WORKERS) as u64 * 1024 * 1024;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let chunks_dir = dir.path().join("chunks");
@@ -4789,7 +4813,13 @@ fn bench_phase2a_chunk_verify(c: &mut Criterion) {
             #[cfg(feature = "bench-internals")]
             {
                 for (path, expected) in &items {
-                    let actual = irmin_rs::game_installer::cache::benchmark::file_md5_digest_with_options(path, 256 * 1024, false).unwrap();
+                    let actual =
+                        irmin_rs::game_installer::cache::benchmark::file_md5_digest_with_options(
+                            path,
+                            256 * 1024,
+                            false,
+                        )
+                        .unwrap();
                     criterion::black_box(actual == *expected);
                 }
             }

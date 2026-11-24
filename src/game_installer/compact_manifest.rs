@@ -70,7 +70,8 @@ pub struct StringArena {
 
 impl StringArena {
     /// Allocate an arena sized for approximately `spans` strings and
-    /// `total_bytes` UTF-8 bytes; capacities may grow if estimates are exceeded.
+    /// `total_bytes` UTF-8 bytes; capacities may grow if estimates are
+    /// exceeded.
     pub fn with_capacity(spans: usize, total_bytes: usize) -> Self {
         let spans = spans
             .min(u32::MAX as usize - 1)
@@ -87,7 +88,8 @@ impl StringArena {
     }
 
     /// Append `s` and return its zero-based index. Duplicate values are stored
-    /// separately; indices are valid only while this arena's ordering is stable.
+    /// separately; indices are valid only while this arena's ordering is
+    /// stable.
     pub fn intern(&mut self, s: &str) -> u32 {
         self.try_intern(s)
             .expect("string exceeds compact u32 index limits")
@@ -209,7 +211,8 @@ impl StringArena {
     }
 
     /// Drop the deduplication map to free memory after all interning is done.
-    /// Release the temporary hash map used by `intern_dedup`; arena contents remain.
+    /// Release the temporary hash map used by `intern_dedup`; arena contents
+    /// remain.
     pub fn clear_dedup(&mut self) {
         self.dedup.clear();
         self.dedup.shrink_to_fit();
@@ -457,7 +460,8 @@ impl CompactManifest {
     /// Find the file index that owns a given global chunk index via binary
     /// search.
     #[inline]
-    /// Owning file index for a global chunk index; caller must pass a valid index.
+    /// Owning file index for a global chunk index; caller must pass a valid
+    /// index.
     pub fn file_idx_for_chunk(&self, chunk_idx: usize) -> usize {
         match self.file_chunk_start.binary_search(&(chunk_idx as u32)) {
             Ok(i) => i,
@@ -480,7 +484,8 @@ impl CompactManifest {
 
     /// Access a chunk by its `(file_idx, chunk_idx_in_file)` pair.
     #[inline]
-    /// Borrowed metadata for a file-local chunk index; indices are not bounds-checked.
+    /// Borrowed metadata for a file-local chunk index; indices are not
+    /// bounds-checked.
     pub fn file_chunk(&self, file_idx: usize, chunk_idx_in_file: usize) -> ChunkRef<'_> {
         let range = self.file_chunk_range(file_idx);
         self.chunk(range.start as usize + chunk_idx_in_file)
@@ -526,7 +531,8 @@ impl CompactManifest {
         self.chunk_name_idx[start as usize + chunk_idx_in_file]
     }
 
-    /// Returns a chunk name by (file_idx, chunk_idx_in_file) without constructing a `ChunkRef`.
+    /// Returns a chunk name by (file_idx, chunk_idx_in_file) without
+    /// constructing a `ChunkRef`.
     #[inline]
     pub fn file_chunk_name_at(&self, file_idx: usize, chunk_idx_in_file: usize) -> &str {
         let range = self.file_chunk_range(file_idx);
@@ -539,7 +545,8 @@ impl CompactManifest {
         self.arena.get(self.chunk_name_idx[chunk_idx])
     }
 
-    /// Returns the chunk's old offset; negative when the chunk is a pure download.
+    /// Returns the chunk's old offset; negative when the chunk is a pure
+    /// download.
     #[inline]
     pub fn chunk_old_offset_at(&self, chunk_idx: usize) -> i64 {
         self.chunk_old_offset[chunk_idx]
@@ -572,7 +579,8 @@ impl CompactManifest {
     /// Compute a chunk's offset within its file by summing decompressed sizes
     /// of all preceding chunks in the same file. O(chunks_before) per call.
     #[inline]
-    /// Byte offset within the owning file, summing preceding decompressed chunk sizes.
+    /// Byte offset within the owning file, summing preceding decompressed chunk
+    /// sizes.
     pub fn chunk_file_offset(&self, chunk_idx: usize) -> u64 {
         let file_idx = self.file_idx_for_chunk(chunk_idx);
         let range = self.file_chunk_range(file_idx);
@@ -583,7 +591,8 @@ impl CompactManifest {
 
     /// Compute the byte offset of a single chunk within its file. O(chunk_idx).
     #[inline]
-    /// Byte offset of the file-local chunk, summing preceding decompressed sizes.
+    /// Byte offset of the file-local chunk, summing preceding decompressed
+    /// sizes.
     pub fn file_chunk_offset(&self, file_idx: usize, chunk_idx: usize) -> u64 {
         let range = self.file_chunk_range(file_idx);
         (range.start as usize..range.start as usize + chunk_idx)
@@ -611,7 +620,8 @@ impl CompactManifest {
     }
 
     /// Columnar byte size for memory logging.
-    /// Approximate memory occupied by column allocations, excluding allocator overhead.
+    /// Approximate memory occupied by column allocations, excluding allocator
+    /// overhead.
     pub fn column_bytes(&self) -> usize {
         let n_files = self.file_name_idx.len();
         let n_chunks = self.chunk_name_idx.len();
@@ -730,19 +740,13 @@ impl CompactManifestBuilder {
         let arena = StringArena {
             data: String::with_capacity(estimated_string_bytes.min(u32::MAX as usize)),
             offsets: Vec::with_capacity(span_count.min(u32::MAX as usize - 1) + 1),
-            dedup: FxHashMap::with_capacity_and_hasher(
-                span_count / 2,
-                Default::default(),
-            ),
+            dedup: FxHashMap::with_capacity_and_hasher(span_count / 2, Default::default()),
             sealed: false,
         };
         let hash_arena = ByteArena {
             data: Vec::with_capacity(estimated_hash_bytes.min(u32::MAX as usize)),
             offsets: Vec::with_capacity(span_count.min(u32::MAX as usize - 1) + 1),
-            dedup: FxHashMap::with_capacity_and_hasher(
-                span_count / 2,
-                Default::default(),
-            ),
+            dedup: FxHashMap::with_capacity_and_hasher(span_count / 2, Default::default()),
             sealed: false,
         };
         Self {
@@ -1195,8 +1199,9 @@ mod tests {
         assert_eq!(cm.hash_arena.len(), 1);
     }
 
-    /// Verifies all stored fields survive Proto -> CompactManifest for 100 assets
-    /// with varied chunk counts. Guards against columnar layout changes dropping data.
+    /// Verifies all stored fields survive Proto -> CompactManifest for 100
+    /// assets with varied chunk counts. Guards against columnar layout changes
+    /// dropping data.
     #[test]
     fn roundtrip_all_fields_100_assets() {
         let assets: Vec<SophonManifestAssetProperty> = (0..100)
@@ -1431,7 +1436,8 @@ mod tests {
         // File 0: chunk 0 at offset 0, chunk 1 at offset 200
         assert_eq!(cm.chunk_file_offset(0), 0);
         assert_eq!(cm.chunk_file_offset(1), 200);
-        // File 1: chunk 2 at offset 0, chunk 3 at offset 300, chunk 4 at offset 700
+        // File 1: chunk 2 at offset 0, chunk 3 at offset 300, chunk 4 at offset
+        // 700
         assert_eq!(cm.chunk_file_offset(2), 0);
         assert_eq!(cm.chunk_file_offset(3), 300);
         assert_eq!(cm.chunk_file_offset(4), 700);
@@ -1458,7 +1464,8 @@ mod tests {
         // Both chunks resolve to the same name.
         assert_eq!(cm.chunk_name_at(0), "shared");
         assert_eq!(cm.chunk_name_at(1), "shared");
-        // The builder does not dedup chunk names; each gets a distinct arena id.
+        // The builder does not dedup chunk names; each gets a distinct arena
+        // id.
         assert_ne!(cm.chunk_name_arena_idx(0), cm.chunk_name_arena_idx(1));
         // 2 file names + 2 chunk name copies; `len()` excludes the sentinel.
         assert_eq!(cm.arena.len(), 4);

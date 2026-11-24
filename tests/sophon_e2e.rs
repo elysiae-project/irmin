@@ -8,7 +8,8 @@
 //! `bench-internals` feature to expose the `bench_test_endpoints` override
 //! that redirects the hardcoded API URLs to the wiremock server.
 //!
-//! Run: cargo test --test sophon_e2e --features bench-internals -- --include-ignored
+//! Run: cargo test --test sophon_e2e --features bench-internals --
+//! --include-ignored
 
 #![cfg(feature = "bench-internals")]
 
@@ -17,10 +18,12 @@ use prost::Message as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use irmin_rs::game_installer::bench_test_endpoints::{set_build_base, set_front_door};
 #[cfg(feature = "preinstall")]
 use irmin_rs::game_installer::bench_test_endpoints::set_patch_build_base;
-use irmin_rs::proto_parse::{SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto};
+use irmin_rs::game_installer::bench_test_endpoints::{set_build_base, set_front_door};
+use irmin_rs::proto_parse::{
+    SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
+};
 use irmin_rs::{DownloadHandle, Sophon, SophonProgress, VerifyMode};
 
 /// Fixture holding the wiremock server and the manifest/chunk data needed
@@ -86,7 +89,9 @@ impl E2eFixture {
             payload.len() as u64,
             Bytes::from(file_md5),
         );
-        let manifest = SophonManifestProto { assets: vec![asset] };
+        let manifest = SophonManifestProto {
+            assets: vec![asset],
+        };
         let manifest_bytes = manifest.encode_to_vec();
 
         // Mount the chunk endpoint: GET /{url_suffix}/{chunk_name}.
@@ -110,10 +115,7 @@ impl E2eFixture {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(manifest_bytes.clone())
-                    .insert_header(
-                        "content-length",
-                        manifest_bytes.len().to_string(),
-                    ),
+                    .insert_header("content-length", manifest_bytes.len().to_string()),
             )
             .mount(&server)
             .await;
@@ -349,7 +351,9 @@ async fn sophon_update_e2e_mocked_http_full_pipeline() {
         payload.len() as u64,
         Bytes::from(file_md5),
     );
-    let new_manifest = SophonManifestProto { assets: vec![asset] };
+    let new_manifest = SophonManifestProto {
+        assets: vec![asset],
+    };
     let new_manifest_bytes = new_manifest.encode_to_vec();
 
     // Old manifest (empty — no files to diff against).
@@ -884,7 +888,9 @@ async fn sophon_download_e2e_chunk_hash_mismatch_returns_error_not_panic() {
         4096,
         Bytes::from(decompressed_hash),
     );
-    let manifest = SophonManifestProto { assets: vec![asset] };
+    let manifest = SophonManifestProto {
+        assets: vec![asset],
+    };
     let manifest_bytes = manifest.encode_to_vec();
 
     Mock::given(method("GET"))
@@ -953,9 +959,7 @@ async fn sophon_download_e2e_chunk_hash_mismatch_returns_error_not_panic() {
         .build();
 
     let handle = DownloadHandle::new();
-    let result = sophon
-        .download(&handle, |_p: SophonProgress| {})
-        .await;
+    let result = sophon.download(&handle, |_p: SophonProgress| {}).await;
 
     set_front_door(None);
     set_build_base(None);
@@ -1006,7 +1010,9 @@ async fn sophon_download_e2e_truncated_chunk_returns_error_not_panic() {
         payload.len() as u64,
         Bytes::from(file_md5),
     );
-    let manifest = SophonManifestProto { assets: vec![asset] };
+    let manifest = SophonManifestProto {
+        assets: vec![asset],
+    };
     let manifest_bytes = manifest.encode_to_vec();
 
     Mock::given(method("GET"))
@@ -1075,9 +1081,7 @@ async fn sophon_download_e2e_truncated_chunk_returns_error_not_panic() {
         .build();
 
     let handle = DownloadHandle::new();
-    let result = sophon
-        .download(&handle, |_p: SophonProgress| {})
-        .await;
+    let result = sophon.download(&handle, |_p: SophonProgress| {}).await;
 
     set_front_door(None);
     set_build_base(None);
@@ -1155,9 +1159,7 @@ async fn sophon_download_e2e_corrupt_manifest_returns_error_not_panic() {
         .build();
 
     let handle = DownloadHandle::new();
-    let result = sophon
-        .download(&handle, |_p: SophonProgress| {})
-        .await;
+    let result = sophon.download(&handle, |_p: SophonProgress| {}).await;
 
     set_front_door(None);
     set_build_base(None);
@@ -1208,7 +1210,9 @@ async fn sophon_download_e2e_chunk_server_error_returns_error_not_panic() {
         payload.len() as u64,
         Bytes::from(file_md5),
     );
-    let manifest = SophonManifestProto { assets: vec![asset] };
+    let manifest = SophonManifestProto {
+        assets: vec![asset],
+    };
     let manifest_bytes = manifest.encode_to_vec();
 
     Mock::given(method("GET"))
@@ -1274,9 +1278,7 @@ async fn sophon_download_e2e_chunk_server_error_returns_error_not_panic() {
         .build();
 
     let handle = DownloadHandle::new();
-    let result = sophon
-        .download(&handle, |_p: SophonProgress| {})
-        .await;
+    let result = sophon.download(&handle, |_p: SophonProgress| {}).await;
 
     set_front_door(None);
     set_build_base(None);
@@ -1348,9 +1350,7 @@ async fn sophon_download_e2e_manifest_not_found_returns_error_not_panic() {
         .build();
 
     let handle = DownloadHandle::new();
-    let result = sophon
-        .download(&handle, |_p: SophonProgress| {})
-        .await;
+    let result = sophon.download(&handle, |_p: SophonProgress| {}).await;
 
     set_front_door(None);
     set_build_base(None);
@@ -1381,7 +1381,8 @@ async fn sophon_download_e2e_connection_drop_mid_stream_returns_error_not_panic(
         // Read the request line + headers (drain until empty line).
         let mut buf = [0u8; 1024];
         let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-        // Send a partial HTTP response: headers claiming 64 KiB, but only 4 bytes of body.
+        // Send a partial HTTP response: headers claiming 64 KiB, but only 4
+        // bytes of body.
         let partial_response =
             b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n1234";
         let _ = socket.write_all(partial_response).await;
@@ -1416,7 +1417,9 @@ async fn sophon_download_e2e_connection_drop_mid_stream_returns_error_not_panic(
         payload.len() as u64,
         Bytes::from(file_md5),
     );
-    let manifest = SophonManifestProto { assets: vec![asset] };
+    let manifest = SophonManifestProto {
+        assets: vec![asset],
+    };
     let manifest_bytes = manifest.encode_to_vec();
 
     Mock::given(method("GET"))

@@ -51,7 +51,8 @@ pub struct PackageBranch {
     pub tag: String,
 }
 
-/// Response envelope for a Sophon build lookup; `data` may be absent when no build is available.
+/// Response envelope for a Sophon build lookup; `data` may be absent when no
+/// build is available.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SophonBuildResponse {
@@ -84,7 +85,8 @@ pub struct SophonManifestMeta {
     pub deduplicated_stats: Option<Stats>,
 }
 
-/// CDN manifest identity and its compressed and expanded byte counts, encoded as strings by the API.
+/// CDN manifest identity and its compressed and expanded byte counts, encoded
+/// as strings by the API.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManifestFileInfo {
@@ -94,7 +96,8 @@ pub struct ManifestFileInfo {
     pub uncompressed_size: String,
 }
 
-/// Describes encryption, compression, and URL construction for downloaded objects.
+/// Describes encryption, compression, and URL construction for downloaded
+/// objects.
 ///
 /// The generated URL is `{url_prefix}/{url_suffix}/{item_name}`, omitting the
 /// suffix segment when it is empty; surrounding slashes are normalized.
@@ -224,8 +227,8 @@ impl DownloadInfo {
         }
     }
 
-    /// Write the same URL as [`Self::url_for`] into `buf`, clearing its previous
-    /// contents first so the allocation can be reused.
+    /// Write the same URL as [`Self::url_for`] into `buf`, clearing its
+    /// previous contents first so the allocation can be reused.
     #[inline]
     pub fn url_for_into(&self, item_name: &str, buf: &mut String) {
         buf.clear();
@@ -248,7 +251,8 @@ impl DownloadInfo {
     }
 }
 
-/// Aggregate sizes and counts from the build API; numeric values are string-encoded.
+/// Aggregate sizes and counts from the build API; numeric values are
+/// string-encoded.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Stats {
@@ -278,7 +282,8 @@ pub struct SophonPatchBuildData {
     pub manifests: Vec<SophonPatchManifestMeta>,
 }
 
-/// Metadata to retrieve a category's patch manifest and associated diff objects.
+/// Metadata to retrieve a category's patch manifest and associated diff
+/// objects.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SophonPatchManifestMeta {

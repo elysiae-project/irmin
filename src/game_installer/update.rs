@@ -84,7 +84,8 @@ impl CompactChunkNameSet {
             range: start..end,
         });
         let index = self.entries.len() - 1;
-        // Rehashing uses stored hashes, while `find` resolves collisions by comparing bytes.
+        // Rehashing uses stored hashes, while `find` resolves collisions by
+        // comparing bytes.
         self.table
             .insert_unique(hash, index, |&entry_index| self.entries[entry_index].hash);
         Ok(true)
@@ -108,7 +109,8 @@ pub struct UpdateInfo {
     pub current_tag: Option<String>,
     pub remote_tag: String,
     pub preinstall_tag: Option<String>,
-    /// Best-effort estimate: zero if unknown, or a conservative cached target total.
+    /// Best-effort estimate: zero if unknown, or a conservative cached target
+    /// total.
     pub update_compressed_size: u64,
     pub update_decompressed_size: u64,
     pub preinstall_compressed_size: u64,
@@ -227,11 +229,15 @@ where
         tokio::join!(update_sizes, preinstall_sizes);
 
     let preinstall_downloaded = cached.is_some();
-    let (preinstall_available, preinstall_tag, preinstall_compressed_size, preinstall_decompressed_size) =
-        match preinstall {
-            Some((tag, cs, ds)) => (true, Some(tag), cs, ds),
-            None => (false, None, 0, 0),
-        };
+    let (
+        preinstall_available,
+        preinstall_tag,
+        preinstall_compressed_size,
+        preinstall_decompressed_size,
+    ) = match preinstall {
+        Some((tag, cs, ds)) => (true, Some(tag), cs, ds),
+        None => (false, None, 0, 0),
+    };
 
     Ok(UpdateInfo {
         update_available,
@@ -247,7 +253,8 @@ where
     })
 }
 
-/// Fetch build statistics and return compressed/uncompressed sizes for matching manifests.
+/// Fetch build statistics and return compressed/uncompressed sizes for matching
+/// manifests.
 pub async fn fetch_build_sizes(
     client: &Client,
     branch: &PackageBranch,
@@ -1082,11 +1089,11 @@ mod diff_sizes_fetch_tests {
     use crate::proto_parse::{
         SophonManifestAssetChunk, SophonManifestAssetProperty, SophonManifestProto,
     };
+    use http_body_util::Full;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
     use hyper::{Request, Response};
-    use http_body_util::Full;
+    use hyper_util::rt::TokioIo;
     use prost::Message;
     use std::convert::Infallible;
     use std::net::TcpListener as StdTcpListener;
@@ -1195,7 +1202,9 @@ mod diff_sizes_fetch_tests {
         let bodies = Arc::new(bodies);
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = bind.accept().await else { continue };
+                let Ok((stream, _)) = bind.accept().await else {
+                    continue;
+                };
                 let bodies = Arc::clone(&bodies);
                 let in_flight = Arc::clone(&in_flight);
                 let max_in_flight = Arc::clone(&max_in_flight);
@@ -1212,13 +1221,16 @@ mod diff_sizes_fetch_tests {
                                 let max_in_flight = Arc::clone(&max_in_flight);
                                 let requests_served = Arc::clone(&requests_served);
                                 async move {
-                                    requests_served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    requests_served
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                     // High-water mark: bump the observed max
                                     // so the test can see overlap after the
                                     // requests complete.
-                                    let now =
-                                        in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                    max_in_flight.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                                    let now = in_flight
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                        + 1;
+                                    max_in_flight
+                                        .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
                                     tokio::time::sleep(delay).await;
                                     in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                                     let empty: hyper::body::Bytes = hyper::body::Bytes::new();
@@ -1273,10 +1285,9 @@ mod diff_sizes_fetch_tests {
         let client = reqwest::Client::new();
 
         let mut seen = CompactChunkNameSet::new();
-        let (cs, ds) =
-            fetch_and_accumulate_diff_sizes(&client, &old_map, &qualifying, &mut seen)
-                .await
-                .unwrap();
+        let (cs, ds) = fetch_and_accumulate_diff_sizes(&client, &old_map, &qualifying, &mut seen)
+            .await
+            .unwrap();
 
         // Concurrency shape: while one pair waits out its round-trip,
         // sibling pairs must be in flight too (a one-pair-at-a-time loop

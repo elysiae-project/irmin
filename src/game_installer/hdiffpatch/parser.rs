@@ -527,7 +527,8 @@ mod tests {
     #[test]
     fn read_long_7bit_tagged_truncated_stream_returns_error() {
         let mut c = src(b"");
-        // prev_byte=0x4A: tag_bit=1 -> bits 0-5 = 0x0A (10), bit 6 set -> continuation
+        // prev_byte=0x4A: tag_bit=1 -> bits 0-5 = 0x0A (10), bit 6 set ->
+        // continuation
         let result = c.read_long_7bit_tagged(1, 0x4A);
         assert!(
             result.is_err(),
