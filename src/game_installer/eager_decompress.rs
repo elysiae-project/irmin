@@ -24,6 +24,13 @@ use super::error::{SophonError, SophonResult};
 /// file. Buffer size used by eager streaming decompression.
 pub const EAGER_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// Test-only stall applied once inside the streaming decoder before it
+/// starts reading, in milliseconds. Lets regression tests force the
+/// "decoder falls behind the producer" condition deterministically.
+#[cfg(test)]
+pub(crate) static DECODER_START_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(feature = "bench-diagnostics")]
 #[derive(Default)]
 pub(crate) struct EagerStreamPhaseTimings {
@@ -333,6 +340,14 @@ fn stream_decompress_to_file_inner(
     #[cfg(feature = "bench-diagnostics")] drain_reader_to_eof: bool,
 ) -> SophonResult<u64> {
     let mut reader = reader;
+
+    #[cfg(test)]
+    {
+        let stall_ms = DECODER_START_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if stall_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(stall_ms));
+        }
+    }
 
     let mut ctx = assembly_opt::take_dctx();
     // zstd DCtx parameters are sticky; set them explicitly instead of

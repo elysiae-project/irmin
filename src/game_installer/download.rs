@@ -27,9 +27,18 @@ pub(crate) trait ChunkHasher {
 #[cfg(feature = "bench-diagnostics")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DownloadPhaseTimings {
+    /// Time from starting response-body polling through observing EOF,
+    /// including writes to the chunk destination but excluding final hash
+    /// verification and durability flush.
+    pub download: std::time::Duration,
     /// Time spent inside the streaming loop, including waiting for response
     /// data.
     pub total: std::time::Duration,
+    /// Time finalizing and checking the selected compressed hash.
+    pub verify_finalize: std::time::Duration,
+    /// Whether the bounded MD5 queue filled and verification was deferred
+    /// to a post-download file scan.
+    pub md5_deferred: bool,
     /// Time awaiting each next response body chunk.
     pub stream_wait: std::time::Duration,
     /// Time writing response chunks through the buffered file writer.
@@ -244,6 +253,27 @@ pub mod benchmark {
         .await?;
         writer.flush_and_evict_all().await.ok();
         Ok(timings)
+    }
+
+    /// Per-frame stall applied inside the hash thread, in milliseconds.
+    /// Benchmarks use it to simulate verification/assembly CPU starvation
+    /// and measure how much download throughput survives; the stall is
+    /// process-global, so benchmarks and tests must not run concurrently.
+    pub fn set_bench_hash_thread_stall_ms(stall_ms: u64) {
+        super::BENCH_HASH_THREAD_STALL_MS.store(stall_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set a sub-millisecond per-frame verification stall for throughput
+    /// benchmarks. This allows the benchmark to separate handoff overhead
+    /// from deliberately slow-consumer backpressure.
+    pub fn set_bench_hash_thread_stall_us(stall_us: u64) {
+        super::BENCH_HASH_THREAD_STALL_US.store(stall_us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Selects the legacy blocking hash hand-off for paired benchmark
+    /// comparisons. Production callers cannot enable this path.
+    pub fn set_bench_legacy_hash_blocking(enabled: bool) {
+        super::BENCH_LEGACY_BLOCKING_HASH.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -484,6 +514,14 @@ fn pread_hash_slice(
 }
 
 fn pread_hash_md5_digest(path: &Path, known_size: Option<u64>) -> SophonResult<[u8; 16]> {
+    pread_hash_md5_digest_with_stall(path, known_size, std::time::Duration::ZERO)
+}
+
+fn pread_hash_md5_digest_with_stall(
+    path: &Path,
+    known_size: Option<u64>,
+    stall_per_64k: std::time::Duration,
+) -> SophonResult<[u8; 16]> {
     let mut file = std::fs::File::open(path)?;
     let len = match known_size {
         Some(s) => s,
@@ -504,6 +542,11 @@ fn pread_hash_md5_digest(path: &Path, known_size: Option<u64>) -> SophonResult<[
                 break;
             }
             hasher.update(buffer.filled(n))?;
+            if !stall_per_64k.is_zero() {
+                for _ in 0..n.div_ceil(64 * 1024) {
+                    std::thread::sleep(stall_per_64k);
+                }
+            }
         }
         hasher.finish().map_err(SophonError::Io)
     };
@@ -758,13 +801,21 @@ pub async fn benchmark_download_chunk_with_timings(
 /// is being hashed. The hash is chained (state depends on frame order), so
 /// frames are hashed strictly in arrival order via a bounded channel.
 ///
+/// The hand-off never blocks the calling (Tokio runtime) worker: when the
+/// bounded channel is full because the hash thread fell behind, the pipeline
+/// asks the thread to finish its queued frames in order and ship the hasher
+/// state back over a oneshot, awaits that reply asynchronously, and continues
+/// hashing inline ([`HashPipeline::Sync`]) for the rest of the chunk. Inline
+/// hashing consumes CPU proportionally in the download task — the pre-PR
+/// behavior — instead of parking a runtime worker and stalling every other
+/// download scheduled on it.
+///
 /// When no hasher is present (skip_hash or empty compressed_hash), the
 /// pipeline is a no-op: [`HashPipeline::None`] skips all hashing.
 enum HashPipeline {
     /// No hashing needed; frames are dropped.
     None,
-    /// Synchronous in-loop hashing (no pipeline). Used when the hash thread
-    /// cannot be spawned or for the xxh64-only path.
+    /// Synchronous in-loop hashing, used for the xxh64-only path.
     Sync {
         md5: Option<PooledMd5>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
@@ -772,10 +823,87 @@ enum HashPipeline {
     /// Pipelined MD5 on a dedicated thread. Only the MD5 path is pipelined;
     /// xxh64 (if present) stays synchronous because it is negligible.
     Pipelined {
-        md5_sender: std::sync::mpsc::SyncSender<bytes::Bytes>,
-        join: std::thread::JoinHandle<std::io::Result<Option<[u8; 16]>>>,
+        md5_sender: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        #[cfg(feature = "bench-internals")]
+        legacy_blocking_sender: Option<std::sync::mpsc::SyncSender<bytes::Bytes>>,
+        join: std::thread::JoinHandle<()>,
+        digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
         xxh64: Option<xxhash_rust::xxh64::Xxh64>,
     },
+    /// The MD5 worker fell behind. The download continues writing the chunk,
+    /// then verifies the complete file on the blocking pool after EOF.
+    DeferredMd5 {
+        md5_sender: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        #[cfg(feature = "bench-internals")]
+        legacy_blocking_sender: Option<std::sync::mpsc::SyncSender<bytes::Bytes>>,
+        join: std::thread::JoinHandle<()>,
+        digest_rx: tokio::sync::oneshot::Receiver<std::io::Result<[u8; 16]>>,
+        xxh64: Option<xxhash_rust::xxh64::Xxh64>,
+    },
+}
+
+/// Test-only per-frame stall applied inside the hash thread, in milliseconds.
+/// Lets regression tests force the "consumer falls behind" condition
+/// deterministically without relying on CPU contention.
+#[cfg(test)]
+pub(crate) static HASH_THREAD_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) static HASH_THREAD_STALL_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Process-global per-frame stall applied inside the hash thread, in
+/// milliseconds; benchmarks use it to simulate a verification consumer that
+/// cannot keep up with the network. Set it only from single-threaded bench
+/// drivers — the stall is global and would leak across parallel tests.
+#[cfg(feature = "bench-internals")]
+pub(crate) static BENCH_HASH_THREAD_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "bench-internals")]
+pub(crate) static BENCH_HASH_THREAD_STALL_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "bench-internals")]
+pub(crate) static BENCH_LEGACY_BLOCKING_HASH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn deferred_hash_stall_per_64k() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        return std::time::Duration::from_millis(
+            HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+    #[cfg(all(not(test), feature = "bench-internals"))]
+    {
+        return std::time::Duration::from_millis(
+            BENCH_HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+        ) + std::time::Duration::from_micros(
+            BENCH_HASH_THREAD_STALL_US.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+    #[cfg(all(not(test), not(feature = "bench-internals")))]
+    std::time::Duration::ZERO
+}
+
+fn update_hash_worker(md5: &mut PooledMd5, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(all(not(test), feature = "bench-internals"))]
+    let stall_duration = std::time::Duration::from_millis(
+        BENCH_HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    ) + std::time::Duration::from_micros(
+        BENCH_HASH_THREAD_STALL_US.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    #[cfg(all(not(test), not(feature = "bench-internals")))]
+    let stall_duration = std::time::Duration::ZERO;
+    #[cfg(test)]
+    let stall_duration = std::time::Duration::from_millis(
+        HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if !stall_duration.is_zero() {
+        std::thread::sleep(stall_duration);
+    }
+    md5.get_mut().update(bytes)
 }
 
 impl HashPipeline {
@@ -783,24 +911,65 @@ impl HashPipeline {
     /// spawns a dedicated hash thread; otherwise uses the sync path.
     fn new(md5: Option<PooledMd5>, xxh64: Option<xxhash_rust::xxh64::Xxh64>) -> Self {
         if let Some(md5) = md5 {
-            // Channel capacity 2: bounds in-flight hash frames to 2 per
-            // chunk. The hash thread processes at ~647 MiB/s (5× typical
-            // download speed), so the channel rarely fills. Reducing from
-            // 4 to 2 saves ~512 KiB per active chunk with no throughput loss.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(2);
+            // Channel capacity 2 bounds in-flight hash frames per chunk.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
+            #[cfg(feature = "bench-internals")]
+            let legacy_mode = BENCH_LEGACY_BLOCKING_HASH.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "bench-internals")]
+            let (legacy_sender, legacy_receiver) = if legacy_mode {
+                let (sender, receiver) = std::sync::mpsc::sync_channel::<bytes::Bytes>(2);
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
+            let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
             let join = std::thread::Builder::new()
                 .stack_size(64 * 1024)
                 .spawn(move || {
                     let mut md5 = md5;
-                    for bytes in rx {
-                        md5.get_mut().update(&bytes)?;
+                    let mut digest_tx = Some(digest_tx);
+                    #[cfg(feature = "bench-internals")]
+                    let hash_frames = legacy_receiver;
+                    #[cfg(feature = "bench-internals")]
+                    if let Some(hash_frames) = hash_frames {
+                        for bytes in hash_frames {
+                            if let Err(err) = update_hash_worker(&mut md5, &bytes) {
+                                if let Some(tx) = digest_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                return;
+                            }
+                        }
+                    } else {
+                        while let Some(bytes) = rx.blocking_recv() {
+                            if let Err(err) = update_hash_worker(&mut md5, &bytes) {
+                                if let Some(tx) = digest_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                return;
+                            }
+                        }
                     }
-                    Ok(Some(md5.finish()?))
+                    #[cfg(not(feature = "bench-internals"))]
+                    while let Some(bytes) = rx.blocking_recv() {
+                        if let Err(err) = update_hash_worker(&mut md5, &bytes) {
+                            if let Some(tx) = digest_tx.take() {
+                                let _ = tx.send(Err(err));
+                            }
+                            return;
+                        }
+                    }
+                    if let Some(tx) = digest_tx.take() {
+                        let _ = tx.send(md5.finish());
+                    }
                 })
                 .expect("spawn hash thread");
             HashPipeline::Pipelined {
                 md5_sender: tx,
+                #[cfg(feature = "bench-internals")]
+                legacy_blocking_sender: legacy_sender,
                 join,
+                digest_rx,
                 xxh64,
             }
         } else if xxh64.is_some() {
@@ -810,21 +979,68 @@ impl HashPipeline {
         }
     }
 
-    /// Send a frame to the hash thread (pipelined) or hash synchronously.
+    /// Send a frame to the hash thread or hash synchronously. A full queue
+    /// switches MD5 verification to a bounded-memory scan of the completed
+    /// chunk file so the download stream does not wait for the hash worker.
     #[inline]
-    fn update(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
+    async fn update(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
+        #[cfg(feature = "bench-internals")]
+        if let HashPipeline::Pipelined {
+            legacy_blocking_sender: Some(sender),
+            xxh64,
+            ..
+        } = self
+        {
+            sender
+                .send(bytes.clone())
+                .map_err(|_| std::io::Error::other("hash thread died"))?;
+            if let Some(xxh64) = xxh64 {
+                xxh64.update(bytes);
+            }
+            return Ok(());
+        }
+        if let HashPipeline::Pipelined {
+            md5_sender, xxh64, ..
+        } = self
+        {
+            let sender = md5_sender.clone();
+            match sender.try_send(bytes.clone()) {
+                Ok(()) => {
+                    if let Some(xxh64) = xxh64 {
+                        xxh64.update(bytes);
+                    }
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(std::io::Error::other("hash thread died"));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(pending)) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(2),
+                        sender.reserve(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => {
+                            permit.send(pending);
+                            if let HashPipeline::Pipelined { xxh64: Some(h), .. } = self {
+                                h.update(bytes);
+                            }
+                            return Ok(());
+                        }
+                        Ok(Err(_)) => return Err(std::io::Error::other("hash thread died")),
+                        Err(_) => self.defer_md5(bytes)?,
+                    }
+                }
+            }
+        }
         match self {
             HashPipeline::None => Ok(()),
+            HashPipeline::Pipelined { .. } => unreachable!("pipelined updates return above"),
             HashPipeline::Sync { md5, xxh64 } => {
                 update_download_hashes(bytes, md5.as_mut(), xxh64.as_mut())
             }
-            HashPipeline::Pipelined {
-                md5_sender, xxh64, ..
-            } => {
-                // Send clones the Bytes refcount (cheap, no data copy).
-                md5_sender
-                    .send(bytes.clone())
-                    .map_err(|_| std::io::Error::other("hash thread died"))?;
+            HashPipeline::DeferredMd5 { xxh64, .. } => {
                 if let Some(xxh64) = xxh64 {
                     xxh64.update(bytes);
                 }
@@ -833,32 +1049,105 @@ impl HashPipeline {
         }
     }
 
-    /// Finalize: drop the sender (signals EOF to the hash thread), wait for
-    /// the digest, and return the MD5 digest and xxh64 digest.
-    fn finish(self) -> std::io::Result<(Option<[u8; 16]>, Option<u64>)> {
+    /// Switch a saturated MD5 pipeline to verification from the completed
+    /// chunk file. The current frame is already on disk and needs no queue
+    /// ownership.
+    fn defer_md5(&mut self, bytes: &bytes::Bytes) -> std::io::Result<()> {
+        let old = std::mem::replace(self, HashPipeline::None);
+        let HashPipeline::Pipelined {
+            md5_sender,
+            #[cfg(feature = "bench-internals")]
+            legacy_blocking_sender,
+            join,
+            digest_rx,
+            mut xxh64,
+        } = old
+        else {
+            *self = old;
+            return Ok(());
+        };
+        if let Some(xxh64) = xxh64.as_mut() {
+            xxh64.update(bytes);
+        }
+        *self = HashPipeline::DeferredMd5 {
+            md5_sender,
+            #[cfg(feature = "bench-internals")]
+            legacy_blocking_sender,
+            join,
+            digest_rx,
+            xxh64,
+        };
+        Ok(())
+    }
+
+    /// Finalize: drop the sender (signals EOF to the hash thread), await the
+    /// digest without blocking the runtime worker, and return the MD5 digest
+    /// and xxh64 digest.
+    async fn finish(
+        self,
+        path: &Path,
+        expected_size: u64,
+    ) -> std::io::Result<(Option<[u8; 16]>, Option<u64>, bool)> {
         match self {
-            HashPipeline::None => Ok((None, None)),
+            HashPipeline::None => Ok((None, None, false)),
             HashPipeline::Sync { mut md5, xxh64 } => {
                 let md5_digest = match &mut md5 {
                     Some(md5) => Some(md5.finish()?),
                     None => None,
                 };
                 let xxh64_digest = xxh64.map(|h| h.digest());
-                Ok((md5_digest, xxh64_digest))
+                Ok((md5_digest, xxh64_digest, false))
             }
             HashPipeline::Pipelined {
                 md5_sender,
+                #[cfg(feature = "bench-internals")]
+                legacy_blocking_sender,
                 join,
+                digest_rx,
                 xxh64,
+                ..
             } => {
                 // Drop the sender to signal the hash thread that no more
                 // frames are coming.
                 drop(md5_sender);
-                let md5_digest = join
-                    .join()
-                    .map_err(|_| std::io::Error::other("hash thread panicked"))??;
+                #[cfg(feature = "bench-internals")]
+                drop(legacy_blocking_sender);
+                let md5_digest = Some(
+                    digest_rx
+                        .await
+                        .map_err(|_| std::io::Error::other("hash thread died"))??,
+                );
+                join.join()
+                    .map_err(|_| std::io::Error::other("hash thread panicked"))?;
                 let xxh64_digest = xxh64.map(|h| h.digest());
-                Ok((md5_digest, xxh64_digest))
+                Ok((md5_digest, xxh64_digest, false))
+            }
+            HashPipeline::DeferredMd5 {
+                md5_sender,
+                join,
+                digest_rx,
+                xxh64,
+                ..
+            } => {
+                drop(md5_sender);
+                let _partial_digest = digest_rx
+                    .await
+                    .map_err(|_| std::io::Error::other("hash thread died"))??;
+                join.join()
+                    .map_err(|_| std::io::Error::other("hash thread panicked"))?;
+                let path = path.to_path_buf();
+                let stall_per_64k = deferred_hash_stall_per_64k();
+                let md5_digest = tokio::task::spawn_blocking(move || {
+                    pread_hash_md5_digest_with_stall(&path, Some(expected_size), stall_per_64k)
+                        .map_err(|error| match error {
+                            SophonError::Io(error) => error,
+                            other => std::io::Error::other(other.to_string()),
+                        })
+                })
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))??;
+                let xxh64_digest = xxh64.map(|hasher| hasher.digest());
+                Ok((Some(md5_digest), xxh64_digest, true))
             }
         }
     }
@@ -883,6 +1172,8 @@ async fn stream_and_verify(
 ) -> SophonResult<()> {
     #[cfg(feature = "bench-diagnostics")]
     let total_started = std::time::Instant::now();
+    #[cfg(feature = "bench-diagnostics")]
+    let download_started = std::time::Instant::now();
     let mut stream = resp.bytes_stream();
     let mut total_len = starting_len;
     // One cancellation waiter per chunk, not per frame: the biased select
@@ -981,7 +1272,7 @@ async fn stream_and_verify(
                 }
                 #[cfg(feature = "bench-diagnostics")]
                 let hash_started = std::time::Instant::now();
-                let hash_result = pipeline.update(&bytes);
+                let hash_result = pipeline.update(&bytes).await;
                 #[cfg(feature = "bench-diagnostics")]
                 if let Some(timings) = timings.as_deref_mut() {
                     let elapsed = hash_started.elapsed();
@@ -1004,7 +1295,13 @@ async fn stream_and_verify(
                 let _ = tokio::fs::remove_file(dest).await;
                 return Err(error.into());
             }
-            None => break,
+            None => {
+                #[cfg(feature = "bench-diagnostics")]
+                if let Some(timings) = timings.as_deref_mut() {
+                    timings.download = download_started.elapsed();
+                }
+                break;
+            }
         }
     }
 
@@ -1035,7 +1332,12 @@ async fn stream_and_verify(
 
     // Finalize the hash pipeline: drop the sender to signal the hash thread
     // that no more frames are coming, wait for the digest, and verify.
-    let (md5_digest, xxh64_digest) = pipeline.finish().map_err(SophonError::Io)?;
+    #[cfg(feature = "bench-diagnostics")]
+    let verify_finalize_started = std::time::Instant::now();
+    let (md5_digest, xxh64_digest, md5_deferred) = pipeline
+        .finish(dest, expected_total)
+        .await
+        .map_err(SophonError::Io)?;
 
     if !compressed_hash.is_empty() {
         match compressed_hash.len() {
@@ -1075,6 +1377,14 @@ async fn stream_and_verify(
             name = chunk_name
         );
     }
+
+    #[cfg(feature = "bench-diagnostics")]
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.verify_finalize = verify_finalize_started.elapsed();
+        timings.md5_deferred = md5_deferred;
+    }
+    #[cfg(not(feature = "bench-diagnostics"))]
+    let _ = md5_deferred;
 
     // Hashers were moved into the pipeline at the start and consumed by
     // finish(): the MD5 hasher is finalized inside the hash thread (or
@@ -1380,7 +1690,6 @@ mod tests {
         let result = stream_and_verify_directly(resp, chunk, &dest, &handle).await;
         assert!(matches!(result, Err(SophonError::Cancelled)));
         assert!(!dest.exists());
-        drop(&handle);
         server.abort();
     }
 
@@ -1404,6 +1713,177 @@ mod tests {
         handle: &DownloadHandle,
     ) -> SophonResult<()> {
         download_full_file_with_response(resp, chunk, dest, Some(handle), false).await
+    }
+
+    /// Regression for PR #15: a stalled hash consumer must not block the
+    /// Tokio runtime worker running the download loop. On unfixed code the
+    /// blocking `SyncSender::send` parks the sole worker of this
+    /// current-thread runtime, starving the heartbeat task for the whole
+    /// stall window. The fixed pipeline hands off without blocking, so the
+    /// heartbeat keeps ticking at its 10 ms cadence.
+    #[test]
+    fn stalled_hash_consumer_does_not_block_runtime_worker() {
+        use http_body_util::StreamBody;
+        use hyper::body::{Frame, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request as HyperRequest, Response as HyperResponse};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const FRAME: usize = 64 * 1024;
+        const FRAMES: usize = 8;
+        const STALL_MS: u64 = 40;
+        let _stall_guard = HASH_THREAD_STALL_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let payload: Vec<u8> = (0..FRAME * FRAMES)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let digest = fast_md5::digest(&payload);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let max_gap_ms = runtime.block_on(async move {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let address = listener.local_addr().unwrap();
+
+            let server_payload = payload.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let body_bytes = server_payload;
+                let service = service_fn(move |_: HyperRequest<Incoming>| {
+                    let body_bytes = body_bytes.clone();
+                    async move {
+                        let frames: Vec<_> = (0..FRAMES)
+                            .map(|i| {
+                                Ok::<_, Infallible>(Frame::data(bytes::Bytes::from(
+                                    body_bytes[i * FRAME..(i + 1) * FRAME].to_vec(),
+                                )))
+                            })
+                            .collect();
+                        let body = StreamBody::new(futures_util::stream::iter(frames));
+                        let mut response = HyperResponse::new(body);
+                        response.headers_mut().insert(
+                            hyper::header::CONTENT_LENGTH,
+                            (FRAME * FRAMES).to_string().parse().unwrap(),
+                        );
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                let connection =
+                    http1::Builder::new().serve_connection(TokioIo::new(socket), service);
+                let _ = connection.await;
+            });
+
+            // Heartbeat: records the largest scheduling gap it observes.
+            let max_gap = Arc::new(AtomicU64::new(0));
+            let heartbeat_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let heartbeat = {
+                let max_gap = Arc::clone(&max_gap);
+                let flag = Arc::clone(&heartbeat_flag);
+                tokio::spawn(async move {
+                    let mut last = std::time::Instant::now();
+                    while !flag.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        let gap = last.elapsed().as_millis() as u64;
+                        max_gap.fetch_max(gap, Ordering::Relaxed);
+                        last = std::time::Instant::now();
+                    }
+                })
+            };
+
+            HASH_THREAD_STALL_MS.store(STALL_MS, Ordering::Relaxed);
+            let client = Client::new();
+            let resp = client
+                .get(format!("http://{address}/payload"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("payload");
+            let chunk = ChunkRef {
+                chunk_name: "payload",
+                chunk_decompressed_hash_md5: b"",
+                chunk_size: (FRAME * FRAMES) as u64,
+                chunk_size_decompressed: (FRAME * FRAMES) as u64,
+                chunk_compressed_hash_md5: &digest,
+                chunk_old_offset: -1,
+            };
+            let handle = DownloadHandle::new();
+            let result = stream_and_verify_directly(resp, chunk, &dest, &handle).await;
+            HASH_THREAD_STALL_MS.store(0, Ordering::Relaxed);
+            heartbeat_flag.store(true, Ordering::Relaxed);
+            let _ = heartbeat.await;
+            server.abort();
+            assert!(result.is_ok(), "download must verify: {result:?}");
+            max_gap.load(Ordering::Relaxed)
+        });
+
+        assert!(
+            max_gap_ms < STALL_MS,
+            "runtime worker blocked for {max_gap_ms} ms while hash consumer \
+             stalled {STALL_MS} ms per frame; download hand-off must not park \
+             the runtime worker"
+        );
+    }
+
+    /// Differential preservation: with a healthy consumer, the pipelined
+    /// digest must equal the scalar digest for randomized frame-size
+    /// sequences spanning the channel-capacity boundaries. Seeded PRNG keeps
+    /// the sequences reproducible.
+    #[tokio::test]
+    async fn pipelined_digest_matches_scalar_for_random_frame_sequences() {
+        let _stall_guard = HASH_THREAD_STALL_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        HASH_THREAD_STALL_MS.store(10, std::sync::atomic::Ordering::Relaxed);
+        fn next_rand(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        for seed in [1u64, 42, 1337, 90210] {
+            let mut state = seed;
+            let mut payload = Vec::new();
+            let mut frames = Vec::new();
+            for _ in 0..24 {
+                let len = (next_rand(&mut state) % (128 * 1024)) as usize + 1;
+                let start = payload.len();
+                for _ in 0..len {
+                    payload.push((next_rand(&mut state) & 0xff) as u8);
+                }
+                frames.push(bytes::Bytes::from(payload[start..].to_vec()));
+            }
+            let expected = fast_md5::digest(&payload);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("deferred.bin");
+            std::fs::write(&path, &payload).unwrap();
+
+            let mut pipeline = HashPipeline::new(Some(PooledMd5::new(take_md5().unwrap())), None);
+            assert!(matches!(pipeline, HashPipeline::Pipelined { .. }));
+            for frame in &frames {
+                pipeline.update(frame).await.unwrap();
+            }
+            assert!(matches!(pipeline, HashPipeline::DeferredMd5 { .. }));
+            let (md5, xxh64, deferred) =
+                pipeline.finish(&path, payload.len() as u64).await.unwrap();
+            assert_eq!(md5.unwrap(), expected, "seed {seed}");
+            assert!(xxh64.is_none());
+            assert!(deferred, "seed {seed} should fill the two-frame hash queue");
+        }
+        HASH_THREAD_STALL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[tokio::test]

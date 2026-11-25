@@ -100,6 +100,11 @@ name = "download_stream_bench"
 harness = false
 required-features = ["benchmark", "bench-internals"]
 
+[[bench]]
+name = "download_verify_pipeline"
+harness = false
+required-features = ["benchmark", "bench-internals", "bench-diagnostics"]
+
 [[bin]]
 name = "bench_memory"
 path = "src/bin/bench_memory.rs"

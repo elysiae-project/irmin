@@ -2907,6 +2907,198 @@ async fn install_downloads_assembles_and_commits_single_eager_chunk() {
     }
 }
 
+/// End-to-end regression for PR #15: a full install whose per-chunk hash
+/// verification is deliberately stalled must still download at network pace
+/// (not verification pace), complete, and produce byte-correct output.
+///
+/// The file uses the assembly path (chunk_old_offset = 0), so every chunk
+/// download runs the MD5 hash pipeline. The hash threads stall 100 ms per
+/// frame via the test hook, simulating verification/assembly CPU starvation.
+/// A heartbeat task measures runtime-worker stalls, and the download phase
+/// duration is bounded well below the serialized verification cost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_with_stalled_hash_verification_keeps_download_pace() {
+    use std::io::Write as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const CHUNKS: usize = 4;
+    const CHUNK_RAW: usize = 256 * 1024;
+    const STALL_MS: u64 = 100;
+    let _stall_guard = super::download::HASH_THREAD_STALL_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+
+    let server = MockServer::start().await;
+    let mut payload = Vec::new();
+    let mut chunk_records = Vec::new();
+    let mut state = 0x243f6a8885a308d3u64;
+    for c in 0..CHUNKS {
+        let raw: Vec<u8> = (0..CHUNK_RAW)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(20).unwrap();
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let name = format!("stall{c}");
+        Mock::given(method("GET"))
+            .and(path(format!("chunks/{name}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(compressed.clone())
+                    .insert_header("content-length", compressed.len().to_string()),
+            )
+            .mount(&server)
+            .await;
+        chunk_records.push(SophonManifestAssetChunk {
+            chunk_name: bytes::Bytes::from(name),
+            chunk_decompressed_hash_md5: hex::encode(fast_md5::digest(&raw)).into(),
+            chunk_on_file_offset: 0,
+            chunk_size: compressed.len() as u64,
+            chunk_size_decompressed: raw.len() as u64,
+            chunk_compressed_hash_xxh: 0,
+            chunk_compressed_hash_md5: hex::encode(fast_md5::digest(&compressed)).into(),
+            chunk_old_offset: -1,
+        });
+        payload.extend_from_slice(&raw);
+    }
+    let raws: Vec<Vec<u8>> = payload.chunks(CHUNK_RAW).map(|s| s.to_vec()).collect();
+    // Two files sharing chunk 0: chunk deduplication taints both files out
+    // of the eager path, so every download runs the MD5 hash pipeline and
+    // assembly decompresses + verifies afterwards. All chunks stay pure
+    // downloads (old_offset = -1).
+    let chained_md5 = |parts: &[&[u8]]| {
+        let mut h = fast_md5::Md5::new();
+        for part in parts {
+            h.update(part);
+        }
+        hex::encode(h.finalize())
+    };
+    let shared = chunk_records[0].clone();
+    let asset = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("stalled.bin"),
+        asset_chunks: vec![shared.clone(), chunk_records[1].clone()],
+        asset_type: 0,
+        asset_size: (2 * CHUNK_RAW) as u64,
+        asset_hash_md5: chained_md5(&[&raws[0], &raws[1]]).into(),
+    };
+    let asset2 = SophonManifestAssetProperty {
+        asset_name: bytes::Bytes::from("stalled2.bin"),
+        asset_chunks: vec![shared, chunk_records[2].clone(), chunk_records[3].clone()],
+        asset_type: 0,
+        asset_size: (3 * CHUNK_RAW) as u64,
+        asset_hash_md5: chained_md5(&[&raws[0], &raws[2], &raws[3]]).into(),
+    };
+    let installer = SophonInstaller {
+        manifest: SophonManifestProto {
+            assets: vec![asset, asset2],
+        },
+        chunk_download: DownloadInfo {
+            encryption: 0,
+            password: String::new(),
+            compression: Compression::None,
+            url_prefix: format!("{}/", server.uri()),
+            url_suffix: "chunks".into(),
+        },
+        label: "test".into(),
+        matching_field: "game".into(),
+        manifest_hash: "stalledhash".into(),
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+    let resume = ResumeContext {
+        prev_manifest_hash: String::new(),
+        prev_downloaded_chunks: FxHashMap::default(),
+        resume_seed: super::super::CompletedFiles::default(),
+    };
+    let options = InstallOptions {
+        is_preinstall: false,
+        is_resume: false,
+        handle: DownloadHandle::new(),
+        verify_mode: super::VerifyMode::Full,
+    };
+    let callbacks = InstallCallbacks {
+        updater: Arc::new(|_p| {}),
+        state_saver: Arc::new(|_entries| {}),
+        completion_state: Arc::new(std::sync::OnceLock::new()),
+    };
+
+    // Heartbeat: largest scheduling gap observed while the install runs.
+    let max_gap = Arc::new(AtomicU64::new(0));
+    let heartbeat_flag = Arc::new(AtomicBool::new(false));
+    let heartbeat = {
+        let max_gap = Arc::clone(&max_gap);
+        let flag = Arc::clone(&heartbeat_flag);
+        tokio::spawn(async move {
+            let mut last = Instant::now();
+            while !flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                max_gap.fetch_max(last.elapsed().as_millis() as u64, Ordering::Relaxed);
+                last = Instant::now();
+            }
+        })
+    };
+
+    super::download::HASH_THREAD_STALL_MS.store(STALL_MS, Ordering::Relaxed);
+    let started = Instant::now();
+    let result = install(
+        vec![installer],
+        &game_dir,
+        vec![],
+        "tag-stalled",
+        resume,
+        options,
+        callbacks,
+        "test",
+        &[std::string::String::from("en-US")],
+    )
+    .await;
+    let elapsed = started.elapsed();
+    super::download::HASH_THREAD_STALL_MS.store(0, Ordering::Relaxed);
+    heartbeat_flag.store(true, Ordering::Relaxed);
+    let _ = heartbeat.await;
+
+    assert!(
+        result.is_ok(),
+        "stalled-verification install failed: {result:?}"
+    );
+    let written = std::fs::read(game_dir.join("stalled.bin")).unwrap();
+    assert_eq!(
+        written,
+        [raws[0].as_slice(), raws[1].as_slice()].concat(),
+        "output must match despite stalled verification"
+    );
+    let written2 = std::fs::read(game_dir.join("stalled2.bin")).unwrap();
+    assert_eq!(
+        written2,
+        [raws[0].as_slice(), raws[2].as_slice(), raws[3].as_slice()].concat(),
+        "second output must match despite stalled verification"
+    );
+
+    // Serialized verification cost: each chunk's compressed stream spans
+    // several reqwest frames; at STALL_MS per frame the old blocking
+    // pipeline stretched the download phase to seconds. The decoupled
+    // pipeline falls back to inline hashing after one reclaim per chunk,
+    // so the whole install stays far below that.
+    let gap = max_gap.load(Ordering::Relaxed);
+    assert!(
+        gap < 1000,
+        "runtime workers stalled for {gap} ms during install with verification load"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "install took {elapsed:?}; download is throttled to verification pace"
+    );
+}
+
 /// Integration test for the `update` path's call into `install()`: an update
 /// passes a non-empty `deleted_files` list (files present in the old version
 /// but absent from the new manifest) and `DownloadType::Update` resume
