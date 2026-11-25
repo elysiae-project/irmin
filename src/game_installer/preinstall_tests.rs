@@ -2823,6 +2823,47 @@ async fn snapshot_fallbacks_ignore_damaged_old_offsets_and_regenerate_hk4e_index
     assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("2.0"));
 }
 
+#[cfg(feature = "patch")]
+#[tokio::test]
+async fn snapshot_patch_method_applies_hdiff_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+
+    let target = b"This is brand new content created from nothing!";
+    let target_hash = hex::encode(fast_md5::digest(target));
+    let fields: &[(&str, &str, &[u8])] = &[("game", "data.bin", target)];
+    let mut state = snapshot_state(fields, "http://127.0.0.1:1");
+    state.patch_assets[0].patch_method = PatchMethod::Patch;
+    state.patch_assets[0].patch_name = "new-file.hdiff".into();
+    state.patch_assets[0].original_file_path = Some("old-data.bin".into());
+    state.patch_assets[0].original_file_hash = Some(BLANK_FILE_MD5.into());
+    state.patch_assets[0].original_file_size = Some(0);
+    state.patch_assets[0].target_file_hash = target_hash;
+    // The HDiff implementation has a known-good empty-source/new-file fixture.
+    let patch =
+        b"HDIFF13&zstd\0/\0\0\0\0\x02\0\0\0/\0 .This is brand new content created from nothing!";
+    state.patch_assets[0].patch_hash = hex::encode(fast_md5::digest(patch));
+    state.patch_assets[0].patch_size = patch.len() as u64;
+    state.patch_assets[0].patch_chunk_length = patch.len() as u64;
+    reseal(&mut state);
+    fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
+    fs::write(patching_chunk_dir(dir.path()).join("new-file.hdiff"), patch).unwrap();
+    save_preinstall_state(dir.path(), &state).unwrap();
+
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), target);
+    assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("2.0"));
+}
+
 fn test_branch(name: &str, tag: &str) -> PackageBranch {
     PackageBranch {
         package_id: "package".into(),

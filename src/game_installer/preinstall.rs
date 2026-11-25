@@ -3132,24 +3132,6 @@ async fn process_patch_asset(ctx: PatchTaskContext) -> SophonResult<()> {
                 .await?;
             }
         }
-        #[cfg(not(feature = "patch"))]
-        PatchMethod::Patch => {
-            // The HDiff engine is not compiled in; fall back to a full
-            // download of the target file.
-            log::warn!(
-                "HDiff engine unavailable, downloading {path} in full",
-                path = asset.target_file_path,
-            );
-            apply_download_over_with_retry(
-                &client,
-                &game_dir,
-                &state,
-                &asset,
-                &download_over_context,
-                &handle,
-            )
-            .await?;
-        }
         PatchMethod::DownloadOver => {
             apply_download_over_with_retry(
                 &client,
