@@ -2270,15 +2270,20 @@ async fn process_eager_item_streaming(
         }
 
         let mut stream = response.bytes_stream();
+        // Deep slot queue: backpressure is governed by the byte budget
+        // below, not the slot count, so a lagging decoder cannot pause
+        // network reads until the in-flight bytes exceed the budget.
         let (sender, receiver) = tokio::sync::mpsc::channel::<Result<StreamMessage, std::io::Error>>(
-            stream_queue_capacity,
+            (EAGER_STREAM_BYTE_BUDGET / (64 * 1024)).max(stream_queue_capacity),
         );
+        let byte_budget = Arc::new(StreamByteBudget::new(EAGER_STREAM_BYTE_BUDGET));
         let out = Arc::clone(&out_file);
         let expected_decompressed_size = chunk.chunk_size_decompressed;
         let chunk_offset = item.output_offset;
         let all_files = all_files.clone();
         #[cfg(feature = "bench-diagnostics")]
         let decoder_timings = timings.clone();
+        let decoder_budget = Arc::clone(&byte_budget);
         let decode_task = tokio::task::spawn_blocking(move || {
             let decompressed_hash: &[u8] = match &all_files {
                 Some(manifest) => manifest.chunk_decompressed_hash_at(global_chunk_idx),
@@ -2292,6 +2297,7 @@ async fn process_eager_item_streaming(
                 current: None,
                 offset: 0,
                 complete: false,
+                byte_budget: Some(decoder_budget),
                 #[cfg(feature = "bench-diagnostics")]
                 timings: decoder_timings.clone(),
             };
@@ -2402,6 +2408,12 @@ async fn process_eager_item_streaming(
             }
             #[cfg(feature = "bench-diagnostics")]
             let send_started = std::time::Instant::now();
+            // Budget gate: only suspend when in-flight bytes exceed the
+            // per-chunk budget (decoder far behind). The await yields the
+            // runtime worker; cancellation stays responsive because the
+            // consumer keeps draining and releasing bytes, and a dead
+            // consumer closes the channel so the send below fails fast.
+            byte_budget.acquire(bytes.len()).await;
             let send_result = sender.send(Ok(StreamMessage::Data(bytes))).await;
             #[cfg(feature = "bench-diagnostics")]
             if let Some(timings) = timings.as_ref() {
@@ -2591,11 +2603,67 @@ enum StreamMessage {
     Complete,
 }
 
+/// Byte budget for in-flight eager stream frames between the download
+/// producer and the decode/verify consumer. The producer keeps receiving
+/// network bytes while the decoder lags, up to this budget; only then does
+/// it suspend (asynchronously — never blocking a runtime worker) until the
+/// consumer releases bytes. Sized so a short decoder stall never pauses
+/// network reads, while per-chunk memory stays bounded.
+const EAGER_STREAM_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Shared producer/consumer byte accounting. `in_flight` counts frame bytes
+/// handed to the channel but not yet consumed by the decoder; the consumer
+/// subtracts as it consumes and notifies, the producer awaits the notify
+/// when the budget is exhausted.
+struct StreamByteBudget {
+    in_flight: AtomicUsize,
+    budget: usize,
+    space: tokio::sync::Notify,
+}
+
+impl StreamByteBudget {
+    fn new(budget: usize) -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            budget,
+            space: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Producer side: wait until `len` more bytes fit the budget, then
+    /// charge them. Suspends only this chunk's task; other downloads and
+    /// the runtime keep running.
+    async fn acquire(&self, len: usize) {
+        loop {
+            let notified = self.space.notified();
+            let current = self.in_flight.load(Ordering::Acquire);
+            // A frame larger than the whole budget still proceeds once the
+            // queue is empty, so oversized frames cannot deadlock.
+            if current + len <= self.budget || current == 0 {
+                self.in_flight.fetch_add(len, Ordering::AcqRel);
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Consumer side: release consumed bytes and wake a waiting producer.
+    fn release(&self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.in_flight.fetch_sub(len, Ordering::AcqRel);
+        self.space.notify_waiters();
+    }
+}
+
 struct ChunkStreamReader {
     receiver: tokio::sync::mpsc::Receiver<Result<StreamMessage, std::io::Error>>,
     current: Option<bytes::Bytes>,
     offset: usize,
     complete: bool,
+    /// None in unit tests that drive the reader without a producer budget.
+    byte_budget: Option<Arc<StreamByteBudget>>,
     #[cfg(feature = "bench-diagnostics")]
     timings: Option<Arc<super::eager_decompress::EagerStreamPhaseTimings>>,
 }
@@ -2669,6 +2737,9 @@ impl std::io::BufRead for ChunkStreamReader {
                 .fetch_add(amt as u64, Ordering::Relaxed);
         }
         self.offset += amt;
+        if let Some(budget) = self.byte_budget.as_ref() {
+            budget.release(amt);
+        }
     }
 }
 
