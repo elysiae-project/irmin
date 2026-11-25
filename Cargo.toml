@@ -80,9 +80,10 @@ default = ["download", "update", "verify", "preinstall", "patch", "plugins"]
 # Fresh-download entry points. The install engine is shared with update
 # and always compiled.
 download = []
-# Update checking and versioned delta installation. Size queries consult
-# cached preinstall packages, so `update` builds on `preinstall`.
-update = ["download", "preinstall"]
+# Update planning and versioned delta installation.
+update = ["download"]
+# Remote update and preinstall availability and size queries.
+discovery = ["download"]
 # Post-install integrity scan and repair. Per-chunk MD5 checks during
 # download and assembly are always on.
 verify = ["download"]
@@ -101,7 +102,7 @@ sophon-profiling = [
 ]
 # Development-only features: kept out of `default` on purpose.
 benchmark = []
-bench-internals = ["benchmark", "update", "preinstall", "verify"]
+bench-internals = ["benchmark", "update", "discovery", "preinstall", "verify"]
 bench-diagnostics = ["benchmark"]
 benchmark-jemalloc = [
     "benchmark",
@@ -142,7 +143,7 @@ required-features = ["update"]
 
 [[example]]
 name = "preinstall"
-required-features = ["preinstall", "update"]
+required-features = ["preinstall", "discovery"]
 
 [[example]]
 name = "verify"
@@ -150,7 +151,7 @@ required-features = ["verify"]
 
 [[example]]
 name = "check_update"
-required-features = ["update"]
+required-features = ["discovery"]
 
 [profile.release]
 opt-level = 3

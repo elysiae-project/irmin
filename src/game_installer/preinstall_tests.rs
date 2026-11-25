@@ -3149,7 +3149,7 @@ async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
     assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("1.0"));
 }
 
-#[cfg(feature = "update")]
+#[cfg(all(feature = "discovery", feature = "preinstall"))]
 #[tokio::test]
 async fn discovery_prefers_valid_live_package_and_keeps_its_sizes_when_queries_fail() {
     let dir = tempfile::tempdir().unwrap();
@@ -3192,7 +3192,7 @@ async fn discovery_prefers_valid_live_package_and_keeps_its_sizes_when_queries_f
     }
 }
 
-#[cfg(feature = "update")]
+#[cfg(all(feature = "discovery", feature = "preinstall"))]
 #[tokio::test]
 async fn discovery_rejects_markers_arbitrary_json_corrupt_snapshots_and_wrong_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -3303,7 +3303,7 @@ async fn successful_apply_removes_only_its_package_state_not_shared_patch_payloa
     );
 }
 
-#[cfg(feature = "update")]
+#[cfg(all(feature = "discovery", feature = "preinstall"))]
 #[tokio::test]
 async fn cached_package_discovery_accepts_equivalent_voice_aliases() {
     let dir = tempfile::tempdir().unwrap();

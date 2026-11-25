@@ -444,7 +444,7 @@ pub fn is_known_vo_locale(matching_field: &str) -> bool {
         || f.windows(5).any(|w| w.eq_ignore_ascii_case(b"ja-jp"))
 }
 
-#[cfg(feature = "update")]
+#[cfg(feature = "discovery")]
 #[inline]
 /// Parse the service size representation into bytes; malformed input returns an
 /// error.

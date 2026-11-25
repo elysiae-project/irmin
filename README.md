@@ -58,7 +58,7 @@ The callback runs on worker tasks, so keep it thread-safe and avoid blocking wor
 | --- | --- |
 | `download(&handle, callback)` | Install a fresh copy. |
 | `update(&handle, callback)` | Update an existing install. Returns `NoInstalledVersion` if none exists. |
-| `check_update()` | Check for update or preinstall availability and sizes. |
+| `check_update()` | Check for update or preinstall availability and sizes (`discovery`). |
 | `preinstall(&handle, callback)` | Download an available version's preinstall package. |
 | `apply_preinstall(tag, &handle, callback)` | Apply a downloaded package after release. |
 | `verify_integrity(callback)` | Check installed files and repair missing or damaged files. |
@@ -92,7 +92,8 @@ irmin = { package = "irmin_rs", version = "1.1", default-features = false, featu
 | Feature | Enables | Depends on |
 | --- | --- | --- |
 | `download` | Fresh install (`Sophon::download`). | — |
-| `update` | `update`, `check_update`. | `download`, `preinstall` |
+| `update` | `update`. | `download` |
+| `discovery` | `check_update` update/preinstall availability and size query. | `download` |
 | `verify` | `verify_integrity` repair. | `download` |
 | `preinstall` | `preinstall`, `apply_preinstall`. | `download`, `patch` |
 | `patch` | HDiff patch engine used when applying preinstall packages. | — |
@@ -100,7 +101,7 @@ irmin = { package = "irmin_rs", version = "1.1", default-features = false, featu
 
 The chunk download and assembly engine, including per-chunk MD5 verification and resume state, is always compiled because every operation shares it. `verify` only gates the explicit post-install repair scan. Selecting `download` alone drops the patch codecs (`lz4`, `flate2`) and the plugin archive reader (`zip`) from the build.
 
-`preinstall` requires `patch`, and `update` also enables `preinstall` for cached-package size queries. If you disable `patch`, the preinstall and update APIs are unavailable; there is no full-download fallback for HDiff assets without the patch engine.
+`preinstall` requires `patch`. `update` does not enable preinstall or HDiff support, and `check_update` is independently enabled by `discovery`. When `preinstall` is disabled, the preinstall availability, tag, and size fields in `UpdateInfo` are empty and should be treated as unsupported rather than as a definitive “not available” result. Enable both `discovery` and `preinstall` to query cached or remote preinstall package information. There is no full-download fallback for HDiff assets without the patch engine.
 
 The `benchmark`, `bench-internals`, `bench-diagnostics`, `benchmark-jemalloc`, `bench-alloc-stats`, and `sophon-profiling` features are development-only and stay off by default.
 

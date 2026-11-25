@@ -24,7 +24,7 @@
     feature = "preinstall"
 ))]
 use std::path::PathBuf;
-#[cfg(feature = "update")]
+#[cfg(all(feature = "discovery", feature = "update"))]
 use std::sync::Arc;
 
 #[cfg(any(
@@ -105,7 +105,7 @@ where
 /// `check_update` must be spawnable on a multi-thread runtime even though it
 /// borrows `&self`. The returned future is `Send + 'static` and owned by the
 /// caller; the borrow of `&self` ends at the call site.
-#[cfg(feature = "update")]
+#[cfg(feature = "discovery")]
 #[test]
 fn check_update_future_is_send_and_static() {
     let sophon = sophon_fixture();
@@ -181,7 +181,7 @@ fn apply_preinstall_future_is_send_and_static() {
 /// runs concurrently on a multi-thread runtime — i.e. holding a `Sophon` in
 /// one async task while another task awaits must not require the caller to
 /// pin or borrow the `Sophon` for a specific lifetime.
-#[cfg(feature = "update")]
+#[cfg(all(feature = "update", feature = "discovery"))]
 #[test]
 fn sophon_owned_can_be_moved_across_await() {
     let sophon: Arc<Sophon> = Arc::new(sophon_fixture());

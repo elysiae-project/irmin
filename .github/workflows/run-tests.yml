@@ -53,8 +53,9 @@ jobs:
               # with and without the default feature set.
               run: |
                 cargo check --all-targets --no-default-features
-                for f in download update verify preinstall patch plugins; do
+                for f in download update discovery verify preinstall patch plugins; do
                   cargo check --all-targets --no-default-features --features "$f"
                 done
+                cargo check --all-targets --no-default-features --features update,discovery
                 cargo check --all-targets --no-default-features --features download,verify
                 cargo check --all-targets --no-default-features --features download,plugins

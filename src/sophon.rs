@@ -28,7 +28,7 @@ use crate::SophonProgress;
 use crate::client::DownloadClient;
 #[cfg(any(feature = "download", feature = "update", feature = "preinstall"))]
 use crate::game_installer::StateSaver;
-#[cfg(feature = "update")]
+#[cfg(feature = "discovery")]
 use crate::game_installer::UpdateInfo;
 use crate::game_installer::{self, VerifyMode};
 #[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
@@ -395,7 +395,7 @@ impl Sophon {
     ///
     /// The returned future is `Send` and owns its data, so it can be spawned on
     /// a multi-threaded runtime. The borrow of `&self` ends at the call site.
-    #[cfg(feature = "update")]
+    #[cfg(feature = "discovery")]
     pub fn check_update(
         &self,
     ) -> impl Future<Output = Result<UpdateInfo, SophonError>> + Send + 'static {

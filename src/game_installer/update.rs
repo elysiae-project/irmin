@@ -165,8 +165,11 @@ where
     F: Fn(PackageBranch, Option<String>) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = SophonResult<(u64, u64)>> + Send,
 {
+    #[cfg(not(feature = "preinstall"))]
+    let _ = (game_id, vo_lang, game_dir, &pre_download_branch);
     let remote_tag = main_branch.tag.clone();
     let update_available = current_tag.as_deref().is_some_and(|tag| tag != remote_tag);
+    #[cfg(feature = "preinstall")]
     let cached_live = update_available
         .then(|| {
             super::preinstall::cached_preinstall(
@@ -178,6 +181,7 @@ where
             )
         })
         .flatten();
+    #[cfg(feature = "preinstall")]
     let cached = cached_live.or_else(|| {
         pre_download_branch.as_ref().and_then(|pre| {
             super::preinstall::cached_preinstall(
@@ -202,15 +206,20 @@ where
             Ok(sizes) => sizes,
             Err(err) => {
                 log::warn!("Failed to estimate update sizes (availability is unchanged): {err}");
-                cached
+                #[cfg(feature = "preinstall")]
+                let fallback_sizes = cached
                     .as_ref()
                     .filter(|state| state.tag == remote_tag)
                     .map(|state| state.cached_sizes())
-                    .unwrap_or((0, 0))
+                    .unwrap_or((0, 0));
+                #[cfg(not(feature = "preinstall"))]
+                let fallback_sizes = (0, 0);
+                fallback_sizes
             }
         }
     };
     // (tag, compressed, decompressed); None means no preinstall package.
+    #[cfg(feature = "preinstall")]
     let preinstall_sizes = async {
         if let Some(state) = &cached {
             let (cs, ds) = state.cached_sizes();
@@ -225,10 +234,16 @@ where
         Some((tag, cs, ds))
     };
 
+    #[cfg(feature = "preinstall")]
     let ((update_compressed_size, update_decompressed_size), preinstall) =
         tokio::join!(update_sizes, preinstall_sizes);
 
+    #[cfg(not(feature = "preinstall"))]
+    let (update_compressed_size, update_decompressed_size) = update_sizes.await;
+
+    #[cfg(feature = "preinstall")]
     let preinstall_downloaded = cached.is_some();
+    #[cfg(feature = "preinstall")]
     let (
         preinstall_available,
         preinstall_tag,
@@ -238,6 +253,15 @@ where
         Some((tag, cs, ds)) => (true, Some(tag), cs, ds),
         None => (false, None, 0, 0),
     };
+
+    #[cfg(not(feature = "preinstall"))]
+    let (
+        preinstall_downloaded,
+        preinstall_available,
+        preinstall_tag,
+        preinstall_compressed_size,
+        preinstall_decompressed_size,
+    ) = (false, false, None, 0, 0);
 
     Ok(UpdateInfo {
         update_available,
@@ -1044,6 +1068,51 @@ mod tests {
         assert!(!info.update_available);
         assert_eq!(info.current_tag.as_deref(), Some("1.0.0"));
         assert_eq!(info.current_tag.as_deref(), Some(info.remote_tag.as_str()));
+    }
+}
+
+#[cfg(all(test, feature = "discovery", not(feature = "preinstall")))]
+mod discovery_without_preinstall_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn update_discovery_works_without_preinstall_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = check_update_with_branches(
+            "nap",
+            "en",
+            dir.path(),
+            Some("1.0".into()),
+            PackageBranch {
+                package_id: "package".into(),
+                branch: "main".into(),
+                password: String::new(),
+                tag: "2.0".into(),
+            },
+            None,
+            |_, from| async move {
+                assert_eq!(from.as_deref(), Some("1.0"));
+                Ok((10, 20))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(info.update_available);
+        assert!(!info.preinstall_available);
+        assert!(!info.preinstall_downloaded);
+        assert_eq!(info.preinstall_tag, None);
+        assert_eq!(
+            (info.update_compressed_size, info.update_decompressed_size),
+            (10, 20)
+        );
+        assert_eq!(
+            (
+                info.preinstall_compressed_size,
+                info.preinstall_decompressed_size
+            ),
+            (0, 0)
+        );
     }
 }
 

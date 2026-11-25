@@ -420,7 +420,10 @@ impl PreinstallState {
         game_dir.join(format!(".sophon_preinstall_{tag}"))
     }
 
-    #[cfg_attr(not(feature = "update"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "discovery", feature = "preinstall")),
+        allow(dead_code)
+    )]
     pub(super) fn cached_sizes(&self) -> (u64, u64) {
         let mut compressed = 0u64;
         let mut decompressed = 0u64;
@@ -452,7 +455,10 @@ impl PreinstallState {
     }
 }
 
-#[cfg_attr(not(feature = "update"), allow(dead_code))]
+#[cfg_attr(
+    not(all(feature = "discovery", feature = "preinstall")),
+    allow(dead_code)
+)]
 pub(super) fn cached_preinstall(
     game_dir: &Path,
     tag: &str,

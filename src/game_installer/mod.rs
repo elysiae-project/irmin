@@ -57,10 +57,10 @@ mod plugin_install;
 #[cfg(feature = "preinstall")]
 pub mod preinstall;
 #[cfg(not(feature = "bench-internals"))]
-#[cfg(feature = "update")]
+#[cfg(feature = "discovery")]
 mod update;
 #[cfg(feature = "bench-internals")]
-#[cfg(feature = "update")]
+#[cfg(feature = "discovery")]
 pub mod update;
 
 mod profiling;
@@ -381,7 +381,7 @@ pub use preinstall::prepare_synthetic_copyover_state as prepare_benchmark_copyov
 pub use preinstall::{HdiffPhaseTimings, apply_synthetic_hdiff_for_benchmark};
 #[cfg(feature = "preinstall")]
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
-#[cfg(feature = "update")]
+#[cfg(feature = "discovery")]
 pub use update::{UpdateInfo, check_update};
 
 /// Advance jemalloc epoch and trigger a background decay pass. Call after
