@@ -3144,11 +3144,19 @@ async fn process_download_item(
     }
 
     if was_actually_downloaded && item.is_pre_downloaded {
-        ctx.resume_bytes_offset
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(chunk.chunk_size))
-            })
-            .ok();
+        let mut current = ctx.resume_bytes_offset.load(Ordering::Relaxed);
+        loop {
+            let updated = current.saturating_sub(chunk.chunk_size);
+            match ctx.resume_bytes_offset.compare_exchange_weak(
+                current,
+                updated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     _chunk_timer.record_phase(super::profiling::ChunkPhase::PostDownload);
