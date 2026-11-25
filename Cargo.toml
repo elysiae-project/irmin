@@ -76,7 +76,7 @@ tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "si
 
 [features]
 # Everything except the development-only benchmark features.
-default = ["download", "update", "verify", "preinstall", "patch", "plugins"]
+default = ["download", "update", "discovery", "verify", "preinstall", "patch", "plugins"]
 # Fresh-download entry points. The install engine is shared with update
 # and always compiled.
 download = []

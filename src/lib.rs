@@ -9,7 +9,7 @@
 //! - `download`: fresh install via [`Sophon::download`].
 //! - `update`: versioned update planning and installation (implies `download`).
 //! - `discovery`: `check_update` availability and size queries (implies
-//!   `download`).
+//!   `download`; enabled by default).
 //! - `verify`: post-install integrity repair via `verify_integrity`.
 //! - `preinstall`: preinstall download and apply (implies `download`, `patch`).
 //! - `patch`: HDiff patch engine used by preinstall apply.
