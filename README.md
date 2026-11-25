@@ -100,6 +100,8 @@ irmin = { package = "irmin_rs", version = "1.1", default-features = false, featu
 
 The chunk download and assembly engine, including per-chunk MD5 verification and resume state, is always compiled because every operation shares it. `verify` only gates the explicit post-install repair scan. Selecting `download` alone drops the patch codecs (`lz4`, `flate2`) and the plugin archive reader (`zip`) from the build.
 
+`preinstall` requires `patch`, and `update` also enables `preinstall` for cached-package size queries. If you disable `patch`, the preinstall and update APIs are unavailable; there is no full-download fallback for HDiff assets without the patch engine.
+
 The `benchmark`, `bench-internals`, `bench-diagnostics`, `benchmark-jemalloc`, `bench-alloc-stats`, and `sophon-profiling` features are development-only and stay off by default.
 
 ## Pause, resume, and cancel
