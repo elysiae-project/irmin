@@ -7,7 +7,7 @@ use reqwest::Client;
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
-use super::api::{fetch_build, is_known_vo_locale, vo_lang_matches};
+use super::api::{fetch_build, fetch_front_door, is_known_vo_locale, vo_lang_matches};
 use super::error::{SophonError, SophonResult};
 use super::read_installed_tag;
 
@@ -98,23 +98,13 @@ impl CompactChunkNameSet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-/// Availability and byte-size summary for update and preinstall operations.
+/// Availability and byte-size summary for updating the installed game.
 pub struct UpdateInfo {
     pub update_available: bool,
-    /// A remote preinstall or a usable local package is available.
-    pub preinstall_available: bool,
-    /// A validated completed-package record exists (not merely a marker).
-    /// Legacy records may still need exact-target metadata recovery on apply.
-    pub preinstall_downloaded: bool,
     pub current_tag: Option<String>,
     pub remote_tag: String,
-    pub preinstall_tag: Option<String>,
-    /// Best-effort estimate: zero if unknown, or a conservative cached target
-    /// total.
     pub update_compressed_size: u64,
     pub update_decompressed_size: u64,
-    pub preinstall_compressed_size: u64,
-    pub preinstall_decompressed_size: u64,
 }
 
 /// Query remote build metadata and compare it with the installed version.
@@ -124,41 +114,24 @@ pub async fn check_update(
     vo_lang: &str,
     game_dir: &Path,
 ) -> SophonResult<UpdateInfo> {
-    let (front_door, current_tag) =
-        tokio::join!(super::api::fetch_front_door(client, game_id), async {
-            read_installed_tag(game_dir)
-        });
-    let (main_branch, pre_download_branch) = front_door?.take_branches();
+    let (front_door, current_tag) = tokio::join!(fetch_front_door(client, game_id), async {
+        read_installed_tag(game_dir)
+    });
+    let (main_branch, _) = front_door?.take_branches();
     let main_branch = main_branch.ok_or(SophonError::NoGameManifest)?;
-    check_update_with_branches(
-        game_id,
-        vo_lang,
-        game_dir,
-        current_tag,
-        main_branch,
-        pre_download_branch,
-        |branch, from| async move {
-            if let Some(from) = from {
-                fetch_diff_sizes(client, &branch, &from, &branch.tag, vo_lang).await
-            } else {
-                fetch_build_sizes(client, &branch, vo_lang).await
-            }
-        },
-    )
+    check_update_with_branches(current_tag, main_branch, |branch, from| async move {
+        if let Some(from) = from {
+            fetch_diff_sizes(client, &branch, &from, &branch.tag, vo_lang).await
+        } else {
+            fetch_build_sizes(client, &branch, vo_lang).await
+        }
+    })
     .await
 }
 
-// Branch discovery is separate from optional size queries, so local completed
-// packages remain usable when historical build/manifest endpoints disappear.
-// `query_sizes` is `Fn` because the two size queries hold shared `&`
-// access to it while both are polled.
-pub(super) async fn check_update_with_branches<F, Fut>(
-    game_id: &str,
-    vo_lang: &str,
-    game_dir: &Path,
+async fn check_update_with_branches<F, Fut>(
     current_tag: Option<String>,
     main_branch: PackageBranch,
-    pre_download_branch: Option<PackageBranch>,
     query_sizes: F,
 ) -> SophonResult<UpdateInfo>
 where
@@ -167,89 +140,24 @@ where
 {
     let remote_tag = main_branch.tag.clone();
     let update_available = current_tag.as_deref().is_some_and(|tag| tag != remote_tag);
-    let cached_live = update_available
-        .then(|| {
-            super::preinstall::cached_preinstall(
-                game_dir,
-                &remote_tag,
-                game_id,
-                vo_lang,
-                current_tag.as_deref(),
-            )
-        })
-        .flatten();
-    let cached = cached_live.or_else(|| {
-        pre_download_branch.as_ref().and_then(|pre| {
-            super::preinstall::cached_preinstall(
-                game_dir,
-                &pre.tag,
-                game_id,
-                vo_lang,
-                current_tag.as_deref(),
-            )
-        })
-    });
-
-    // The update-size query and the preinstall-size query hit the same API
-    // and each handles its own error, so they run concurrently; when a
-    // cached package or a quiet branch short-circuits one side, its future
-    // is already complete and the join! is free.
-    let update_sizes = async {
-        if !update_available {
-            return (0, 0);
-        }
-        match query_sizes(main_branch.clone(), current_tag.clone()).await {
+    let (update_compressed_size, update_decompressed_size) = if update_available {
+        match query_sizes(main_branch, current_tag.clone()).await {
             Ok(sizes) => sizes,
             Err(err) => {
                 log::warn!("Failed to estimate update sizes (availability is unchanged): {err}");
-                cached
-                    .as_ref()
-                    .filter(|state| state.tag == remote_tag)
-                    .map(|state| state.cached_sizes())
-                    .unwrap_or((0, 0))
+                (0, 0)
             }
         }
-    };
-    // (tag, compressed, decompressed); None means no preinstall package.
-    let preinstall_sizes = async {
-        if let Some(state) = &cached {
-            let (cs, ds) = state.cached_sizes();
-            return Some((state.tag.clone(), cs, ds));
-        }
-        let pre = pre_download_branch.clone()?;
-        let tag = pre.tag.clone();
-        let (cs, ds) = query_sizes(pre, None).await.unwrap_or_else(|err| {
-            log::warn!("Failed to fetch preinstall sizes: {err}");
-            (0, 0)
-        });
-        Some((tag, cs, ds))
-    };
-
-    let ((update_compressed_size, update_decompressed_size), preinstall) =
-        tokio::join!(update_sizes, preinstall_sizes);
-
-    let preinstall_downloaded = cached.is_some();
-    let (
-        preinstall_available,
-        preinstall_tag,
-        preinstall_compressed_size,
-        preinstall_decompressed_size,
-    ) = match preinstall {
-        Some((tag, cs, ds)) => (true, Some(tag), cs, ds),
-        None => (false, None, 0, 0),
+    } else {
+        (0, 0)
     };
 
     Ok(UpdateInfo {
         update_available,
-        preinstall_available,
-        preinstall_downloaded,
         current_tag,
         remote_tag,
-        preinstall_tag,
         update_compressed_size,
         update_decompressed_size,
-        preinstall_compressed_size,
-        preinstall_decompressed_size,
     })
 }
 
@@ -492,11 +400,11 @@ where
 }
 
 #[cfg(test)]
-fn borrowed_diff_indexes_collect<'a>(
-    old_manifest: &'a crate::proto_parse::SophonManifestProto,
+fn borrowed_diff_indexes_collect(
+    old_manifest: &crate::proto_parse::SophonManifestProto,
 ) -> (
-    rustc_hash::FxHashMap<&'a str, &'a str>,
-    rustc_hash::FxHashSet<&'a str>,
+    rustc_hash::FxHashMap<&str, &str>,
+    rustc_hash::FxHashSet<&str>,
 ) {
     let old_files_md5 = old_manifest
         .assets
@@ -557,9 +465,7 @@ fn make_diff_size_benchmark_manifests(
     let make_file = |file_idx: usize, changed: bool, is_old: bool| {
         let asset_chunks = (0..chunks_per_file)
             .map(|chunk_idx| {
-                let hash = if is_old {
-                    format!("old-hash-{:04}", chunk_idx % 32)
-                } else if !changed && chunk_idx % 100 < reused_hash_percent {
+                let hash = if is_old || (!changed && chunk_idx % 100 < reused_hash_percent) {
                     format!("old-hash-{:04}", chunk_idx % 32)
                 } else {
                     format!("new-hash-{file_idx:06}-{chunk_idx:04}")
@@ -980,44 +886,31 @@ mod tests {
     fn update_info_serde_roundtrip_basic() {
         let info = UpdateInfo {
             update_available: true,
-            preinstall_available: false,
-            preinstall_downloaded: false,
             current_tag: Some("1.0.0".into()),
             remote_tag: "2.0.0".into(),
-            preinstall_tag: None,
             update_compressed_size: 1_000_000,
             update_decompressed_size: 5_000_000,
-            preinstall_compressed_size: 0,
-            preinstall_decompressed_size: 0,
         };
         let json = serde_json::to_string(&info).unwrap();
         let decoded: UpdateInfo = serde_json::from_str(&json).unwrap();
         assert!(decoded.update_available);
-        assert!(!decoded.preinstall_available);
         assert_eq!(decoded.current_tag, Some("1.0.0".to_string()));
         assert_eq!(decoded.remote_tag, "2.0.0");
         assert_eq!(decoded.update_compressed_size, 1_000_000);
     }
 
     #[test]
-    fn update_info_serde_roundtrip_all_fields() {
+    fn update_info_serde_roundtrip_large_sizes() {
         let info = UpdateInfo {
             update_available: false,
-            preinstall_available: true,
-            preinstall_downloaded: true,
             current_tag: None,
             remote_tag: "3.0.0-pre".into(),
-            preinstall_tag: Some("3.0.0-pre".into()),
             update_compressed_size: u64::MAX,
             update_decompressed_size: u64::MAX,
-            preinstall_compressed_size: 0,
-            preinstall_decompressed_size: 0,
         };
         let json = serde_json::to_string(&info).unwrap();
         let decoded: UpdateInfo = serde_json::from_str(&json).unwrap();
-        assert!(decoded.preinstall_available);
         assert_eq!(decoded.current_tag, None);
-        assert_eq!(decoded.preinstall_tag, Some("3.0.0-pre".to_string()));
         assert_eq!(decoded.update_compressed_size, u64::MAX);
     }
 
@@ -1031,19 +924,44 @@ mod tests {
     fn update_info_no_update_when_tags_match() {
         let info = UpdateInfo {
             update_available: false,
-            preinstall_available: false,
-            preinstall_downloaded: false,
             current_tag: Some("1.0.0".into()),
             remote_tag: "1.0.0".into(),
-            preinstall_tag: None,
             update_compressed_size: 0,
             update_decompressed_size: 0,
-            preinstall_compressed_size: 0,
-            preinstall_decompressed_size: 0,
         };
         assert!(!info.update_available);
         assert_eq!(info.current_tag.as_deref(), Some("1.0.0"));
         assert_eq!(info.current_tag.as_deref(), Some(info.remote_tag.as_str()));
+    }
+}
+
+#[cfg(all(test, feature = "discovery"))]
+mod update_discovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn update_discovery_queries_sizes_only_when_update_exists() {
+        let info = check_update_with_branches(
+            Some("1.0".into()),
+            PackageBranch {
+                package_id: "package".into(),
+                branch: "main".into(),
+                password: String::new(),
+                tag: "2.0".into(),
+            },
+            |_, from| async move {
+                assert_eq!(from.as_deref(), Some("1.0"));
+                Ok((10, 20))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(info.update_available);
+        assert_eq!(
+            (info.update_compressed_size, info.update_decompressed_size),
+            (10, 20)
+        );
     }
 }
 

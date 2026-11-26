@@ -10,6 +10,7 @@
 //! Compare to baseline: cargo bench -- --baseline before
 
 use std::fs;
+use std::hint::black_box;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt;
@@ -18,8 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use fast_md5;
-
 use irmin_rs::game_installer::{
     VerifyMode,
     assembly::{assemble_file, assemble_file_with_benchmark_epochs, chunk_filename},
@@ -187,7 +186,7 @@ fn bench_md5_multibuffer(c: &mut Criterion) {
 
     group.bench_function("hash_many_avx2", |b| {
         b.iter(|| {
-            let mut engine = Md5Engine::new();
+            let engine = Md5Engine::new();
             let mut outputs = [[0u8; 16]; N_MSG];
             engine.hash_many(&inputs, &mut outputs);
             std::hint::black_box(outputs);
@@ -201,11 +200,7 @@ fn bench_md5_multibuffer(c: &mut Criterion) {
         let expect = fast_md5::digest(m);
         assert_eq!(outputs[i], expect, "lane {i} digest mismatch");
         let _ = simd_digest; // keep import honest: also compare crate one-shot
-        assert_eq!(
-            simd_digest(&inputs[i]),
-            expect,
-            "lane {i} one-shot mismatch"
-        );
+        assert_eq!(simd_digest(inputs[i]), expect, "lane {i} one-shot mismatch");
     }
 
     group.finish();
@@ -1272,7 +1267,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
                     path,
                     tiny_bytes,
-                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(md5)
                         .unwrap_or_default()
                         .as_slice(),
                     &game_dir,
@@ -1515,7 +1510,7 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
                 assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
             }
             let digest = hasher.finish().unwrap();
-            criterion::black_box(digest);
+            black_box(digest);
         });
     });
     group.finish();
@@ -1846,7 +1841,7 @@ fn encode_7bit_varint(v: i64) -> Vec<u8> {
         return vec![v as u8];
     }
     let bits = 64 - (v as u64).leading_zeros() as usize;
-    let groups = (bits + 6) / 7;
+    let groups = bits.div_ceil(7);
     let mut out = Vec::with_capacity(groups);
     for i in (0..groups).rev() {
         let chunk = ((v >> (i * 7)) & 0x7F) as u8;
@@ -1928,7 +1923,7 @@ fn encode_cover_header_entry(
         // Need continuation bytes. First byte: sign | 0x40 (continuation set) |
         // top 6 bits
         let bits = 64 - (inc_old_pos as u64).leading_zeros() as usize;
-        let groups = (bits.saturating_sub(6) + 6) / 7 + 1; // 1 for first 6-bit group
+        let groups = bits.saturating_sub(6).div_ceil(7) + 1; // 1 for first 6-bit group
         let shift = (groups - 1) * 7;
         let first_payload = ((inc_old_pos >> shift) & 0x3F) as u8;
         out.push((sign << 7) | 0x40 | first_payload);
@@ -2156,7 +2151,7 @@ fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         // First 6 bits in byte 0, then 7-bit groups
         let remaining_bits = bits - 6;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x3F) as u8;
         out.push((sign << 7) | 0x40 | first_payload);
@@ -2185,7 +2180,7 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
 
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -2550,7 +2545,7 @@ fn gen_hdiff_v20_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -2583,11 +2578,7 @@ fn gen_hdiff_v20_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut last_old_end = 0u64;
     let mut last_new_end = 0u64;
     for &(old_pos, new_pos, length) in &covers {
-        let delta = if old_pos >= last_old_end {
-            old_pos - last_old_end
-        } else {
-            last_old_end - old_pos
-        };
+        let delta = old_pos.abs_diff(last_old_end);
         let sign = if old_pos >= last_old_end { 0 } else { 1 };
         cover_buf.extend_from_slice(&encode_tagged_1bit(sign, delta as i64));
         cover_buf.extend_from_slice(&encode_7bit_varint((new_pos - last_new_end) as i64));
@@ -2664,7 +2655,7 @@ fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
     } else {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         let remaining_bits = bits - 5;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x1F) as u8;
         out.push((rle_type << 6) | 0x20 | first_payload);
@@ -2692,7 +2683,7 @@ fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
 
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -2909,7 +2900,7 @@ fn gen_hdiff_v13_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -3665,6 +3656,7 @@ fn bench_eager_stream_input_chain(c: &mut Criterion) {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&out_path)
             .expect("open output");
         out_file
@@ -3980,7 +3972,8 @@ fn bench_installer_save_offload(c: &mut Criterion) {
                 // previous iteration's real save + spawn of this one;
                 // this is the production caller stall, not the cost of
                 // a save.
-                if let Some(handle) = last_save.lock().unwrap().take() {
+                let pending = last_save.lock().unwrap().take();
+                if let Some(handle) = pending {
                     let _ = handle.await;
                 }
                 // Each iteration awaits the previous save and the final
@@ -4068,7 +4061,8 @@ fn bench_installer_save_offload(c: &mut Criterion) {
                     }
                     while wave.join_next().await.is_some() {}
                     total += start.elapsed();
-                    if let Some(handle) = last_save.lock().unwrap().take() {
+                    let pending = last_save.lock().unwrap().take();
+                    if let Some(handle) = pending {
                         let _ = handle.await;
                     }
                     // The wave must have produced real saves.
@@ -4475,6 +4469,7 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&out_path)
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
@@ -4496,6 +4491,7 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&out_path)
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
@@ -4603,7 +4599,7 @@ fn bench_state_save(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(count), &downloaded, |b, dc| {
             b.iter(|| {
                 let entries = snapshot_downloaded_chunks(dc, &lookup);
-                criterion::black_box(entries);
+                black_box(entries);
             });
         });
 
@@ -4624,7 +4620,7 @@ fn bench_state_save(c: &mut Criterion) {
                 b.iter(|| {
                     let entries = snapshot_downloaded_chunks(&downloaded, &lookup);
                     let len = irmin_rs::sophon::bench_serialize_state(&entries);
-                    criterion::black_box(len);
+                    black_box(len);
                 });
             });
         }
@@ -4772,7 +4768,7 @@ fn bench_load_download_state(c: &mut Criterion) {
             |b, path| {
                 b.iter(|| {
                     let state = load_download_state(path.parent().unwrap(), "hk4e");
-                    criterion::black_box(state);
+                    black_box(state);
                 });
             },
         );
@@ -4820,14 +4816,14 @@ fn bench_phase2a_chunk_verify(c: &mut Criterion) {
                             false,
                         )
                         .unwrap();
-                    criterion::black_box(actual == *expected);
+                    black_box(actual == *expected);
                 }
             }
             #[cfg(not(feature = "bench-internals"))]
             {
                 for (path, expected) in &items {
                     let actual = irmin_rs::game_installer::cache::file_md5_digest(path).unwrap();
-                    criterion::black_box(actual == *expected);
+                    black_box(actual == *expected);
                 }
             }
         });
@@ -4837,7 +4833,7 @@ fn bench_phase2a_chunk_verify(c: &mut Criterion) {
         b.iter(|| {
             let results =
                 irmin_rs::game_installer::md5_multibuffer::verify_md5_batch(&items).unwrap();
-            criterion::black_box(results);
+            black_box(results);
         });
     });
 
@@ -4860,7 +4856,7 @@ fn bench_verify_file_hash(c: &mut Criterion) {
     group.bench_function("binary", |b| {
         b.iter(|| {
             let ok = verify_file_hash(&path, &md5_bytes);
-            criterion::black_box(ok);
+            black_box(ok);
         });
     });
     group.finish();
@@ -4876,7 +4872,7 @@ fn bench_hex_to_bytes(c: &mut Criterion) {
     group.bench_function("lut", |b| {
         b.iter(|| {
             let bytes = hex_to_bytes(&hex);
-            criterion::black_box(bytes);
+            black_box(bytes);
         });
     });
     group.finish();
@@ -4893,7 +4889,7 @@ fn bench_md5_hex_eq(c: &mut Criterion) {
     group.bench_function("lut", |b| {
         b.iter(|| {
             let ok = md5_hex_eq(&digest, &hex);
-            criterion::black_box(ok);
+            black_box(ok);
         });
     });
     group.finish();
@@ -4910,7 +4906,7 @@ fn bench_xxh64_hex_eq(c: &mut Criterion) {
     group.bench_function("lut", |b| {
         b.iter(|| {
             let ok = xxh64_hex_eq(value, &hex);
-            criterion::black_box(ok);
+            black_box(ok);
         });
     });
     group.finish();
@@ -4960,7 +4956,7 @@ fn bench_chunk_accessors(c: &mut Criterion) {
                 .filter(|c| seen.insert(c.chunk_name))
                 .map(|c| c.chunk_size)
                 .fold(0u64, |acc, x| acc.saturating_add(x));
-            criterion::black_box(total);
+            black_box(total);
         });
     });
 
@@ -4972,7 +4968,7 @@ fn bench_chunk_accessors(c: &mut Criterion) {
                 .filter(|&i| seen.insert(manifest.chunk_name_at(i)))
                 .map(|i| manifest.chunk_size_at(i))
                 .fold(0u64, |acc, x| acc.saturating_add(x));
-            criterion::black_box(total);
+            black_box(total);
         });
     });
 

@@ -850,7 +850,8 @@ pub(crate) static HASH_THREAD_STALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
-pub(crate) static HASH_THREAD_STALL_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static HASH_THREAD_STALL_GUARD: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Process-global per-frame stall applied inside the hash thread, in
 /// milliseconds; benchmarks use it to simulate a verification consumer that
@@ -871,17 +872,17 @@ pub(crate) static BENCH_LEGACY_BLOCKING_HASH: std::sync::atomic::AtomicBool =
 fn deferred_hash_stall_per_64k() -> std::time::Duration {
     #[cfg(test)]
     {
-        return std::time::Duration::from_millis(
+        std::time::Duration::from_millis(
             HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        )
     }
     #[cfg(all(not(test), feature = "bench-internals"))]
     {
-        return std::time::Duration::from_millis(
+        std::time::Duration::from_millis(
             BENCH_HASH_THREAD_STALL_MS.load(std::sync::atomic::Ordering::Relaxed),
         ) + std::time::Duration::from_micros(
             BENCH_HASH_THREAD_STALL_US.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        )
     }
     #[cfg(all(not(test), not(feature = "bench-internals")))]
     std::time::Duration::ZERO
@@ -1124,12 +1125,15 @@ impl HashPipeline {
             }
             HashPipeline::DeferredMd5 {
                 md5_sender,
+                #[cfg(feature = "bench-internals")]
+                legacy_blocking_sender,
                 join,
                 digest_rx,
                 xxh64,
-                ..
             } => {
                 drop(md5_sender);
+                #[cfg(feature = "bench-internals")]
+                drop(legacy_blocking_sender);
                 let _partial_digest = digest_rx
                     .await
                     .map_err(|_| std::io::Error::other("hash thread died"))??;
@@ -1736,9 +1740,7 @@ mod tests {
         const FRAME: usize = 64 * 1024;
         const FRAMES: usize = 8;
         const STALL_MS: u64 = 40;
-        let _stall_guard = HASH_THREAD_STALL_GUARD
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _stall_guard = HASH_THREAD_STALL_GUARD.blocking_lock();
 
         let payload: Vec<u8> = (0..FRAME * FRAMES)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
@@ -1844,9 +1846,7 @@ mod tests {
     /// the sequences reproducible.
     #[tokio::test]
     async fn pipelined_digest_matches_scalar_for_random_frame_sequences() {
-        let _stall_guard = HASH_THREAD_STALL_GUARD
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _stall_guard = HASH_THREAD_STALL_GUARD.lock().await;
         HASH_THREAD_STALL_MS.store(10, std::sync::atomic::Ordering::Relaxed);
         fn next_rand(state: &mut u64) -> u64 {
             *state ^= *state << 13;

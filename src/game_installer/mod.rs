@@ -37,9 +37,9 @@ pub mod eager_decompress;
 mod error;
 mod game_filters;
 mod handle;
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "patch", feature = "benchmark"))]
 pub mod hdiffpatch;
-#[cfg(not(feature = "benchmark"))]
+#[cfg(all(feature = "patch", not(feature = "benchmark")))]
 mod hdiffpatch;
 /// Manifest planning and download/assembly orchestration.
 pub mod installer;
@@ -50,17 +50,25 @@ pub mod installer;
 pub mod md5_multibuffer;
 /// Output-file preallocation and shared file-handle management.
 pub mod output_allocator;
+#[cfg(feature = "plugins")]
 mod plugin_api;
+#[cfg(feature = "plugins")]
 mod plugin_install;
-#[cfg_attr(feature = "benchmark", allow(unreachable_pub))]
+#[cfg(feature = "preinstall")]
 pub mod preinstall;
-mod snapshot;
+#[cfg(feature = "discovery")]
+mod preinstall_discovery;
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
+mod preinstall_state;
 #[cfg(not(feature = "bench-internals"))]
+#[cfg(feature = "discovery")]
 mod update;
 #[cfg(feature = "bench-internals")]
+#[cfg(feature = "discovery")]
 pub mod update;
 
 mod profiling;
+mod snapshot;
 /// Platform file-copy and preallocation helpers.
 pub mod sysio;
 
@@ -99,6 +107,7 @@ pub fn retry_delay(attempt: u32) -> Duration {
 }
 
 /// Sleep for `delay`, returning `Err(())` if the handle is cancelled first.
+#[allow(clippy::result_unit_err)]
 pub async fn cancelable_sleep(
     handle: &crate::game_installer::handle::DownloadHandle,
     delay: Duration,
@@ -243,15 +252,19 @@ pub(crate) mod test_endpoints {
     thread_local! {
         static FRONT_DOOR: RefCell<Option<String>> = const { RefCell::new(None) };
         static BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
+        #[cfg(all(feature = "discovery", feature = "bench-internals"))]
         static PATCH_BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
+    #[cfg(feature = "bench-internals")]
     pub fn set_front_door(url: Option<String>) {
         FRONT_DOOR.with(|c| *c.borrow_mut() = url);
     }
+    #[cfg(feature = "bench-internals")]
     pub fn set_build_base(url: Option<String>) {
         BUILD_BASE.with(|c| *c.borrow_mut() = url);
     }
+    #[cfg(all(feature = "discovery", feature = "bench-internals"))]
     pub fn set_patch_build_base(url: Option<String>) {
         PATCH_BUILD_BASE.with(|c| *c.borrow_mut() = url);
     }
@@ -262,8 +275,16 @@ pub(crate) mod test_endpoints {
     pub fn build_base() -> Option<String> {
         BUILD_BASE.with(|c| c.borrow().clone())
     }
+    #[cfg(any(feature = "discovery", feature = "preinstall"))]
     pub fn patch_build_base() -> Option<String> {
-        PATCH_BUILD_BASE.with(|c| c.borrow().clone())
+        #[cfg(all(feature = "bench-internals", feature = "preinstall"))]
+        {
+            PATCH_BUILD_BASE.with(|c| c.borrow().clone())
+        }
+        #[cfg(not(all(feature = "bench-internals", feature = "preinstall")))]
+        {
+            None
+        }
     }
 }
 
@@ -272,7 +293,9 @@ pub(crate) mod test_endpoints {
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod bench_test_endpoints {
-    pub use super::test_endpoints::{set_build_base, set_front_door, set_patch_build_base};
+    #[cfg(all(feature = "discovery", feature = "bench-internals"))]
+    pub use super::test_endpoints::set_patch_build_base;
+    pub use super::test_endpoints::{set_build_base, set_front_door};
 }
 
 /// Resolve the front-door URL, honoring test overrides when present.
@@ -300,12 +323,14 @@ pub(crate) fn sophon_build_url_base() -> String {
 }
 
 /// Base endpoint for patch-build metadata requests.
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 pub const SOPHON_PATCH_BUILD_URL_BASE: &str = concat!(
     "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
     "/downloader/sophon_chunk/api/getPatchBuild"
 );
 
 /// Resolve the patch-build URL base, honoring test overrides when present.
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 pub(crate) fn sophon_patch_build_url_base() -> String {
     #[cfg(any(test, feature = "bench-internals"))]
     {
@@ -343,29 +368,36 @@ pub use assembly::validate_asset_name;
 pub use error::SophonError;
 pub use handle::ControlState;
 pub use handle::DownloadHandle;
-pub use installer::{
-    InstallCallbacks, InstallOptions, ResumeContext, StateSaver, assign_chunk_offsets,
-    build_installers, build_installers_for_tag, build_update_installers, install,
-    intern_old_chunk_offsets, verify_integrity,
-};
+#[cfg(feature = "verify")]
+pub use installer::verify_integrity;
+pub use installer::{InstallCallbacks, InstallOptions, ResumeContext, StateSaver, install};
+#[cfg(feature = "update")]
+pub use installer::{assign_chunk_offsets, build_update_installers, intern_old_chunk_offsets};
+#[cfg(feature = "download")]
+pub use installer::{build_installers, build_installers_for_tag};
+#[cfg(feature = "plugins")]
 pub use plugin_install::{install_channel_sdks, install_plugins};
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "preinstall"))]
 pub use preinstall::benchmark_download_over_bounded_drain_stream;
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "preinstall"))]
 pub use preinstall::benchmark_download_over_bounded_pending_stream;
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "preinstall"))]
 pub use preinstall::benchmark_download_over_bounded_stream;
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "preinstall"))]
 pub use preinstall::benchmark_download_over_chunk_future;
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "preinstall"))]
 pub use preinstall::benchmark_download_over_future_batch;
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "preinstall"))]
 pub use preinstall::prepare_synthetic_apply_state as prepare_benchmark_preinstall_state;
-#[cfg(feature = "benchmark")]
+#[cfg(all(feature = "benchmark", feature = "preinstall"))]
 pub use preinstall::prepare_synthetic_copyover_state as prepare_benchmark_copyover_state;
-#[cfg(feature = "bench-diagnostics")]
+#[cfg(all(feature = "bench-diagnostics", feature = "preinstall"))]
 pub use preinstall::{HdiffPhaseTimings, apply_synthetic_hdiff_for_benchmark};
+#[cfg(feature = "preinstall")]
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
+#[cfg(feature = "discovery")]
+pub use preinstall_discovery::{PreinstallInfo, check_preinstall};
+#[cfg(feature = "discovery")]
 pub use update::{UpdateInfo, check_update};
 
 /// Advance jemalloc epoch and trigger a background decay pass. Call after
@@ -376,6 +408,7 @@ pub fn reclaim_memory() {
     {
         let _ = tikv_jemalloc_ctl::epoch::advance();
     }
+    #[cfg(feature = "patch")]
     hdiffpatch::trim_idle_buffers();
     assembly_opt::trim_thread_local_buffers();
     assembly::trim_transfer_buffer();

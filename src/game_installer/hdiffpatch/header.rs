@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(test, feature = "preinstall")),
+    allow(dead_code, unused_imports)
+)]
+
 use super::compression_mode::CompressionMode;
 
 #[derive(Debug, Clone, Default)]

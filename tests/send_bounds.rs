@@ -17,10 +17,32 @@
 
 #![cfg(test)]
 
+#[cfg(any(
+    feature = "download",
+    feature = "update",
+    feature = "verify",
+    feature = "preinstall",
+    feature = "discovery"
+))]
 use std::path::PathBuf;
+#[cfg(all(feature = "discovery", feature = "update"))]
 use std::sync::Arc;
 
-use irmin_rs::{DownloadHandle, Sophon, SophonProgress, game_installer::SophonError};
+#[cfg(any(
+    feature = "download",
+    feature = "update",
+    feature = "verify",
+    feature = "preinstall",
+    feature = "discovery"
+))]
+use irmin_rs::Sophon;
+#[cfg(any(
+    feature = "download",
+    feature = "update",
+    feature = "verify",
+    feature = "preinstall"
+))]
+use irmin_rs::{DownloadHandle, SophonProgress, game_installer::SophonError};
 
 /// Build a `Sophon` pointed at a nonexistent install dir and game id.
 ///
@@ -28,6 +50,13 @@ use irmin_rs::{DownloadHandle, Sophon, SophonProgress, game_installer::SophonErr
 /// future on a multi-threaded runtime and assert its `Send + 'static` bounds
 /// survive the type-checker. Every method below fails fast (network or
 /// manifest error) without touching disk beyond reading the (missing) tag.
+#[cfg(any(
+    feature = "download",
+    feature = "update",
+    feature = "verify",
+    feature = "preinstall",
+    feature = "discovery"
+))]
 fn sophon_fixture() -> Sophon {
     Sophon::builder(
         "test-game-id",
@@ -38,6 +67,12 @@ fn sophon_fixture() -> Sophon {
 }
 
 /// Cheap progress callback satisfying `ProgressFn` (`Send + Sync + 'static`).
+#[cfg(any(
+    feature = "download",
+    feature = "update",
+    feature = "verify",
+    feature = "preinstall"
+))]
 fn noop_progress() -> impl Fn(SophonProgress) + Send + Sync + 'static {
     move |_event: SophonProgress| {}
 }
@@ -50,6 +85,13 @@ fn noop_progress() -> impl Fn(SophonProgress) + Send + Sync + 'static {
 /// one specific borrow lifetime, this function fails to compile with the
 /// same "implementation of `Send` is not general enough" error that real
 /// consumers see at their build time.
+#[cfg(any(
+    feature = "download",
+    feature = "update",
+    feature = "verify",
+    feature = "preinstall",
+    feature = "discovery"
+))]
 fn spawn_on_multi_thread<F>(f: F) -> F::Output
 where
     F: std::future::Future + Send + 'static,
@@ -67,6 +109,7 @@ where
 /// `check_update` must be spawnable on a multi-thread runtime even though it
 /// borrows `&self`. The returned future is `Send + 'static` and owned by the
 /// caller; the borrow of `&self` ends at the call site.
+#[cfg(feature = "discovery")]
 #[test]
 fn check_update_future_is_send_and_static() {
     let sophon = sophon_fixture();
@@ -79,8 +122,18 @@ fn check_update_future_is_send_and_static() {
     let _ = result;
 }
 
+/// `check_preinstall` must also return a spawnable owned future.
+#[cfg(feature = "discovery")]
+#[test]
+fn check_preinstall_future_is_send_and_static() {
+    let sophon = sophon_fixture();
+    let result = spawn_on_multi_thread(sophon.check_preinstall());
+    let _ = result;
+}
+
 /// `verify_integrity` must be spawnable on a multi-thread runtime. Its
 /// progress callback is `'static` so the future must be too.
+#[cfg(feature = "verify")]
 #[test]
 fn verify_integrity_future_is_send_and_static() {
     let sophon = sophon_fixture();
@@ -93,6 +146,7 @@ fn verify_integrity_future_is_send_and_static() {
 /// `download` must be spawnable on a multi-thread runtime even though it
 /// borrows `&self` and `&DownloadHandle`. The returned future is
 /// `Send + 'static`.
+#[cfg(feature = "download")]
 #[test]
 fn download_future_is_send_and_static() {
     let sophon = sophon_fixture();
@@ -103,6 +157,7 @@ fn download_future_is_send_and_static() {
 }
 
 /// `update` must be spawnable on a multi-thread runtime.
+#[cfg(feature = "update")]
 #[test]
 fn update_future_is_send_and_static() {
     let sophon = sophon_fixture();
@@ -113,6 +168,7 @@ fn update_future_is_send_and_static() {
 }
 
 /// `preinstall` must be spawnable on a multi-thread runtime.
+#[cfg(feature = "preinstall")]
 #[test]
 fn preinstall_future_is_send_and_static() {
     let sophon = sophon_fixture();
@@ -124,6 +180,7 @@ fn preinstall_future_is_send_and_static() {
 
 /// `apply_preinstall` must be spawnable on a multi-thread runtime even though
 /// it borrows `&self`, `&str` (`preinstall_tag`), and `&DownloadHandle`.
+#[cfg(feature = "preinstall")]
 #[test]
 fn apply_preinstall_future_is_send_and_static() {
     let sophon = sophon_fixture();
@@ -137,6 +194,7 @@ fn apply_preinstall_future_is_send_and_static() {
 /// runs concurrently on a multi-thread runtime — i.e. holding a `Sophon` in
 /// one async task while another task awaits must not require the caller to
 /// pin or borrow the `Sophon` for a specific lifetime.
+#[cfg(all(feature = "update", feature = "discovery"))]
 #[test]
 fn sophon_owned_can_be_moved_across_await() {
     let sophon: Arc<Sophon> = Arc::new(sophon_fixture());
@@ -144,9 +202,8 @@ fn sophon_owned_can_be_moved_across_await() {
     let fut = async move {
         // Rebind `s` across an await to prove the future is `Send + 'static`
         // even when a `Sophon` is captured by an `Arc` clone.
-        let inner = tokio::task::yield_now().await;
-        let _ = inner;
+        tokio::task::yield_now().await;
         let _ = s.check_update().await;
     };
-    let _ = spawn_on_multi_thread(fut);
+    spawn_on_multi_thread(fut);
 }

@@ -1,3 +1,4 @@
+use super::super::preinstall_state::cached_preinstall;
 use super::*;
 use fast_md5;
 
@@ -55,10 +56,7 @@ fn benchmark_original_hash_mismatch_validation() {
             return Ok::<bool, ()>(true);
         }
         let mismatch_for_normal = !verify_file_hash(&path, expected_hash);
-        if mismatch_for_normal && !is_filtered_asset(cache, &asset) {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(!(mismatch_for_normal && !is_filtered_asset(cache, &asset)))
     };
 
     let verify_single_hash = |cache: &FilterCache, expected_hash: &[u8]| {
@@ -272,10 +270,12 @@ fn chunk_info(name: &str, size: u64) -> PatchChunkInfo {
     }
 }
 
-fn capture_saver() -> (
+type CapturedSaver = (
     Arc<std::sync::Mutex<Vec<(String, u64)>>>,
     super::super::installer::StateSaver,
-) {
+);
+
+fn capture_saver() -> CapturedSaver {
     let saved = Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
     let saved_for_callback = Arc::clone(&saved);
     let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
@@ -1271,6 +1271,7 @@ fn apply_copy_over_with_offset_non_hdiff_seeks_back() {
     assert_eq!(written, target_data);
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_copy_over_detects_hdiff_magic() {
     let dir = tempfile::tempdir().unwrap();
@@ -1305,6 +1306,7 @@ fn apply_copy_over_detects_hdiff_magic() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_copy_over_cleans_up_diff_temp_on_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -1344,6 +1346,7 @@ fn apply_copy_over_cleans_up_diff_temp_on_failure() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_size_mismatch_returns_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -1395,6 +1398,7 @@ fn apply_hdiff_patch_size_mismatch_returns_error() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_original_hash_mismatch_returns_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -1430,6 +1434,7 @@ fn apply_hdiff_patch_original_hash_mismatch_returns_error() {
     assert!(matches!(error, SophonError::OriginalFileMissing(_)));
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_filtered_original_hash_mismatch_skips() {
     let dir = tempfile::tempdir().unwrap();
@@ -1460,6 +1465,7 @@ fn apply_hdiff_patch_filtered_original_hash_mismatch_skips() {
     apply_hdiff_patch(dir.path(), &chunks_dir, &asset, &cache).unwrap();
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_blank_original_creates_diff_ref() {
     let dir = tempfile::tempdir().unwrap();
@@ -1505,6 +1511,7 @@ fn apply_hdiff_patch_blank_original_creates_diff_ref() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_blank_original_by_size() {
     let dir = tempfile::tempdir().unwrap();
@@ -1550,6 +1557,7 @@ fn apply_hdiff_patch_blank_original_by_size() {
 }
 /// BLANK_FILE_MD5 triggers blank-file handling even when
 /// original_file_size is non-zero. Hash takes precedence over size.
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_blank_original_by_hash_ignores_size() {
     let dir = tempfile::tempdir().unwrap();
@@ -1597,6 +1605,7 @@ fn apply_hdiff_patch_blank_original_by_hash_ignores_size() {
 /// New subdirectories introduced by a patch must be created before the
 /// temp output is renamed into place; otherwise fs::rename fails with
 /// ENOENT ("No such file or directory").
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_creates_nested_target_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -1638,6 +1647,7 @@ fn apply_hdiff_patch_creates_nested_target_dir() {
     );
 }
 
+#[cfg(feature = "patch")]
 #[test]
 fn apply_hdiff_patch_from_files_blank_diff_ref_hash_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -2028,11 +2038,7 @@ fn benchmark_patch_asset_filter_pass() {
                         .iter()
                         .filter(|asset| asset.patch_method == PatchMethod::Skip)
                         .count();
-                    let expected_filtered = if hit_stride > 0 {
-                        asset_count / hit_stride
-                    } else {
-                        0
-                    };
+                    let expected_filtered = asset_count.checked_div(hit_stride).unwrap_or(0);
                     assert_eq!(filtered, expected_filtered);
                     total_filtered += filtered;
                 }
@@ -2813,6 +2819,47 @@ async fn snapshot_fallbacks_ignore_damaged_old_offsets_and_regenerate_hk4e_index
     assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("2.0"));
 }
 
+#[cfg(feature = "patch")]
+#[tokio::test]
+async fn snapshot_patch_method_applies_hdiff_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::write_installed_tag(dir.path(), "1.0").unwrap();
+
+    let target = b"This is brand new content created from nothing!";
+    let target_hash = hex::encode(fast_md5::digest(target));
+    let fields: &[(&str, &str, &[u8])] = &[("game", "data.bin", target)];
+    let mut state = snapshot_state(fields, "http://127.0.0.1:1");
+    state.patch_assets[0].patch_method = PatchMethod::Patch;
+    state.patch_assets[0].patch_name = "new-file.hdiff".into();
+    state.patch_assets[0].original_file_path = Some("old-data.bin".into());
+    state.patch_assets[0].original_file_hash = Some(BLANK_FILE_MD5.into());
+    state.patch_assets[0].original_file_size = Some(0);
+    state.patch_assets[0].target_file_hash = target_hash;
+    // The HDiff implementation has a known-good empty-source/new-file fixture.
+    let patch =
+        b"HDIFF13&zstd\0/\0\0\0\0\x02\0\0\0/\0 .This is brand new content created from nothing!";
+    state.patch_assets[0].patch_hash = hex::encode(fast_md5::digest(patch));
+    state.patch_assets[0].patch_size = patch.len() as u64;
+    state.patch_assets[0].patch_chunk_length = patch.len() as u64;
+    reseal(&mut state);
+    fs::create_dir_all(patching_chunk_dir(dir.path())).unwrap();
+    fs::write(patching_chunk_dir(dir.path()).join("new-file.hdiff"), patch).unwrap();
+    save_preinstall_state(dir.path(), &state).unwrap();
+
+    apply_preinstall(
+        &Client::new(),
+        dir.path(),
+        "2.0",
+        Arc::new(|_| {}),
+        &DownloadHandle::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), target);
+    assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("2.0"));
+}
+
 fn test_branch(name: &str, tag: &str) -> PackageBranch {
     PackageBranch {
         package_id: "package".into(),
@@ -3098,48 +3145,19 @@ async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
     assert_eq!(read_installed_tag(dir.path()).as_deref(), Some("1.0"));
 }
 
-#[tokio::test]
-async fn discovery_prefers_valid_live_package_and_keeps_its_sizes_when_queries_fail() {
+#[cfg(all(feature = "discovery", feature = "preinstall"))]
+#[test]
+fn cache_discovery_prefers_valid_live_package_and_preserves_cached_sizes() {
     let dir = tempfile::tempdir().unwrap();
     let state = snapshot_state(&[("game", "data.bin", b"target")], "http://localhost");
     save_preinstall_state(dir.path(), &state).unwrap();
     assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
-    for pre in [None, Some(test_branch("pre", "3.0"))] {
-        let queries = AtomicUsize::new(0);
-        let info = super::super::update::check_update_with_branches(
-            "nap",
-            "en",
-            dir.path(),
-            Some("1.0".into()),
-            test_branch("main", "2.0"),
-            pre,
-            |branch, from| {
-                queries.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(branch.tag, "2.0");
-                assert_eq!(from.as_deref(), Some("1.0"));
-                async { Err(SophonError::NoManifests) }
-            },
-        )
-        .await
-        .unwrap();
-        assert!(info.update_available && info.preinstall_available && info.preinstall_downloaded);
-        assert_eq!(info.preinstall_tag.as_deref(), Some("2.0"));
-        assert_eq!(info.remote_tag, "2.0");
-        assert_eq!(
-            (
-                info.preinstall_compressed_size,
-                info.preinstall_decompressed_size
-            ),
-            (6, 6)
-        );
-        assert_eq!(
-            (info.update_compressed_size, info.update_decompressed_size),
-            (6, 6)
-        );
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
-    }
+    let cached = cached_preinstall(dir.path(), "2.0", "nap", "en", Some("1.0")).unwrap();
+    assert_eq!(cached.tag, "2.0");
+    assert_eq!(cached.cached_sizes(), (6, 6));
 }
 
+#[cfg(all(feature = "discovery", feature = "preinstall"))]
 #[tokio::test]
 async fn discovery_rejects_markers_arbitrary_json_corrupt_snapshots_and_wrong_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -3170,31 +3188,9 @@ async fn discovery_rejects_markers_arbitrary_json_corrupt_snapshots_and_wrong_id
                 save_preinstall_state(dir.path(), &wrong_source).unwrap();
             }
         }
-        let info = super::super::update::check_update_with_branches(
-            "nap",
-            "en",
-            dir.path(),
-            Some("1.0".into()),
-            test_branch("main", "2.0"),
-            Some(test_branch("pre", "3.0")),
-            |branch, _| async move {
-                Ok(if branch.tag == "3.0" {
-                    (300, 900)
-                } else {
-                    (200, 600)
-                })
-            },
-        )
-        .await
-        .unwrap();
-        assert!(!info.preinstall_downloaded, "case {case}");
-        assert_eq!(info.preinstall_tag.as_deref(), Some("3.0"));
-        assert_eq!(
-            (
-                info.preinstall_compressed_size,
-                info.preinstall_decompressed_size
-            ),
-            (300, 900)
+        assert!(
+            cached_preinstall(dir.path(), "2.0", "nap", "en", Some("1.0")).is_none(),
+            "invalid cached package accepted in case {case}"
         );
     }
 }
@@ -3250,6 +3246,7 @@ async fn successful_apply_removes_only_its_package_state_not_shared_patch_payloa
     );
 }
 
+#[cfg(all(feature = "discovery", feature = "preinstall"))]
 #[tokio::test]
 async fn cached_package_discovery_accepts_equivalent_voice_aliases() {
     let dir = tempfile::tempdir().unwrap();
@@ -3259,22 +3256,9 @@ async fn cached_package_discovery_accepts_equivalent_voice_aliases() {
     );
     save_preinstall_state(dir.path(), &state).unwrap();
     for alias in ["en", "en-us", "en-US", "EN"] {
-        let info = super::super::update::check_update_with_branches(
-            "nap",
-            alias,
-            dir.path(),
-            Some("1.0".into()),
-            test_branch("main", "2.0"),
-            None,
-            |_, _| async { Err(SophonError::NoManifests) },
-        )
-        .await
-        .unwrap();
-        assert!(
-            info.preinstall_downloaded,
-            "alias {alias} hid the completed package"
-        );
-        assert_eq!(info.preinstall_tag.as_deref(), Some("2.0"));
+        let cached = cached_preinstall(dir.path(), "2.0", "nap", alias, Some("1.0"));
+        assert!(cached.is_some(), "alias {alias} hid the completed package");
+        assert_eq!(cached.unwrap().tag, "2.0");
     }
     assert!(cached_preinstall(dir.path(), "2.0", "nap", "jp", Some("1.0")).is_none());
 }

@@ -118,10 +118,7 @@ pub fn validate_chunk_name(chunk_name: &str) -> bool {
         i += 1;
     }
     // Check trailing segment
-    if i - seg_start == 2 && b[seg_start] == b'.' && b[seg_start + 1] == b'.' {
-        return false;
-    }
-    true
+    !(i - seg_start == 2 && b[seg_start] == b'.' && b[seg_start + 1] == b'.')
 }
 
 /// Reject empty, absolute, drive-prefixed, NUL-containing, or parent-traversal
@@ -250,9 +247,11 @@ pub(crate) fn assemble_file_in_epoch(
 }
 
 pub(crate) struct AssembleOutcome {
+    #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
     pub(crate) file_hash_verified: bool,
 }
 
+#[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_file_for_download_over(
     all_files: &CompactManifest,
@@ -548,6 +547,7 @@ fn assemble_file_inner(
     validate_asset_name(file_name)?;
     if is_dir {
         return Ok(AssembleOutcome {
+            #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
             file_hash_verified: false,
         });
     }
@@ -596,6 +596,7 @@ fn assemble_file_inner(
                 );
             }
             return Ok(AssembleOutcome {
+                #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
                 file_hash_verified: true,
             });
         }
@@ -699,6 +700,7 @@ fn assemble_file_inner(
         Some(take_md5()?)
     };
 
+    #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
     let sequential_file_hash = file_hasher.is_some();
     let hasher_result: Mutex<Option<SophonResult<[u8; 16]>>> = Mutex::new(None);
 
@@ -1197,19 +1199,18 @@ fn assemble_file_inner(
             chunk_end: chunk_range.end,
             bytes: total_written,
         };
-        let directive = match epoch.epochs.stage(out_file, stage_req) {
-            Ok(directive) => {
-                guard.chunks.clear();
-                directive
-            }
-            Err(err) => return Err(err),
-        };
+        let directive = epoch.epochs.stage(out_file, stage_req)?;
+        guard.chunks.clear();
+        #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
         let file_hash_verified = has_file_hash && (sequential_file_hash || parallel_hashed_file);
         TRANSFER_BUF.with(|cell| cell.replace(transfer_buffer));
         if directive.is_due() {
             epoch.epochs.commit()?;
         }
-        return Ok(AssembleOutcome { file_hash_verified });
+        return Ok(AssembleOutcome {
+            #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
+            file_hash_verified,
+        });
     }
 
     out_file.sync_data().map_err(|err| {
@@ -1285,11 +1286,15 @@ fn assemble_file_inner(
         }
     }
 
+    #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
     let file_hash_verified = has_file_hash && (sequential_file_hash || parallel_hashed_file);
 
     TRANSFER_BUF.with(|cell| cell.replace(transfer_buffer));
 
-    Ok(AssembleOutcome { file_hash_verified })
+    Ok(AssembleOutcome {
+        #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
+        file_hash_verified,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

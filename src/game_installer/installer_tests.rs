@@ -14,6 +14,7 @@ fn make_chunk(name: &str, size: u64) -> SophonManifestAssetChunk {
     }
 }
 
+#[cfg(any(feature = "update", feature = "bench-diagnostics"))]
 fn make_chunk_with_hash(
     name: &str,
     size: u64,
@@ -472,7 +473,7 @@ fn from_manifest_dedups_shared_chunk_names_across_files() {
     // does not dedup names during interning, so the two entries get distinct
     // arena ids. from_manifest must dedup by name so lookup returns one index.
     let items = [(0, 0), (1, 0)];
-    let lookup = ChunkNameLookup::from_manifest(Arc::clone(&manifest), items.into_iter());
+    let lookup = ChunkNameLookup::from_manifest(Arc::clone(&manifest), items);
 
     assert_eq!(
         lookup.name_locs.len(),
@@ -839,6 +840,7 @@ fn compute_totals_same_name_different_size() {
     assert_eq!(files_count, 2);
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn compute_diff_files_all_new() {
     let new_manifest = SophonManifestProto {
@@ -853,6 +855,7 @@ fn compute_diff_files_all_new() {
     assert_eq!(diff.len(), 3);
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn compute_diff_files_unchanged_excluded() {
     let new_manifest = SophonManifestProto {
@@ -864,6 +867,7 @@ fn compute_diff_files_unchanged_excluded() {
     assert!(diff.is_empty());
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn compute_diff_files_changed_included() {
     let new_manifest = SophonManifestProto {
@@ -875,6 +879,7 @@ fn compute_diff_files_changed_included() {
     assert_eq!(diff.len(), 1);
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn compute_diff_files_dirs_included() {
     let new_manifest = SophonManifestProto {
@@ -887,6 +892,7 @@ fn compute_diff_files_dirs_included() {
     assert!(names.contains(&"a.pak"));
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn compute_diff_files_mixed() {
     let new_manifest = SophonManifestProto {
@@ -908,6 +914,7 @@ fn compute_diff_files_mixed() {
     assert!(names.contains(&"somedir")); // directories are included in diff
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn intern_old_chunk_offsets_assigns_unique_ids() {
     let manifest = SophonManifestProto {
@@ -944,6 +951,7 @@ fn intern_old_chunk_offsets_assigns_unique_ids() {
     assert_eq!(offsets.get(&(b_id, h0)), Some(&0));
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn intern_old_chunk_offsets_empty_manifest() {
     let manifest = SophonManifestProto { assets: vec![] };
@@ -953,6 +961,7 @@ fn intern_old_chunk_offsets_empty_manifest() {
     assert!(hash_to_id.is_empty());
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn intern_old_chunk_offsets_only_dirs() {
     let manifest = SophonManifestProto {
@@ -964,6 +973,7 @@ fn intern_old_chunk_offsets_only_dirs() {
     assert!(hash_to_id.is_empty());
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn assign_chunk_offsets_reuses_matching_old_entries() {
     let old_manifest = SophonManifestProto {
@@ -990,6 +1000,7 @@ fn assign_chunk_offsets_reuses_matching_old_entries() {
     assert_eq!(diff[0].asset_chunks[1].chunk_old_offset, -1);
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn assign_chunk_offsets_unknown_file_name_all_minus_one() {
     let old_manifest = SophonManifestProto {
@@ -1011,6 +1022,7 @@ fn assign_chunk_offsets_unknown_file_name_all_minus_one() {
     assert_eq!(diff[0].asset_chunks[0].chunk_old_offset, -1);
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn assign_chunk_offsets_empty_maps_all_minus_one() {
     let mut diff = vec![make_file(
@@ -1029,6 +1041,7 @@ fn assign_chunk_offsets_empty_maps_all_minus_one() {
 
 /// Same chunk hash at different offsets in different files must resolve
 /// to the per-file offset, not a single global offset.
+#[cfg(feature = "update")]
 #[test]
 fn assign_chunk_offsets_same_hash_different_offsets_per_file() {
     let old_manifest = SophonManifestProto {
@@ -1081,6 +1094,7 @@ fn assign_chunk_offsets_same_hash_different_offsets_per_file() {
 /// cast to use `i64::try_from(off).unwrap_or(-1)` or similar, this test
 /// must still pass; if they change it to produce a positive value for
 /// `u64::MAX`, this test catches the regression.
+#[cfg(feature = "update")]
 #[test]
 fn assign_chunk_offsets_u64_max_offset_does_not_produce_misleading_positive() {
     // Old manifest with a chunk whose offset is u64::MAX (exabytes — not
@@ -1114,6 +1128,7 @@ fn assign_chunk_offsets_u64_max_offset_does_not_produce_misleading_positive() {
     );
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn collect_deleted_files_basic() {
     let old = SophonManifestProto {
@@ -1128,10 +1143,11 @@ fn collect_deleted_files_basic() {
     new_names.insert("D");
     let deleted = collect_deleted_files(&old, &new_names);
     assert_eq!(deleted.len(), 2);
-    assert!(deleted.contains(&"B".to_string()));
-    assert!(deleted.contains(&"C".to_string()));
+    assert!(deleted.iter().any(|item| item == "B"));
+    assert!(deleted.iter().any(|item| item == "C"));
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn collect_deleted_files_none() {
     let old = SophonManifestProto {
@@ -1144,6 +1160,7 @@ fn collect_deleted_files_none() {
     assert!(deleted.is_empty());
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn collect_deleted_files_dirs_excluded() {
     let old = SophonManifestProto {
@@ -1154,6 +1171,7 @@ fn collect_deleted_files_dirs_excluded() {
     assert!(deleted.is_empty());
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn build_old_md5_map_basic() {
     let manifest = SophonManifestProto {
@@ -2279,6 +2297,7 @@ fn combine_manifest_hashes_empty() {
     assert_eq!(hash.len(), 16);
 }
 
+#[cfg(feature = "update")]
 #[test]
 fn compute_diff_files_all_unchanged() {
     let new_manifest = SophonManifestProto {
@@ -2925,9 +2944,7 @@ async fn install_with_stalled_hash_verification_keeps_download_pace() {
     const CHUNKS: usize = 4;
     const CHUNK_RAW: usize = 256 * 1024;
     const STALL_MS: u64 = 100;
-    let _stall_guard = super::download::HASH_THREAD_STALL_GUARD
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _stall_guard = super::download::HASH_THREAD_STALL_GUARD.lock().await;
 
     let server = MockServer::start().await;
     let mut payload = Vec::new();
@@ -3333,6 +3350,7 @@ async fn install_resume_phase1_checking_files_does_not_panic_with_matching_state
 /// manifest, which is where the user's crash occurred. If the OnceLock
 /// ordering regresses, this test panics instead of returning
 /// `Err(Cancelled)`.
+#[cfg(feature = "download")]
 #[tokio::test]
 #[ignore = "requires network access to the live Sophon API"]
 async fn sophon_download_live_api_reaches_install_without_panic() {

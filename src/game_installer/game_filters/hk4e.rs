@@ -89,7 +89,7 @@ impl Hk4eFilter {
 
             for pattern in &self.patterns_lower {
                 if asset_lower.contains(pattern) {
-                    log::warn!("Filtered unneeded audio asset: {}", &asset.asset_name_str());
+                    log::warn!("Filtered unneeded audio asset: {}", asset.asset_name_str());
                     return false;
                 }
             }
@@ -103,6 +103,7 @@ impl Hk4eFilter {
 
 /// Remove manifest entries that should not be installed for the current HK4E
 /// layout.
+#[cfg(any(test, feature = "verify", feature = "preinstall"))]
 pub fn filter_hk4e_asset_list(
     game_dir: &Path,
     assets: &mut Vec<SophonManifestAssetProperty>,
@@ -137,6 +138,7 @@ fn locale_code_to_audio_lang_name(locale: &str) -> Option<&'static str> {
 }
 
 /// Exactly the root indexes rebuilt by `write_pkg_version_from_manifest`.
+#[cfg_attr(not(feature = "verify"), allow(dead_code))]
 pub(crate) fn is_generated_pkg_version(filename: &str, vo_langs: &[String]) -> bool {
     filename == "pkg_version"
         || filename

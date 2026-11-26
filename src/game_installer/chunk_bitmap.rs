@@ -107,10 +107,11 @@ impl ChunkBitmap {
                     error
                 }
             })?;
+            let (word_chunks, _) = bytes.as_chunks::<8>();
             bits.extend(
-                bytes
-                    .chunks_exact(8)
-                    .map(|word| AtomicU64::new(u64::from_le_bytes(word.try_into().unwrap()))),
+                word_chunks
+                    .iter()
+                    .map(|word| AtomicU64::new(u64::from_le_bytes(*word))),
             );
             remaining_words -= words;
         }
@@ -172,8 +173,8 @@ impl ChunkBitmap {
             return false;
         }
 
-        for word_idx in first_word + 1..last_word {
-            if self.bits[word_idx].load(Ordering::Acquire) != u64::MAX {
+        for word in &self.bits[first_word + 1..last_word] {
+            if word.load(Ordering::Acquire) != u64::MAX {
                 return false;
             }
         }

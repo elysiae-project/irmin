@@ -18,8 +18,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::adaptive_assembly::AdaptiveAssembly;
 use super::api::{fetch_build, fetch_front_door, is_known_vo_locale, vo_lang_matches};
+#[cfg(feature = "verify")]
+use super::assembly;
 use super::assembly::{
-    self, AssemblyTaskParams, cleanup_tmp_files, spawn_assembly_task, validate_asset_name,
+    AssemblyTaskParams, cleanup_tmp_files, spawn_assembly_task, validate_asset_name,
     validate_chunk_name,
 };
 use super::cache::{self, VerificationEntry};
@@ -32,6 +34,7 @@ use crate::SophonProgress;
 use crate::api_scrape::{DownloadInfo, SophonBuildData, SophonManifestMeta};
 use crate::proto_parse::{SophonManifestAssetProperty, SophonManifestProto};
 
+#[cfg(any(test, feature = "verify"))]
 use crate::proto_parse::SophonManifestAssetChunk;
 
 /// Sorted name index mapping chunk names to dense indices via binary search.
@@ -426,6 +429,7 @@ fn download_work_abandoned(remaining: &AtomicUsize, handle: &DownloadHandle) -> 
     !handle.is_cancelled() && !download_work_finished(remaining)
 }
 
+#[cfg(any(test, feature = "verify"))]
 fn insert_new_chunk_name<'a>(
     seen_chunks: &mut rustc_hash::FxHashSet<&'a str>,
     name: &'a str,
@@ -524,6 +528,7 @@ fn validate_resume_chunk_batch(entries: &mut [Option<(String, u64)>], chunks_dir
     }
 }
 
+#[cfg(any(test, feature = "verify"))]
 fn bounded_stoppable_stream<I, F, Fut>(
     items: Vec<I>,
     limit: usize,
@@ -823,6 +828,7 @@ pub async fn build_installers_for_tag(
 
 /// Build an update plan from an installed tag to the current build, including
 /// deleted paths and the new tag/hash. Existing chunk offsets may be reused.
+#[cfg(feature = "update")]
 pub async fn build_update_installers(
     client: &Client,
     game_id: &str,
@@ -893,6 +899,7 @@ fn combine_manifest_hashes(installers: &[SophonInstaller]) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
+#[cfg(feature = "update")]
 #[inline]
 fn collect_deleted_files(
     old_manifest: &SophonManifestProto,
@@ -906,6 +913,7 @@ fn collect_deleted_files(
         .collect()
 }
 
+#[cfg(feature = "update")]
 #[inline]
 fn build_old_md5_map(old_manifest: &SophonManifestProto) -> FxHashMap<&str, &str> {
     old_manifest
@@ -916,6 +924,7 @@ fn build_old_md5_map(old_manifest: &SophonManifestProto) -> FxHashMap<&str, &str
         .collect()
 }
 
+#[cfg(feature = "update")]
 #[inline]
 fn compute_diff_files(
     new_manifest: SophonManifestProto,
@@ -939,6 +948,7 @@ fn compute_diff_files(
 /// Build the reverse interning maps (`name_to_id`, `hash_to_id`) and the
 /// `(u32, u32) -> offset` table from an old manifest. Extracted so the
 /// interning logic is unit-testable without a network round-trip.
+#[cfg(feature = "update")]
 #[allow(clippy::type_complexity)]
 /// Intern old chunk metadata and offset mappings for reuse during update
 /// planning.
@@ -980,6 +990,7 @@ pub fn intern_old_chunk_offsets<'a>(
 /// Stamp each chunk's `chunk_old_offset` with the matching old-file offset
 /// using the interned reverse maps. Chunks with no old match get `-1`.
 #[allow(clippy::type_complexity)]
+#[cfg(feature = "update")]
 /// Assign reusable source-file offsets to matching chunks in the update
 /// installers.
 pub fn assign_chunk_offsets(
@@ -1008,6 +1019,7 @@ pub fn assign_chunk_offsets(
     }
 }
 
+#[cfg(feature = "update")]
 async fn build_diff_installers(
     client: &Client,
     old_build: &SophonBuildData,
@@ -3132,11 +3144,19 @@ async fn process_download_item(
     }
 
     if was_actually_downloaded && item.is_pre_downloaded {
-        ctx.resume_bytes_offset
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(chunk.chunk_size))
-            })
-            .ok();
+        let mut current = ctx.resume_bytes_offset.load(Ordering::Relaxed);
+        loop {
+            let updated = current.saturating_sub(chunk.chunk_size);
+            match ctx.resume_bytes_offset.compare_exchange_weak(
+                current,
+                updated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     _chunk_timer.record_phase(super::profiling::ChunkPhase::PostDownload);
@@ -4305,6 +4325,7 @@ pub async fn install(
 }
 
 /// Verify installed manifest files and repair missing or damaged files.
+#[cfg(feature = "verify")]
 pub async fn verify_integrity(
     client: &Client,
     game_id: &str,
@@ -4332,6 +4353,7 @@ pub async fn verify_integrity(
     verify_installers(client, installers, game_id, vo_lang, game_dir, emit).await
 }
 
+#[cfg(feature = "verify")]
 async fn verify_installers(
     client: &Client,
     mut installers: Vec<SophonInstaller>,
@@ -4417,6 +4439,7 @@ async fn verify_installers(
 }
 
 /// One unique chunk pending a cached-copy MD5 check in the repair path.
+#[cfg(feature = "verify")]
 struct PendingChunkCheck {
     chunk: SophonManifestAssetChunk,
     download: Arc<DownloadInfo>,
@@ -4427,6 +4450,7 @@ struct PendingChunkCheck {
     position: usize,
 }
 
+#[cfg(feature = "verify")]
 async fn repair_assets(
     client: &Client,
     mut all_assets: Vec<(SophonManifestAssetProperty, Arc<DownloadInfo>)>,
@@ -4850,6 +4874,7 @@ async fn repair_assets(
 /// "needs download": re-downloading rewrites the file and surfaces any
 /// real I/O failure there, instead of failing the whole repair over one
 /// bad cache chunk.
+#[cfg(feature = "verify")]
 async fn precheck_cached_chunks(
     unique_chunks: Vec<PendingChunkCheck>,
     verify_cache: &Arc<DashMap<String, VerificationEntry>>,
@@ -4924,6 +4949,7 @@ async fn precheck_cached_chunks(
 
 /// Bounded blocking work: a failed/panicking task stops scheduling, but every
 /// already-started task is joined before returning an error to the caller.
+#[cfg(feature = "verify")]
 async fn run_repair_jobs(
     count: usize,
     job: impl Fn(usize) -> SophonResult<()> + Send + Sync + 'static,
@@ -4969,8 +4995,10 @@ async fn run_repair_jobs(
     Ok(())
 }
 
+#[cfg(feature = "verify")]
 struct RepairTempDir(PathBuf);
 
+#[cfg(feature = "verify")]
 impl RepairTempDir {
     fn new(game_dir: &Path) -> std::io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -4986,6 +5014,7 @@ impl RepairTempDir {
     }
 }
 
+#[cfg(feature = "verify")]
 impl Drop for RepairTempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -4996,7 +5025,7 @@ impl Drop for RepairTempDir {
 #[path = "installer_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "verify"))]
 #[path = "repair_tests.rs"]
 mod repair_tests;
 

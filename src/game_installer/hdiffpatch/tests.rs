@@ -2335,7 +2335,7 @@ fn hdiff_header_rejects_header_without_null_terminator() {
     // the same error the streaming parser produced.
     let dir = tempfile::tempdir().unwrap();
     let patch_path = dir.path().join("no-nul.hdiff");
-    fs::write(&patch_path, &[b'H'; 1024]).unwrap();
+    fs::write(&patch_path, [b'H'; 1024]).unwrap();
     let out_path = dir.path().join("out.bin");
     let mut hdiff = HDiff::new(
         dir.path()

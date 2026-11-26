@@ -78,7 +78,7 @@ impl HkrpgFilter {
             let asset_lower = asset.asset_name_str().to_ascii_lowercase();
             for entry in &self.blacklist_lower {
                 if asset_lower.contains(entry) {
-                    log::warn!("Filtered blacklisted asset: {}", &asset.asset_name_str());
+                    log::warn!("Filtered blacklisted asset: {}", asset.asset_name_str());
                     return false;
                 }
             }
@@ -89,6 +89,7 @@ impl HkrpgFilter {
 }
 
 /// Remove manifest entries excluded for the current HKRPG installation.
+#[cfg(any(test, feature = "verify"))]
 pub fn filter_hkrpg_asset_list(game_dir: &Path, assets: &mut Vec<SophonManifestAssetProperty>) {
     let filtered = HkrpgFilter::load(game_dir).apply(assets);
     if filtered > 0 {

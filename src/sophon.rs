@@ -1,22 +1,45 @@
 //! High-level Sophon entry point. Owns the HTTP client, game identity, paths,
 //! verify mode, and resume state, hiding the internal installer plumbing.
 
+#[cfg(feature = "preinstall")]
 use std::collections::HashMap;
+#[cfg(any(feature = "download", feature = "update"))]
 use std::future::Future;
+#[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "download", feature = "update", feature = "preinstall"))]
+use std::sync::Arc;
+#[cfg(any(feature = "download", feature = "update"))]
+use std::sync::OnceLock;
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 
+#[cfg(any(test, feature = "download", feature = "update"))]
 use rustc_hash::FxHashMap;
 
 use crate::SophonProgress;
 use crate::client::DownloadClient;
-use crate::game_installer::{
-    self, CompletedFiles, DownloadHandle, InstallCallbacks, InstallOptions, ResumeContext,
-    SophonError, StateSaver, UpdateInfo, VerifyMode,
-};
-use crate::types::{DownloadState, DownloadType, ResumeInfo};
+#[cfg(any(feature = "download", feature = "update"))]
+use crate::game_installer::InstallCallbacks;
+#[cfg(any(feature = "download", feature = "update", feature = "discovery"))]
+use crate::game_installer::SophonError;
+#[cfg(any(feature = "download", feature = "update", feature = "preinstall"))]
+use crate::game_installer::StateSaver;
+use crate::game_installer::{self, VerifyMode};
+#[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
+use crate::game_installer::{CompletedFiles, DownloadHandle, InstallOptions, ResumeContext};
+#[cfg(feature = "discovery")]
+use crate::game_installer::{PreinstallInfo, UpdateInfo};
+#[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
+use crate::types::DownloadType;
+use crate::types::{DownloadState, ResumeInfo};
 
 /// Closure accepted by every progress-bearing method. Implementations must be
 /// `'static` so the library can share the callback across worker tasks.
@@ -26,17 +49,34 @@ impl<T: Fn(SophonProgress) + Send + Sync + 'static> ProgressFn for T {}
 /// Per-game resume-state filename within `state_dir`.
 const STATE_FILE_PREFIX: &str = ".sophon_download_state_";
 const STATE_FILE_SUFFIX: &str = ".json";
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 static STATE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Primary entry point. Owns its manifest-fetch HTTP client, game identity,
 /// install path, resume-state directory, and verify mode. Chunk downloads
 /// build their own HTTP/1.1 client internally regardless of `client`.
 pub struct Sophon {
+    #[cfg_attr(
+        not(any(
+            feature = "download",
+            feature = "update",
+            feature = "verify",
+            feature = "preinstall"
+        )),
+        allow(dead_code)
+    )]
     client: reqwest::Client,
     game_id: String,
     vo_lang: String,
     game_dir: PathBuf,
     state_dir: PathBuf,
+    #[cfg_attr(not(any(feature = "download", feature = "update")), allow(dead_code))]
     verify_mode: VerifyMode,
 }
 
@@ -128,6 +168,7 @@ impl Sophon {
     /// Fresh download with automatic resume. Reuses on-disk chunks when the
     /// persisted manifest hash matches the remote; otherwise discards stale
     /// state and downloads fresh. Removes the resume state on success.
+    #[cfg(feature = "download")]
     pub fn download(
         &self,
         handle: &DownloadHandle,
@@ -195,6 +236,7 @@ impl Sophon {
     /// Update an existing installation to the latest remote tag. Reads the
     /// installed tag, builds an update plan, and installs. Returns
     /// [`SophonError::NoInstalledVersion`] when no installation is present.
+    #[cfg(feature = "update")]
     pub fn update(
         &self,
         handle: &DownloadHandle,
@@ -273,6 +315,7 @@ impl Sophon {
     /// persisting chunk progress for resume. Completed packages retain their
     /// exact target metadata for release-day application. Returns
     /// [`SophonError::NoPreinstallAvailable`] when no preinstall exists.
+    #[cfg(feature = "preinstall")]
     pub fn preinstall(
         &self,
         handle: &DownloadHandle,
@@ -330,6 +373,7 @@ impl Sophon {
     /// metadata even after upstream pre-download metadata disappears. Payload
     /// chunks may still require the CDN. Legacy packages require exact-target
     /// metadata recovery; failure preserves their cached state and payloads.
+    #[cfg(feature = "preinstall")]
     pub fn apply_preinstall(
         &self,
         preinstall_tag: &str,
@@ -348,11 +392,11 @@ impl Sophon {
         }
     }
 
-    /// Query update and preinstall availability and sizes without mutating
-    /// disk.
+    /// Query update availability and estimated sizes without mutating disk.
     ///
     /// The returned future is `Send` and owns its data, so it can be spawned on
     /// a multi-threaded runtime. The borrow of `&self` ends at the call site.
+    #[cfg(feature = "discovery")]
     pub fn check_update(
         &self,
     ) -> impl Future<Output = Result<UpdateInfo, SophonError>> + Send + 'static {
@@ -363,6 +407,19 @@ impl Sophon {
         async move { game_installer::check_update(&client, &game_id, &vo_lang, &game_dir).await }
     }
 
+    /// Query preinstall availability and best-effort package sizes without
+    /// downloading or applying the package.
+    #[cfg(feature = "discovery")]
+    pub fn check_preinstall(
+        &self,
+    ) -> impl Future<Output = Result<PreinstallInfo, SophonError>> + Send + 'static {
+        let client = self.client.clone();
+        let game_id = self.game_id.clone();
+        let vo_lang = self.vo_lang.clone();
+        let game_dir = self.game_dir.clone();
+        async move { game_installer::check_preinstall(&client, &game_id, &vo_lang, &game_dir).await }
+    }
+
     /// Hash installed files and re-download missing or damaged files.
     ///
     /// This explicit repair bypasses persisted verification-cache hits, honors
@@ -370,6 +427,7 @@ impl Sophon {
     /// regenerates launcher-owned metadata. `Ok(())` and `Finished` are emitted
     /// only after successful repair and regeneration. Plugins/SDKs are outside
     /// this scope.
+    #[cfg(feature = "verify")]
     pub fn verify_integrity(
         &self,
         on_progress: impl ProgressFn,
@@ -402,6 +460,7 @@ impl Sophon {
         game_installer::read_installed_tag(&self.game_dir)
     }
 
+    #[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
     fn state_file(&self) -> PathBuf {
         state_file_path(&self.state_dir, &self.game_id)
     }
@@ -414,6 +473,7 @@ impl Sophon {
     /// Static variant of [`load_state`](Self::load_state) taking the fields
     /// that drive it. Used by `Send`-returning public methods that have moved
     /// `&self` fields into owned locals before the first `await`.
+    #[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
     fn load_state_owned(state_dir: &Path, game_id: &str) -> Option<DownloadState> {
         load_download_state(state_dir, game_id)
     }
@@ -443,6 +503,7 @@ impl Sophon {
     /// Static variant of [`resolve_resume`](Self::resolve_resume) taking the
     /// `Sophon` fields by reference so the public `Send`-returning methods can
     /// call it from inside an `async move` block after cloning `&self` fields.
+    #[cfg(any(test, feature = "download", feature = "update"))]
     #[allow(clippy::too_many_arguments)]
     fn resolve_resume_owned(
         state_dir: &Path,
@@ -496,6 +557,7 @@ impl Sophon {
     /// Static variant of [`build_callbacks`](Self::build_callbacks) taking the
     /// `Sophon` fields by value/clone so the public `Send`-returning methods
     /// can call it from inside an `async move` block.
+    #[cfg(any(feature = "download", feature = "update"))]
     #[allow(clippy::too_many_arguments)]
     fn build_callbacks_owned(
         state_file: PathBuf,
@@ -531,6 +593,7 @@ impl Sophon {
     }
 
     /// Static variant of [`build_preinstall_saver`](Self::build_preinstall_saver).
+    #[cfg(feature = "preinstall")]
     fn build_preinstall_saver_owned(
         state_file: PathBuf,
         game_id: String,
@@ -555,6 +618,7 @@ impl Sophon {
     }
 }
 
+#[cfg(any(test, feature = "download", feature = "update"))]
 fn empty_resume() -> ResumeContext {
     ResumeContext {
         prev_manifest_hash: String::new(),
@@ -581,6 +645,13 @@ fn atomic_write(target: &Path, data: &[u8]) {
     let _ = temp_file.commit(target);
 }
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 fn create_state_temp_file(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     let name = target
         .file_name()
@@ -606,11 +677,25 @@ fn create_state_temp_file(target: &Path) -> std::io::Result<(PathBuf, std::fs::F
     ))
 }
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 struct StateTempFile {
     path: PathBuf,
     committed: bool,
 }
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 impl StateTempFile {
     fn new(path: PathBuf) -> Self {
         Self {
@@ -626,6 +711,13 @@ impl StateTempFile {
     }
 }
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 impl Drop for StateTempFile {
     fn drop(&mut self) {
         if !self.committed {
@@ -635,8 +727,22 @@ impl Drop for StateTempFile {
 }
 
 /// Serializes `&[(&str, u64)]` as a JSON map.
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 struct ChunkSliceMap<'a>(&'a [(&'a str, u64)]);
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 impl serde::Serialize for ChunkSliceMap<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
@@ -686,6 +792,13 @@ pub fn bench_serialize_state(entries: &[(&str, u64)]) -> usize {
     buf.len()
 }
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadStateRef<'a> {
@@ -700,6 +813,13 @@ struct DownloadStateRef<'a> {
     completed_files: &'a [usize],
 }
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 fn serialize_chunk_slice<S: serde::Serializer>(
     chunks: &[(&str, u64)],
     serializer: S,
@@ -708,6 +828,13 @@ fn serialize_chunk_slice<S: serde::Serializer>(
     ChunkSliceMap(chunks).serialize(serializer)
 }
 
+#[cfg(any(
+    test,
+    feature = "download",
+    feature = "update",
+    feature = "preinstall",
+    feature = "benchmark"
+))]
 fn atomic_write_serialized<T: serde::Serialize>(target: &Path, value: &T) {
     if let Some(parent) = target.parent() {
         let _ = std::fs::create_dir_all(parent);

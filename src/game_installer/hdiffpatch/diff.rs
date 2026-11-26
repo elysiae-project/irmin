@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(test, feature = "preinstall")),
+    allow(dead_code, unused_imports)
+)]
+
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 #[cfg(all(feature = "benchmark", unix))]

@@ -2,21 +2,31 @@ mod hk4e;
 mod hkrpg;
 mod nap;
 
+#[cfg(any(feature = "verify", feature = "preinstall"))]
+pub use hk4e::filter_hk4e_asset_list;
+#[cfg(feature = "preinstall")]
+pub use hk4e::find_hk4e_persistent_dir;
+#[cfg(feature = "verify")]
 pub(crate) use hk4e::is_generated_pkg_version;
 pub use hk4e::{
-    Hk4eFilter, filter_hk4e_asset_list, find_hk4e_persistent_dir,
-    write_audio_lang_record as write_hk4e_audio_lang_record, write_pkg_version_from_manifest,
+    Hk4eFilter, write_audio_lang_record as write_hk4e_audio_lang_record,
+    write_pkg_version_from_manifest,
 };
+#[cfg(feature = "verify")]
+pub use hkrpg::filter_hkrpg_asset_list;
 pub use hkrpg::{
-    HkrpgFilter, filter_hkrpg_asset_list, write_app_info as write_hkrpg_app_info,
+    HkrpgFilter, write_app_info as write_hkrpg_app_info,
     write_audio_lang_record as write_hkrpg_audio_lang_record,
     write_binary_version_files as write_hkrpg_binary_version_files,
 };
-pub use nap::{filter_nap_asset_list, filter_nap_installers, write_nap_audio_lang_records};
+#[cfg(feature = "verify")]
+pub use nap::filter_nap_asset_list;
+pub use nap::{filter_nap_installers, write_nap_audio_lang_records};
 
 /// True when `target_file_path` is a CDN-shipped file that sophon regenerates
 /// locally (filtered or rewritten), so a byte-level CDN patch for it can never
 /// apply and must be skipped during preinstall apply.
+#[cfg(any(test, feature = "preinstall"))]
 pub fn is_sophon_synthesized_asset(game_code: &str, target_file_path: &str) -> bool {
     let name = target_file_path
         .rsplit('/')

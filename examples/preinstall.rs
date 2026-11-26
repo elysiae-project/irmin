@@ -42,7 +42,7 @@ async fn main() {
         }
         None => {
             println!("checking for a preinstall...");
-            let info = match sophon.check_update().await {
+            let info = match sophon.check_preinstall().await {
                 Ok(i) => i,
                 Err(e) => {
                     eprintln!("error: {e:?}");

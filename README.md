@@ -58,7 +58,8 @@ The callback runs on worker tasks, so keep it thread-safe and avoid blocking wor
 | --- | --- |
 | `download(&handle, callback)` | Install a fresh copy. |
 | `update(&handle, callback)` | Update an existing install. Returns `NoInstalledVersion` if none exists. |
-| `check_update()` | Check for update or preinstall availability and sizes. |
+| `check_update()` | Check update availability and estimated sizes (`discovery`). |
+| `check_preinstall()` | Check preinstall availability and estimated sizes (`discovery`). |
 | `preinstall(&handle, callback)` | Download an available version's preinstall package. |
 | `apply_preinstall(tag, &handle, callback)` | Apply a downloaded package after release. |
 | `verify_integrity(callback)` | Check installed files and repair missing or damaged files. |
@@ -79,6 +80,31 @@ The builder requires a game identifier and install directory. These options are 
 Supported game codes: `hk4e`, `hkrpg`, `nap`, `bh3`. Supported voice locales: `en-us`, `zh-cn`, `zh-tw`, `ko-kr`, `ja-jp`.
 
 `VerifyMode::Full` hashes chunks and supports crash resume. `Deferred` checks completed files and restarts incomplete files from scratch after interruption. `None` checks sizes without hashing and also restarts incomplete files from scratch. Keep `Full` unless your application has a specific reason to trade integrity checks or resume support for lower CPU use.
+
+## Feature flags
+
+All operations are enabled by default. To compile only what you use, turn off the default features and select the ones you need:
+
+```toml
+[dependencies]
+irmin = { package = "irmin_rs", version = "1.1", default-features = false, features = ["download"] }
+```
+
+| Feature | Enables | Depends on |
+| --- | --- | --- |
+| `download` | Fresh install (`Sophon::download`). | — |
+| `update` | `update`. | `download` |
+| `discovery` | `check_update` and `check_preinstall` metadata queries. | — |
+| `verify` | `verify_integrity` repair. | `download` |
+| `preinstall` | `preinstall`, `apply_preinstall`. | `download`, `patch` |
+| `patch` | HDiff patch engine used when applying preinstall packages. | — |
+| `plugins` | Plugin and channel SDK installation. | — |
+
+The chunk download and assembly engine, including per-chunk MD5 verification and resume state, is always compiled because every operation shares it. `verify` only gates the explicit post-install repair scan. Selecting `download` alone drops the patch codecs (`lz4`, `flate2`) and the plugin archive reader (`zip`) from the build.
+
+`preinstall` requires `patch`. `update` does not enable discovery, preinstall, or HDiff support. `discovery` enables both metadata queries without enabling download/update/preinstall operations or HDiff codecs. `check_update()` returns update-only data; `check_preinstall()` returns preinstall-only data. There is no full-download fallback for HDiff assets without the patch engine.
+
+The `benchmark`, `bench-internals`, `bench-diagnostics`, `benchmark-jemalloc`, `bench-alloc-stats`, and `sophon-profiling` features are development-only and stay off by default.
 
 ## Pause, resume, and cancel
 
