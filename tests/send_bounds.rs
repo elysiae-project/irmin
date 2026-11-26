@@ -21,7 +21,8 @@
     feature = "download",
     feature = "update",
     feature = "verify",
-    feature = "preinstall"
+    feature = "preinstall",
+    feature = "discovery"
 ))]
 use std::path::PathBuf;
 #[cfg(all(feature = "discovery", feature = "update"))]
@@ -31,7 +32,8 @@ use std::sync::Arc;
     feature = "download",
     feature = "update",
     feature = "verify",
-    feature = "preinstall"
+    feature = "preinstall",
+    feature = "discovery"
 ))]
 use irmin_rs::Sophon;
 #[cfg(any(
@@ -52,7 +54,8 @@ use irmin_rs::{DownloadHandle, SophonProgress, game_installer::SophonError};
     feature = "download",
     feature = "update",
     feature = "verify",
-    feature = "preinstall"
+    feature = "preinstall",
+    feature = "discovery"
 ))]
 fn sophon_fixture() -> Sophon {
     Sophon::builder(
@@ -86,7 +89,8 @@ fn noop_progress() -> impl Fn(SophonProgress) + Send + Sync + 'static {
     feature = "download",
     feature = "update",
     feature = "verify",
-    feature = "preinstall"
+    feature = "preinstall",
+    feature = "discovery"
 ))]
 fn spawn_on_multi_thread<F>(f: F) -> F::Output
 where
@@ -115,6 +119,15 @@ fn check_update_future_is_send_and_static() {
     // checked as `Send + 'static` and was spawned. The error, if any, will be
     // a transport or manifest error, never a `NoGameManifest` from a
     // successful-but-wrong path.
+    let _ = result;
+}
+
+/// `check_preinstall` must also return a spawnable owned future.
+#[cfg(feature = "discovery")]
+#[test]
+fn check_preinstall_future_is_send_and_static() {
+    let sophon = sophon_fixture();
+    let result = spawn_on_multi_thread(sophon.check_preinstall());
     let _ = result;
 }
 

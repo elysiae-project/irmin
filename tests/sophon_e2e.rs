@@ -302,6 +302,28 @@ async fn sophon_check_update_e2e_mocked_http() {
     let _ = info.update_available;
 }
 
+/// `Sophon::check_preinstall` reports no preinstall when the front door has no
+/// pre-download branch, without invoking update planning or patch application.
+#[tokio::test]
+async fn sophon_check_preinstall_e2e_without_pre_download_branch() {
+    let _fixture = E2eFixture::setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+
+    let sophon = Sophon::builder("nap", game_dir)
+        .vo_lang("en-US")
+        .verify_mode(VerifyMode::None)
+        .build();
+
+    let info = sophon.check_preinstall().await.unwrap();
+    assert!(!info.preinstall_available);
+    assert!(!info.preinstall_downloaded);
+    assert_eq!(info.preinstall_tag, None);
+    assert_eq!(info.preinstall_compressed_size, 0);
+    assert_eq!(info.preinstall_decompressed_size, 0);
+}
+
 /// `Sophon::update` end-to-end: writes an installed tag, fetches the
 /// mocked front-door + old build + new build + manifests, computes the diff,
 /// downloads the new chunk, assembles, and commits. Guards the update
@@ -646,6 +668,11 @@ async fn sophon_preinstall_e2e_mocked_http_empty_patch() {
         .vo_lang("en-US")
         .verify_mode(VerifyMode::None)
         .build();
+
+    let info = sophon.check_preinstall().await.unwrap();
+    assert!(info.preinstall_available);
+    assert!(!info.preinstall_downloaded);
+    assert_eq!(info.preinstall_tag.as_deref(), Some("2.0.0"));
 
     let handle = DownloadHandle::new();
     let on_progress = |_p: SophonProgress| {};

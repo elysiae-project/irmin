@@ -26,15 +26,17 @@ use rustc_hash::FxHashMap;
 
 use crate::SophonProgress;
 use crate::client::DownloadClient;
+#[cfg(any(feature = "download", feature = "update"))]
+use crate::game_installer::InstallCallbacks;
+#[cfg(any(feature = "download", feature = "update", feature = "discovery"))]
+use crate::game_installer::SophonError;
 #[cfg(any(feature = "download", feature = "update", feature = "preinstall"))]
 use crate::game_installer::StateSaver;
-#[cfg(feature = "discovery")]
-use crate::game_installer::UpdateInfo;
 use crate::game_installer::{self, VerifyMode};
 #[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
 use crate::game_installer::{CompletedFiles, DownloadHandle, InstallOptions, ResumeContext};
-#[cfg(any(feature = "download", feature = "update"))]
-use crate::game_installer::{InstallCallbacks, SophonError};
+#[cfg(feature = "discovery")]
+use crate::game_installer::{PreinstallInfo, UpdateInfo};
 #[cfg(any(test, feature = "download", feature = "update", feature = "preinstall"))]
 use crate::types::DownloadType;
 use crate::types::{DownloadState, ResumeInfo};
@@ -390,8 +392,7 @@ impl Sophon {
         }
     }
 
-    /// Query update and preinstall availability and sizes without mutating
-    /// disk.
+    /// Query update availability and estimated sizes without mutating disk.
     ///
     /// The returned future is `Send` and owns its data, so it can be spawned on
     /// a multi-threaded runtime. The borrow of `&self` ends at the call site.
@@ -404,6 +405,19 @@ impl Sophon {
         let vo_lang = self.vo_lang.clone();
         let game_dir = self.game_dir.clone();
         async move { game_installer::check_update(&client, &game_id, &vo_lang, &game_dir).await }
+    }
+
+    /// Query preinstall availability and best-effort package sizes without
+    /// downloading or applying the package.
+    #[cfg(feature = "discovery")]
+    pub fn check_preinstall(
+        &self,
+    ) -> impl Future<Output = Result<PreinstallInfo, SophonError>> + Send + 'static {
+        let client = self.client.clone();
+        let game_id = self.game_id.clone();
+        let vo_lang = self.vo_lang.clone();
+        let game_dir = self.game_dir.clone();
+        async move { game_installer::check_preinstall(&client, &game_id, &vo_lang, &game_dir).await }
     }
 
     /// Hash installed files and re-download missing or damaged files.

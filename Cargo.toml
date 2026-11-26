@@ -82,8 +82,8 @@ default = ["download", "update", "discovery", "verify", "preinstall", "patch", "
 download = []
 # Update planning and versioned delta installation.
 update = ["download"]
-# Remote update and preinstall availability and size queries.
-discovery = ["download"]
+# Update and preinstall metadata queries. Does not enable install operations.
+discovery = []
 # Post-install integrity scan and repair. Per-chunk MD5 checks during
 # download and assembly are always on.
 verify = ["download"]

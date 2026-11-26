@@ -3151,46 +3151,15 @@ async fn snapshot_apply_failure_and_cancellation_keep_metadata_and_payloads() {
 }
 
 #[cfg(all(feature = "discovery", feature = "preinstall"))]
-#[tokio::test]
-async fn discovery_prefers_valid_live_package_and_keeps_its_sizes_when_queries_fail() {
+#[test]
+fn cache_discovery_prefers_valid_live_package_and_preserves_cached_sizes() {
     let dir = tempfile::tempdir().unwrap();
     let state = snapshot_state(&[("game", "data.bin", b"target")], "http://localhost");
     save_preinstall_state(dir.path(), &state).unwrap();
     assert!(!PreinstallState::marker_file_path(dir.path(), "2.0").exists());
-    for pre in [None, Some(test_branch("pre", "3.0"))] {
-        let queries = AtomicUsize::new(0);
-        let info = super::super::update::check_update_with_branches(
-            "nap",
-            "en",
-            dir.path(),
-            Some("1.0".into()),
-            test_branch("main", "2.0"),
-            pre,
-            |branch, from| {
-                queries.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(branch.tag, "2.0");
-                assert_eq!(from.as_deref(), Some("1.0"));
-                async { Err(SophonError::NoManifests) }
-            },
-        )
-        .await
-        .unwrap();
-        assert!(info.update_available && info.preinstall_available && info.preinstall_downloaded);
-        assert_eq!(info.preinstall_tag.as_deref(), Some("2.0"));
-        assert_eq!(info.remote_tag, "2.0");
-        assert_eq!(
-            (
-                info.preinstall_compressed_size,
-                info.preinstall_decompressed_size
-            ),
-            (6, 6)
-        );
-        assert_eq!(
-            (info.update_compressed_size, info.update_decompressed_size),
-            (6, 6)
-        );
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
-    }
+    let cached = cached_preinstall(dir.path(), "2.0", "nap", "en", Some("1.0")).unwrap();
+    assert_eq!(cached.tag, "2.0");
+    assert_eq!(cached.cached_sizes(), (6, 6));
 }
 
 #[cfg(all(feature = "discovery", feature = "preinstall"))]
@@ -3224,31 +3193,9 @@ async fn discovery_rejects_markers_arbitrary_json_corrupt_snapshots_and_wrong_id
                 save_preinstall_state(dir.path(), &wrong_source).unwrap();
             }
         }
-        let info = super::super::update::check_update_with_branches(
-            "nap",
-            "en",
-            dir.path(),
-            Some("1.0".into()),
-            test_branch("main", "2.0"),
-            Some(test_branch("pre", "3.0")),
-            |branch, _| async move {
-                Ok(if branch.tag == "3.0" {
-                    (300, 900)
-                } else {
-                    (200, 600)
-                })
-            },
-        )
-        .await
-        .unwrap();
-        assert!(!info.preinstall_downloaded, "case {case}");
-        assert_eq!(info.preinstall_tag.as_deref(), Some("3.0"));
-        assert_eq!(
-            (
-                info.preinstall_compressed_size,
-                info.preinstall_decompressed_size
-            ),
-            (300, 900)
+        assert!(
+            cached_preinstall(dir.path(), "2.0", "nap", "en", Some("1.0")).is_none(),
+            "invalid cached package accepted in case {case}"
         );
     }
 }
@@ -3314,22 +3261,9 @@ async fn cached_package_discovery_accepts_equivalent_voice_aliases() {
     );
     save_preinstall_state(dir.path(), &state).unwrap();
     for alias in ["en", "en-us", "en-US", "EN"] {
-        let info = super::super::update::check_update_with_branches(
-            "nap",
-            alias,
-            dir.path(),
-            Some("1.0".into()),
-            test_branch("main", "2.0"),
-            None,
-            |_, _| async { Err(SophonError::NoManifests) },
-        )
-        .await
-        .unwrap();
-        assert!(
-            info.preinstall_downloaded,
-            "alias {alias} hid the completed package"
-        );
-        assert_eq!(info.preinstall_tag.as_deref(), Some("2.0"));
+        let cached = cached_preinstall(dir.path(), "2.0", "nap", alias, Some("1.0"));
+        assert!(cached.is_some(), "alias {alias} hid the completed package");
+        assert_eq!(cached.unwrap().tag, "2.0");
     }
     assert!(cached_preinstall(dir.path(), "2.0", "nap", "jp", Some("1.0")).is_none());
 }

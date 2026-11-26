@@ -8,8 +8,8 @@
 //!
 //! - `download`: fresh install via [`Sophon::download`].
 //! - `update`: versioned update planning and installation (implies `download`).
-//! - `discovery`: `check_update` availability and size queries (implies
-//!   `download`; enabled by default).
+//! - `discovery`: update and preinstall availability/size queries (enabled by
+//!   default; does not enable download operations).
 //! - `verify`: post-install integrity repair via `verify_integrity`.
 //! - `preinstall`: preinstall download and apply (implies `download`, `patch`).
 //! - `patch`: HDiff patch engine used by preinstall apply.
@@ -18,8 +18,6 @@
 //! The chunk download/assembly engine, per-chunk MD5 verification, and resume
 //! state are always compiled because every operation shares them. The
 //! `benchmark*` and `sophon-profiling` features are development-only.
-//! Without `preinstall`, the preinstall fields in `UpdateInfo` are empty and
-//! should be treated as unsupported rather than unavailable.
 
 /// Wire-format models for game branches, builds, and download metadata.
 pub mod api_scrape;

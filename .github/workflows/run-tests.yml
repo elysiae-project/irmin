@@ -57,5 +57,7 @@ jobs:
                   cargo check --all-targets --no-default-features --features "$f"
                 done
                 cargo check --all-targets --no-default-features --features update,discovery
+                cargo check --all-targets --no-default-features --features discovery,preinstall
                 cargo check --all-targets --no-default-features --features download,verify
                 cargo check --all-targets --no-default-features --features download,plugins
+                cargo test --test sophon_e2e --features bench-internals

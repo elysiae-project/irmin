@@ -1,5 +1,4 @@
-//! Query the live API for update and preinstall availability without writing
-//! disk. The one cheap live operation.
+//! Query the live API for update availability without writing disk.
 //!
 //! Usage: `cargo run --example check_update -- <game_id> <vo_lang> <game_dir>`
 
@@ -34,16 +33,5 @@ fn print_update_info(i: &UpdateInfo) {
     println!(
         "update_decompressed_size: {} bytes",
         i.update_decompressed_size
-    );
-    println!("preinstall_available: {}", i.preinstall_available);
-    println!("preinstall_downloaded: {}", i.preinstall_downloaded);
-    println!("preinstall_tag: {:?}", i.preinstall_tag);
-    println!(
-        "preinstall_compressed_size: {} bytes",
-        i.preinstall_compressed_size
-    );
-    println!(
-        "preinstall_decompressed_size: {} bytes",
-        i.preinstall_decompressed_size
     );
 }
