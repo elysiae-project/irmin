@@ -400,11 +400,11 @@ where
 }
 
 #[cfg(test)]
-fn borrowed_diff_indexes_collect<'a>(
-    old_manifest: &'a crate::proto_parse::SophonManifestProto,
+fn borrowed_diff_indexes_collect(
+    old_manifest: &crate::proto_parse::SophonManifestProto,
 ) -> (
-    rustc_hash::FxHashMap<&'a str, &'a str>,
-    rustc_hash::FxHashSet<&'a str>,
+    rustc_hash::FxHashMap<&str, &str>,
+    rustc_hash::FxHashSet<&str>,
 ) {
     let old_files_md5 = old_manifest
         .assets
@@ -465,9 +465,7 @@ fn make_diff_size_benchmark_manifests(
     let make_file = |file_idx: usize, changed: bool, is_old: bool| {
         let asset_chunks = (0..chunks_per_file)
             .map(|chunk_idx| {
-                let hash = if is_old {
-                    format!("old-hash-{:04}", chunk_idx % 32)
-                } else if !changed && chunk_idx % 100 < reused_hash_percent {
+                let hash = if is_old || (!changed && chunk_idx % 100 < reused_hash_percent) {
                     format!("old-hash-{:04}", chunk_idx % 32)
                 } else {
                     format!("new-hash-{file_idx:06}-{chunk_idx:04}")

@@ -9,9 +9,10 @@
 //! - `stalled_verification`: the hash consumer is delayed 80 ms per response
 //!   frame via the `set_bench_hash_thread_stall_us` hook, slower than the
 //!   configured network pace and emulating verifier CPU starvation.
+//!
 //! The nominal and stalled scenarios run in both fixed and legacy modes to
-//! compare transfer rates directly under identical inputs.
-//! Set `IRMIN_BENCH_ASSEMBLY=1` to add assembly-like CPU contention.
+//! compare transfer rates directly under identical inputs. Set
+//! `IRMIN_BENCH_ASSEMBLY=1` to add assembly-like CPU contention.
 //!
 //! The benchmark reports transfer throughput through body EOF separately
 //! from verified completion latency. It also reports how often the bounded

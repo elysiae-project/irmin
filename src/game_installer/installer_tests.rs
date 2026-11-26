@@ -473,7 +473,7 @@ fn from_manifest_dedups_shared_chunk_names_across_files() {
     // does not dedup names during interning, so the two entries get distinct
     // arena ids. from_manifest must dedup by name so lookup returns one index.
     let items = [(0, 0), (1, 0)];
-    let lookup = ChunkNameLookup::from_manifest(Arc::clone(&manifest), items.into_iter());
+    let lookup = ChunkNameLookup::from_manifest(Arc::clone(&manifest), items);
 
     assert_eq!(
         lookup.name_locs.len(),
@@ -1143,8 +1143,8 @@ fn collect_deleted_files_basic() {
     new_names.insert("D");
     let deleted = collect_deleted_files(&old, &new_names);
     assert_eq!(deleted.len(), 2);
-    assert!(deleted.contains(&"B".to_string()));
-    assert!(deleted.contains(&"C".to_string()));
+    assert!(deleted.iter().any(|item| item == "B"));
+    assert!(deleted.iter().any(|item| item == "C"));
 }
 
 #[cfg(feature = "update")]
@@ -2944,9 +2944,7 @@ async fn install_with_stalled_hash_verification_keeps_download_pace() {
     const CHUNKS: usize = 4;
     const CHUNK_RAW: usize = 256 * 1024;
     const STALL_MS: u64 = 100;
-    let _stall_guard = super::download::HASH_THREAD_STALL_GUARD
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _stall_guard = super::download::HASH_THREAD_STALL_GUARD.lock().await;
 
     let server = MockServer::start().await;
     let mut payload = Vec::new();

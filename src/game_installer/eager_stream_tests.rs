@@ -74,8 +74,10 @@ fn eager_item() -> DownloadItem {
 #[test]
 fn eager_stream_threshold_preserves_small_one_shot_path() {
     assert_eq!(super::EAGER_STREAM_THRESHOLD, 64 * 1024 * 1024);
-    assert!(super::EAGER_STREAM_THRESHOLD > 8 * 1024 * 1024);
-    assert!(super::EAGER_STREAM_THRESHOLD <= 64 * 1024 * 1024);
+    const {
+        assert!(super::EAGER_STREAM_THRESHOLD > 8 * 1024 * 1024);
+        assert!(super::EAGER_STREAM_THRESHOLD <= 64 * 1024 * 1024);
+    }
     assert!(!super::should_stream_eager(
         super::EAGER_STREAM_THRESHOLD - 1,
         None

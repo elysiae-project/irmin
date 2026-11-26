@@ -19,8 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use fast_md5;
-
 use irmin_rs::game_installer::{
     VerifyMode,
     assembly::{assemble_file, assemble_file_with_benchmark_epochs, chunk_filename},
@@ -202,11 +200,7 @@ fn bench_md5_multibuffer(c: &mut Criterion) {
         let expect = fast_md5::digest(m);
         assert_eq!(outputs[i], expect, "lane {i} digest mismatch");
         let _ = simd_digest; // keep import honest: also compare crate one-shot
-        assert_eq!(
-            simd_digest(&inputs[i]),
-            expect,
-            "lane {i} one-shot mismatch"
-        );
+        assert_eq!(simd_digest(inputs[i]), expect, "lane {i} one-shot mismatch");
     }
 
     group.finish();
@@ -1273,7 +1267,7 @@ fn bench_verify_file_md5(c: &mut Criterion) {
                 let valid = irmin_rs::game_installer::cache::check_file_md5_cached(
                     path,
                     tiny_bytes,
-                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(&md5)
+                    irmin_rs::game_installer::assembly_opt::hex_to_bytes(md5)
                         .unwrap_or_default()
                         .as_slice(),
                     &game_dir,
@@ -1847,7 +1841,7 @@ fn encode_7bit_varint(v: i64) -> Vec<u8> {
         return vec![v as u8];
     }
     let bits = 64 - (v as u64).leading_zeros() as usize;
-    let groups = (bits + 6) / 7;
+    let groups = bits.div_ceil(7);
     let mut out = Vec::with_capacity(groups);
     for i in (0..groups).rev() {
         let chunk = ((v >> (i * 7)) & 0x7F) as u8;
@@ -1929,7 +1923,7 @@ fn encode_cover_header_entry(
         // Need continuation bytes. First byte: sign | 0x40 (continuation set) |
         // top 6 bits
         let bits = 64 - (inc_old_pos as u64).leading_zeros() as usize;
-        let groups = (bits.saturating_sub(6) + 6) / 7 + 1; // 1 for first 6-bit group
+        let groups = bits.saturating_sub(6).div_ceil(7) + 1; // 1 for first 6-bit group
         let shift = (groups - 1) * 7;
         let first_payload = ((inc_old_pos >> shift) & 0x3F) as u8;
         out.push((sign << 7) | 0x40 | first_payload);
@@ -2157,7 +2151,7 @@ fn encode_tagged_1bit(sign: u8, value: i64) -> Vec<u8> {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         // First 6 bits in byte 0, then 7-bit groups
         let remaining_bits = bits - 6;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x3F) as u8;
         out.push((sign << 7) | 0x40 | first_payload);
@@ -2186,7 +2180,7 @@ fn gen_hdiff_v20_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
 
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -2551,7 +2545,7 @@ fn gen_hdiff_v20_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -2584,11 +2578,7 @@ fn gen_hdiff_v20_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut last_old_end = 0u64;
     let mut last_new_end = 0u64;
     for &(old_pos, new_pos, length) in &covers {
-        let delta = if old_pos >= last_old_end {
-            old_pos - last_old_end
-        } else {
-            last_old_end - old_pos
-        };
+        let delta = old_pos.abs_diff(last_old_end);
         let sign = if old_pos >= last_old_end { 0 } else { 1 };
         cover_buf.extend_from_slice(&encode_tagged_1bit(sign, delta as i64));
         cover_buf.extend_from_slice(&encode_7bit_varint((new_pos - last_new_end) as i64));
@@ -2665,7 +2655,7 @@ fn encode_tagged_2bit(rle_type: u8, value: i64) -> Vec<u8> {
     } else {
         let bits = 64 - (value as u64).leading_zeros() as usize;
         let remaining_bits = bits - 5;
-        let extra_groups = (remaining_bits + 6) / 7;
+        let extra_groups = remaining_bits.div_ceil(7);
         let total_shift = extra_groups * 7;
         let first_payload = ((value >> total_shift) & 0x1F) as u8;
         out.push((rle_type << 6) | 0x20 | first_payload);
@@ -2693,7 +2683,7 @@ fn gen_hdiff_v13_patch(old: &[u8], new: &[u8]) -> Vec<u8> {
 
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -2910,7 +2900,7 @@ fn gen_hdiff_v13_patch_zstd(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut run_start: Option<usize> = None;
     for i in 0..num_blocks {
         let off = i * block_size;
-        let same = &old[off..off + block_size] == &new[off..off + block_size];
+        let same = old[off..off + block_size] == new[off..off + block_size];
         if same {
             if run_start.is_none() {
                 run_start = Some(i);
@@ -3666,6 +3656,7 @@ fn bench_eager_stream_input_chain(c: &mut Criterion) {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&out_path)
             .expect("open output");
         out_file
@@ -3981,7 +3972,8 @@ fn bench_installer_save_offload(c: &mut Criterion) {
                 // previous iteration's real save + spawn of this one;
                 // this is the production caller stall, not the cost of
                 // a save.
-                if let Some(handle) = last_save.lock().unwrap().take() {
+                let pending = last_save.lock().unwrap().take();
+                if let Some(handle) = pending {
                     let _ = handle.await;
                 }
                 // Each iteration awaits the previous save and the final
@@ -4069,7 +4061,8 @@ fn bench_installer_save_offload(c: &mut Criterion) {
                     }
                     while wave.join_next().await.is_some() {}
                     total += start.elapsed();
-                    if let Some(handle) = last_save.lock().unwrap().take() {
+                    let pending = last_save.lock().unwrap().take();
+                    if let Some(handle) = pending {
                         let _ = handle.await;
                     }
                     // The wave must have produced real saves.
@@ -4476,6 +4469,7 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&out_path)
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();
@@ -4497,6 +4491,7 @@ fn bench_eager_decompress(c: &mut Criterion) {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&out_path)
                 .unwrap();
             out_file.set_len(data_size as u64).unwrap();

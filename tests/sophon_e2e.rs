@@ -1478,7 +1478,7 @@ async fn sophon_download_e2e_connection_drop_mid_stream_returns_error_not_panic(
             "manifest": { "id": "manifest-game", "checksum": "x",
                 "compressed_size": "0", "uncompressed_size": "0" },
             "chunk_download": { "encryption": 0, "password": "", "compression": 0,
-                "url_prefix": format!("{server_uri}"), "url_suffix": "chunks" },
+                "url_prefix": server_uri, "url_suffix": "chunks" },
             "manifest_download": { "encryption": 0, "password": "", "compression": 0,
                 "url_prefix": format!("{}/", server.uri()), "url_suffix": "manifests" },
             "stats": { "compressed_size": "0", "uncompressed_size": "0",

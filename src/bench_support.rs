@@ -384,6 +384,53 @@ pub fn apply_hdiff_fixture_with_backend(
     Ok(())
 }
 
+fn encode_varint(value: u64) -> Vec<u8> {
+    if value < 0x80 {
+        return vec![value as u8];
+    }
+    let groups = (64 - value.leading_zeros() as usize).div_ceil(7);
+    let mut bytes = Vec::with_capacity(groups);
+    for group in (0..groups).rev() {
+        let part = ((value >> (group * 7)) & 0x7f) as u8;
+        bytes.push(if group > 0 { part | 0x80 } else { part });
+    }
+    bytes
+}
+
+fn encode_tagged_1bit(sign: u8, value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if value < 64 {
+        bytes.push((sign << 7) | value as u8);
+        return bytes;
+    }
+    let bits = 64 - value.leading_zeros() as usize;
+    let extra_groups = (bits - 6).div_ceil(7);
+    let first_shift = extra_groups * 7;
+    bytes.push((sign << 7) | 0x40 | ((value >> first_shift) as u8 & 0x3f));
+    for group in (0..extra_groups).rev() {
+        let chunk = ((value >> (group * 7)) & 0x7f) as u8;
+        bytes.push(if group > 0 { chunk | 0x80 } else { chunk });
+    }
+    bytes
+}
+
+fn encode_tagged_2bit(rle_type: u8, value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if value < 32 {
+        bytes.push((rle_type << 6) | value as u8);
+        return bytes;
+    }
+    let bits = 64 - value.leading_zeros() as usize;
+    let extra_groups = (bits - 5).div_ceil(7);
+    let first_shift = extra_groups * 7;
+    bytes.push((rle_type << 6) | 0x20 | ((value >> first_shift) as u8 & 0x1f));
+    for group in (0..extra_groups).rev() {
+        let chunk = ((value >> (group * 7)) & 0x7f) as u8;
+        bytes.push(if group > 0 { chunk | 0x80 } else { chunk });
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,51 +595,4 @@ mod tests {
             compare_hdiff_fixture(dir.path()).unwrap();
         }
     }
-}
-
-fn encode_varint(value: u64) -> Vec<u8> {
-    if value < 0x80 {
-        return vec![value as u8];
-    }
-    let groups = (64 - value.leading_zeros() as usize).div_ceil(7);
-    let mut bytes = Vec::with_capacity(groups);
-    for group in (0..groups).rev() {
-        let part = ((value >> (group * 7)) & 0x7f) as u8;
-        bytes.push(if group > 0 { part | 0x80 } else { part });
-    }
-    bytes
-}
-
-fn encode_tagged_1bit(sign: u8, value: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if value < 64 {
-        bytes.push((sign << 7) | value as u8);
-        return bytes;
-    }
-    let bits = 64 - value.leading_zeros() as usize;
-    let extra_groups = (bits - 6).div_ceil(7);
-    let first_shift = extra_groups * 7;
-    bytes.push((sign << 7) | 0x40 | ((value >> first_shift) as u8 & 0x3f));
-    for group in (0..extra_groups).rev() {
-        let chunk = ((value >> (group * 7)) & 0x7f) as u8;
-        bytes.push(if group > 0 { chunk | 0x80 } else { chunk });
-    }
-    bytes
-}
-
-fn encode_tagged_2bit(rle_type: u8, value: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if value < 32 {
-        bytes.push((rle_type << 6) | value as u8);
-        return bytes;
-    }
-    let bits = 64 - value.leading_zeros() as usize;
-    let extra_groups = (bits - 5).div_ceil(7);
-    let first_shift = extra_groups * 7;
-    bytes.push((rle_type << 6) | 0x20 | ((value >> first_shift) as u8 & 0x1f));
-    for group in (0..extra_groups).rev() {
-        let chunk = ((value >> (group * 7)) & 0x7f) as u8;
-        bytes.push(if group > 0 { chunk | 0x80 } else { chunk });
-    }
-    bytes
 }

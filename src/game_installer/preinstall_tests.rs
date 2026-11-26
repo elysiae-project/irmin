@@ -56,10 +56,7 @@ fn benchmark_original_hash_mismatch_validation() {
             return Ok::<bool, ()>(true);
         }
         let mismatch_for_normal = !verify_file_hash(&path, expected_hash);
-        if mismatch_for_normal && !is_filtered_asset(cache, &asset) {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(!(mismatch_for_normal && !is_filtered_asset(cache, &asset)))
     };
 
     let verify_single_hash = |cache: &FilterCache, expected_hash: &[u8]| {
@@ -273,10 +270,12 @@ fn chunk_info(name: &str, size: u64) -> PatchChunkInfo {
     }
 }
 
-fn capture_saver() -> (
+type CapturedSaver = (
     Arc<std::sync::Mutex<Vec<(String, u64)>>>,
     super::super::installer::StateSaver,
-) {
+);
+
+fn capture_saver() -> CapturedSaver {
     let saved = Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
     let saved_for_callback = Arc::clone(&saved);
     let saver: super::super::installer::StateSaver = Arc::new(move |snapshot| {
@@ -2039,11 +2038,7 @@ fn benchmark_patch_asset_filter_pass() {
                         .iter()
                         .filter(|asset| asset.patch_method == PatchMethod::Skip)
                         .count();
-                    let expected_filtered = if hit_stride > 0 {
-                        asset_count / hit_stride
-                    } else {
-                        0
-                    };
+                    let expected_filtered = asset_count.checked_div(hit_stride).unwrap_or(0);
                     assert_eq!(filtered, expected_filtered);
                     total_filtered += filtered;
                 }

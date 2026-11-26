@@ -947,7 +947,7 @@ mod tests {
             bytes::Bytes::from_static("pathд.pak".as_bytes()),
             bytes::Bytes::from_static(b"0123456789abcdef0123456789abcdef"),
         );
-        assert!(decode_manifest(&ok.encode_to_vec()).is_ok());
+        assert!(decode_manifest(ok.encode_to_vec()).is_ok());
 
         // Sequence straddling the two fields is rejected even though the
         // raw concatenation of the fields decodes as valid UTF-8.

@@ -202,9 +202,8 @@ fn sophon_owned_can_be_moved_across_await() {
     let fut = async move {
         // Rebind `s` across an await to prove the future is `Send + 'static`
         // even when a `Sophon` is captured by an `Arc` clone.
-        let inner = tokio::task::yield_now().await;
-        let _ = inner;
+        tokio::task::yield_now().await;
         let _ = s.check_update().await;
     };
-    let _ = spawn_on_multi_thread(fut);
+    spawn_on_multi_thread(fut);
 }
