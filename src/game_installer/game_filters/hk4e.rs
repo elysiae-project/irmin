@@ -89,7 +89,7 @@ impl Hk4eFilter {
 
             for pattern in &self.patterns_lower {
                 if asset_lower.contains(pattern) {
-                    log::warn!("Filtered unneeded audio asset: {}", &asset.asset_name_str());
+                    log::warn!("Filtered unneeded audio asset: {}", asset.asset_name_str());
                     return false;
                 }
             }

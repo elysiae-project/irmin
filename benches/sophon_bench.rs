@@ -10,6 +10,7 @@
 //! Compare to baseline: cargo bench -- --baseline before
 
 use std::fs;
+use std::hint::black_box;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt;
@@ -187,7 +188,7 @@ fn bench_md5_multibuffer(c: &mut Criterion) {
 
     group.bench_function("hash_many_avx2", |b| {
         b.iter(|| {
-            let mut engine = Md5Engine::new();
+            let engine = Md5Engine::new();
             let mut outputs = [[0u8; 16]; N_MSG];
             engine.hash_many(&inputs, &mut outputs);
             std::hint::black_box(outputs);
@@ -1515,7 +1516,7 @@ fn bench_chunk_decompress_production(c: &mut Criterion) {
                 assert_eq!(written, (CHUNK_MIB * 1024 * 1024) as u64);
             }
             let digest = hasher.finish().unwrap();
-            criterion::black_box(digest);
+            black_box(digest);
         });
     });
     group.finish();
@@ -4603,7 +4604,7 @@ fn bench_state_save(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(count), &downloaded, |b, dc| {
             b.iter(|| {
                 let entries = snapshot_downloaded_chunks(dc, &lookup);
-                criterion::black_box(entries);
+                black_box(entries);
             });
         });
 
@@ -4624,7 +4625,7 @@ fn bench_state_save(c: &mut Criterion) {
                 b.iter(|| {
                     let entries = snapshot_downloaded_chunks(&downloaded, &lookup);
                     let len = irmin_rs::sophon::bench_serialize_state(&entries);
-                    criterion::black_box(len);
+                    black_box(len);
                 });
             });
         }
@@ -4772,7 +4773,7 @@ fn bench_load_download_state(c: &mut Criterion) {
             |b, path| {
                 b.iter(|| {
                     let state = load_download_state(path.parent().unwrap(), "hk4e");
-                    criterion::black_box(state);
+                    black_box(state);
                 });
             },
         );
@@ -4820,14 +4821,14 @@ fn bench_phase2a_chunk_verify(c: &mut Criterion) {
                             false,
                         )
                         .unwrap();
-                    criterion::black_box(actual == *expected);
+                    black_box(actual == *expected);
                 }
             }
             #[cfg(not(feature = "bench-internals"))]
             {
                 for (path, expected) in &items {
                     let actual = irmin_rs::game_installer::cache::file_md5_digest(path).unwrap();
-                    criterion::black_box(actual == *expected);
+                    black_box(actual == *expected);
                 }
             }
         });
@@ -4837,7 +4838,7 @@ fn bench_phase2a_chunk_verify(c: &mut Criterion) {
         b.iter(|| {
             let results =
                 irmin_rs::game_installer::md5_multibuffer::verify_md5_batch(&items).unwrap();
-            criterion::black_box(results);
+            black_box(results);
         });
     });
 
@@ -4860,7 +4861,7 @@ fn bench_verify_file_hash(c: &mut Criterion) {
     group.bench_function("binary", |b| {
         b.iter(|| {
             let ok = verify_file_hash(&path, &md5_bytes);
-            criterion::black_box(ok);
+            black_box(ok);
         });
     });
     group.finish();
@@ -4876,7 +4877,7 @@ fn bench_hex_to_bytes(c: &mut Criterion) {
     group.bench_function("lut", |b| {
         b.iter(|| {
             let bytes = hex_to_bytes(&hex);
-            criterion::black_box(bytes);
+            black_box(bytes);
         });
     });
     group.finish();
@@ -4893,7 +4894,7 @@ fn bench_md5_hex_eq(c: &mut Criterion) {
     group.bench_function("lut", |b| {
         b.iter(|| {
             let ok = md5_hex_eq(&digest, &hex);
-            criterion::black_box(ok);
+            black_box(ok);
         });
     });
     group.finish();
@@ -4910,7 +4911,7 @@ fn bench_xxh64_hex_eq(c: &mut Criterion) {
     group.bench_function("lut", |b| {
         b.iter(|| {
             let ok = xxh64_hex_eq(value, &hex);
-            criterion::black_box(ok);
+            black_box(ok);
         });
     });
     group.finish();
@@ -4960,7 +4961,7 @@ fn bench_chunk_accessors(c: &mut Criterion) {
                 .filter(|c| seen.insert(c.chunk_name))
                 .map(|c| c.chunk_size)
                 .fold(0u64, |acc, x| acc.saturating_add(x));
-            criterion::black_box(total);
+            black_box(total);
         });
     });
 
@@ -4972,7 +4973,7 @@ fn bench_chunk_accessors(c: &mut Criterion) {
                 .filter(|&i| seen.insert(manifest.chunk_name_at(i)))
                 .map(|i| manifest.chunk_size_at(i))
                 .fold(0u64, |acc, x| acc.saturating_add(x));
-            criterion::black_box(total);
+            black_box(total);
         });
     });
 

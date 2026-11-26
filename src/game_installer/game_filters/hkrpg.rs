@@ -78,7 +78,7 @@ impl HkrpgFilter {
             let asset_lower = asset.asset_name_str().to_ascii_lowercase();
             for entry in &self.blacklist_lower {
                 if asset_lower.contains(entry) {
-                    log::warn!("Filtered blacklisted asset: {}", &asset.asset_name_str());
+                    log::warn!("Filtered blacklisted asset: {}", asset.asset_name_str());
                     return false;
                 }
             }

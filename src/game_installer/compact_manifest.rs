@@ -26,8 +26,9 @@ fn byte_arena_hash(bytes: &[u8]) -> u64 {
         }
         32 => {
             let mut h = rustc_hash::FxHasher::default();
-            for c in bytes.chunks_exact(8) {
-                h.write_u64(u64::from_ne_bytes(c.try_into().unwrap()));
+            let (chunks, _) = bytes.as_chunks::<8>();
+            for chunk in chunks {
+                h.write_u64(u64::from_ne_bytes(*chunk));
             }
             h.finish()
         }

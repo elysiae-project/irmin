@@ -118,10 +118,7 @@ pub fn validate_chunk_name(chunk_name: &str) -> bool {
         i += 1;
     }
     // Check trailing segment
-    if i - seg_start == 2 && b[seg_start] == b'.' && b[seg_start + 1] == b'.' {
-        return false;
-    }
-    true
+    !(i - seg_start == 2 && b[seg_start] == b'.' && b[seg_start + 1] == b'.')
 }
 
 /// Reject empty, absolute, drive-prefixed, NUL-containing, or parent-traversal
@@ -1202,13 +1199,8 @@ fn assemble_file_inner(
             chunk_end: chunk_range.end,
             bytes: total_written,
         };
-        let directive = match epoch.epochs.stage(out_file, stage_req) {
-            Ok(directive) => {
-                guard.chunks.clear();
-                directive
-            }
-            Err(err) => return Err(err),
-        };
+        let directive = epoch.epochs.stage(out_file, stage_req)?;
+        guard.chunks.clear();
         #[cfg(any(test, feature = "benchmark", feature = "preinstall"))]
         let file_hash_verified = has_file_hash && (sequential_file_hash || parallel_hashed_file);
         TRANSFER_BUF.with(|cell| cell.replace(transfer_buffer));
