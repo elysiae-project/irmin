@@ -1,3 +1,4 @@
+use super::super::preinstall_state::cached_preinstall;
 use super::*;
 use fast_md5;
 

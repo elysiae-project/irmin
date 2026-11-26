@@ -56,6 +56,10 @@ mod plugin_api;
 mod plugin_install;
 #[cfg(feature = "preinstall")]
 pub mod preinstall;
+#[cfg(feature = "discovery")]
+mod preinstall_discovery;
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
+mod preinstall_state;
 #[cfg(not(feature = "bench-internals"))]
 #[cfg(feature = "discovery")]
 mod update;
@@ -248,7 +252,7 @@ pub(crate) mod test_endpoints {
     thread_local! {
         static FRONT_DOOR: RefCell<Option<String>> = const { RefCell::new(None) };
         static BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
-        #[cfg(all(feature = "preinstall", feature = "bench-internals"))]
+        #[cfg(all(feature = "discovery", feature = "bench-internals"))]
         static PATCH_BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
@@ -260,7 +264,7 @@ pub(crate) mod test_endpoints {
     pub fn set_build_base(url: Option<String>) {
         BUILD_BASE.with(|c| *c.borrow_mut() = url);
     }
-    #[cfg(all(feature = "preinstall", feature = "bench-internals"))]
+    #[cfg(all(feature = "discovery", feature = "bench-internals"))]
     pub fn set_patch_build_base(url: Option<String>) {
         PATCH_BUILD_BASE.with(|c| *c.borrow_mut() = url);
     }
@@ -271,13 +275,13 @@ pub(crate) mod test_endpoints {
     pub fn build_base() -> Option<String> {
         BUILD_BASE.with(|c| c.borrow().clone())
     }
-    #[cfg(feature = "preinstall")]
+    #[cfg(any(feature = "discovery", feature = "preinstall"))]
     pub fn patch_build_base() -> Option<String> {
-        #[cfg(feature = "bench-internals")]
+        #[cfg(all(feature = "bench-internals", feature = "preinstall"))]
         {
             PATCH_BUILD_BASE.with(|c| c.borrow().clone())
         }
-        #[cfg(not(feature = "bench-internals"))]
+        #[cfg(not(all(feature = "bench-internals", feature = "preinstall")))]
         {
             None
         }
@@ -289,7 +293,7 @@ pub(crate) mod test_endpoints {
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod bench_test_endpoints {
-    #[cfg(all(feature = "preinstall", feature = "bench-internals"))]
+    #[cfg(all(feature = "discovery", feature = "bench-internals"))]
     pub use super::test_endpoints::set_patch_build_base;
     pub use super::test_endpoints::{set_build_base, set_front_door};
 }
@@ -319,14 +323,14 @@ pub(crate) fn sophon_build_url_base() -> String {
 }
 
 /// Base endpoint for patch-build metadata requests.
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 pub const SOPHON_PATCH_BUILD_URL_BASE: &str = concat!(
     "\x68\x74\x74\x70\x73\x3a\x2f\x2f\x73\x67\x2d\x70\x75\x62\x6c\x69\x63\x2d\x61\x70\x69\x2e\x68\x6f\x79\x6f\x76\x65\x72\x73\x65\x2e\x63\x6f\x6d",
     "/downloader/sophon_chunk/api/getPatchBuild"
 );
 
 /// Resolve the patch-build URL base, honoring test overrides when present.
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 pub(crate) fn sophon_patch_build_url_base() -> String {
     #[cfg(any(test, feature = "bench-internals"))]
     {
@@ -391,6 +395,8 @@ pub use preinstall::prepare_synthetic_copyover_state as prepare_benchmark_copyov
 pub use preinstall::{HdiffPhaseTimings, apply_synthetic_hdiff_for_benchmark};
 #[cfg(feature = "preinstall")]
 pub use preinstall::{apply_preinstall, build_preinstall_plan, preinstall_download};
+#[cfg(feature = "discovery")]
+pub use preinstall_discovery::{PreinstallInfo, check_preinstall};
 #[cfg(feature = "discovery")]
 pub use update::{UpdateInfo, check_update};
 

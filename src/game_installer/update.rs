@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::api::{fetch_build, is_known_vo_locale, vo_lang_matches};
 use super::error::{SophonError, SophonResult};
+#[cfg(feature = "preinstall")]
+use super::preinstall_state::cached_preinstall;
 use super::read_installed_tag;
 
 use crate::api_scrape::PackageBranch;
@@ -172,7 +174,7 @@ where
     #[cfg(feature = "preinstall")]
     let cached_live = update_available
         .then(|| {
-            super::preinstall::cached_preinstall(
+            cached_preinstall(
                 game_dir,
                 &remote_tag,
                 game_id,
@@ -184,13 +186,7 @@ where
     #[cfg(feature = "preinstall")]
     let cached = cached_live.or_else(|| {
         pre_download_branch.as_ref().and_then(|pre| {
-            super::preinstall::cached_preinstall(
-                game_dir,
-                &pre.tag,
-                game_id,
-                vo_lang,
-                current_tag.as_deref(),
-            )
+            cached_preinstall(game_dir, &pre.tag, game_id, vo_lang, current_tag.as_deref())
         })
     });
 

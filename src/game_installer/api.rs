@@ -5,14 +5,14 @@ use reqwest::Client;
 use crate::api_scrape::{
     FrontDoorResponse, GameBranch, PackageBranch, SophonBuildData, SophonBuildResponse,
 };
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 use crate::api_scrape::{SophonPatchBuildData, SophonPatchBuildResponse, SophonPatchManifestMeta};
 use crate::proto_parse::{SophonManifestProto, decode_manifest_from_bytes};
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 use crate::proto_parse::{SophonPatchProto, decode_patch_manifest};
 
 use super::error::{SophonError, SophonResult};
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 use super::sophon_patch_build_url_base;
 use super::{front_door_url, sophon_build_url_base};
 use crate::api_scrape::DownloadInfo;
@@ -297,7 +297,7 @@ pub async fn fetch_build(
 }
 
 /// Fetch metadata describing the available patch build.
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 pub async fn fetch_patch_build(
     client: &Client,
     branch: &PackageBranch,
@@ -357,15 +357,16 @@ pub async fn fetch_patch_build(
 
 /// Decoded patch manifest together with the build metadata needed to resolve
 /// its entries.
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 pub struct PatchManifestWithMeta {
     pub patch_manifest: SophonPatchProto,
+    #[cfg(feature = "preinstall")]
     pub diff_download: DownloadInfo,
     pub matching_field: String,
 }
 
 /// Download and decode a patch manifest and retain its metadata.
-#[cfg(feature = "preinstall")]
+#[cfg(any(feature = "discovery", feature = "preinstall"))]
 pub async fn fetch_patch_manifest(
     client: &Client,
     meta: &SophonPatchManifestMeta,
@@ -404,6 +405,7 @@ pub async fn fetch_patch_manifest(
 
     Ok(PatchManifestWithMeta {
         patch_manifest,
+        #[cfg(feature = "preinstall")]
         diff_download: meta.diff_download.clone(),
         matching_field: meta.matching_field.clone(),
     })
