@@ -103,6 +103,7 @@ pub fn retry_delay(attempt: u32) -> Duration {
 }
 
 /// Sleep for `delay`, returning `Err(())` if the handle is cancelled first.
+#[allow(clippy::result_unit_err)]
 pub async fn cancelable_sleep(
     handle: &crate::game_installer::handle::DownloadHandle,
     delay: Duration,
@@ -247,17 +248,19 @@ pub(crate) mod test_endpoints {
     thread_local! {
         static FRONT_DOOR: RefCell<Option<String>> = const { RefCell::new(None) };
         static BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
-        #[cfg(feature = "preinstall")]
+        #[cfg(all(feature = "preinstall", feature = "bench-internals"))]
         static PATCH_BUILD_BASE: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
+    #[cfg(feature = "bench-internals")]
     pub fn set_front_door(url: Option<String>) {
         FRONT_DOOR.with(|c| *c.borrow_mut() = url);
     }
+    #[cfg(feature = "bench-internals")]
     pub fn set_build_base(url: Option<String>) {
         BUILD_BASE.with(|c| *c.borrow_mut() = url);
     }
-    #[cfg(feature = "preinstall")]
+    #[cfg(all(feature = "preinstall", feature = "bench-internals"))]
     pub fn set_patch_build_base(url: Option<String>) {
         PATCH_BUILD_BASE.with(|c| *c.borrow_mut() = url);
     }
@@ -270,7 +273,14 @@ pub(crate) mod test_endpoints {
     }
     #[cfg(feature = "preinstall")]
     pub fn patch_build_base() -> Option<String> {
-        PATCH_BUILD_BASE.with(|c| c.borrow().clone())
+        #[cfg(feature = "bench-internals")]
+        {
+            PATCH_BUILD_BASE.with(|c| c.borrow().clone())
+        }
+        #[cfg(not(feature = "bench-internals"))]
+        {
+            None
+        }
     }
 }
 
@@ -279,7 +289,7 @@ pub(crate) mod test_endpoints {
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod bench_test_endpoints {
-    #[cfg(feature = "preinstall")]
+    #[cfg(all(feature = "preinstall", feature = "bench-internals"))]
     pub use super::test_endpoints::set_patch_build_base;
     pub use super::test_endpoints::{set_build_base, set_front_door};
 }

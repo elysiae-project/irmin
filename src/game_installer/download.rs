@@ -1124,12 +1124,15 @@ impl HashPipeline {
             }
             HashPipeline::DeferredMd5 {
                 md5_sender,
+                #[cfg(feature = "bench-internals")]
+                legacy_blocking_sender,
                 join,
                 digest_rx,
                 xxh64,
-                ..
             } => {
                 drop(md5_sender);
+                #[cfg(feature = "bench-internals")]
+                drop(legacy_blocking_sender);
                 let _partial_digest = digest_rx
                     .await
                     .map_err(|_| std::io::Error::other("hash thread died"))??;
